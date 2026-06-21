@@ -20,6 +20,8 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
   30s quickstart, verbatim `lha eval` 5/5 table, how-it-works, why-different. Substantiable badges only.
 - 0.2 docs/demo.md — exact asciinema/agg recording script for the approval→resume demo + eval;
   human records the GIF (headless: no TTY recorder).
+- 1.1 docs/BENCHMARKS.md — ResearchAgentBench-Lite: verbatim 5/5 table, per-task objective oracle,
+  verification-ablation centerpiece (with/without-verifier contrast on real numbers), reproduce cmd.
 
 ## Remaining (from BACKLOG, top-down)
 - Tier 0: 0.3 repo metadata (morning report)
@@ -36,3 +38,4 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2026-06-21 · baseline · gates green (ruff/pytest 33/facade/eval 5/5); gitignore hygiene · PASS
 - 2026-06-21 · 0.1 README rewrite · top-tier README, real eval table · PASS (ruff/pytest/grep; eval unchanged)
 - 2026-06-21 · 0.2 docs/demo.md · recording script + human NOTE · PASS (docs-only)
+- 2026-06-21 · 1.1 docs/BENCHMARKS.md · 5/5 table + ablation centerpiece · PASS (docs; eval 5/5 quoted)
