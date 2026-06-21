@@ -74,3 +74,4 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2026-06-21 · 2.4(format) ruff format · 26 files reformatted; eval 5/5 · PASS (eval 5/5)
 - 2026-06-21 · 2.4 pre-commit · .pre-commit-config.yaml (ruff lint/format + hygiene) + CONTRIBUTING note · PASS (config-only)
 - 2026-06-21 · 2.3 coverage · pytest-cov; +8 meaningful tests (MCP parse/diff/factory) 65%→69%; documented · PASS
+- 2026-06-21 · 3.2 docs/QUICKSTART.md · 0→running tutorial w/ real expected output; linked from README · PASS (docs-only)

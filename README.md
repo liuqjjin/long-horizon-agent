@@ -125,6 +125,8 @@ framework required) with the live-context machinery quarantined behind a facade.
 
 ## Documentation
 
+- [docs/QUICKSTART.md](docs/QUICKSTART.md) — clone → verified run in a few minutes,
+  with expected output.
 - [docs/VERIFICATION_FIRST.md](docs/VERIFICATION_FIRST.md) — the thesis: why error
   compounding makes an objective oracle the highest-leverage lever.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the spine, the facade, the verifier
