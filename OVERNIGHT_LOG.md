@@ -22,10 +22,12 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
   human records the GIF (headless: no TTY recorder).
 - 1.1 docs/BENCHMARKS.md — ResearchAgentBench-Lite: verbatim 5/5 table, per-task objective oracle,
   verification-ablation centerpiece (with/without-verifier contrast on real numbers), reproduce cmd.
+- 1.2 docs/ARCHITECTURE.md — spine, facade+isolation grep, 3 verifier families, durable runtime,
+  agent team, skill memory, module map, two mermaid diagrams.
 
 ## Remaining (from BACKLOG, top-down)
 - Tier 0: 0.3 repo metadata (morning report)
-- Tier 1: 1.1 BENCHMARKS · 1.2 ARCHITECTURE · 1.3 VERIFICATION_FIRST · 1.4 clean-checkout repro
+- Tier 1: 1.3 VERIFICATION_FIRST · 1.4 clean-checkout repro · (then add README Documentation links)
 - Tier 2: 2.1 CI · 2.2 type-check · 2.3 coverage · 2.4 pre-commit · 2.5 governance · 2.6 CHANGELOG
 - Tier 3: 3.1 examples · 3.2 QUICKSTART · 3.3 CLI polish · 3.4 demo task
 - Tier 4: 4.1 failure memory · 4.2 eval corpus · 4.3 observability
@@ -39,3 +41,4 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2026-06-21 · 0.1 README rewrite · top-tier README, real eval table · PASS (ruff/pytest/grep; eval unchanged)
 - 2026-06-21 · 0.2 docs/demo.md · recording script + human NOTE · PASS (docs-only)
 - 2026-06-21 · 1.1 docs/BENCHMARKS.md · 5/5 table + ablation centerpiece · PASS (docs; eval 5/5 quoted)
+- 2026-06-21 · 1.2 docs/ARCHITECTURE.md · spine+facade+verifiers+runtime, mermaid · PASS (docs-only)
