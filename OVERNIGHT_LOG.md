@@ -42,3 +42,4 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2026-06-21 · 0.2 docs/demo.md · recording script + human NOTE · PASS (docs-only)
 - 2026-06-21 · 1.1 docs/BENCHMARKS.md · 5/5 table + ablation centerpiece · PASS (docs; eval 5/5 quoted)
 - 2026-06-21 · 1.2 docs/ARCHITECTURE.md · spine+facade+verifiers+runtime, mermaid · PASS (docs-only)
+- 2026-06-21 · 1.3 docs/VERIFICATION_FIRST.md · thesis: compounding math + RLVR link + refs · PASS (docs-only)
