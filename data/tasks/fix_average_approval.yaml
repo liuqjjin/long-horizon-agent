@@ -1,0 +1,17 @@
+# Same fix as fix_average, but the edit step requires human approval before
+# verification — demonstrates the LangGraph interrupt() + Command(resume) gate:
+#   lha run --runtime langgraph data/tasks/fix_average_approval.yaml   # -> AWAITING_APPROVAL
+#   lha approve <run_id>
+#   lha resume --runtime langgraph <run_id>                            # -> DONE
+kind: issue_to_pr
+title: "Fix average() off-by-one (with approval gate)"
+description: >
+  average() in mathutils.py is off by one; fix it. The edit requires human
+  approval before it is verified and accepted.
+target_repo: data/sample_repo
+inputs:
+  context_query: "average function arithmetic mean"
+  require_approval: true
+success:
+  - "pytest passes"
+  - "ruff clean"

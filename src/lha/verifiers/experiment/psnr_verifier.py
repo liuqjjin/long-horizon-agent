@@ -1,0 +1,65 @@
+"""Experiment verifier: independently recompute PSNR and gate on a threshold.
+
+Recomputing from the saved arrays (rather than trusting the experiment's
+self-reported number) is the point — it catches a fabricated metric. A non-finite
+result (NaN/inf, e.g. a degenerate or diverged run) or a failed experiment is a
+verification FAILURE, never a silent pass.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..base import Verifier, VerifyContext
+from ..verdict import Check
+from .common import is_finite, load_arrays, precheck
+
+
+class PSNRVerifier(Verifier):
+    name = "psnr"
+    family = "experiment"
+
+    def verify(self, artifact: Any, ctx: VerifyContext) -> Check:
+        failed = precheck(artifact, self.name, self.family)
+        if failed is not None:
+            return failed
+
+        ref, pred = load_arrays(artifact, ctx.workdir)
+        if ref is None:
+            return Check(name=self.name, family=self.family, passed=False,
+                         detail={"summary": "no reference/prediction arrays to score"})
+
+        from skimage.metrics import peak_signal_noise_ratio
+
+        data_range = float(ctx.step.params.get("data_range", 1.0))
+        value = float(peak_signal_noise_ratio(ref, pred, data_range=data_range))
+        threshold = ctx.step.params.get("psnr_min")
+        reported = getattr(artifact, "metrics", {}).get("psnr")
+
+        reasons: list[str] = []
+        if not is_finite(value):
+            reasons.append(f"non-finite PSNR ({value}) — degenerate result")
+        else:
+            if threshold is not None and value < float(threshold):
+                reasons.append(f"PSNR {value:.3f} < threshold {threshold}")
+            if reported is not None:
+                if not is_finite(reported):
+                    reasons.append(f"self-reported PSNR is non-finite ({reported})")
+                elif abs(value - float(reported)) > 1.0:
+                    reasons.append(
+                        f"recomputed {value:.3f} dB inconsistent with reported {float(reported):.3f} dB"
+                    )
+
+        score = value if is_finite(value) else None
+        shown = f"{value:.3f} dB" if is_finite(value) else str(value)
+        return Check(
+            name=self.name,
+            family=self.family,
+            passed=not reasons,
+            score=score,
+            threshold=float(threshold) if threshold is not None else None,
+            detail={
+                "summary": f"PSNR={shown} (reported={reported}, threshold={threshold})",
+                "reasons": reasons,
+            },
+        )

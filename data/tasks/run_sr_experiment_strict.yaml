@@ -1,0 +1,19 @@
+# Verification-ablation case: the bicubic baseline (~25 dB) cannot meet a 40 dB
+# bar, so a correct harness must FAIL this run. It proves verification is
+# load-bearing: without the PSNR verifier this bad result would be "accepted".
+kind: paper_to_experiment
+title: "SR experiment with an unreachable PSNR bar (ablation)"
+description: "Run the bicubic SR experiment against an impossible PSNR threshold; the verifier must reject it."
+target_repo: data/sample_experiment
+inputs:
+  context_query: "PSNR SSIM super-resolution baseline"
+  experiment_script: experiment.py
+  experiment_args: ["--out", "out", "--seed", "42", "--scale", "4"]
+  out_dir: out
+  thresholds:
+    psnr_min: 40.0
+    ssim_min: 0.80
+    data_range: 1.0
+    channel_axis: -1
+success:
+  - "PSNR >= 40.0 dB (intentionally unreachable)"

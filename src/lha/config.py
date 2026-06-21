@@ -1,0 +1,78 @@
+"""Runtime configuration, populated from environment variables (``LHA_*``).
+
+A ``.env`` file in the project root is loaded automatically if python-dotenv is
+available. Everything here has a sensible default so the walking skeleton runs
+with zero configuration.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from pydantic import BaseModel
+
+try:  # optional: load .env if python-dotenv is installed
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:  # pragma: no cover - dotenv is optional
+    pass
+
+
+def _env(key: str, default: str) -> str:
+    return os.environ.get(key, default)
+
+
+class Config(BaseModel):
+    """Harness configuration. Construct with ``Config.from_env()``."""
+
+    # Loop budget
+    max_steps: int = 20
+    max_repairs: int = 3
+    deadline_s: float | None = None
+
+    # Run the selected verifiers concurrently
+    parallel_verify: bool = True
+
+    # Record verified successes as retrievable skills (Voyager-lite)
+    use_skill_memory: bool = True
+
+    # Freshness
+    freshness_max_age_s: float = 3600.0
+
+    # LLM backend: "stub" | "claude_cli" | "anthropic"
+    llm_backend: str = "stub"
+    claude_cli_path: str = "claude"
+    anthropic_model_impl: str = "claude-opus-4-8"
+    anthropic_model_orchestration: str = "claude-sonnet-4-6"
+
+    # Code search backend: "ccc" | "null"  ("auto" picks ccc if available)
+    code_backend: str = "auto"
+    embedder_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    # Paths
+    runs_dir: Path = Path("runs")
+    data_dir: Path = Path("data")
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        return cls(
+            max_steps=int(_env("LHA_MAX_STEPS", "20")),
+            max_repairs=int(_env("LHA_MAX_REPAIRS", "3")),
+            parallel_verify=_env("LHA_PARALLEL_VERIFY", "1") not in ("0", "false", "False"),
+            use_skill_memory=_env("LHA_SKILL_MEMORY", "1") not in ("0", "false", "False"),
+            freshness_max_age_s=float(_env("LHA_FRESHNESS_MAX_AGE_S", "3600")),
+            llm_backend=_env("LHA_LLM_BACKEND", "stub"),
+            claude_cli_path=_env("LHA_CLAUDE_CLI", "claude"),
+            anthropic_model_impl=_env("LHA_ANTHROPIC_MODEL_IMPL", "claude-opus-4-8"),
+            anthropic_model_orchestration=_env(
+                "LHA_ANTHROPIC_MODEL_ORCH", "claude-sonnet-4-6"
+            ),
+            code_backend=_env("LHA_CODE_BACKEND", "auto"),
+            embedder_model=_env(
+                "LHA_EMBEDDER_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+            ),
+            runs_dir=Path(_env("LHA_RUNS_DIR", "runs")),
+            data_dir=Path(_env("LHA_DATA_DIR", "data")),
+        )

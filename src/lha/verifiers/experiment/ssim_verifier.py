@@ -1,0 +1,67 @@
+"""Experiment verifier: independently recompute SSIM and gate on a threshold.
+
+A non-finite result or a failed experiment is a verification FAILURE.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..base import Verifier, VerifyContext
+from ..verdict import Check
+from .common import is_finite, load_arrays, precheck
+
+
+class SSIMVerifier(Verifier):
+    name = "ssim"
+    family = "experiment"
+
+    def verify(self, artifact: Any, ctx: VerifyContext) -> Check:
+        failed = precheck(artifact, self.name, self.family)
+        if failed is not None:
+            return failed
+
+        ref, pred = load_arrays(artifact, ctx.workdir)
+        if ref is None:
+            return Check(name=self.name, family=self.family, passed=False,
+                         detail={"summary": "no reference/prediction arrays to score"})
+
+        from skimage.metrics import structural_similarity
+
+        data_range = float(ctx.step.params.get("data_range", 1.0))
+        channel_axis = ctx.step.params.get("channel_axis", -1 if ref.ndim == 3 else None)
+        kwargs: dict[str, Any] = {"data_range": data_range, "channel_axis": channel_axis}
+        if "win_size" in ctx.step.params:
+            kwargs["win_size"] = int(ctx.step.params["win_size"])
+
+        value = float(structural_similarity(ref, pred, **kwargs))
+        threshold = ctx.step.params.get("ssim_min")
+        reported = getattr(artifact, "metrics", {}).get("ssim")
+
+        reasons: list[str] = []
+        if not is_finite(value):
+            reasons.append(f"non-finite SSIM ({value}) — degenerate result")
+        else:
+            if threshold is not None and value < float(threshold):
+                reasons.append(f"SSIM {value:.4f} < threshold {threshold}")
+            if reported is not None:
+                if not is_finite(reported):
+                    reasons.append(f"self-reported SSIM is non-finite ({reported})")
+                elif abs(value - float(reported)) > 0.01:
+                    reasons.append(
+                        f"recomputed {value:.4f} inconsistent with reported {float(reported):.4f}"
+                    )
+
+        score = value if is_finite(value) else None
+        shown = f"{value:.4f}" if is_finite(value) else str(value)
+        return Check(
+            name=self.name,
+            family=self.family,
+            passed=not reasons,
+            score=score,
+            threshold=float(threshold) if threshold is not None else None,
+            detail={
+                "summary": f"SSIM={shown} (reported={reported}, threshold={threshold})",
+                "reasons": reasons,
+            },
+        )

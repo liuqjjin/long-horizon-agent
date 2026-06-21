@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Harness run artifacts and indexes
+runs/
+.cocoindex_code/
+.pytest_cache/
+.lha_pytest.json
+data/.lha_index/
+data/skills/
+
+# Local env / secrets
+.env
+
+# OS / editor / local agent tooling (machine-specific)
+.DS_Store
+.claude/
+.mcp.json

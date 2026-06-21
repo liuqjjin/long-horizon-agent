@@ -1,0 +1,21 @@
+kind: paper_to_experiment
+title: "Bicubic 4x super-resolution baseline"
+description: >
+  Run the bicubic 4x super-resolution experiment and verify PSNR/SSIM meet the
+  acceptance thresholds (paper convention: data_range=1.0, SSIM channel_axis=-1)
+  and that the run is reproducible.
+target_repo: data/sample_experiment
+inputs:
+  context_query: "PSNR SSIM data_range super-resolution baseline bicubic"
+  experiment_script: experiment.py
+  experiment_args: ["--out", "out", "--seed", "42", "--scale", "4"]
+  out_dir: out
+  thresholds:
+    psnr_min: 24.0
+    ssim_min: 0.80
+    data_range: 1.0
+    channel_axis: -1
+success:
+  - "PSNR >= 24.0 dB"
+  - "SSIM >= 0.80"
+  - "reproducible (re-run matches; seed + versions recorded)"

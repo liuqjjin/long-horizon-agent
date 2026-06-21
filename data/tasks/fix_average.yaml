@@ -1,0 +1,11 @@
+kind: issue_to_pr
+title: "Fix average() off-by-one bug"
+description: >
+  average() in mathutils.py returns the wrong value because of a stray "- 1".
+  tests/test_mathutils.py::test_average fails. Fix the function so the tests pass.
+target_repo: data/sample_repo
+inputs:
+  context_query: "average function arithmetic mean"
+success:
+  - "pytest passes"
+  - "ruff clean"
