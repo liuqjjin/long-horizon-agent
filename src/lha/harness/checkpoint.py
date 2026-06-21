@@ -44,7 +44,11 @@ def read_ledger(run_dir: str | Path) -> list[StepRecord]:
     path = Path(run_dir) / LEDGER_FILE
     if not path.exists():
         return []
-    return [StepRecord.model_validate_json(line) for line in path.read_text().splitlines() if line.strip()]
+    return [
+        StepRecord.model_validate_json(line)
+        for line in path.read_text().splitlines()
+        if line.strip()
+    ]
 
 
 class FileCheckpointer:

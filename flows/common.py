@@ -76,7 +76,9 @@ async def app_main(sourcedir: pathlib.Path, outdir: pathlib.Path, kind: str) -> 
     await coco.mount_each(process_note, files.items(), outdir, kind, str(sourcedir))
 
 
-def make_app(name: str, sourcedir: str | pathlib.Path, outdir: str | pathlib.Path, kind: str) -> coco.App:
+def make_app(
+    name: str, sourcedir: str | pathlib.Path, outdir: str | pathlib.Path, kind: str
+) -> coco.App:
     return coco.App(
         coco.AppConfig(name=name),
         app_main,

@@ -86,8 +86,11 @@ class LangGraphHarness:
             if snap.next:  # graph is paused at an interrupt (awaiting approval)
                 decision = HumanApprovalGate(run_dir).decision()
                 if decision is None:
-                    return RunResult(load_state_by_id(self.config.runs_dir, state.run_id),
-                                     "AWAITING_APPROVAL", "approval pending")
+                    return RunResult(
+                        load_state_by_id(self.config.runs_dir, state.run_id),
+                        "AWAITING_APPROVAL",
+                        "approval pending",
+                    )
                 HumanApprovalGate(run_dir).clear()
                 graph.invoke(Command(resume={"approved": decision.approved}), gcfg)
             else:
@@ -137,7 +140,9 @@ class LangGraphHarness:
         workdir = Path(state.workdir)
 
         def ledger(phase: Phase, **kw):
-            append_ledger(state, StepRecord(seq=state.next_seq(), step_id=step.step_id, phase=phase, **kw))
+            append_ledger(
+                state, StepRecord(seq=state.next_seq(), step_id=step.step_id, phase=phase, **kw)
+            )
 
         bundle = ContextEngineer(self.config).gather(step)
         (run_dir / "context_bundle.json").write_text(bundle.model_dump_json(indent=2))

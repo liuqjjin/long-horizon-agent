@@ -58,9 +58,7 @@ def apply_patch(patch: Patch, workdir: str | Path) -> tuple[list[str], Backup]:
             diff_path = f.name
         # Idempotent: if the diff is already applied (e.g. on resume), skip it
         # rather than failing with "patch already applied".
-        already = run(
-            ["git", "apply", "--reverse", "--check", "-p1", diff_path], cwd=workdir
-        )
+        already = run(["git", "apply", "--reverse", "--check", "-p1", diff_path], cwd=workdir)
         if already.ok:
             return list(patch.touched_files), backup
         res = run(

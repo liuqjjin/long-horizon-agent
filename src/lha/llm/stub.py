@@ -25,9 +25,7 @@ class DeterministicStub(LLMClient):
     def complete(self, system: str, prompt: str) -> str:  # not used by the stub
         return ""
 
-    def propose_patch(
-        self, step, bundle: ContextBundle, workdir: str | Path
-    ) -> Patch:
+    def propose_patch(self, step, bundle: ContextBundle, workdir: str | Path) -> Patch:
         workdir = Path(workdir)
         target_rel = "mathutils.py"
         target = workdir / target_rel

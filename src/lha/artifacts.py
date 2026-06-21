@@ -34,9 +34,7 @@ class Step(BaseModel):
     prior_failures: list[str] = Field(default_factory=list)
 
     def as_repair(self, failures: list[str]) -> "Step":
-        return self.model_copy(
-            update={"repair_of": self.step_id, "prior_failures": failures}
-        )
+        return self.model_copy(update={"repair_of": self.step_id, "prior_failures": failures})
 
 
 class Plan(BaseModel):

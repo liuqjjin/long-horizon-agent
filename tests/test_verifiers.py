@@ -23,26 +23,42 @@ def _step(*verifiers: str) -> Step:
 
 
 def test_pytest_verifier_pass(tmp_path):
-    repo = _repo(tmp_path, "def f():\n    return 1\n", "from m import f\n\n\ndef test_f():\n    assert f() == 1\n")
-    check = PytestVerifier().verify(Patch(step_id="s"), VerifyContext(workdir=repo, step=_step("pytest")))
+    repo = _repo(
+        tmp_path,
+        "def f():\n    return 1\n",
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+    check = PytestVerifier().verify(
+        Patch(step_id="s"), VerifyContext(workdir=repo, step=_step("pytest"))
+    )
     assert check.passed
     assert check.score == 1.0
 
 
 def test_pytest_verifier_fail(tmp_path):
-    repo = _repo(tmp_path, "def f():\n    return 2\n", "from m import f\n\n\ndef test_f():\n    assert f() == 1\n")
-    check = PytestVerifier().verify(Patch(step_id="s"), VerifyContext(workdir=repo, step=_step("pytest")))
+    repo = _repo(
+        tmp_path,
+        "def f():\n    return 2\n",
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+    check = PytestVerifier().verify(
+        Patch(step_id="s"), VerifyContext(workdir=repo, step=_step("pytest"))
+    )
     assert not check.passed
     assert check.detail["failing"]
 
 
 def test_ruff_verifier(tmp_path):
     (tmp_path / "clean.py").write_text("x = 1\nprint(x)\n")
-    clean = RuffVerifier().verify(Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=_step("ruff")))
+    clean = RuffVerifier().verify(
+        Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=_step("ruff"))
+    )
     assert clean.passed
 
     (tmp_path / "dirty.py").write_text("import os\n")  # F401 unused import
-    dirty = RuffVerifier().verify(Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=_step("ruff")))
+    dirty = RuffVerifier().verify(
+        Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=_step("ruff"))
+    )
     assert not dirty.passed
     assert dirty.score >= 1
 

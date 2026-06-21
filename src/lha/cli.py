@@ -1,11 +1,11 @@
 """``lha`` command-line interface.
 
-    lha run <task.yaml>      run a task through the verification loop
-    lha resume <run_id>      resume a paused/awaiting run
-    lha index <path>         (re)build the code index for a repo
-    lha ask <query...>       answer a query with fresh, cited context
-    lha approve <run_id>     approve a pending human-approval gate
-    lha reject <run_id>      reject a pending human-approval gate
+lha run <task.yaml>      run a task through the verification loop
+lha resume <run_id>      resume a paused/awaiting run
+lha index <path>         (re)build the code index for a repo
+lha ask <query...>       answer a query with fresh, cited context
+lha approve <run_id>     approve a pending human-approval gate
+lha reject <run_id>      reject a pending human-approval gate
 """
 
 from __future__ import annotations
@@ -116,14 +116,18 @@ def _cmd_ask(args) -> int:
         query, kinds=kinds, k=args.k, max_age_s=cfg.freshness_max_age_s
     )
     print(f"Q: {query}")
-    print(f"freshness: stale={bundle.freshness.is_stale()} "
-          f"indexed_at={bundle.freshness.indexed_at:%Y-%m-%d %H:%M:%S} "
-          f"reasons={bundle.freshness.reasons or '-'}")
+    print(
+        f"freshness: stale={bundle.freshness.is_stale()} "
+        f"indexed_at={bundle.freshness.indexed_at:%Y-%m-%d %H:%M:%S} "
+        f"reasons={bundle.freshness.reasons or '-'}"
+    )
     if bundle.freshness.is_stale():
         print("-> context is stale; reject_stale() reindexing incrementally...")
         bundle = live_context.reject_stale(bundle)
-        print(f"   refreshed: stale={bundle.freshness.is_stale()} "
-              f"indexed_at={bundle.freshness.indexed_at:%Y-%m-%d %H:%M:%S}")
+        print(
+            f"   refreshed: stale={bundle.freshness.is_stale()} "
+            f"indexed_at={bundle.freshness.indexed_at:%Y-%m-%d %H:%M:%S}"
+        )
     print(f"{len(bundle.items)} context item(s):")
     for item in bundle.items:
         snippet = " ".join(item.text.split())[:120]
@@ -138,7 +142,9 @@ def _cmd_approve(args, approved: bool) -> int:
     state = load_state_by_id(cfg.runs_dir, args.run_id)
     gate = HumanApprovalGate(state.run_dir)
     gate.resolve(approved=approved, note=args.note or "")
-    print(f"{'approved' if approved else 'rejected'} run {args.run_id}; run `lha resume {args.run_id}`")
+    print(
+        f"{'approved' if approved else 'rejected'} run {args.run_id}; run `lha resume {args.run_id}`"
+    )
     return 0
 
 
@@ -194,7 +200,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("--llm", choices=["stub", "claude_cli", "anthropic"], help="LLM backend override")
+    p.add_argument(
+        "--llm", choices=["stub", "claude_cli", "anthropic"], help="LLM backend override"
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pr = sub.add_parser("run", help="run a task")

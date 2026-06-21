@@ -22,8 +22,7 @@ class SearchBackend(ABC):
         return True
 
     @abstractmethod
-    def search(self, query: str, *, k: int = 8, **filters) -> list[Hit]:
-        ...
+    def search(self, query: str, *, k: int = 8, **filters) -> list[Hit]: ...
 
     @abstractmethod
     def index_meta(self) -> tuple[str, datetime]:

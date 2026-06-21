@@ -308,7 +308,9 @@ class Harness:
         checks = []
         if verdict:
             for c in verdict.checks:
-                checks.append(f"{c.name}: {c.detail.get('summary', 'passed' if c.passed else 'failed')}")
+                checks.append(
+                    f"{c.name}: {c.detail.get('summary', 'passed' if c.passed else 'failed')}"
+                )
         pr = PRSummary(
             title=state.task.title,
             task_id=state.run_id,
@@ -338,7 +340,9 @@ class Harness:
         reproducible = False
         if verdict:
             for c in verdict.checks:
-                checks.append(f"{c.name}: {c.detail.get('summary', 'passed' if c.passed else 'failed')}")
+                checks.append(
+                    f"{c.name}: {c.detail.get('summary', 'passed' if c.passed else 'failed')}"
+                )
                 if c.name in ("psnr", "ssim") and c.score is not None:
                     metrics[c.name] = round(c.score, 6)
                 if c.name == "reproducibility":

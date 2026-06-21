@@ -66,13 +66,9 @@ class Config(BaseModel):
             llm_backend=_env("LHA_LLM_BACKEND", "stub"),
             claude_cli_path=_env("LHA_CLAUDE_CLI", "claude"),
             anthropic_model_impl=_env("LHA_ANTHROPIC_MODEL_IMPL", "claude-opus-4-8"),
-            anthropic_model_orchestration=_env(
-                "LHA_ANTHROPIC_MODEL_ORCH", "claude-sonnet-4-6"
-            ),
+            anthropic_model_orchestration=_env("LHA_ANTHROPIC_MODEL_ORCH", "claude-sonnet-4-6"),
             code_backend=_env("LHA_CODE_BACKEND", "auto"),
-            embedder_model=_env(
-                "LHA_EMBEDDER_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-            ),
+            embedder_model=_env("LHA_EMBEDDER_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
             runs_dir=Path(_env("LHA_RUNS_DIR", "runs")),
             data_dir=Path(_env("LHA_DATA_DIR", "data")),
         )

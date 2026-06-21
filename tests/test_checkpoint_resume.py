@@ -25,7 +25,9 @@ def test_pause_then_resume(tmp_path):
 
     # a fresh harness (new process) resumes from the checkpoint
     resumed = Harness(
-        Config(llm_backend="stub", code_backend="null", runs_dir=runs, data_dir=nodata, max_steps=20)
+        Config(
+            llm_backend="stub", code_backend="null", runs_dir=runs, data_dir=nodata, max_steps=20
+        )
     )
     r2 = resumed.resume(r1.state.run_id)
     assert r2.status == "DONE"

@@ -15,8 +15,12 @@ from lha.verifiers import VerifyContext
 
 
 def test_missing_verifier_fails_not_silently_passes(tmp_path):
-    step = Step(step_id="s", kind="code", action="edit_code", goal="g", verifiers=["does_not_exist"])
-    verdict = VerifierAgent().verify(step, Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=step))
+    step = Step(
+        step_id="s", kind="code", action="edit_code", goal="g", verifiers=["does_not_exist"]
+    )
+    verdict = VerifierAgent().verify(
+        step, Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=step)
+    )
     assert verdict.passed is False
     assert any(c.name == "does_not_exist" and not c.passed for c in verdict.checks)
 

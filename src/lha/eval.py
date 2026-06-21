@@ -66,7 +66,9 @@ def _verified(result) -> bool:
 def _case_issue_to_pr(base: Config) -> EvalResult:
     r = Harness(_cfg(base, "issue_to_pr")).run(TaskSpec.from_file("data/tasks/fix_average.yaml"))
     ok = r.status == "DONE" and _verified(r)
-    return EvalResult("fix_average", "issue-to-PR", ok, f"status={r.status} verified={_verified(r)}")
+    return EvalResult(
+        "fix_average", "issue-to-PR", ok, f"status={r.status} verified={_verified(r)}"
+    )
 
 
 def _case_resume(base: Config) -> EvalResult:
@@ -75,7 +77,9 @@ def _case_resume(base: Config) -> EvalResult:
     )
     resumed = Harness(_cfg(base, "resume")).resume(paused.state.run_id)
     ok = paused.status == "PAUSED" and resumed.status == "DONE" and _verified(resumed)
-    return EvalResult("pause_resume", "resume", ok, f"first={paused.status} resumed={resumed.status}")
+    return EvalResult(
+        "pause_resume", "resume", ok, f"first={paused.status} resumed={resumed.status}"
+    )
 
 
 def _case_freshness(base: Config) -> EvalResult:
@@ -120,7 +124,9 @@ def _case_paper_to_experiment(base: Config) -> EvalResult:
         TaskSpec.from_file("data/tasks/run_sr_experiment.yaml")
     )
     ok = r.status == "DONE" and _verified(r)
-    return EvalResult("bicubic_sr", "paper-to-experiment", ok, f"status={r.status} verified={_verified(r)}")
+    return EvalResult(
+        "bicubic_sr", "paper-to-experiment", ok, f"status={r.status} verified={_verified(r)}"
+    )
 
 
 def _case_verification_ablation(base: Config) -> EvalResult:

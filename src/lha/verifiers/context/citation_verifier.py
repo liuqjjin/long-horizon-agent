@@ -36,7 +36,9 @@ class CitationVerifier(Verifier):
                 name=self.name,
                 family=self.family,
                 passed=have_prov,
-                detail={"summary": f"{len(artifact.items)} items, all with provenance: {have_prov}"},
+                detail={
+                    "summary": f"{len(artifact.items)} items, all with provenance: {have_prov}"
+                },
             )
 
         return Check(name=self.name, family=self.family, passed=True, detail={"summary": "n/a"})

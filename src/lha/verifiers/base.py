@@ -34,5 +34,4 @@ class Verifier(ABC):
         return self.name in step.verifiers
 
     @abstractmethod
-    def verify(self, artifact: Any, ctx: VerifyContext) -> Check:
-        ...
+    def verify(self, artifact: Any, ctx: VerifyContext) -> Check: ...

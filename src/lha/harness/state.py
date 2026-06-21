@@ -16,9 +16,7 @@ from ..clock import now
 from ..tasks.spec import TaskSpec
 
 RunStatus = Literal["RUNNING", "AWAITING_APPROVAL", "DONE", "FAILED", "PAUSED"]
-Phase = Literal[
-    "plan", "context", "execute", "approval", "verify", "repair", "complete", "fail"
-]
+Phase = Literal["plan", "context", "execute", "approval", "verify", "repair", "complete", "fail"]
 
 
 class StepRecord(BaseModel):

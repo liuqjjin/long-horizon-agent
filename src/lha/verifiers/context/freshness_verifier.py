@@ -15,7 +15,9 @@ class FreshnessVerifier(Verifier):
     def verify(self, artifact: Any, ctx: VerifyContext) -> Check:
         bundle = ctx.bundle
         if bundle is None:
-            return Check(name=self.name, family=self.family, passed=True, detail={"summary": "no bundle"})
+            return Check(
+                name=self.name, family=self.family, passed=True, detail={"summary": "no bundle"}
+            )
         stale = bundle.freshness.is_stale()
         return Check(
             name=self.name,

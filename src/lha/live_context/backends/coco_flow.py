@@ -72,9 +72,7 @@ class CocoFlowBackend(SearchBackend):
             )
         metrics_raw = meta.get("metrics") if isinstance(meta.get("metrics"), dict) else {}
         metrics = {
-            str(k): float(v)
-            for k, v in (metrics_raw or {}).items()
-            if isinstance(v, (int, float))
+            str(k): float(v) for k, v in (metrics_raw or {}).items() if isinstance(v, (int, float))
         }
         return ExperimentHit(
             text=rec.get("text", ""),
@@ -87,7 +85,10 @@ class CocoFlowBackend(SearchBackend):
     def index_meta(self) -> tuple[str, datetime]:
         if self.available():
             mtime = max(p.stat().st_mtime for p in self.index_dir.glob("*.json"))
-            return (f"coco:{self.kind}@{int(mtime)}", datetime.fromtimestamp(mtime, tz=timezone.utc))
+            return (
+                f"coco:{self.kind}@{int(mtime)}",
+                datetime.fromtimestamp(mtime, tz=timezone.utc),
+            )
         return (f"coco:{self.kind}@uninitialized", now())
 
     # --- build path (runs CocoIndex) ---------------------------------------

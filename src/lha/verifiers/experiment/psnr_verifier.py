@@ -26,8 +26,12 @@ class PSNRVerifier(Verifier):
 
         ref, pred = load_arrays(artifact, ctx.workdir)
         if ref is None:
-            return Check(name=self.name, family=self.family, passed=False,
-                         detail={"summary": "no reference/prediction arrays to score"})
+            return Check(
+                name=self.name,
+                family=self.family,
+                passed=False,
+                detail={"summary": "no reference/prediction arrays to score"},
+            )
 
         from skimage.metrics import peak_signal_noise_ratio
 

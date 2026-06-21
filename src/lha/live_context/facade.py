@@ -116,13 +116,9 @@ def search_papers(query: str, *, k: int = 5) -> list[PaperHit]:
     return [h if isinstance(h, PaperHit) else PaperHit(**h.model_dump()) for h in hits]
 
 
-def search_experiments(
-    query: str, *, k: int = 5, metric: str | None = None
-) -> list[ExperimentHit]:
+def search_experiments(query: str, *, k: int = 5, metric: str | None = None) -> list[ExperimentHit]:
     hits = _backend_for("experiment").search(query, k=k, metric=metric)
-    return [
-        h if isinstance(h, ExperimentHit) else ExperimentHit(**h.model_dump()) for h in hits
-    ]
+    return [h if isinstance(h, ExperimentHit) else ExperimentHit(**h.model_dump()) for h in hits]
 
 
 def search_skills(query: str, *, k: int = 5) -> list[SkillHit]:
@@ -174,9 +170,9 @@ def reject_stale(bundle: ContextBundle, *, reindex: bool = True) -> ContextBundl
         raise StaleContextError(
             f"context for {bundle.query!r} is stale: {bundle.freshness.reasons}"
         )
-    kinds: tuple[SourceKind, ...] = (
-        tuple(dict.fromkeys(i.provenance.source_kind for i in bundle.items)) or ("code",)
-    )
+    kinds: tuple[SourceKind, ...] = tuple(
+        dict.fromkeys(i.provenance.source_kind for i in bundle.items)
+    ) or ("code",)
     for kind in kinds:
         _backend_for(kind).reindex()
     _state.reset_cache()

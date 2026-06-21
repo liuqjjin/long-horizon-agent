@@ -43,7 +43,7 @@ def _parse(task: str, proc: subprocess.CompletedProcess) -> TaskOutcome:
     for line in reversed((proc.stdout or "").splitlines()):
         if line.startswith(_RESULT_PREFIX):
             try:
-                d = json.loads(line[len(_RESULT_PREFIX):])
+                d = json.loads(line[len(_RESULT_PREFIX) :])
             except json.JSONDecodeError:
                 break
             status = d.get("status", "ERROR")

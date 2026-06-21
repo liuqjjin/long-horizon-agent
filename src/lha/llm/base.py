@@ -38,17 +38,12 @@ class LLMClient(ABC):
     name: str = "base"
 
     @abstractmethod
-    def complete(self, system: str, prompt: str) -> str:
-        ...
+    def complete(self, system: str, prompt: str) -> str: ...
 
-    def propose_patch(
-        self, step, bundle: ContextBundle, workdir: str | Path
-    ) -> Patch:
+    def propose_patch(self, step, bundle: ContextBundle, workdir: str | Path) -> Patch:
         """Default: prompt the model with context and parse a unified diff."""
         workdir = Path(workdir)
-        ctx_text = "\n\n".join(
-            f"# {i.provenance.locator}\n{i.text}" for i in bundle.items[:8]
-        )
+        ctx_text = "\n\n".join(f"# {i.provenance.locator}\n{i.text}" for i in bundle.items[:8])
         files_text = self._read_repo_python(workdir)
         prompt = (
             f"## Issue\n{step.goal}\n\n"
