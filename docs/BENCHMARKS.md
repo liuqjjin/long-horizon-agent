@@ -81,6 +81,10 @@ demonstrated on a runnable task rather than asserted. It also guards against
 - **Scope.** This is a *lite* benchmark on small, bundled tasks — it measures that
   the harness's own workflows behave correctly end-to-end, not performance against
   an external SWE/agent benchmark. No external leaderboard numbers are claimed.
+- **Reproducibility.** From a clean checkout, `uv sync && uv run lha eval` (run from
+  the repo root) reproduces `5/5` — verified by deleting all gitignored generated
+  state (`runs/`, `data/.lha_index/`, `data/skills/`) and re-running. The first run
+  downloads a small sentence-transformers model (~tens of MB, one-time).
 - **Determinism.** The experiment is seeded and deterministic; the freshness case
   is tested via index-generation timestamps (not wall-clock races). A clean
   checkout with a fresh `ccc` daemon reproduces `5/5`; a daemon heavily churned by

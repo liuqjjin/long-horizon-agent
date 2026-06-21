@@ -24,10 +24,13 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
   verification-ablation centerpiece (with/without-verifier contrast on real numbers), reproduce cmd.
 - 1.2 docs/ARCHITECTURE.md — spine, facade+isolation grep, 3 verifier families, durable runtime,
   agent team, skill memory, module map, two mermaid diagrams.
+- 1.3 docs/VERIFICATION_FIRST.md — thesis: error-compounding math, RLVR link, honest limits, refs.
+- 0.1(h) README Documentation section linking the four docs (all targets exist).
+- 1.4 clean-checkout reproducibility — verified `uv sync && lha eval` → 5/5 after deleting all
+  gitignored generated state (runs/, data/.lha_index/, data/skills/) on a fresh daemon; documented.
 
 ## Remaining (from BACKLOG, top-down)
 - Tier 0: 0.3 repo metadata (morning report)
-- Tier 1: 1.3 VERIFICATION_FIRST · 1.4 clean-checkout repro · (then add README Documentation links)
 - Tier 2: 2.1 CI · 2.2 type-check · 2.3 coverage · 2.4 pre-commit · 2.5 governance · 2.6 CHANGELOG
 - Tier 3: 3.1 examples · 3.2 QUICKSTART · 3.3 CLI polish · 3.4 demo task
 - Tier 4: 4.1 failure memory · 4.2 eval corpus · 4.3 observability
@@ -44,3 +47,4 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2026-06-21 · 1.2 docs/ARCHITECTURE.md · spine+facade+verifiers+runtime, mermaid · PASS (docs-only)
 - 2026-06-21 · 1.3 docs/VERIFICATION_FIRST.md · thesis: compounding math + RLVR link + refs · PASS (docs-only)
 - 2026-06-21 · 0.1(h) README docs links · added Documentation section (all targets exist) · PASS (docs-only)
+- 2026-06-21 · 1.4 clean-checkout repro · deleted gitignored state + fresh daemon → eval 5/5; documented · PASS (eval 5/5)

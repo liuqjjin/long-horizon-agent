@@ -60,6 +60,11 @@ uv run lha run data/tasks/fix_average.yaml     # find a bug, fix it, verify with
 uv run lha eval                                # self-evaluate across all 5 workflows
 ```
 
+Run from the repo root. `uv sync && uv run lha eval` reproduces `5/5` from a clean
+checkout (generated indexes/runs are gitignored and rebuilt on demand); the first
+`lha eval` downloads a small embedding model (~tens of MB, one-time) for the
+paper/experiment/freshness cases.
+
 The walking skeleton runs with a **deterministic stub** implementer, so a real
 `pytest` verifies a real fix with no API key and no network. Swap in an LLM with
 `--llm claude_cli` (uses the authenticated `claude` CLI) or `--llm anthropic`.
