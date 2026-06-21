@@ -14,11 +14,15 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 ---
 
 ## Completed
-- (baseline) Established git baseline; gates green at start: ruff clean, pytest 33 passed,
-  facade-isolation clean, `lha eval` 5/5. Added `.DS_Store`/`.claude/`/`.mcp.json` to `.gitignore`.
+- (baseline) git baseline; gates green: ruff clean, pytest 33, facade clean, `lha eval` 5/5.
+  gitignore hygiene (`.DS_Store`/`.claude/`/`.mcp.json`).
+- 0.1 README rewrite — differentiator tagline, compounding-error hook, mermaid spine diagram,
+  30s quickstart, verbatim `lha eval` 5/5 table, how-it-works, why-different. Substantiable badges only.
+- 0.2 docs/demo.md — exact asciinema/agg recording script for the approval→resume demo + eval;
+  human records the GIF (headless: no TTY recorder).
 
 ## Remaining (from BACKLOG, top-down)
-- Tier 0: 0.1 README rewrite · 0.2 demo asset · 0.3 repo metadata (morning report)
+- Tier 0: 0.3 repo metadata (morning report)
 - Tier 1: 1.1 BENCHMARKS · 1.2 ARCHITECTURE · 1.3 VERIFICATION_FIRST · 1.4 clean-checkout repro
 - Tier 2: 2.1 CI · 2.2 type-check · 2.3 coverage · 2.4 pre-commit · 2.5 governance · 2.6 CHANGELOG
 - Tier 3: 3.1 examples · 3.2 QUICKSTART · 3.3 CLI polish · 3.4 demo task
@@ -30,3 +34,5 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 
 ## Iterations
 - 2026-06-21 · baseline · gates green (ruff/pytest 33/facade/eval 5/5); gitignore hygiene · PASS
+- 2026-06-21 · 0.1 README rewrite · top-tier README, real eval table · PASS (ruff/pytest/grep; eval unchanged)
+- 2026-06-21 · 0.2 docs/demo.md · recording script + human NOTE · PASS (docs-only)
