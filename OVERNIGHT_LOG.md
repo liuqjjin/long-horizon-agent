@@ -1,5 +1,58 @@
 # Overnight optimization log
 
+## ☀️ Morning report (2026-06-21)
+
+A documentation, presentation, and engineering-rigor pass: **17 improvement commits**
+(this report is the 18th), each small, reversible, and conventional; every commit
+left the gate green.
+
+**Final gate (verbatim):** `ruff check .` clean · `pyright src/lha` 0 errors ·
+`pytest` 41 passed · facade-isolation grep clean · `lha eval` **5/5**.
+
+**What changed, by theme**
+- *First impression (Tier 0):* rewrote the README around the differentiator
+  (objective-oracle verification, not LLM-as-judge) with an error-compounding hook,
+  a mermaid spine diagram, a 30s quickstart, and the verbatim `lha eval` 5/5 table;
+  added `docs/demo.md` (GIF recording script for a human to run).
+- *Differentiator made legible (Tier 1):* `docs/BENCHMARKS.md` (per-task oracle +
+  the verification-ablation centerpiece), `docs/ARCHITECTURE.md` (spine/facade/
+  verifiers/runtime + diagrams), `docs/VERIFICATION_FIRST.md` (the thesis: error
+  compounding `pⁿ`, horizon `≈ ln(1/τ)/ε`, RLVR link, real references), and verified
+  clean-checkout reproducibility (`uv sync && lha eval` → 5/5).
+- *Engineering rigor (Tier 2):* GitHub Actions CI mirroring the gate; **pyright**
+  driven to 0 and added to the gate + CI (type-only fixes, no logic change);
+  coverage measured (65%→**69%**) via 8 meaningful unit tests; pre-commit config;
+  governance (CONTRIBUTING with the "no claim without a runnable check" rule,
+  SECURITY, CODE_OF_CONDUCT, issue/PR templates); CHANGELOG (draft 0.1.0).
+- *Polish (Tier 3):* `lha --version` + CLI help examples; `docs/QUICKSTART.md`
+  (0→verified-run with real expected output); applied `ruff format` repo-wide.
+
+**Proposed repo metadata (for the human — I can't edit GitHub settings)**
+- *Description (≤350):* "Verification-first long-horizon agent harness: every step
+  is gated by an objective oracle (real pytest/ruff for code, recomputed PSNR/SSIM
+  for experiments, freshness/citation for context), not an LLM judge. Three verifier
+  families behind one facade, checkpoint/resume, an opt-in LangGraph durable runtime,
+  and a 5/5 self-eval."
+- *Topics (~15):* llm-agents, ai-agents, agent-harness, agentic-ai, langgraph, mcp,
+  rag, llm-evals, research-agent, verification, cocoindex, durable-execution,
+  reproducibility, human-in-the-loop, python.
+
+**Needs human decision** (details under that section below)
+- **LICENSE** — none present; pick MIT or Apache-2.0 (blocks reuse + a license badge).
+- **CI badge** — add after first green Actions run (needs the GitHub owner/repo slug).
+- **Demo GIF** — record via `docs/demo.md` and embed in the README (top star-driver).
+- **CODE_OF_CONDUCT contact** — add a concrete maintainer contact if desired.
+- **Coverage badge** — wire Codecov (a static badge would rot).
+
+**Top 3 next steps**
+1. Add a LICENSE (MIT/Apache-2.0) and set `[project].license` — unblocks everything else.
+2. Push to GitHub; confirm CI is green; add the CI badge; record + embed the demo GIF.
+3. Backlog depth: `examples/` (runnable self-contained demos, Tier 3.1) and episodic
+   failure memory (Reflexion-lite, Tier 4.1); optionally harden `lha eval` against a
+   churned-daemon transient miss (the only known flakiness; clean checkout is reliable).
+
+---
+
 Autonomous maintainer working `tools/overnight/BACKLOG.md` top-down. One small,
 reversible increment per entry; all gates green before every commit.
 
@@ -36,13 +89,17 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
   a CI step; pyright is now part of the gate.
 - 2.5 governance/community files — CONTRIBUTING (verification-first rule + the full gate),
   SECURITY, CODE_OF_CONDUCT (Contributor Covenant 2.1), issue templates, PR template (gate checklist).
+- 2.3 coverage — pytest-cov + 8 meaningful unit tests (MCP parse/diff/factory); 65%→69%; documented.
+- 2.4 pre-commit — `ruff format` repo-wide + .pre-commit-config.yaml (ruff lint/format + hygiene).
+- 2.6 CHANGELOG.md — Keep-a-Changelog; draft 0.1.0 (untagged → needs human).
+- 3.3 CLI polish — `lha --version` + help epilog examples.
+- 3.2 docs/QUICKSTART.md — 0→verified-run tutorial with real expected output; linked from README.
+- 0.3 repo metadata — proposed description + topics (see Morning report).
 
 ## Remaining (from BACKLOG, top-down)
-- Tier 0: 0.3 repo metadata (morning report)
-- Tier 2: 2.3 coverage · 2.4 pre-commit · 2.6 CHANGELOG
-- Tier 3: 3.1 examples · 3.2 QUICKSTART · 3.3 CLI polish · 3.4 demo task
-- Tier 4: 4.1 failure memory · 4.2 eval corpus · 4.3 observability
-- Cross-cutting: harden `lha eval` against daemon-state flakiness (reliability of the 5/5 claim)
+- Tier 3: 3.1 examples/ (runnable self-contained demos) · 3.4 bundle a one-command demo task
+- Tier 4: 4.1 episodic failure memory · 4.2 grow eval corpus · 4.3 observability (`lha trace`)
+- Cross-cutting: optional — harden `lha eval` vs a churned-daemon transient miss (clean checkout is reliable)
 
 ## Needs human decision
 - LICENSE: the repo has no LICENSE file. Without one it is "all rights reserved" and not
@@ -75,3 +132,4 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2026-06-21 · 2.4 pre-commit · .pre-commit-config.yaml (ruff lint/format + hygiene) + CONTRIBUTING note · PASS (config-only)
 - 2026-06-21 · 2.3 coverage · pytest-cov; +8 meaningful tests (MCP parse/diff/factory) 65%→69%; documented · PASS
 - 2026-06-21 · 3.2 docs/QUICKSTART.md · 0→running tutorial w/ real expected output; linked from README · PASS (docs-only)
+- 2026-06-21 · morning report · summary + repo metadata + needs-human + next steps; reconciled lists · PASS (docs-only)
