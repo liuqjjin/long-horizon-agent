@@ -1,109 +1,143 @@
 # Long-Horizon Research Agent
 
-A **verification-first** long-horizon agent harness for scientific software
-engineering — code, papers, and experiments.
+**A verification-first agent harness: every step is gated by an _objective oracle_
+— real tests, PSNR/SSIM, reproducibility — not an LLM judging itself.**
 
-The spine of the project is the **verification loop**:
+![python](https://img.shields.io/badge/python-3.11%2B-blue)
+![lint: ruff](https://img.shields.io/badge/lint-ruff-261230)
+![tests](https://img.shields.io/badge/tests-pytest-0a9edc)
 
-```
-context → tool call → execute → verify → repair → checkpoint → repeat
-```
+Long-horizon agents fail because **errors compound**: at per-step reliability `p`
+over `n` steps, end-to-end success scales like `pⁿ`, so even a strong model drifts
+as tasks get longer. Asking the model to check its own work doesn't reliably break
+the spiral — there's no external signal. This harness dampens compounding by
+gating **every** step on an objective verifier and only advancing when the oracle
+says so:
 
-with max-steps, checkpoint/resume, and a human-approval gate. Every agent emits a
-**structured artifact** (a plan, a context bundle with provenance, a patch, a
-verdict) — never free-form chat. A **live-context layer** sits underneath the
-spine as infrastructure, reachable only through a small facade (`lha.live_context`)
-so the rest of the system never depends on how context is indexed.
+- **code** → a real `pytest` run + `ruff` (and the change is reverted if it can't be verified)
+- **experiment** → PSNR / SSIM **recomputed from the output** + a reproducibility re-run
+- **context** → freshness (is the index behind the source?) + citation (does every claim resolve to a source?)
 
-## Why "verification-first"
+The result is a loop you can trust to *refuse* unverifiable success — see the
+[verification-ablation](#results-lha-eval) result, where the harness correctly
+**fails** an experiment that cannot meet its metric bar.
 
-Two objective sources keep the agent honest:
+## The spine
 
-| Family       | Verifiers                                  |
-|--------------|--------------------------------------------|
-| code         | `pytest`, `ruff` (type-check next)          |
-| experiment   | `psnr`, `ssim`, `reproducibility`           |
-| context      | `freshness`, `citation`                     |
+```mermaid
+flowchart LR
+    T[Task] --> S[Supervisor<br/>plan]
+    subgraph LOOP["verification loop  (max-steps · checkpoint · resume · approval gate)"]
+        direction LR
+        C[Context<br/>Engineer] --> X[Implementer /<br/>Experimenter]
+        X --> V{Verify}
+        V -- pass --> N[next step]
+        V -- fail --> R[repair]
+        R --> C
+    end
+    S --> C
+    N --> CP[(checkpoint)]
 
-PSNR is just one verifier among many — the core has no metric-specific assumptions.
-The PSNR/SSIM verifiers **independently recompute** the metric from the saved
-arrays rather than trusting the experiment's self-reported number, so a fabricated
-metric is caught; `reproducibility` re-runs the experiment and checks the numbers
-match plus that seed/versions/commit were recorded.
+    C -. only via facade .-> F[[live_context facade]]
+    F --> CODE[(code: ccc / MCP)]
+    F --> DOCS[(papers · experiments · skills:<br/>CocoIndex flows)]
 
-## Architecture
-
-```
-src/lha/
-  harness/        the spine: loop, state, checkpoint, budget, approval
-  live_context/   the facade (the ONLY door to the indexers)
-  agents/         Supervisor · ContextEngineer · Implementer · Experimenter · VerifierAgent
-  verifiers/      pluggable code / experiment / context families
-  llm/            stub | claude_cli | anthropic, behind one interface
-  runtime/        opt-in LangGraph durable runtime (SqliteSaver + interrupt)
-  memory.py       skill memory (Voyager-lite): record verified successes
-  orchestrator.py run many tasks in parallel via process-isolated workers
-  eval.py         ResearchAgentBench-Lite (the harness measuring itself)
-  tasks/ tools/   task specs; sandbox patch/shell helpers
-  cli.py          lha run | resume | batch | eval | index | index-docs | ask | approve | reject
-flows/            paper/experiment/skill index flows (behind the facade)
-data/             sample repo (toy bug) + paper note + experiment log + experiment script
-runs/<run_id>/    per-run artifacts: state.json, ledger.jsonl, plan, patch,
-                  verify.json, pr_summary.md, graph.sqlite, workdir/
+    V --> VF[code: pytest · ruff]
+    V --> VE[experiment: PSNR · SSIM · repro]
+    V --> VC[context: freshness · citation]
 ```
 
-The facade exposes exactly: `search_code`, `search_papers`, `search_experiments`,
-`search_skills`, `get_fresh_context`, `reject_stale`. A CI grep enforces that
-nothing outside `live_context/` imports the underlying indexers.
+The rest of the system reaches indexed context **only** through the
+`live_context` facade (`search_code` / `search_papers` / `search_experiments` /
+`search_skills` / `get_fresh_context` / `reject_stale`); CocoIndex and the code
+indexer live entirely behind it. A `grep` check enforces the boundary.
 
-## Quickstart
+## Quickstart (30 seconds)
 
 ```bash
-uv sync                     # install deps
-# (one-time) install the code indexer used by search_code:
-pipx install 'cocoindex-code[full]'
-
-# Run the toy issue->PR task: finds the bug, fixes it, verifies with REAL pytest
-uv run lha run data/tasks/fix_average.yaml
-
-# Run the paper-to-experiment task: runs a real experiment, verifies PSNR/SSIM + reproducibility
-uv run lha index-docs            # build paper/experiment context (CocoIndex flows)
-uv run lha run data/tasks/run_sr_experiment.yaml
-
-# Answer a query with fresh, cited context
-uv run lha index data/sample_repo
-uv run lha ask "how is average computed" --root data/sample_repo --kinds code
-
-# Resume a paused run
-uv run lha resume <run_id>
-
-# Self-evaluate across all 5 workflows (ResearchAgentBench-Lite)
-uv run lha eval                  # -> scorecard + runs/eval_report.json
-
-# Run many tasks in parallel (orchestrator-worker, process-isolated)
-uv run lha batch data/tasks/fix_average.yaml data/tasks/run_sr_experiment.yaml
-
-# Durable runtime with an approval gate (LangGraph interrupt + resume)
-uv run lha run --runtime langgraph data/tasks/fix_average_approval.yaml   # -> AWAITING_APPROVAL
-uv run lha approve <run_id> && uv run lha resume --runtime langgraph <run_id>
+uv sync                                        # install (Python 3.11+)
+uv run lha run data/tasks/fix_average.yaml     # find a bug, fix it, verify with REAL pytest
+uv run lha eval                                # self-evaluate across all 5 workflows
 ```
 
-The walking skeleton runs with a **deterministic stub** implementer — a REAL
-`pytest` verifies a REAL fix with no API key and no network. Swap in a real LLM
-with `--llm claude_cli` (uses the authenticated `claude` CLI) or `--llm anthropic`.
+The walking skeleton runs with a **deterministic stub** implementer, so a real
+`pytest` verifies a real fix with no API key and no network. Swap in an LLM with
+`--llm claude_cli` (uses the authenticated `claude` CLI) or `--llm anthropic`.
+
+## Results (`lha eval`)
+
+`lha eval` is the harness measuring itself — **ResearchAgentBench-Lite**, five
+tasks each with an objective pass/fail. Output, verbatim, from this repo:
+
+```
+# ResearchAgentBench-Lite — 5/5
+
+| dimension              | case                    | result | detail |
+|------------------------|-------------------------|--------|--------|
+| issue-to-PR            | fix_average             | PASS   | status=DONE verified=True |
+| resume                 | pause_resume            | PASS   | first=PAUSED resumed=DONE |
+| freshness              | edit_reindex            | PASS   | initial_fresh=True stale_after_edit=True fresh_after_reject=True |
+| paper-to-experiment    | bicubic_sr              | PASS   | status=DONE verified=True |
+| verification-ablation  | strict_threshold_caught | PASS   | status=FAILED psnr_correctly_rejected=True reached_psnr_step=True |
+
+score: 5/5
+```
+
+Reproduce: `uv run lha eval`. The **verification-ablation** case is the point —
+the bicubic baseline reaches **PSNR ≈ 25.07 dB / SSIM ≈ 0.8246** (recomputed by
+the verifier with `data_range=1.0`), so when asked to clear a 40 dB bar the
+harness reports `FAILED`: it refuses to claim a result it cannot verify.
+
+## How it works
+
+- **The loop (spine).** `context → execute → verify → repair → checkpoint → repeat`,
+  with max-steps, durable checkpoint/resume, and a human-approval gate. State is a
+  JSON checkpoint plus an append-only `ledger.jsonl`.
+- **Structured artifacts, not chat.** Each role emits a typed artifact: Supervisor →
+  `Plan`, Context Engineer → `ContextBundle` (with provenance), Implementer → `Patch`,
+  Verifier → `Verdict` (`verify.json`).
+- **Three verifier families behind one interface.** `code` (`pytest`, `ruff`),
+  `experiment` (`psnr`, `ssim`, `reproducibility`), `context` (`freshness`,
+  `citation`). PSNR is just one verifier among many — the core has no metric-specific
+  assumptions, and a verifier that *can't* run a check fails rather than passing.
+- **Live context, isolated.** Code search goes through `ccc` (cocoindex-code) via its
+  MCP tool; paper/experiment/skill context comes from CocoIndex flows. All of it sits
+  behind the `live_context` facade.
+- **Durable runtime (opt-in).** `lha run --runtime langgraph` drives the same plan
+  through a LangGraph `StateGraph` checkpointed by `SqliteSaver`, using `interrupt()`
+  for the approval gate (run → `AWAITING_APPROVAL` → `lha approve` → `lha resume` → `DONE`).
+- **Skill memory.** Verified successes are distilled to retrievable notes and surfaced
+  as context for future tasks.
+
+## Why it's different
+
+Most agent frameworks orchestrate tool calls and, when they evaluate at all, use an
+LLM as judge. This project's bet is the opposite: **the loop is only as reliable as
+its verifier**, so the verifier is an *objective* oracle wherever one exists (a test
+suite, an image metric, a freshness check), and the harness is built to fail loudly
+when it can't verify. It's a small, readable, dependency-light core (no heavy agent
+framework required) with the live-context machinery quarantined behind a facade.
+
+## CLI
+
+```
+lha run <task.yaml> [--runtime loop|langgraph] [--llm stub|claude_cli|anthropic]
+lha resume <run_id>             lha approve|reject <run_id>
+lha eval [--quick]              lha batch <task.yaml> ...      # parallel, process-isolated
+lha index <path>                lha index-docs                 lha ask <query> --kinds code,paper,...
+```
+
+## Requirements & install
+
+- **Python 3.11+**, [`uv`](https://docs.astral.sh/uv/).
+- `uv sync` installs the harness and its deps.
+- Code search uses [`cocoindex-code`](https://github.com/cocoindex-io/cocoindex-code)
+  (`pipx install 'cocoindex-code[full]'`, then `claude mcp add cocoindex-code -- ccc mcp`
+  for the outer agent). The harness talks to its MCP `search` tool directly; the
+  bundled demos run without it.
 
 ## Status
 
-- **Week 1-A (done):** verified loop, code search via the facade, pytest/ruff
-  verifiers, checkpoint/resume, freshness + stale-context rejection, the toy
-  issue→PR task, and a hermetic test suite (`uv run pytest`).
-- **Week 1-B (done):** paper/experiment context flows behind the facade.
-- **Week 2-3 (done):** `psnr`/`ssim`/`reproducibility` verifiers + the
-  paper-to-experiment workflow (run a real experiment → recompute & verify
-  metrics → check reproducibility → cite the paper/baseline).
-- **Week 4 (done):** multi-agent orchestration (parallel verifiers + a
-  process-isolated batch orchestrator), **ResearchAgentBench-Lite** self-eval
-  (5/5: issue-to-PR · paper-to-experiment · resume · freshness ·
-  verification-ablation), **skill memory** (record verified successes → retrieve
-  for future tasks), and an opt-in **LangGraph durable runtime** (SqliteSaver
-  checkpoint/resume + `interrupt()` approval gate).
+Walking-skeleton through durable-runtime are implemented and exercised by
+`uv run pytest` and `uv run lha eval`. This repo is a portfolio/research artifact,
+not a production service.
