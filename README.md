@@ -118,6 +118,16 @@ suite, an image metric, a freshness check), and the harness is built to fail lou
 when it can't verify. It's a small, readable, dependency-light core (no heavy agent
 framework required) with the live-context machinery quarantined behind a facade.
 
+## Documentation
+
+- [docs/VERIFICATION_FIRST.md](docs/VERIFICATION_FIRST.md) — the thesis: why error
+  compounding makes an objective oracle the highest-leverage lever.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the spine, the facade, the verifier
+  families, the durable runtime (with diagrams).
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — ResearchAgentBench-Lite, what each task
+  verifies, and how to reproduce `5/5`.
+- [docs/demo.md](docs/demo.md) — script to record the terminal demo GIF.
+
 ## CLI
 
 ```
