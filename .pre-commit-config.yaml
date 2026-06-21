@@ -1,0 +1,18 @@
+# Optional but recommended: `uv run pre-commit install`
+# Mirrors the lint/format part of the gate; the full gate (pyright, pytest,
+# lha eval, facade grep) runs in CI and is documented in CONTRIBUTING.md.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.18
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files

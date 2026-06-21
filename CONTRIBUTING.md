@@ -11,6 +11,7 @@ its thesis (see [docs/VERIFICATION_FIRST.md](docs/VERIFICATION_FIRST.md)):
 
 ```bash
 uv sync                 # installs the harness + dev tools (Python 3.11+)
+uv run pre-commit install   # optional: auto-run ruff lint+format on commit
 ```
 
 ## The gate (run before every PR)
