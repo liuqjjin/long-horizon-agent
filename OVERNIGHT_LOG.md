@@ -31,15 +31,26 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2.1 GitHub Actions CI (.github/workflows/ci.yml) — mirrors the local gate exactly (ruff,
   facade-isolation grep that fails on a leak, pytest, `lha eval`) with HF model caching. YAML +
   grep logic validated locally; cannot run Actions headless (see Needs human decision for the badge).
+- 2.2 type-check (pyright) — drove `pyright src/lha` to 0 errors (None-guards, Literal narrowing,
+  targeted casts/ignores for third-party stub gaps; no logic change); added [tool.pyright] config +
+  a CI step; pyright is now part of the gate.
+- 2.5 governance/community files — CONTRIBUTING (verification-first rule + the full gate),
+  SECURITY, CODE_OF_CONDUCT (Contributor Covenant 2.1), issue templates, PR template (gate checklist).
 
 ## Remaining (from BACKLOG, top-down)
 - Tier 0: 0.3 repo metadata (morning report)
-- Tier 2: 2.3 coverage · 2.4 pre-commit · 2.5 governance · 2.6 CHANGELOG
+- Tier 2: 2.3 coverage · 2.4 pre-commit · 2.6 CHANGELOG
 - Tier 3: 3.1 examples · 3.2 QUICKSTART · 3.3 CLI polish · 3.4 demo task
 - Tier 4: 4.1 failure memory · 4.2 eval corpus · 4.3 observability
 - Cross-cutting: harden `lha eval` against daemon-state flakiness (reliability of the 5/5 claim)
 
 ## Needs human decision
+- LICENSE: the repo has no LICENSE file. Without one it is "all rights reserved" and not
+  reusable. Recommend **MIT** (simplest, permissive) or **Apache-2.0** (permissive + explicit
+  patent grant). Add `LICENSE` and set `[project].license` in pyproject; then a license badge can
+  be added. Not chosen automatically (licensing is the author's call).
+- CODE_OF_CONDUCT contact: enforcement currently points to "repository contact channels / private
+  security advisory". Add a concrete maintainer contact if desired.
 - CI badge: after pushing to GitHub and confirming the first CI run is green, add
   `![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)` to the README.
   (Headless agent has no remote/owner slug and cannot run Actions, so no badge added yet —
@@ -57,3 +68,4 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2026-06-21 · 1.4 clean-checkout repro · deleted gitignored state + fresh daemon → eval 5/5; documented · PASS (eval 5/5)
 - 2026-06-21 · 2.1 CI workflow · .github/workflows/ci.yml mirrors local gate; yaml+grep validated · PASS (ci-file)
 - 2026-06-21 · 2.2 pyright · fixed 21 type errors → 0; config + CI step; eval 5/5 · PASS
+- 2026-06-21 · 2.5 governance · CONTRIBUTING/SECURITY/CoC/issue+PR templates; LICENSE→needs-human · PASS (docs-only)
