@@ -14,10 +14,18 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import live_context
+from . import __version__, live_context
 from .config import Config
 from .harness import Harness, HumanApprovalGate, load_state_by_id
 from .tasks.spec import TaskSpec
+
+_EPILOG = """\
+examples:
+  lha run data/tasks/fix_average.yaml            fix a bug, verified by real pytest
+  lha eval                                       self-evaluate (ResearchAgentBench-Lite)
+  lha run --runtime langgraph <task>             durable run with an approval gate
+  lha ask "how is average computed" --kinds code answer with fresh, cited context
+"""
 
 
 def _config(args) -> Config:
@@ -179,7 +187,13 @@ def _print_result(result) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="lha", description="verification-first agent harness")
+    p = argparse.ArgumentParser(
+        prog="lha",
+        description="verification-first long-horizon agent harness",
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--llm", choices=["stub", "claude_cli", "anthropic"], help="LLM backend override")
     sub = p.add_subparsers(dest="cmd", required=True)
 

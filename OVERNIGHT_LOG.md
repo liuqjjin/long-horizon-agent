@@ -70,3 +70,4 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2026-06-21 · 2.2 pyright · fixed 21 type errors → 0; config + CI step; eval 5/5 · PASS
 - 2026-06-21 · 2.5 governance · CONTRIBUTING/SECURITY/CoC/issue+PR templates; LICENSE→needs-human · PASS (docs-only)
 - 2026-06-21 · 2.6 CHANGELOG.md · Keep-a-Changelog; draft 0.1.0 (not tagged → needs-human) · PASS (docs-only)
+- 2026-06-21 · 3.3 CLI polish · added `lha --version` + help epilog examples · PASS (parser-only; eval result unaffected, parse verified)
