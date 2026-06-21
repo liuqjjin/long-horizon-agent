@@ -34,7 +34,8 @@ class SSIMVerifier(Verifier):
         if "win_size" in ctx.step.params:
             kwargs["win_size"] = int(ctx.step.params["win_size"])
 
-        value = float(structural_similarity(ref, pred, **kwargs))
+        # ssim returns a float here; with **kwargs the stub widens to a union, so cast.
+        value = float(structural_similarity(ref, pred, **kwargs))  # type: ignore[arg-type]
         threshold = ctx.step.params.get("ssim_min")
         reported = getattr(artifact, "metrics", {}).get("ssim")
 

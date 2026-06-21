@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from ..verdict import Check
+from ..verdict import Check, VerifierFamily
 
 
 def is_finite(x: Any) -> bool:
@@ -17,7 +17,7 @@ def is_finite(x: Any) -> bool:
         return False
 
 
-def precheck(artifact: Any, name: str, family: str = "experiment") -> Check | None:
+def precheck(artifact: Any, name: str, family: VerifierFamily = "experiment") -> Check | None:
     """Fail fast if the experiment that produced the artifact did not succeed.
 
     A nonzero exit means the metrics/arrays can't be trusted, so no experiment

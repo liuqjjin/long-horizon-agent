@@ -209,6 +209,7 @@ class Harness:
             )
         elif state.repairs_for(step) < budget.max_repairs:
             state.record_repair(step)
+            assert state.plan is not None  # set before the loop body runs
             state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
             append_ledger(
                 state,
@@ -370,6 +371,7 @@ class Harness:
     @staticmethod
     def _plan_md(state: RunState) -> str:
         plan = state.plan
+        assert plan is not None  # only called after planning
         lines = [f"# Plan — {plan.summary}", ""]
         for i, s in enumerate(plan.steps):
             lines.append(f"{i + 1}. **{s.step_id}** ({s.action}) — {s.goal}")

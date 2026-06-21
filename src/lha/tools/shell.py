@@ -41,7 +41,8 @@ def run(
         )
         return ProcResult(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - start)
     except subprocess.TimeoutExpired as e:
-        return ProcResult(124, e.stdout or "", f"timeout after {timeout}s", time.monotonic() - start)
+        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        return ProcResult(124, out, f"timeout after {timeout}s", time.monotonic() - start)
 
 
 def venv_tool(name: str) -> str:

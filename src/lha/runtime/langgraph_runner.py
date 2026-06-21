@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from .. import live_context
 from ..agents import ContextEngineer, Supervisor, VerifierAgent
@@ -20,7 +20,7 @@ from ..config import Config
 from ..harness.approval import HumanApprovalGate
 from ..harness.checkpoint import append_ledger, load_state_by_id, save_state
 from ..harness.loop import Harness, RunResult, _gen_run_id
-from ..harness.state import RunState, StepRecord
+from ..harness.state import Phase, RunState, StepRecord
 from ..verifiers import VerifyContext
 
 
@@ -80,7 +80,7 @@ class LangGraphHarness:
         conn = sqlite3.connect(str(run_dir / "graph.sqlite"), check_same_thread=False)
         try:
             graph = self._compile(conn)
-            gcfg = {"configurable": {"thread_id": state.run_id}}
+            gcfg: Any = {"configurable": {"thread_id": state.run_id}}  # LangGraph RunnableConfig
             snap = graph.get_state(gcfg)
 
             if snap.next:  # graph is paused at an interrupt (awaiting approval)
@@ -120,7 +120,7 @@ class LangGraphHarness:
         saver = SqliteSaver(conn)
         saver.setup()
         builder = StateGraph(GraphState)
-        builder.add_node("step", self._step_node)
+        builder.add_node("step", self._step_node)  # type: ignore[arg-type]
         builder.add_edge(START, "step")
         builder.add_conditional_edges("step", _route, {"continue": "step", "done": END})
         return builder.compile(checkpointer=saver)
@@ -136,7 +136,7 @@ class LangGraphHarness:
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
 
-        def ledger(phase: str, **kw):
+        def ledger(phase: Phase, **kw):
             append_ledger(state, StepRecord(seq=state.next_seq(), step_id=step.step_id, phase=phase, **kw))
 
         bundle = ContextEngineer(self.config).gather(step)
@@ -166,6 +166,7 @@ class LangGraphHarness:
             ledger("complete")
         elif state.repairs_for(step) < self.config.max_repairs:
             state.record_repair(step)
+            assert state.plan is not None  # plan set before stepping
             state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
             ledger("repair", notes="; ".join(verdict.failures)[:300])
         else:

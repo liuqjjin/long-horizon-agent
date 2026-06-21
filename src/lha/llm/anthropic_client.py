@@ -19,7 +19,7 @@ class AnthropicClient(LLMClient):
 
     def _ensure(self):
         if self._client is None:
-            from anthropic import Anthropic  # lazy: optional dependency
+            from anthropic import Anthropic  # type: ignore  # lazy optional dependency (extra: llm)
 
             self._client = Anthropic()
         return self._client

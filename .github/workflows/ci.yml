@@ -34,6 +34,9 @@ jobs:
           fi
           echo "facade isolation: clean"
 
+      - name: Type-check (pyright)
+        run: uv run pyright src/lha
+
       - name: Tests (pytest)
         run: uv run pytest -q
 

@@ -3,7 +3,7 @@
 Autonomous maintainer working `tools/overnight/BACKLOG.md` top-down. One small,
 reversible increment per entry; all gates green before every commit.
 
-**Gate** = `uv run pytest` · `ruff check .` · facade-isolation grep · `lha eval` (5/5).
+**Gate** = `uv run pytest` · `ruff check .` · `uv run pyright src/lha` · facade-isolation grep · `lha eval` (5/5).
 Eval policy: run `lha eval` for changes that can affect it (code/flows/verifiers/eval/data/tasks/config)
 and at session start/end; pure docs/CI/governance commits run the fast gates (pytest/ruff/grep)
 since eval cannot change when no runtime code changed. Last full eval: 5/5 (session start).
@@ -34,7 +34,7 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 
 ## Remaining (from BACKLOG, top-down)
 - Tier 0: 0.3 repo metadata (morning report)
-- Tier 2: 2.2 type-check · 2.3 coverage · 2.4 pre-commit · 2.5 governance · 2.6 CHANGELOG
+- Tier 2: 2.3 coverage · 2.4 pre-commit · 2.5 governance · 2.6 CHANGELOG
 - Tier 3: 3.1 examples · 3.2 QUICKSTART · 3.3 CLI polish · 3.4 demo task
 - Tier 4: 4.1 failure memory · 4.2 eval corpus · 4.3 observability
 - Cross-cutting: harden `lha eval` against daemon-state flakiness (reliability of the 5/5 claim)
@@ -56,3 +56,4 @@ a fresh daemon / clean checkout is reliably 5/5. Tracked under Remaining (harden
 - 2026-06-21 · 0.1(h) README docs links · added Documentation section (all targets exist) · PASS (docs-only)
 - 2026-06-21 · 1.4 clean-checkout repro · deleted gitignored state + fresh daemon → eval 5/5; documented · PASS (eval 5/5)
 - 2026-06-21 · 2.1 CI workflow · .github/workflows/ci.yml mirrors local gate; yaml+grep validated · PASS (ci-file)
+- 2026-06-21 · 2.2 pyright · fixed 21 type errors → 0; config + CI step; eval 5/5 · PASS

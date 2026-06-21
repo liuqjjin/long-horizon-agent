@@ -174,7 +174,9 @@ def reject_stale(bundle: ContextBundle, *, reindex: bool = True) -> ContextBundl
         raise StaleContextError(
             f"context for {bundle.query!r} is stale: {bundle.freshness.reasons}"
         )
-    kinds = tuple(dict.fromkeys(i.provenance.source_kind for i in bundle.items)) or ("code",)
+    kinds: tuple[SourceKind, ...] = (
+        tuple(dict.fromkeys(i.provenance.source_kind for i in bundle.items)) or ("code",)
+    )
     for kind in kinds:
         _backend_for(kind).reindex()
     _state.reset_cache()

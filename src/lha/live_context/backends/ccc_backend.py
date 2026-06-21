@@ -52,7 +52,7 @@ def _first(d: dict, *keys, default=None):
 def _result_to_codehit(d: dict[str, Any], root: Path, indexed_at: datetime) -> CodeHit:
     raw_path = _first(d, "path", "file", "filename", "file_path", default="")
     # Express the locator relative to cwd so freshness checks resolve uniformly.
-    p = Path(raw_path)
+    p = Path(str(raw_path))
     abs_path = p if p.is_absolute() else (root / p)
     try:
         rel = str(abs_path.resolve().relative_to(Path.cwd().resolve()))
@@ -62,7 +62,7 @@ def _result_to_codehit(d: dict[str, Any], root: Path, indexed_at: datetime) -> C
         rel = str(abs_path.resolve())
     line_start = _first(d, "line_start", "start_line", "start", "lineStart")
     line_end = _first(d, "line_end", "end_line", "end", "lineEnd")
-    code = _first(d, "code", "content", "text", "snippet", default="")
+    code = str(_first(d, "code", "content", "text", "snippet", default="") or "")
     language = _first(d, "language", "lang")
     score = float(_first(d, "score", "similarity", "distance_score", default=0.0) or 0.0)
 
@@ -147,7 +147,7 @@ class CccBackend(SearchBackend):
         from mcp.client.stdio import stdio_client
 
         params = StdioServerParameters(
-            command=self._ccc,
+            command=self._ccc or "ccc",  # available() guarantees non-None; satisfies the type
             args=["mcp"],
             cwd=str(self.root),
             env=_env_with_local_bin(),
@@ -179,7 +179,8 @@ class CccBackend(SearchBackend):
             rows = asyncio.run(self._search_async(query, k, languages, paths, refresh))
         except Exception:
             return []
-        return [_result_to_codehit(r, self.root, indexed_at) for r in rows][:k]
+        hits: list[Hit] = [_result_to_codehit(r, self.root, indexed_at) for r in rows]
+        return hits[:k]
 
     # --- index management via CLI ------------------------------------------
     def index_meta(self) -> tuple[str, datetime]:
