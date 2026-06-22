@@ -156,4 +156,10 @@ _SLOW = [_case_paper_to_experiment, _case_verification_ablation]
 
 def run_eval(base: Config, *, quick: bool = False) -> EvalReport:
     cases = _FAST + ([] if quick else _SLOW)
-    return EvalReport(results=[case(base) for case in cases])
+    results: list[EvalResult] = []
+    for case in cases:
+        try:
+            results.append(case(base))
+        except Exception as e:  # one case crashing must not zero out the whole report
+            results.append(EvalResult(case.__name__, "?", False, f"errored: {e!r}"))
+    return EvalReport(results=results)

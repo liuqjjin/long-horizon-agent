@@ -17,6 +17,7 @@ from pydantic import BaseModel
 class ApprovalDecision(BaseModel):
     approved: bool
     note: str = ""
+    step_id: str | None = None  # which step this decision was made for (anti-misattribution)
 
 
 class HumanApprovalGate:
@@ -39,8 +40,18 @@ class HumanApprovalGate:
         return None
 
     def resolve(self, approved: bool, note: str = "") -> None:
+        # Tag the decision with the step it answers, read from the pending request,
+        # so a stale decision can't be misattributed to a later step.
+        step_id = None
+        if self.pending.exists():
+            try:
+                step_id = json.loads(self.pending.read_text()).get("step_id")
+            except (json.JSONDecodeError, OSError):
+                pass
         self.decision_file.write_text(
-            ApprovalDecision(approved=approved, note=note).model_dump_json(indent=2)
+            ApprovalDecision(approved=approved, note=note, step_id=step_id).model_dump_json(
+                indent=2
+            )
         )
         self.pending.unlink(missing_ok=True)
 

@@ -28,6 +28,7 @@ def run(
     cwd: str | Path | None = None,
     timeout: float = 300.0,
     env: dict[str, str] | None = None,
+    input: str | None = None,
 ) -> ProcResult:
     start = time.monotonic()
     try:
@@ -38,6 +39,7 @@ def run(
             text=True,
             timeout=timeout,
             env=env,
+            input=input,
         )
         return ProcResult(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - start)
     except subprocess.TimeoutExpired as e:

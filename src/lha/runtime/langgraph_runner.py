@@ -84,14 +84,21 @@ class LangGraphHarness:
             snap = graph.get_state(gcfg)
 
             if snap.next:  # graph is paused at an interrupt (awaiting approval)
-                decision = HumanApprovalGate(run_dir).decision()
+                gate = HumanApprovalGate(run_dir)
+                decision = gate.decision()
+                interrupted_step = None
+                for intr in snap.interrupts or []:
+                    interrupted_step = (getattr(intr, "value", {}) or {}).get("step_id")
+                if decision is not None and decision.step_id not in (None, interrupted_step):
+                    gate.clear()  # a decision for a different step must not resume this one
+                    decision = None
                 if decision is None:
                     return RunResult(
                         load_state_by_id(self.config.runs_dir, state.run_id),
                         "AWAITING_APPROVAL",
                         "approval pending",
                     )
-                HumanApprovalGate(run_dir).clear()
+                gate.clear()
                 graph.invoke(Command(resume={"approved": decision.approved}), gcfg)
             else:
                 graph.invoke({"rs": state.model_dump(mode="json")}, gcfg)
@@ -203,7 +210,8 @@ class LangGraphHarness:
             try:
                 from ..memory import SkillMemory
 
-                SkillMemory(Path(self.config.data_dir) / "skills").record(state)
+                if SkillMemory(Path(self.config.data_dir) / "skills").record(state) is not None:
+                    live_context.index_docs(("skill",))  # keep the skill retrievable next run
             except Exception:
                 pass
 

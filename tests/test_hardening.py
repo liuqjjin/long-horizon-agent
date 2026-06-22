@@ -16,7 +16,7 @@ from lha.agents.verifier_agent import VerifierAgent
 from lha.artifacts import Patch, Step
 from lha.config import Config
 from lha.harness import Harness
-from lha.harness.approval import HumanApprovalGate
+from lha.harness.approval import ApprovalDecision, HumanApprovalGate
 from lha.llm.anthropic_client import AnthropicClient, AnthropicResponseError
 from lha.tasks.spec import TaskSpec
 from lha.tools.shell import ProcResult
@@ -260,3 +260,15 @@ def test_loop_reverts_on_approval_rejection(tmp_path):
     rejected = Harness(cfg).resume(paused.state.run_id)
     assert rejected.status == "FAILED"
     assert "len(values) - 1" in mathutils.read_text()  # rejected change reverted
+
+
+def test_stale_approval_decision_is_ignored(tmp_path):
+    cfg = _cfg(tmp_path)
+    paused = Harness(cfg).run(TaskSpec.from_file("data/tasks/fix_average_approval.yaml"))
+    assert paused.status == "AWAITING_APPROVAL"
+    # an approval left for a DIFFERENT step must not resume the current one.
+    (Path(paused.state.run_dir) / "approval.json").write_text(
+        ApprovalDecision(approved=True, step_id="some-other-step").model_dump_json()
+    )
+    resumed = Harness(cfg).resume(paused.state.run_id)
+    assert resumed.status == "AWAITING_APPROVAL"  # stale decision discarded, not applied

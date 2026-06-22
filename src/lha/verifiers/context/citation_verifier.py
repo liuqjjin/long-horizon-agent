@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...artifacts import Patch
 from ...live_context.models import ContextBundle
 from ..base import Verifier, VerifyContext
 from ..verdict import Check
@@ -18,14 +17,17 @@ class CitationVerifier(Verifier):
         bundle = ctx.bundle
         known = set(bundle.locators()) if bundle else set()
 
-        if isinstance(artifact, Patch):
-            unresolved = [c for c in artifact.based_on_context if c not in known]
+        # Any artifact that carries provenance (Patch, ExperimentResult, ...) must
+        # have every citation resolve to a known source — not just Patch.
+        cites = getattr(artifact, "based_on_context", None)
+        if isinstance(cites, list):
+            unresolved = [c for c in cites if c not in known]
             return Check(
                 name=self.name,
                 family=self.family,
                 passed=not unresolved,
                 detail={
-                    "summary": f"{len(artifact.based_on_context)} citations, {len(unresolved)} unresolved",
+                    "summary": f"{len(cites)} citations, {len(unresolved)} unresolved",
                     "unresolved": unresolved[:5],
                 },
             )

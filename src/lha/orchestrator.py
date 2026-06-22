@@ -84,6 +84,10 @@ def run_tasks(
             )
         except subprocess.TimeoutExpired:
             return TaskOutcome(task=str(task_path), status="TIMEOUT")
+        except (OSError, subprocess.SubprocessError) as e:
+            # A spawn failure (ENOMEM, EMFILE, bad interpreter, ...) for one task must
+            # not propagate through ex.map and discard every sibling result.
+            return TaskOutcome(task=str(task_path), status="ERROR", detail=f"spawn failed: {e}")
         return _parse(str(task_path), proc)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:

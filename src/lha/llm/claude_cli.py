@@ -17,9 +17,12 @@ class ClaudeCLIClient(LLMClient):
         self.timeout = timeout
 
     def complete(self, system: str, prompt: str) -> str:
+        # Pipe the prompt via stdin instead of argv: a large-repo prompt on argv
+        # overflows ARG_MAX (E2BIG). `claude -p` reads the prompt from stdin.
         res = run(
-            [self.cli_path, "-p", prompt, "--append-system-prompt", system],
+            [self.cli_path, "-p", "--append-system-prompt", system],
             timeout=self.timeout,
+            input=prompt,
         )
         if not res.ok:
             raise RuntimeError(f"claude CLI failed ({res.returncode}): {res.stderr[:400]}")

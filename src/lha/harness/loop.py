@@ -8,6 +8,7 @@ state is a JSON checkpoint + a step ledger, shaped so LangGraph drops in later.
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import sys
@@ -37,6 +38,8 @@ from .budget import StepBudget
 from .checkpoint import append_ledger, load_state_by_id, save_state
 from .errors import ApprovalPending, ApprovalRejected, BudgetExceeded
 from .state import RunState, StepRecord
+
+logger = logging.getLogger(__name__)
 
 _IGNORE = shutil.ignore_patterns(
     ".cocoindex_code", ".git", "__pycache__", "*.pyc", ".lha_pytest.json", "runs"
@@ -96,13 +99,13 @@ class Harness:
         live_context.configure(code_root=code_root, config=self.config)
         try:
             live_context.index_code(code_root)
-        except Exception:
-            pass  # best-effort; loop still runs with empty context
+        except Exception:  # best-effort; loop still runs with empty context
+            logger.debug("index_code(%s) failed", code_root, exc_info=True)
         if state.task.kind == "paper_to_experiment":
             try:
                 live_context.index_docs()  # best-effort: paper/experiment context
             except Exception:
-                pass
+                logger.debug("index_docs() failed", exc_info=True)
 
         # Seed the budget from the checkpoint so max_steps/deadline bound the whole
         # run across pause/resume, not just this process.
@@ -122,6 +125,7 @@ class Harness:
             append_ledger(state, StepRecord(seq=state.next_seq(), step_id="-", phase="plan"))
             save_state(state)
 
+        in_flight = None  # the step currently executing, for revert on an unexpected fault
         try:
             while not state.is_terminal():
                 step = state.next_step()
@@ -129,7 +133,9 @@ class Harness:
                     break
                 budget.tick()
                 state.steps_used = budget.steps_used  # persist even if the step pauses
+                in_flight = step
                 self._run_step(state, step, budget)
+                in_flight = None  # finished cleanly (cursor may have advanced)
                 state.elapsed_s = budget.elapsed()
                 save_state(state)
         except BudgetExceeded as e:
@@ -147,6 +153,30 @@ class Harness:
             state.status = "FAILED"
             save_state(state)
             return RunResult(state, "FAILED", str(e))
+        except Exception as e:
+            # An unexpected fault mid-step (unknown action, failed patch apply, a
+            # crashing tool) must not leave the run wedged at RUNNING with a
+            # half-applied sandbox: revert the in-flight step, fail closed, checkpoint.
+            if in_flight is not None:
+                try:
+                    self._revert_step(in_flight, workdir)
+                except Exception:  # a revert failure must not abort the fail-closed path
+                    logger.exception("revert failed for step %s", in_flight.step_id)
+                append_ledger(
+                    state,
+                    StepRecord(
+                        seq=state.next_seq(),
+                        step_id=in_flight.step_id,
+                        phase="fail",
+                        notes=f"error: {type(e).__name__}: {e}"[:300],
+                    ),
+                )
+                state.fail_current(in_flight)
+            else:
+                state.status = "FAILED"
+            state.elapsed_s = budget.elapsed()
+            save_state(state)
+            return RunResult(state, "FAILED", f"{type(e).__name__}: {e}")
 
         if not state.is_terminal():
             state.status = "DONE"
@@ -158,9 +188,12 @@ class Harness:
             try:
                 from ..memory import SkillMemory
 
-                SkillMemory(Path(self.config.data_dir) / "skills").record(state)
-            except Exception:
-                pass  # skill recording is best-effort
+                if SkillMemory(Path(self.config.data_dir) / "skills").record(state) is not None:
+                    # Re-index so the new skill is retrievable on the next run — without
+                    # this the Voyager-lite memory loop stays open for issue_to_pr runs.
+                    live_context.index_docs(("skill",))
+            except Exception:  # skill recording is best-effort
+                logger.debug("skill recording failed", exc_info=True)
         save_state(state)
         return RunResult(state, state.status)
 
@@ -284,6 +317,9 @@ class Harness:
     def _approval_gate(self, state: RunState, step, artifact_ref: str) -> None:
         gate = HumanApprovalGate(state.run_dir)
         decision = gate.decision()
+        if decision is not None and decision.step_id not in (None, step.step_id):
+            gate.clear()  # a decision left for a different step must not approve this one
+            decision = None
         if decision is not None:
             gate.clear()
             if not decision.approved:
