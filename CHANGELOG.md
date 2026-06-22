@@ -6,6 +6,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.0] — 2026-06-22
+
 ### Fixed — verification-first correctness
 
 - **ruff verifier gated on exit code.** A ruff invocation that *failed to run* (config
@@ -64,10 +68,7 @@ Documentation & engineering-rigor pass (no behavior change unless noted):
   narrowing, and a few targeted casts for third-party stub gaps. No logic changes;
   `lha eval` remains 5/5.
 
-## 0.1.0 — draft (not yet tagged)
-
-The initial feature-complete harness. *Draft notes for the first release; cutting
-the tag is a maintainer decision.*
+### The initial feature-complete harness
 
 ### Added
 - **Verification loop** (the spine): `context → execute → verify → repair →
