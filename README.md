@@ -139,10 +139,13 @@ framework required) with the live-context machinery quarantined behind a facade.
 
 ```
 lha run <task.yaml> [--runtime loop|langgraph] [--llm stub|claude_cli|anthropic]
-lha resume <run_id>             lha approve|reject <run_id>
+lha resume <run_id>             lha approve|reject <run_id>    lha trace <run_id>
 lha eval [--quick]              lha batch <task.yaml> ...      # parallel, process-isolated
 lha index <path>                lha index-docs                 lha ask <query> --kinds code,paper,...
 ```
+
+`-v`/`--verbose` raises log verbosity; `lha trace <run_id>` renders a run's ledger
+timeline. To run in a container, see [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Requirements & install
 

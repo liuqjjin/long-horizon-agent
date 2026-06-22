@@ -6,6 +6,48 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed — verification-first correctness
+
+- **ruff verifier gated on exit code.** A ruff invocation that *failed to run* (config
+  error, timeout, non-JSON output) silently passed; it now fails, upholding the
+  "a check that can't run must fail" rule (`pytest` already enforced it).
+- **LangGraph runtime reverts unverified/rejected patches**, matching the default loop —
+  a change that fails verification (or is rejected) no longer survives in the sandbox.
+- **Budget bounds the whole run across pause/resume.** `max_steps`/`deadline_s` were
+  per-process; cumulative `steps_used`/`elapsed_s` are now persisted and re-seeded on
+  resume (check-before-increment, so a pause is exact). `LHA_DEADLINE_S` now reaches the
+  loop and rejects non-finite/negative values.
+- **Anthropic backend fails closed** on `stop_reason` `max_tokens`/`refusal` instead of
+  returning a silently truncated/empty completion; default `max_tokens` 16000 (was a
+  truncating 4096) with adaptive thinking + high effort for `claude-opus-4-8`.
+- **A step that verified nothing no longer passes** (empty verifier list fails closed).
+- **Citations are checked on any provenance-bearing artifact** (e.g. experiments), not
+  only patches.
+- **Human rejection reverts the change**, and stale approval decisions can no longer be
+  misattributed to a later step (decisions carry a `step_id`).
+
+### Fixed — robustness
+
+- The loop **fails closed on an unexpected mid-step fault** (reverts, ledgers, checkpoints)
+  instead of wedging at `RUNNING` with a half-applied sandbox.
+- The orchestrator **survives a per-task spawn failure** (broadened beyond `TimeoutExpired`)
+  so one bad worker can't discard the whole batch; `lha eval` **isolates each case** so one
+  crash doesn't zero the report.
+- The skill-memory note is **re-indexed after recording**, closing the retrieval loop for
+  `issue_to_pr` runs.
+- The `claude_cli` backend **pipes the prompt via stdin** (avoids `E2BIG` on large repos).
+
+### Added — observability & deployability
+
+- `lha trace <run_id>` renders a run's ledger timeline; `-v/--verbose` enables logging.
+- **Containerization:** multi-stage `Dockerfile` (uv, non-root, layer-cached, HF cache),
+  `.dockerignore`, and `docs/DEPLOY.md`.
+- Packaging: `py.typed` marker, single-sourced `__version__`, MIT `LICENSE`, and PEP 639
+  license/keyword/classifier metadata.
+- Pinning tests for all of the above (`tests/test_hardening.py`, `tests/test_deployability.py`).
+
+---
+
 Documentation & engineering-rigor pass (no behavior change unless noted):
 
 ### Added
