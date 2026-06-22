@@ -115,6 +115,8 @@ class LangGraphHarness:
             conn.close()
 
         final = load_state_by_id(self.config.runs_dir, state.run_id)
+        if final.status == "PAUSED":  # budget exhausted mid-graph
+            return RunResult(final, "PAUSED", "budget exceeded")
         if not final.is_terminal():
             final.status = "DONE"
         if final.status == "DONE":
@@ -142,6 +144,15 @@ class LangGraphHarness:
         step = state.next_step()
         if step is None or state.is_terminal():
             return {"rs": state.model_dump(mode="json")}
+
+        # Bound the run: max_steps caps total node executions so the durable runtime
+        # can't run an unbounded plan (persisted in steps_used, so it survives resume).
+        # Conservative across approval re-runs; deadline enforcement stays loop-only.
+        if state.steps_used >= self.config.max_steps:
+            state.status = "PAUSED"
+            save_state(state)
+            return {"rs": state.model_dump(mode="json")}
+        state.steps_used += 1
 
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
@@ -218,6 +229,6 @@ class LangGraphHarness:
 
 def _route(gstate: GraphState) -> str:
     state = RunState.model_validate(gstate["rs"])
-    if state.is_terminal() or state.next_step() is None:
+    if state.is_terminal() or state.status == "PAUSED" or state.next_step() is None:
         return "done"
     return "continue"

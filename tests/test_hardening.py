@@ -249,6 +249,18 @@ def test_langgraph_reverts_unverified_patch(tmp_path, monkeypatch):
     assert "len(values) - 1" in restored
 
 
+def test_langgraph_budget_caps_steps(tmp_path):
+    pytest.importorskip("langgraph")
+    from lha.runtime.langgraph_runner import LangGraphHarness
+
+    paused = LangGraphHarness(_cfg(tmp_path, max_steps=1)).run(
+        TaskSpec.from_file("data/tasks/fix_average.yaml")
+    )
+    assert paused.status == "PAUSED"  # max_steps bounds the durable runtime too
+    assert paused.state.steps_used == 1
+    assert paused.state.cursor == 1  # ran step 1, paused before step 2
+
+
 def test_loop_reverts_on_approval_rejection(tmp_path):
     cfg = _cfg(tmp_path)  # auto_approve defaults to False -> non-interactive pause
     paused = Harness(cfg).run(TaskSpec.from_file("data/tasks/fix_average_approval.yaml"))
