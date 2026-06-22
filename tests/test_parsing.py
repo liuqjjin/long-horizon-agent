@@ -19,12 +19,16 @@ from lha.llm.base import _touched_from_diff, extract_unified_diff
 
 # --- ccc MCP result parsing -------------------------------------------------
 def test_extract_results_from_structured_content():
-    cr = SimpleNamespace(structuredContent={"results": [{"path": "a.py"}, {"path": "b.py"}]}, content=[])
+    cr = SimpleNamespace(
+        structuredContent={"results": [{"path": "a.py"}, {"path": "b.py"}]}, content=[]
+    )
     assert [r["path"] for r in _extract_results(cr)] == ["a.py", "b.py"]
 
 
 def test_extract_results_from_text_json_blocks():
-    cr = SimpleNamespace(structuredContent=None, content=[SimpleNamespace(text='[{"path": "a.py"}]')])
+    cr = SimpleNamespace(
+        structuredContent=None, content=[SimpleNamespace(text='[{"path": "a.py"}]')]
+    )
     assert _extract_results(cr) == [{"path": "a.py"}]
 
 
@@ -34,7 +38,14 @@ def test_extract_results_empty_when_nothing_parseable():
 
 
 def test_result_to_codehit_maps_fields_and_locator():
-    d = {"path": "m.py", "line_start": 1, "line_end": 9, "code": "x = 1", "language": "python", "score": 0.5}
+    d = {
+        "path": "m.py",
+        "line_start": 1,
+        "line_end": 9,
+        "code": "x = 1",
+        "language": "python",
+        "score": 0.5,
+    }
     hit = _result_to_codehit(d, Path("/tmp/somewhere"), now())
     assert isinstance(hit, CodeHit)
     assert hit.text == "x = 1"
