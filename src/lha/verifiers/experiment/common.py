@@ -64,6 +64,11 @@ def load_arrays(artifact: Any, workdir: str | Path):
     if not rp or not pp:
         return None, None
     try:
-        return np.load(workdir / rp), np.load(workdir / pp)
+        # allow_pickle=False (numpy's default since 2.x) keeps a malicious .npy from
+        # executing pickle on load — make it explicit so it can't drift.
+        return (
+            np.load(workdir / rp, allow_pickle=False),
+            np.load(workdir / pp, allow_pickle=False),
+        )
     except (OSError, ValueError):
         return None, None

@@ -129,6 +129,20 @@ def test_loop_reverts_applied_patch_on_midstep_fault(tmp_path, monkeypatch):
     assert "len(values) - 1" in restored
 
 
+# --- a patch can never write outside the run sandbox ------------------------
+def test_apply_patch_rejects_path_traversal(tmp_path):
+    import pytest
+
+    from lha.tools.patch import apply_patch
+
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    for bad_key in ("../escape.txt", "/tmp/lha_escape.txt", "a/../../escape.txt"):
+        with pytest.raises(ValueError):
+            apply_patch(Patch(step_id="s", file_contents={bad_key: "pwned"}), workdir)
+    assert not (tmp_path / "escape.txt").exists()  # nothing landed outside the sandbox
+
+
 # --- citations on an experiment artifact are now checked, not skipped -------
 def test_citation_verifies_experiment_result(tmp_path):
     step = Step(

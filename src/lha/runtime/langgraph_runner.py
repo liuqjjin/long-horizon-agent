@@ -10,6 +10,7 @@ Enable with ``lha run --runtime langgraph`` (and ``lha resume --runtime langgrap
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, TypedDict
@@ -22,6 +23,8 @@ from ..harness.checkpoint import append_ledger, load_state_by_id, save_state
 from ..harness.loop import Harness, RunResult, _gen_run_id
 from ..harness.state import Phase, RunState, StepRecord
 from ..verifiers import VerifyContext
+
+logger = logging.getLogger(__name__)
 
 
 class GraphState(TypedDict):
@@ -64,13 +67,13 @@ class LangGraphHarness:
         live_context.configure(code_root=code_root, config=self.config)
         try:
             live_context.index_code(code_root)
-        except Exception:
-            pass
+        except Exception:  # best-effort; loop still runs with empty context
+            logger.debug("index_code(%s) failed", code_root, exc_info=True)
         if state.task.kind == "paper_to_experiment":
             try:
                 live_context.index_docs()
             except Exception:
-                pass
+                logger.debug("index_docs() failed", exc_info=True)
 
         if state.plan is None:
             state.plan = Supervisor(self.config).plan(state.task)

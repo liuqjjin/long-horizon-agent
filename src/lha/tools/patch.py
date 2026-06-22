@@ -9,12 +9,25 @@ from __future__ import annotations
 
 import difflib
 import json
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..artifacts import Patch
 from .shell import run
+
+
+def _safe_target(workdir: Path, rel: str) -> Path:
+    """Resolve ``rel`` inside the sandbox, refusing anything that escapes it.
+
+    A patch is model/LLM output; an absolute or ``../`` key must never let a write
+    land outside the run sandbox. (``git apply`` already rejects out-of-tree paths;
+    this guards the direct ``file_contents`` write path.)
+    """
+    root = workdir.resolve()
+    target = (root / rel).resolve()
+    if Path(rel).is_absolute() or not target.is_relative_to(root):
+        raise ValueError(f"refusing to write outside the sandbox: {rel!r}")
+    return target
 
 
 def make_unified_diff(original: str, updated: str, relpath: str) -> str:
@@ -41,29 +54,37 @@ def apply_patch(patch: Patch, workdir: str | Path) -> tuple[list[str], Backup]:
     touched: list[str] = []
 
     if patch.file_contents:
-        for rel, content in patch.file_contents.items():
-            target = workdir / rel
-            backup.originals[rel] = target.read_text() if target.exists() else None
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
-            touched.append(rel)
+        # Snapshot-as-we-go, and on any mid-write failure revert what was already
+        # written so a multi-file patch can never leave a half-applied sandbox.
+        try:
+            for rel, content in patch.file_contents.items():
+                target = _safe_target(workdir, rel)
+                backup.originals[rel] = target.read_text() if target.exists() else None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+                touched.append(rel)
+        except Exception:
+            revert_patch(backup, workdir)
+            raise
         return touched, backup
 
     if patch.unified_diff.strip():
         for rel in patch.touched_files:
             target = workdir / rel
             backup.originals[rel] = target.read_text() if target.exists() else None
-        with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=False) as f:
-            f.write(patch.unified_diff)
-            diff_path = f.name
-        # Idempotent: if the diff is already applied (e.g. on resume), skip it
-        # rather than failing with "patch already applied".
-        already = run(["git", "apply", "--reverse", "--check", "-p1", diff_path], cwd=workdir)
+        # Pipe the diff via stdin (no temp file to leak). Idempotent: if it is
+        # already applied (e.g. on resume), skip rather than failing.
+        already = run(
+            ["git", "apply", "--reverse", "--check", "-p1", "-"],
+            cwd=workdir,
+            input=patch.unified_diff,
+        )
         if already.ok:
             return list(patch.touched_files), backup
         res = run(
-            ["git", "apply", "--whitespace=nowarn", "-p1", diff_path],
+            ["git", "apply", "--whitespace=nowarn", "-p1", "-"],
             cwd=workdir,
+            input=patch.unified_diff,
         )
         if not res.ok:
             raise RuntimeError(f"git apply failed: {res.stderr or res.stdout}")
