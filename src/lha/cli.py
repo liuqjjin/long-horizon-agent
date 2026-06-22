@@ -2,15 +2,21 @@
 
 lha run <task.yaml>      run a task through the verification loop
 lha resume <run_id>      resume a paused/awaiting run
+lha eval [--quick]       run ResearchAgentBench-Lite (self-evaluation)
+lha batch <task>...      run multiple tasks in parallel (process-isolated)
+lha trace <run_id>       render a run's ledger timeline
 lha index <path>         (re)build the code index for a repo
+lha index-docs           (re)build paper/experiment indexes via CocoIndex
 lha ask <query...>       answer a query with fresh, cited context
-lha approve <run_id>     approve a pending human-approval gate
-lha reject <run_id>      reject a pending human-approval gate
+lha approve|reject <run_id>   resolve a pending human-approval gate
+
+Global: --llm {stub,claude_cli,anthropic}, -v/--verbose, --version.
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -137,6 +143,36 @@ def _cmd_ask(args) -> int:
     return 0
 
 
+def _cmd_trace(args) -> int:
+    import json
+
+    cfg = _config(args)
+    state = load_state_by_id(cfg.runs_dir, args.run_id)
+    run_dir = Path(state.run_dir)
+    print(f"run_id : {state.run_id}")
+    print(f"status : {state.status}")
+    print(f"task   : {state.task.title} ({state.task.kind})")
+    ledger = run_dir / "ledger.jsonl"
+    if not ledger.exists():
+        print("(no ledger)")
+        return 0
+    print(f"\nledger: {ledger}")
+    for line in ledger.read_text().splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts = str(e.get("timestamp", ""))[:19].replace("T", " ")
+        ref = e.get("verdict_ref") or e.get("artifact_ref") or ""
+        extra = f"  {ref}" if ref else ""
+        if e.get("notes"):
+            extra += f"  — {e['notes']}"
+        print(
+            f"  [{e.get('seq', '-'):>3}] {ts}  {e.get('step_id', '-'):<12} {e.get('phase', ''):<9}{extra}"
+        )
+    return 0
+
+
 def _cmd_approve(args, approved: bool) -> int:
     cfg = _config(args)
     state = load_state_by_id(cfg.runs_dir, args.run_id)
@@ -203,6 +239,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--llm", choices=["stub", "claude_cli", "anthropic"], help="LLM backend override"
     )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="increase log verbosity (-v info, -vv debug)",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pr = sub.add_parser("run", help="run a task")
@@ -242,6 +285,10 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--k", type=int, default=8)
     pa.set_defaults(func=_cmd_ask)
 
+    ptr = sub.add_parser("trace", help="render a run's ledger timeline")
+    ptr.add_argument("run_id")
+    ptr.set_defaults(func=_cmd_trace)
+
     pap = sub.add_parser("approve", help="approve a pending gate")
     pap.add_argument("run_id")
     pap.add_argument("--note", default="")
@@ -255,9 +302,15 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _setup_logging(verbosity: int) -> None:
+    level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    _setup_logging(getattr(args, "verbose", 0))
     sys.exit(args.func(args))
 
 
