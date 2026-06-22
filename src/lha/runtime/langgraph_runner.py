@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -20,7 +21,7 @@ from ..agents import ContextEngineer, Supervisor, VerifierAgent
 from ..config import Config
 from ..harness.approval import HumanApprovalGate
 from ..harness.checkpoint import append_ledger, load_state_by_id, save_state
-from ..harness.loop import Harness, RunResult, _gen_run_id
+from ..harness.loop import Harness, RunResult, _dump, _gen_run_id
 from ..harness.state import Phase, RunState, StepRecord
 from ..verifiers import VerifyContext
 
@@ -63,6 +64,10 @@ class LangGraphHarness:
 
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
+        # Wall-clock budget across nodes: prior_elapsed (from earlier processes) plus
+        # this process's monotonic delta gives the run's total elapsed for deadline_s.
+        self._t0 = time.monotonic()
+        self._prior_elapsed = state.elapsed_s
         code_root = state.task.target_repo or str(workdir)
         live_context.configure(code_root=code_root, config=self.config)
         try:
@@ -76,7 +81,7 @@ class LangGraphHarness:
                 logger.debug("index_docs() failed", exc_info=True)
 
         if state.plan is None:
-            state.plan = Supervisor(self.config).plan(state.task)
+            state.plan = Supervisor(self.config, self._h.llm).plan(state.task)
             (run_dir / "plan.json").write_text(state.plan.model_dump_json(indent=2))
             save_state(state)
 
@@ -148,14 +153,20 @@ class LangGraphHarness:
         if step is None or state.is_terminal():
             return {"rs": state.model_dump(mode="json")}
 
-        # Bound the run: max_steps caps total node executions so the durable runtime
-        # can't run an unbounded plan (persisted in steps_used, so it survives resume).
-        # Conservative across approval re-runs; deadline enforcement stays loop-only.
-        if state.steps_used >= self.config.max_steps:
+        # Bound the run: max_steps caps total node executions and deadline_s caps
+        # wall-clock, both persisted so they survive resume. (max_steps is conservative
+        # across approval re-runs — it may count a paused-then-resumed step twice.)
+        elapsed = self._prior_elapsed + (time.monotonic() - self._t0)
+        deadline = self.config.deadline_s
+        if state.steps_used >= self.config.max_steps or (
+            deadline is not None and elapsed > deadline
+        ):
             state.status = "PAUSED"
+            state.elapsed_s = elapsed
             save_state(state)
             return {"rs": state.model_dump(mode="json")}
         state.steps_used += 1
+        state.elapsed_s = elapsed
 
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
@@ -166,7 +177,7 @@ class LangGraphHarness:
             )
 
         bundle = ContextEngineer(self.config).gather(step)
-        (run_dir / "context_bundle.json").write_text(bundle.model_dump_json(indent=2))
+        _dump(run_dir, step.step_id, "context_bundle.json", bundle.model_dump_json(indent=2))
         ledger("context", artifact_ref="context_bundle.json")
         artifact, ref = self._h._execute(state, step, bundle)
         ledger("execute", artifact_ref=ref)
@@ -185,7 +196,7 @@ class LangGraphHarness:
         verdict = VerifierAgent(parallel=self.config.parallel_verify).verify(
             step, artifact, VerifyContext(workdir=workdir, step=step, bundle=bundle)
         )
-        (run_dir / "verify.json").write_text(verdict.model_dump_json(indent=2))
+        _dump(run_dir, step.step_id, "verify.json", verdict.model_dump_json(indent=2))
         ledger("verify", verdict_ref="verify.json")
 
         if verdict.passed:

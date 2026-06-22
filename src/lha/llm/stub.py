@@ -25,6 +25,9 @@ class DeterministicStub(LLMClient):
     def complete(self, system: str, prompt: str) -> str:  # not used by the stub
         return ""
 
+    def plan(self, task, template):  # deterministic: keep the Supervisor's template plan
+        return None
+
     def propose_patch(self, step, bundle: ContextBundle, workdir: str | Path) -> Patch:
         workdir = Path(workdir)
         target_rel = "mathutils.py"

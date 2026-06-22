@@ -261,6 +261,16 @@ def test_langgraph_budget_caps_steps(tmp_path):
     assert paused.state.cursor == 1  # ran step 1, paused before step 2
 
 
+def test_langgraph_deadline_pauses(tmp_path):
+    pytest.importorskip("langgraph")
+    from lha.runtime.langgraph_runner import LangGraphHarness
+
+    paused = LangGraphHarness(_cfg(tmp_path, deadline_s=0.0)).run(
+        TaskSpec.from_file("data/tasks/fix_average.yaml")
+    )
+    assert paused.status == "PAUSED"  # deadline_s now bounds the durable runtime too
+
+
 def test_loop_reverts_on_approval_rejection(tmp_path):
     cfg = _cfg(tmp_path)  # auto_approve defaults to False -> non-interactive pause
     paused = Harness(cfg).run(TaskSpec.from_file("data/tasks/fix_average_approval.yaml"))
@@ -272,6 +282,26 @@ def test_loop_reverts_on_approval_rejection(tmp_path):
     rejected = Harness(cfg).resume(paused.state.run_id)
     assert rejected.status == "FAILED"
     assert "len(values) - 1" in mathutils.read_text()  # rejected change reverted
+
+
+def test_approval_reuses_the_reviewed_patch_on_resume(tmp_path, monkeypatch):
+    from lha.agents import implementer
+
+    cfg = _cfg(tmp_path)
+    paused = Harness(cfg).run(TaskSpec.from_file("data/tasks/fix_average_approval.yaml"))
+    assert paused.status == "AWAITING_APPROVAL"
+    HumanApprovalGate(paused.state.run_dir).resolve(approved=True, note="ok")
+
+    # The approved patch must be reused, not regenerated: if the harness called the
+    # implementer again on resume this would raise and the run would FAIL instead.
+    def boom(self, *a, **k):
+        raise RuntimeError("must not regenerate an approved patch")
+
+    monkeypatch.setattr(implementer.Implementer, "implement", boom)
+    done = Harness(cfg).resume(paused.state.run_id)
+    assert done.status == "DONE"
+    fixed = (Path(done.state.run_dir) / "workdir" / "mathutils.py").read_text()
+    assert "len(values) - 1" not in fixed  # the reviewed fix was applied
 
 
 def test_stale_approval_decision_is_ignored(tmp_path):

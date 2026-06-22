@@ -7,14 +7,35 @@ runs swap in ``ClaudeCLIClient`` (default) or ``AnthropicClient`` via config.
 
 from __future__ import annotations
 
+import json
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from ..artifacts import Patch
+from ..artifacts import Patch, Plan, Step
 from ..live_context.models import ContextBundle
 
 _DIFF_FENCE = re.compile(r"```(?:diff|patch)?\s*\n(.*?)```", re.DOTALL)
+_JSON_FENCE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+
+_PLAN_SYSTEM = (
+    "You are the planning agent of a verification-first harness. Decompose the task "
+    "into an ordered list of verifiable steps. Output ONLY a JSON object in a ```json "
+    "fenced block with keys `summary` (string) and `steps` (array). Each step has: "
+    "`step_id`, `kind` (code|experiment|context), `action` "
+    "(gather_context|edit_code|run_experiment|answer_query), `goal`, and `verifiers` "
+    "(subset of: pytest, ruff, psnr, ssim, reproducibility, freshness, citation). "
+    "Mirror the structure of the example plan. Do not explain."
+)
+
+
+def extract_json(text: str) -> str:
+    m = _JSON_FENCE.search(text)
+    if m:
+        return m.group(1)
+    s = text.strip()
+    return s if s.startswith("{") else ""
+
 
 _IMPL_SYSTEM = (
     "You are a careful software engineer. Given an issue, relevant code context, "
@@ -39,6 +60,33 @@ class LLMClient(ABC):
 
     @abstractmethod
     def complete(self, system: str, prompt: str) -> str: ...
+
+    def plan(self, task, template: Plan) -> Plan | None:
+        """Ask the LLM to (re)plan the task, or return None to use the caller's template.
+
+        Real backends inherit this; the deterministic stub overrides it to return None
+        so the default/eval path stays template-driven. Any parse/validation failure
+        also yields None — the Supervisor then keeps its template plan.
+        """
+        prompt = (
+            f"## Task\nkind: {task.kind}\ntitle: {task.title}\n"
+            f"description: {task.description or task.title}\n\n"
+            f"## Example plan for this task kind\n{template.model_dump_json(indent=2)}\n\n"
+            "Return a JSON plan decomposing this task into verifiable steps."
+        )
+        try:
+            data = json.loads(extract_json(self.complete(_PLAN_SYSTEM, prompt)) or "{}")
+            steps = [Step.model_validate(s) for s in data.get("steps", [])]
+            if not steps:
+                return None
+            return Plan(
+                task_id=task.title,
+                summary=data.get("summary", f"Plan: {task.title}"),
+                steps=steps,
+                overall_success=task.success or template.overall_success,
+            )
+        except Exception:
+            return None
 
     def propose_patch(self, step, bundle: ContextBundle, workdir: str | Path) -> Patch:
         """Default: prompt the model with context and parse a unified diff."""

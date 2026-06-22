@@ -129,6 +129,31 @@ def test_loop_reverts_applied_patch_on_midstep_fault(tmp_path, monkeypatch):
     assert "len(values) - 1" in restored
 
 
+# --- per-step artifacts preserve every step's provenance --------------------
+def test_per_step_artifacts_written_and_finalizer_reads_the_edit_step(tmp_path):
+    result = Harness(_cfg(tmp_path)).run(TaskSpec.from_file("data/tasks/fix_average.yaml"))
+    assert result.status == "DONE"
+    run_dir = Path(result.state.run_dir)
+    # both steps keep their own verify.json; the edit step keeps its patch.json
+    assert (run_dir / "steps" / "s1-context" / "verify.json").exists()
+    assert (run_dir / "steps" / "s2-fix" / "patch.json").exists()
+    assert (run_dir / "steps" / "s2-fix" / "verify.json").exists()
+    # the PR summary reports the edit step's verdict (pytest/ruff), not the context step's
+    pr = (run_dir / "pr_summary.md").read_text()
+    assert "pytest" in pr
+
+
+# --- per-step artifact paths can't escape the run dir (defense in depth) ----
+def test_dump_keeps_artifacts_inside_the_run_dir(tmp_path):
+    from lha.harness.loop import _dump
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _dump(run_dir, "../../escape", "verify.json", "{}")  # malicious step_id
+    assert not (tmp_path / "escape").exists()  # did not escape run_dir/steps
+    assert list((run_dir / "steps").glob("*/verify.json"))  # landed inside, sanitized
+
+
 # --- a patch can never write outside the run sandbox ------------------------
 def test_apply_patch_rejects_path_traversal(tmp_path):
     import pytest

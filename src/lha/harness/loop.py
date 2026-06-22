@@ -58,6 +58,25 @@ def _slug(text: str) -> str:
     return s[:32] or "task"
 
 
+def _safe_seg(step_id: str) -> str:
+    """A single, path-safe filesystem segment for a step_id.
+
+    A dynamic (LLM-generated) plan could carry a step_id like ``../../escape``;
+    collapsing path separators and leading/trailing dots keeps it inside the run dir.
+    """
+    seg = re.sub(r"[^A-Za-z0-9_.-]", "_", step_id).strip(".")
+    return seg or "step"
+
+
+def _dump(run_dir: Path, step_id: str, name: str, text: str) -> None:
+    """Write an artifact both flat (back-compat / last-writer) and per-step under
+    ``steps/<step_id>/`` so a multi-step plan keeps every step's provenance."""
+    (run_dir / name).write_text(text)
+    step_dir = run_dir / "steps" / _safe_seg(step_id)
+    step_dir.mkdir(parents=True, exist_ok=True)
+    (step_dir / name).write_text(text)
+
+
 def _gen_run_id(task: TaskSpec) -> str:
     return f"{now():%Y%m%d-%H%M%S}-{_slug(task.title)}-{uuid.uuid4().hex[:4]}"
 
@@ -119,7 +138,7 @@ class Harness:
 
         # PLAN (once)
         if state.plan is None:
-            state.plan = Supervisor(self.config).plan(state.task)
+            state.plan = Supervisor(self.config, self.llm).plan(state.task)
             (run_dir / "plan.json").write_text(state.plan.model_dump_json(indent=2))
             (run_dir / "plan.md").write_text(self._plan_md(state))
             append_ledger(state, StepRecord(seq=state.next_seq(), step_id="-", phase="plan"))
@@ -204,7 +223,7 @@ class Harness:
 
         # 1. CONTEXT
         bundle = ContextEngineer(self.config).gather(step)
-        (run_dir / "context_bundle.json").write_text(bundle.model_dump_json(indent=2))
+        _dump(run_dir, step.step_id, "context_bundle.json", bundle.model_dump_json(indent=2))
         append_ledger(
             state,
             StepRecord(
@@ -235,7 +254,7 @@ class Harness:
         verdict = VerifierAgent(parallel=self.config.parallel_verify).verify(
             step, artifact, VerifyContext(workdir=workdir, step=step, bundle=bundle)
         )
-        (run_dir / "verify.json").write_text(verdict.model_dump_json(indent=2))
+        _dump(run_dir, step.step_id, "verify.json", verdict.model_dump_json(indent=2))
         append_ledger(
             state,
             StepRecord(
@@ -286,9 +305,13 @@ class Harness:
             return bundle, "context_bundle.json"
 
         if step.action == "edit_code":
-            patch: Patch = Implementer(self.llm).implement(step, bundle, workdir)
+            # On resume after approval, reuse the exact patch the human reviewed
+            # rather than regenerating it (a non-deterministic backend could differ).
+            patch = self._approved_patch(state, step)
+            if patch is None:
+                patch = Implementer(self.llm).implement(step, bundle, workdir)
             (run_dir / "patch.diff").write_text(patch.unified_diff or "(no diff)\n")
-            (run_dir / "patch.json").write_text(patch.model_dump_json(indent=2))
+            _dump(run_dir, step.step_id, "patch.json", patch.model_dump_json(indent=2))
             # Only touch the sandbox if there is a new patch. On a repair pass an
             # idempotent implementer may return an empty patch (already fixed) —
             # keep the prior fix rather than reverting it.
@@ -296,12 +319,12 @@ class Harness:
                 self._revert_step(step, workdir)  # undo a prior attempt for this step
                 _touched, backup = apply_patch(patch, workdir)
                 self._backups[step.step_id] = backup
-                save_backup(backup, run_dir / "backups" / f"{step.step_id}.json")
+                save_backup(backup, run_dir / "backups" / f"{_safe_seg(step.step_id)}.json")
             return patch, "patch.diff"
 
         if step.action == "run_experiment":
             result: ExperimentResult = Experimenter().run(step, bundle, workdir)
-            (run_dir / "experiment.json").write_text(result.model_dump_json(indent=2))
+            _dump(run_dir, step.step_id, "experiment.json", result.model_dump_json(indent=2))
             return result, "experiment.json"
 
         raise ValueError(f"unknown action: {step.action}")
@@ -309,9 +332,31 @@ class Harness:
     def _revert_step(self, step, workdir: Path) -> None:
         backup = self._backups.pop(step.step_id, None)
         if backup is None:  # not in memory (e.g. resumed in a fresh process) -> disk
-            backup = load_backup(Path(workdir).parent / "backups" / f"{step.step_id}.json")
+            backup = load_backup(
+                Path(workdir).parent / "backups" / f"{_safe_seg(step.step_id)}.json"
+            )
         if backup is not None:
             revert_patch(backup, workdir)
+
+    def _approved_patch(self, state: RunState, step) -> Patch | None:
+        """The persisted patch a human already approved for this step, if any.
+
+        Binds the approval to the artifact: on resume, an approval-gated step reuses
+        the exact patch the human reviewed instead of regenerating one that could
+        differ under a non-deterministic backend.
+        """
+        if not step.requires_approval:
+            return None
+        decision = HumanApprovalGate(state.run_dir).decision()
+        if decision is None or decision.step_id not in (None, step.step_id):
+            return None
+        patch_json = Path(state.run_dir) / "patch.json"
+        if not patch_json.exists():
+            return None
+        try:
+            return Patch.model_validate_json(patch_json.read_text())
+        except Exception:
+            return None
 
     # --- approval -----------------------------------------------------------
     def _approval_gate(self, state: RunState, step, artifact_ref: str) -> None:
@@ -346,16 +391,33 @@ class Harness:
         raise ApprovalPending(state.run_id, step.step_id)
 
     # --- finalize -----------------------------------------------------------
+    def _materializing_step_id(self, state: RunState, action: str) -> str | None:
+        """The last completed step with this action — whose artifacts the finalizer
+        should report. Robust to plan order rather than 'whichever file wrote last'."""
+        if state.plan is None:
+            return None
+        done = set(state.completed_steps)
+        ids = [s.step_id for s in state.plan.steps if s.action == action and s.step_id in done]
+        return ids[-1] if ids else None
+
+    def _load_artifact(self, state: RunState, step_id: str | None, name: str, model):
+        """Load a per-step artifact (``steps/<id>/<name>``), falling back to the flat file."""
+        run_dir = Path(state.run_dir)
+        per_step = [run_dir / "steps" / _safe_seg(step_id) / name] if step_id else []
+        candidates = per_step + [run_dir / name]
+        for path in candidates:
+            if path.exists():
+                try:
+                    return model.model_validate_json(path.read_text())
+                except Exception:
+                    continue
+        return None
+
     def _finalize_pr(self, state: RunState) -> None:
         run_dir = Path(state.run_dir)
-        patch = Patch(step_id="-")
-        patch_json = run_dir / "patch.json"
-        if patch_json.exists():
-            patch = Patch.model_validate_json(patch_json.read_text())
-        verdict = None
-        verify_json = run_dir / "verify.json"
-        if verify_json.exists():
-            verdict = Verdict.model_validate_json(verify_json.read_text())
+        sid = self._materializing_step_id(state, "edit_code")
+        patch = self._load_artifact(state, sid, "patch.json", Patch) or Patch(step_id="-")
+        verdict = self._load_artifact(state, sid, "verify.json", Verdict)
 
         checks = []
         if verdict:
@@ -377,14 +439,11 @@ class Harness:
 
     def _finalize_experiment(self, state: RunState) -> None:
         run_dir = Path(state.run_dir)
-        result = ExperimentResult(step_id="-")
-        exp_json = run_dir / "experiment.json"
-        if exp_json.exists():
-            result = ExperimentResult.model_validate_json(exp_json.read_text())
-        verdict = None
-        verify_json = run_dir / "verify.json"
-        if verify_json.exists():
-            verdict = Verdict.model_validate_json(verify_json.read_text())
+        sid = self._materializing_step_id(state, "run_experiment")
+        result = self._load_artifact(state, sid, "experiment.json", ExperimentResult) or (
+            ExperimentResult(step_id="-")
+        )
+        verdict = self._load_artifact(state, sid, "verify.json", Verdict)
 
         # Prefer verifier-recomputed metrics (authoritative) over self-reported.
         metrics: dict[str, float] = dict(result.metrics)

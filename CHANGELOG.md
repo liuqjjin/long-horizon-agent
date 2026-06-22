@@ -6,7 +6,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **Dynamic LLM planning** (opt-in: `Config.dynamic_planning` / `LHA_DYNAMIC_PLANNING`,
+  default off). A real backend can decompose a task into a verifiable plan; the
+  candidate is validated (registered verifiers, path-safe step ids) and falls back to
+  the deterministic template on any failure, so the stub/`lha eval` path stays
+  reproducible.
+- **Per-step artifacts** under `runs/<id>/steps/<step_id>/` (verify/patch/experiment/
+  context), so a multi-step plan keeps every step's provenance; the PR/experiment
+  finalizers report the load-bearing step rather than whichever file wrote last.
+
+### Changed
+- The **LangGraph runtime now enforces `deadline_s`** in addition to `max_steps`.
+- The **default-loop approval gate reuses the exact patch the human approved** on resume
+  rather than regenerating it (artifact-binding; see SECURITY.md for the LangGraph caveat).
+
+### Security
+- Step ids used as filesystem paths (per-step artifacts, backups) are sanitized to a
+  single safe segment, and dynamic plans carrying an unsafe step id are rejected — a
+  defense-in-depth guard now that plans can be model-generated.
 
 ## [0.1.0] — 2026-06-22
 

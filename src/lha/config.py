@@ -57,6 +57,10 @@ class Config(BaseModel):
     # Record verified successes as retrievable skills (Voyager-lite)
     use_skill_memory: bool = True
 
+    # Let the LLM backend (re)plan the task instead of the deterministic template.
+    # Off by default so the stub/eval path stays deterministic; real backends only.
+    dynamic_planning: bool = False
+
     # Freshness
     freshness_max_age_s: float = 3600.0
 
@@ -82,6 +86,7 @@ class Config(BaseModel):
             deadline_s=_env_float_opt("LHA_DEADLINE_S"),
             parallel_verify=_env("LHA_PARALLEL_VERIFY", "1") not in ("0", "false", "False"),
             use_skill_memory=_env("LHA_SKILL_MEMORY", "1") not in ("0", "false", "False"),
+            dynamic_planning=_env("LHA_DYNAMIC_PLANNING", "0") not in ("0", "false", "False"),
             freshness_max_age_s=float(_env("LHA_FRESHNESS_MAX_AGE_S", "3600")),
             llm_backend=_env("LHA_LLM_BACKEND", "stub"),
             claude_cli_path=_env("LHA_CLAUDE_CLI", "claude"),

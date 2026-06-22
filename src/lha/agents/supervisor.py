@@ -2,16 +2,49 @@
 
 from __future__ import annotations
 
+import re
+
 from ..artifacts import Plan, Step
 from ..config import Config
 from ..tasks.spec import TaskSpec
+from ..verifiers.registry import get as _get_verifier
+
+_SAFE_STEP_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 
 class Supervisor:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, llm=None):
         self.config = config
+        self.llm = llm
 
     def plan(self, task: TaskSpec) -> Plan:
+        """A verifiable Plan: the deterministic template, optionally replaced by an
+        LLM-generated plan when dynamic_planning is on and the candidate is valid."""
+        template = self._template(task)
+        if self.config.dynamic_planning and self.llm is not None:
+            try:
+                candidate = self.llm.plan(task, template)
+            except Exception:
+                candidate = None
+            if candidate is not None and self._valid(candidate):
+                return candidate
+        return template
+
+    @staticmethod
+    def _valid(plan: Plan) -> bool:
+        """A usable LLM plan: non-empty; every step has a path-safe step_id and declares
+        only registered verifiers (so it can't inject a path or an unrunnable check)."""
+        if not plan.steps:
+            return False
+        return all(
+            _SAFE_STEP_ID.fullmatch(s.step_id) is not None
+            and s.step_id not in (".", "..")
+            and bool(s.verifiers)
+            and all(_get_verifier(v) is not None for v in s.verifiers)
+            for s in plan.steps
+        )
+
+    def _template(self, task: TaskSpec) -> Plan:
         cq = task.inputs.get("context_query") or task.title
         if task.kind == "issue_to_pr":
             steps = [

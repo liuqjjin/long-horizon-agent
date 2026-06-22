@@ -12,11 +12,11 @@ execute.
 
 ## Known limitations
 
-- **The human-approval gate is not yet content-bound to the approved artifact.**
-  On resume, the step's artifact is regenerated. With the default deterministic
-  backend (`stub`) the regenerated patch is identical to the one approved; with an
-  opt-in non-deterministic backend (`claude_cli`/`anthropic`) it could differ from
-  what the human reviewed. Binding the approval to a content hash is planned.
+- **Approval artifact-binding differs by runtime.** The default loop reuses the
+  exact patch the human approved when it resumes — it is not regenerated. The
+  opt-in LangGraph runtime re-executes the step node on resume (a property of
+  `interrupt()`), so with a non-deterministic backend its resumed artifact could
+  differ from what was reviewed; binding it identically is planned.
 
 ## Reporting a vulnerability
 
