@@ -12,7 +12,7 @@ from typing import Any
 
 from ..base import Verifier, VerifyContext
 from ..verdict import Check
-from .common import is_finite, load_arrays, precheck
+from .common import is_finite, load_arrays, metric_param, precheck
 
 
 class PSNRVerifier(Verifier):
@@ -35,12 +35,18 @@ class PSNRVerifier(Verifier):
 
         from skimage.metrics import peak_signal_noise_ratio
 
-        data_range = float(ctx.step.params.get("data_range", 1.0))
+        data_range_v, dr_conflict = metric_param(artifact, ctx.step, "data_range", 1.0)
+        data_range = float(data_range_v)
         value = float(peak_signal_noise_ratio(ref, pred, data_range=data_range))
         threshold = ctx.step.params.get("psnr_min")
         reported = getattr(artifact, "metrics", {}).get("psnr")
 
         reasons: list[str] = []
+        if dr_conflict:
+            reasons.append(
+                f"data_range mismatch: task={ctx.step.params.get('data_range')} vs "
+                f"experiment-recorded={(getattr(artifact, 'repro', {}) or {}).get('data_range')}"
+            )
         if not is_finite(value):
             reasons.append(f"non-finite PSNR ({value}) — degenerate result")
         else:

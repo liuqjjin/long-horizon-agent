@@ -17,6 +17,26 @@ def is_finite(x: Any) -> bool:
         return False
 
 
+def metric_param(artifact: Any, step: Any, key: str, default: Any) -> tuple[Any, bool]:
+    """Resolve a metric param (e.g. ``data_range``), preferring what the experiment recorded.
+
+    The experiment writes the value it actually used into ``repro.json``; the task may
+    pin an override in ``step.params``. Returns ``(value, conflict)``: when both are
+    present and disagree, ``conflict`` is True — a mismatched ``data_range``/``channel_axis``
+    makes the recomputed metric (and its consistency check vs the self-reported value)
+    meaningless, so the caller must fail rather than silently rescale.
+    """
+    recorded = (getattr(artifact, "repro", {}) or {}).get(key)
+    override = step.params.get(key)
+    if override is not None and recorded is not None and override != recorded:
+        return override, True
+    if override is not None:
+        return override, False
+    if recorded is not None:
+        return recorded, False
+    return default, False
+
+
 def precheck(artifact: Any, name: str, family: VerifierFamily = "experiment") -> Check | None:
     """Fail fast if the experiment that produced the artifact did not succeed.
 

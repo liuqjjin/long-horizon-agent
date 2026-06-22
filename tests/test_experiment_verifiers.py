@@ -122,6 +122,33 @@ def test_repro_fails_without_seed(tmp_path):
     assert not check.passed
 
 
+# --- the verifier scores with the params the experiment recorded -----------
+def test_psnr_fails_on_data_range_mismatch(tmp_path):
+    rng = np.random.default_rng(6)
+    ref = rng.random((32, 32, 3)).astype(np.float32)
+    pred = (ref + rng.normal(0, 0.001, ref.shape)).astype(np.float32)
+    art = _write_pair(tmp_path, ref, pred)
+    art.repro = {"data_range": 255.0}  # experiment used 255; task pins 1.0 -> meaningless
+    check = PSNRVerifier().verify(
+        art,
+        VerifyContext(workdir=tmp_path, step=_step("psnr", {"psnr_min": 1.0, "data_range": 1.0})),
+    )
+    assert not check.passed
+    assert any("data_range mismatch" in r for r in check.detail["reasons"])
+
+
+def test_ssim_uses_recorded_channel_axis_without_override(tmp_path):
+    rng = np.random.default_rng(7)
+    ref = rng.random((32, 32, 3)).astype(np.float32)
+    pred = (ref + rng.normal(0, 0.001, ref.shape)).astype(np.float32)
+    art = _write_pair(tmp_path, ref, pred)
+    art.repro = {"data_range": 1.0, "channel_axis": -1}  # recorded; task gives no override
+    check = SSIMVerifier().verify(
+        art, VerifyContext(workdir=tmp_path, step=_step("ssim", {"ssim_min": 0.9}))
+    )
+    assert check.passed and check.score > 0.9
+
+
 # --- review regressions: non-finite metrics + failed experiments -----------
 def test_psnr_fails_when_experiment_failed(tmp_path):
     rng = np.random.default_rng(4)

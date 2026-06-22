@@ -9,7 +9,7 @@ from typing import Any
 
 from ..base import Verifier, VerifyContext
 from ..verdict import Check
-from .common import is_finite, load_arrays, precheck
+from .common import is_finite, load_arrays, metric_param, precheck
 
 
 class SSIMVerifier(Verifier):
@@ -32,8 +32,11 @@ class SSIMVerifier(Verifier):
 
         from skimage.metrics import structural_similarity
 
-        data_range = float(ctx.step.params.get("data_range", 1.0))
-        channel_axis = ctx.step.params.get("channel_axis", -1 if ref.ndim == 3 else None)
+        data_range_v, dr_conflict = metric_param(artifact, ctx.step, "data_range", 1.0)
+        data_range = float(data_range_v)
+        channel_axis, ca_conflict = metric_param(
+            artifact, ctx.step, "channel_axis", -1 if ref.ndim == 3 else None
+        )
         kwargs: dict[str, Any] = {"data_range": data_range, "channel_axis": channel_axis}
         if "win_size" in ctx.step.params:
             kwargs["win_size"] = int(ctx.step.params["win_size"])
@@ -43,7 +46,18 @@ class SSIMVerifier(Verifier):
         threshold = ctx.step.params.get("ssim_min")
         reported = getattr(artifact, "metrics", {}).get("ssim")
 
+        repro = getattr(artifact, "repro", {}) or {}
         reasons: list[str] = []
+        if dr_conflict:
+            reasons.append(
+                f"data_range mismatch: task={ctx.step.params.get('data_range')} vs "
+                f"experiment-recorded={repro.get('data_range')}"
+            )
+        if ca_conflict:
+            reasons.append(
+                f"channel_axis mismatch: task={ctx.step.params.get('channel_axis')} vs "
+                f"experiment-recorded={repro.get('channel_axis')}"
+            )
         if not is_finite(value):
             reasons.append(f"non-finite SSIM ({value}) — degenerate result")
         else:
