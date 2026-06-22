@@ -6,6 +6,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.2.0] — 2026-06-22
+
 ### Added
 - **Dynamic LLM planning** (opt-in: `Config.dynamic_planning` / `LHA_DYNAMIC_PLANNING`,
   default off). A real backend can decompose a task into a verifiable plan; the
