@@ -75,6 +75,17 @@ class VerifierAgent:
                         detail={"summary": f"verifier '{name}' is not registered"},
                     )
                 )
+        # Defense in depth: a step that produced zero checks verified nothing, so it
+        # must not pass vacuously (Verdict.from_checks treats an empty list as pass).
+        if not checks:
+            checks.append(
+                Check(
+                    name="no-verifier",
+                    family="context",
+                    passed=False,
+                    detail={"summary": "step declared no verifiers — nothing was verified"},
+                )
+            )
         return Verdict.from_checks(
             step.step_id,
             checks,

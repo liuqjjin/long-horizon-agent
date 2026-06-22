@@ -154,6 +154,7 @@ class LangGraphHarness:
             decision = interrupt({"step_id": step.step_id, "goal": step.goal})
             if not (isinstance(decision, dict) and decision.get("approved")):
                 ledger("approval", notes="rejected")
+                self._h._revert_step(step, workdir)  # rejected change must not survive
                 state.fail_current(step)
                 ledger("fail")
                 save_state(state)
@@ -175,6 +176,9 @@ class LangGraphHarness:
             state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
             ledger("repair", notes="; ".join(verdict.failures)[:300])
         else:
+            # Match the default loop: a step that exhausts its repairs is reverted
+            # so an unverified change never survives in the sandbox (loop.py:_revert_step).
+            self._h._revert_step(step, workdir)
             state.fail_current(step)
             ledger("fail")
         save_state(state)

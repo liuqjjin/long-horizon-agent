@@ -44,6 +44,10 @@ class RunState(BaseModel):
     workdir: str = ""
     pr_summary_path: str | None = None
     seq: int = 0  # ledger sequence counter
+    # Cumulative budget consumption, persisted so max_steps/deadline bound the
+    # whole run across pause/resume cycles rather than resetting per process.
+    steps_used: int = 0
+    elapsed_s: float = 0.0
     schema_version: int = 1
     # --- LangGraph-shaped fields (unused in v1, present for drop-in) ---
     thread_id: str = ""

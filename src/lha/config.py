@@ -7,6 +7,7 @@ with zero configuration.
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -22,6 +23,24 @@ except Exception:  # pragma: no cover - dotenv is optional
 
 def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
+
+
+def _env_float_opt(key: str) -> float | None:
+    """Optional positive-float env var: ``None`` when unset/blank, parsed otherwise.
+
+    Rejects non-finite (NaN/inf) and negative values so a misconfigured deadline
+    can't silently disable the budget check.
+    """
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ValueError(f"{key} must be a number, got {raw!r}") from e
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{key} must be a finite, non-negative number, got {raw!r}")
+    return value
 
 
 class Config(BaseModel):
@@ -60,6 +79,7 @@ class Config(BaseModel):
         return cls(
             max_steps=int(_env("LHA_MAX_STEPS", "20")),
             max_repairs=int(_env("LHA_MAX_REPAIRS", "3")),
+            deadline_s=_env_float_opt("LHA_DEADLINE_S"),
             parallel_verify=_env("LHA_PARALLEL_VERIFY", "1") not in ("0", "false", "False"),
             use_skill_memory=_env("LHA_SKILL_MEMORY", "1") not in ("0", "false", "False"),
             freshness_max_age_s=float(_env("LHA_FRESHNESS_MAX_AGE_S", "3600")),

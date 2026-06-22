@@ -104,10 +104,14 @@ class Harness:
             except Exception:
                 pass
 
+        # Seed the budget from the checkpoint so max_steps/deadline bound the whole
+        # run across pause/resume, not just this process.
         budget = StepBudget(
             max_steps=self.config.max_steps,
             max_repairs=self.config.max_repairs,
             deadline_s=self.config.deadline_s,
+            steps_used=state.steps_used,
+            prior_elapsed_s=state.elapsed_s,
         )
 
         # PLAN (once)
@@ -124,14 +128,22 @@ class Harness:
                 if step is None:
                     break
                 budget.tick()
+                state.steps_used = budget.steps_used  # persist even if the step pauses
                 self._run_step(state, step, budget)
+                state.elapsed_s = budget.elapsed()
+                save_state(state)
         except BudgetExceeded as e:
+            state.steps_used = budget.steps_used
+            state.elapsed_s = budget.elapsed()
             state.status = "PAUSED"
             save_state(state)
             return RunResult(state, "PAUSED", str(e))
         except ApprovalPending as e:
+            state.elapsed_s = budget.elapsed()
+            save_state(state)
             return RunResult(state, "AWAITING_APPROVAL", str(e))
         except ApprovalRejected as e:
+            state.elapsed_s = budget.elapsed()
             state.status = "FAILED"
             save_state(state)
             return RunResult(state, "FAILED", str(e))
@@ -275,6 +287,9 @@ class Harness:
         if decision is not None:
             gate.clear()
             if not decision.approved:
+                # A rejected change must not survive in the sandbox, same as a
+                # change that fails verification.
+                self._revert_step(step, Path(state.workdir))
                 raise ApprovalRejected(f"step {step.step_id} rejected: {decision.note}")
             return
         if self.auto_approve:
@@ -282,6 +297,7 @@ class Harness:
         if sys.stdin is not None and sys.stdin.isatty():
             ans = input(f"[approval] proceed with step {step.step_id} ({step.goal})? [y/N] ")
             if ans.strip().lower() not in ("y", "yes"):
+                self._revert_step(step, Path(state.workdir))
                 raise ApprovalRejected(f"step {step.step_id} rejected interactively")
             return
         # non-interactive: pause for async approval
