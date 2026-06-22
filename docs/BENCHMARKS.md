@@ -34,7 +34,7 @@ Verbatim output of `uv run lha eval`:
 score: 5/5
 ```
 
-The companion unit suite is green too: `uv run pytest` → 33 passed.
+The companion unit suite is green too (`uv run pytest`).
 
 ## What each task verifies
 
@@ -89,4 +89,4 @@ demonstrated on a runnable task rather than asserted. It also guards against
   is tested via index-generation timestamps (not wall-clock races). A clean
   checkout with a fresh `ccc` daemon reproduces `5/5`; a daemon heavily churned by
   many prior ad-hoc runs can briefly report a transient code-context miss — re-run
-  on a fresh daemon. (Hardening this is tracked in `OVERNIGHT_LOG.md`.)
+  on a fresh daemon.

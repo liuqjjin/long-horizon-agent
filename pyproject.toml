@@ -43,9 +43,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-experiment = ["scikit-image>=0.24", "numpy>=1.26"]
-coco = ["cocoindex>=1.0"]
-llm = ["anthropic>=0.40"]
+# scikit-image / numpy / cocoindex are already core deps; the only genuinely
+# optional backends are the Anthropic SDK and the pyright type-checker.
+llm = ["anthropic>=0.69"]  # needs the Opus-4.8 surface (adaptive thinking, output_config.effort)
 typecheck = ["pyright>=1.1"]
 
 [project.scripts]

@@ -6,7 +6,7 @@ on:
   pull_request:
 
 # Mirrors the local closing gate exactly:
-#   ruff check . · facade-isolation grep · uv run pytest · uv run lha eval (5/5)
+#   ruff check . · facade-isolation grep · pyright src/lha · uv run pytest · uv run lha eval (5/5)
 jobs:
   gate:
     runs-on: ubuntu-latest

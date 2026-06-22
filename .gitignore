@@ -13,9 +13,15 @@ wheels/
 runs/
 .cocoindex_code/
 .pytest_cache/
+.ruff_cache/
 .lha_pytest.json
 data/.lha_index/
 data/skills/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
 
 # Local env / secrets
 .env

@@ -39,7 +39,7 @@ restart the `ccc` daemon (`ccc daemon restart`) and re-run.
 uv run pytest --cov=lha --cov-report=term-missing
 ```
 
-Line coverage is currently **69%** (41 tests). The uncovered lines are mostly the
+Line coverage is currently **73%** (65 tests). The uncovered lines are mostly the
 network/CLI-bound backends (`ccc` MCP I/O, the `claude_cli`/`anthropic` LLM clients)
 that can't be unit-tested hermetically; their pure logic (result parsing, the LLM
 factory, diff extraction) *is* tested. New code should come with a meaningful test —

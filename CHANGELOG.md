@@ -66,8 +66,8 @@ Documentation & engineering-rigor pass (no behavior change unless noted):
 
 ## 0.1.0 — draft (not yet tagged)
 
-The initial feature-complete harness. *Draft notes for the first release; the tag
-is a human decision (see `OVERNIGHT_LOG.md`).*
+The initial feature-complete harness. *Draft notes for the first release; cutting
+the tag is a maintainer decision.*
 
 ### Added
 - **Verification loop** (the spine): `context → execute → verify → repair →
@@ -88,4 +88,4 @@ is a human decision (see `OVERNIGHT_LOG.md`).*
   context for future tasks.
 - **ResearchAgentBench-Lite** (`lha eval`): self-evaluation across issue-to-PR,
   paper-to-experiment, resume, freshness, and verification-ablation (currently 5/5).
-- **CLI:** `lha run|resume|batch|eval|index|index-docs|ask|approve|reject`.
+- **CLI:** `lha run|resume|batch|eval|trace|index|index-docs|ask|approve|reject`.

@@ -120,8 +120,10 @@ Most agent frameworks orchestrate tool calls and, when they evaluate at all, use
 LLM as judge. This project's bet is the opposite: **the loop is only as reliable as
 its verifier**, so the verifier is an *objective* oracle wherever one exists (a test
 suite, an image metric, a freshness check), and the harness is built to fail loudly
-when it can't verify. It's a small, readable, dependency-light core (no heavy agent
-framework required) with the live-context machinery quarantined behind a facade.
+when it can't verify. The core is small and readable (no heavy agent framework
+required), with the live-context machinery quarantined behind a facade — though the
+embedding/index stack does pull a GB-scale dependency set (torch, cocoindex) on the
+first `uv sync`.
 
 ## Documentation
 
@@ -160,4 +162,6 @@ timeline. To run in a container, see [docs/DEPLOY.md](docs/DEPLOY.md).
 
 Walking-skeleton through durable-runtime are implemented and exercised by
 `uv run pytest` and `uv run lha eval`. This repo is a portfolio/research artifact,
-not a production service.
+not a production service. Run `lha eval` and the bundled demos from a source
+checkout — the wheel ships the harness, while the benchmark fixtures under `data/`
+live in the repo.
