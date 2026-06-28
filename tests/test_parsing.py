@@ -9,12 +9,13 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from lha.artifacts import Step
 from lha.clock import now
 from lha.config import Config
 from lha.live_context.backends.ccc_backend import _extract_results, _result_to_codehit
-from lha.live_context.models import CodeHit
+from lha.live_context.models import CodeHit, ContextBundle, Freshness
 from lha.llm import DeterministicStub, get_llm
-from lha.llm.base import _touched_from_diff, extract_unified_diff
+from lha.llm.base import LLMClient, _touched_from_diff, extract_file_blocks, extract_unified_diff
 
 
 # --- ccc MCP result parsing -------------------------------------------------
@@ -73,6 +74,66 @@ def test_extract_unified_diff_from_fence():
 def test_extract_unified_diff_bare_and_absent():
     assert extract_unified_diff("--- a/x.py\n+++ b/x.py\n").startswith("--- a/x.py")
     assert extract_unified_diff("just prose, no diff") == ""
+
+
+# --- whole-file rewrite extraction (the robust apply path) ------------------
+class _Echo(LLMClient):
+    name = "echo"
+
+    def complete(self, system: str, prompt: str) -> str:  # unused here
+        return ""
+
+
+def _bundle() -> ContextBundle:
+    return ContextBundle(query="q", freshness=Freshness(index_version="v", indexed_at=now()))
+
+
+def _step() -> Step:
+    return Step(step_id="s", kind="code", action="edit_code", goal="g")
+
+
+def test_extract_file_blocks_multiple():
+    text = (
+        "Here is the fix.\n"
+        "### pkg/a.py\n```python\nprint('a')\n```\n"
+        "### b.py\n```\nx = 2\n```\n"
+    )
+    blocks = extract_file_blocks(text)
+    assert blocks == {"pkg/a.py": "print('a')", "b.py": "x = 2"}
+
+
+def test_patch_from_response_builds_file_contents_and_diff(tmp_path):
+    (tmp_path / "m.py").write_text("def f():\n    return 1\n")
+    resp = "### m.py\n```python\ndef f():\n    return 2\n```\n"
+    patch = _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+    assert patch.file_contents["m.py"] == "def f():\n    return 2\n"
+    assert patch.touched_files == ["m.py"]
+    assert patch.unified_diff  # a display diff is recorded
+    assert "return 2" in patch.unified_diff
+
+
+def test_patch_from_response_skips_unchanged(tmp_path):
+    (tmp_path / "m.py").write_text("def f():\n    return 1\n")
+    resp = "### m.py\n```python\ndef f():\n    return 1\n```\n"  # identical
+    patch = _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+    assert patch.is_empty()
+
+
+def test_patch_from_response_single_block_fallback(tmp_path):
+    # No '### path', but exactly one non-test source file -> map the lone block to it.
+    (tmp_path / "only.py").write_text("v = 0\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_only.py").write_text("def test(): pass\n")
+    resp = "```python\nv = 1\n```"
+    patch = _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+    assert patch.file_contents == {"only.py": "v = 1\n"}
+
+
+def test_patch_from_response_rejects_path_escape(tmp_path):
+    resp = "### ../evil.py\n```\nboom\n```\n"
+    patch = _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+    assert patch.is_empty()
+    assert not (tmp_path.parent / "evil.py").exists()
 
 
 # --- LLM factory ------------------------------------------------------------

@@ -8,6 +8,47 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.3.0] — 2026-06-28
+
+### Added — the measured thesis
+- **Verification ablation** (`lha ablate`): the project's central claim, *measured*
+  against a real LLM. A **paired** design draws one first attempt per task and scores
+  the same attempt under `trust` (apply-and-accept), `gate` (apply, run the objective
+  test gate, refuse on failure), and `verify` (gate + repair loop), reporting `claimed`
+  vs `true` vs **`false` success**. It is leak-free (single-shot implementer with file
+  tools denied, shown only non-test source), tamper-proof (patches may edit source
+  only; the test oracle and config stay canonical), and honest (transient backend
+  errors are retried and excluded, never cached). A weaker implementer `--model`
+  calibrates difficulty so the gate can bite. See [docs/ABLATION.md](docs/ABLATION.md).
+- **Bug-fix benchmark corpus**: 11 small, self-contained Python repos
+  (`data/bench/*`, `data/tasks/bench_*.yaml`), each a planted bug with a comprehensive
+  pytest oracle, spanning arithmetic/strings/recursion/stack/search/parsing. Each was
+  authored and then **adversarially screened** (bug is real, oracle catches a naive
+  fix, issue stays symptom-level).
+
+### Changed
+- **Whole-file rewrites in the LLM implementer.** Real backends now return the full
+  corrected file (`file_contents`, a robust direct write) rather than a unified diff —
+  the latter is the single most common way `git apply` throws away an otherwise-correct
+  fix on trivial context drift. A display diff is still recorded for the artifact.
+- The **pytest verifier surfaces the failing assertion messages** (compact, ACI-style)
+  so the repair loop fixes the real defect instead of guessing from "tests failed".
+- The **implementer no longer dumps test files into the prompt** — a fix is reasoned
+  from the issue and structured failure feedback, not transcribed from the oracle.
+- `ClaudeCLIClient` gained `--model` and a `no_tools` (single-shot, tools-denied) mode.
+
+### Fixed
+- The **pytest verifier clears stale `__pycache__`** before running: a repair that
+  rewrites a file to the same byte-size within the same mtime-second could otherwise
+  be graded against cached bytecode, so the repair loop could never converge.
+- **Path-traversal hardening** in the whole-file parser: a `### ../escape` header (and
+  absolute paths) are refused, and a header naming a directory/binary file is skipped
+  rather than crashing the step.
+
+### CI
+- The CI now **builds the Docker image** (`docker` job), so deployability is verified
+  rather than asserted.
+
 ## [0.2.0] — 2026-06-22
 
 ### Added

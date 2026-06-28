@@ -3,6 +3,7 @@
 lha run <task.yaml>      run a task through the verification loop
 lha resume <run_id>      resume a paused/awaiting run
 lha eval [--quick]       run ResearchAgentBench-Lite (self-evaluation)
+lha ablate [tasks...]    verification ablation: trust vs gate vs verify (real LLM)
 lha batch <task>...      run multiple tasks in parallel (process-isolated)
 lha trace <run_id>       render a run's ledger timeline
 lha index <path>         (re)build the code index for a repo
@@ -96,6 +97,30 @@ def _cmd_eval(args) -> int:
     )
     print(f"report: {out}")
     return 0 if report.all_passed else 1
+
+
+def _cmd_ablate(args) -> int:
+    import glob
+
+    from .ablation import run_ablation
+
+    cfg = _config(args)
+    tasks = args.tasks or sorted(glob.glob("data/tasks/bench_*.yaml"))
+    if not tasks:
+        print("no tasks (pass paths or add data/tasks/bench_*.yaml)")
+        return 1
+    llm = getattr(args, "llm", None) or "claude_cli"
+    out = Path(args.out) if args.out else Path(cfg.runs_dir) / "ablation"
+    model = args.model or None
+    print(
+        f"verification ablation: {len(tasks)} task(s) x 3 conditions x {args.reps} rep(s), "
+        f"llm={llm} model={model or '(default)'}"
+    )
+    report = run_ablation(cfg, tasks, llm=llm, model=model, reps=args.reps, out_dir=out)
+    print()
+    print(report.to_markdown())
+    print(f"report: {out / 'ablation_report.md'}")
+    return 0
 
 
 def _cmd_index(args) -> int:
@@ -270,6 +295,13 @@ def build_parser() -> argparse.ArgumentParser:
     pev = sub.add_parser("eval", help="run ResearchAgentBench-Lite (self-evaluation)")
     pev.add_argument("--quick", action="store_true", help="skip the slow experiment cases")
     pev.set_defaults(func=_cmd_eval)
+
+    pab = sub.add_parser("ablate", help="verification ablation (trust vs gate vs verify)")
+    pab.add_argument("tasks", nargs="*", help="task yamls (default: data/tasks/bench_*.yaml)")
+    pab.add_argument("--reps", type=int, default=1, help="repetitions per condition")
+    pab.add_argument("--model", default="", help="implementer model (e.g. haiku) to calibrate difficulty")
+    pab.add_argument("--out", default="", help="output dir (default: <runs>/ablation)")
+    pab.set_defaults(func=_cmd_ablate)
 
     pi = sub.add_parser("index", help="build the code index for a path")
     pi.add_argument("path")

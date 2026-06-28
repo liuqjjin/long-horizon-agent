@@ -1,0 +1,10 @@
+kind: issue_to_pr
+title: "num_pages() drops the last partial page"
+description: >
+  num_pages(10, 3) returns 3 but should be 4 (the last 1 item needs its own page).
+target_repo: data/bench/paginate
+inputs:
+  context_query: "pagination pages ceil"
+success:
+  - "pytest passes"
+  - "ruff clean"

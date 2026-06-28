@@ -1,0 +1,10 @@
+kind: issue_to_pr
+title: "eval_rpn() gets subtraction and division operand order backwards"
+description: >
+  eval_rpn(['5','3','-']) returns -2 but should be 2; division is similarly reversed.
+target_repo: data/bench/rpn
+inputs:
+  context_query: "reverse polish notation operand order"
+success:
+  - "pytest passes"
+  - "ruff clean"

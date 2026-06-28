@@ -1,0 +1,10 @@
+kind: issue_to_pr
+title: "to_roman() does not use subtractive notation"
+description: >
+  to_roman(4) returns "IIII" and to_roman(9) returns "VIIII"; they should be "IV" and "IX".
+target_repo: data/bench/roman
+inputs:
+  context_query: "roman numeral subtractive"
+success:
+  - "pytest passes"
+  - "ruff clean"

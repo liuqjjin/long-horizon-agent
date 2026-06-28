@@ -1,0 +1,10 @@
+kind: issue_to_pr
+title: "encrypt() breaks at the end of the alphabet and corrupts punctuation"
+description: >
+  encrypt('z', 1) returns '{' but should wrap to 'a'; encrypt('a b!', 1) corrupts the space and '!'.
+target_repo: data/bench/caesar
+inputs:
+  context_query: "caesar cipher shift wrap"
+success:
+  - "pytest passes"
+  - "ruff clean"

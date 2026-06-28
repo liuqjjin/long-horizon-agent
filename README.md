@@ -18,9 +18,28 @@ says so:
 - **experiment** → PSNR / SSIM **recomputed from the output** + a reproducibility re-run
 - **context** → freshness (is the index behind the source?) + citation (does every claim resolve to a source?)
 
-The result is a loop you can trust to *refuse* unverifiable success — see the
-[verification-ablation](#results-lha-eval) result, where the harness correctly
-**fails** an experiment that cannot meet its metric bar.
+The result is a loop you can trust to *refuse* unverifiable success.
+
+## Does verification actually help? A measured answer
+
+The bet above is testable, so I tested it. [`lha ablate`](docs/ABLATION.md) drives a
+**real LLM** through the *same* harness under three conditions and scores the
+**identical** first attempt under each, so the contrast is exact, not statistical:
+
+_Implementer `claude_cli` on `haiku`, 11 bug-fix tasks × 3 reps, 0 transient errors:_
+
+| condition | claimed | **true success** | **false success** |
+|---|---|---|---|
+| `trust` — apply the fix, no gate          | 100% | 61% | **39%** |
+| `gate` — run the test gate, refuse on fail | 61%  | 61% | **0%**  |
+| `verify` — gate **+ repair loop**          | 85%  | **85%** | **0%**  |
+
+**Orchestrate-and-trust silently ships 39% wrong fixes; the objective gate drives that
+to 0%, and the repair loop lifts true success from 61% → 85%** — measured, not asserted.
+`trust` and `gate` run the same attempts, so the 39%→0% gap *is* the gate. The
+experiment is **paired**, **leak-free** (the implementer never sees the tests), and
+**tamper-proof** (a patch cannot touch the oracle); method and honest limits in
+[docs/ABLATION.md](docs/ABLATION.md).
 
 ## The spine
 
@@ -131,6 +150,8 @@ first `uv sync`.
   with expected output.
 - [docs/VERIFICATION_FIRST.md](docs/VERIFICATION_FIRST.md) — the thesis: why error
   compounding makes an objective oracle the highest-leverage lever.
+- [docs/ABLATION.md](docs/ABLATION.md) — the thesis *measured*: a real LLM run with
+  verification off vs. on, and what the gate and the repair loop each buy.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the spine, the facade, the verifier
   families, the durable runtime (with diagrams).
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — ResearchAgentBench-Lite, what each task
@@ -143,6 +164,7 @@ first `uv sync`.
 lha run <task.yaml> [--runtime loop|langgraph] [--llm stub|claude_cli|anthropic]
 lha resume <run_id>             lha approve|reject <run_id>    lha trace <run_id>
 lha eval [--quick]              lha batch <task.yaml> ...      # parallel, process-isolated
+lha ablate [task.yaml ...]      # verification ablation: trust vs gate vs verify (real LLM)
 lha index <path>                lha index-docs                 lha ask <query> --kinds code,paper,...
 ```
 

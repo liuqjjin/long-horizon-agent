@@ -1,0 +1,10 @@
+kind: issue_to_pr
+title: "moving_average() uses the wrong window width"
+description: >
+  moving_average([1,2,3,4], 2) returns [1.5, 2.5, 3.5] in length but the values/window are off by one element.
+target_repo: data/bench/window
+inputs:
+  context_query: "moving average sliding window"
+success:
+  - "pytest passes"
+  - "ruff clean"
