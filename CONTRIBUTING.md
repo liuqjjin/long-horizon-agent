@@ -1,11 +1,11 @@
 # Contributing
 
-Thanks for your interest. This project has one non-negotiable rule that flows from
-its thesis (see [docs/VERIFICATION_FIRST.md](docs/VERIFICATION_FIRST.md)):
+This project has one rule, which follows from its thesis (see
+[docs/VERIFICATION_FIRST.md](docs/VERIFICATION_FIRST.md)):
 
 > **No claim without a runnable check.** Any behavior, number, or benchmark you add
 > or assert in docs must be backed by something runnable in this repo. To state a
-> result, run it and quote the actual output. This applies to the agent *and* to us.
+> result, run it and quote the actual output. This applies to the agent and to contributors.
 
 ## Dev setup
 
@@ -22,7 +22,7 @@ Every change must keep all of these green — this is exactly what CI runs:
 uv run ruff check .                         # lint
 uv run pyright src/lha                       # type-check
 uv run pytest -q                             # unit tests (hermetic)
-uv run lha eval                              # ResearchAgentBench-Lite — must be 5/5
+uv run lha eval                              # self-eval — must be 5/5
 
 # facade isolation: CocoIndex must never leak out of live_context (must print nothing)
 grep -rnE "^[[:space:]]*(import|from)[[:space:]]+(cocoindex|cocoindex_code)" \

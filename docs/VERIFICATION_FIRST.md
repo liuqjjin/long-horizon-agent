@@ -1,7 +1,7 @@
 # Why verification-first
 
-The thesis behind this project, and why the loop is built around an *objective
-oracle* rather than an LLM judging its own work.
+The thesis behind this project, and why the loop is built around an objective
+oracle rather than an LLM judging its own work.
 
 ## 1. Long-horizon agents fail because errors compound
 
@@ -28,9 +28,9 @@ n*(τ) ≈ ln(1/τ) / ε
 
 Two consequences:
 
-- The horizon scales like **1/ε**. **Halving the per-step error roughly doubles the
-  number of steps you can chain** before reliability collapses. Capability at the
-  *step* level buys super-linear capability at the *task* level.
+- The horizon scales like 1/ε. Halving the per-step error roughly doubles the
+  number of steps you can chain before reliability collapses. Capability at the
+  step level buys super-linear capability at the task level.
 - Conversely, even an excellent model (say `p = 0.99`) drifts: at `τ = 0.5`,
   `n* ≈ ln 2 / 0.01 ≈ 69` steps. Real research tasks are longer.
 
@@ -44,11 +44,11 @@ exactly where leverage is: **drive down per-step error**.
 The tempting fix is to ask the model to check its own work. But without an external
 signal, intrinsic self-correction is unreliable: a model that produced a wrong step
 has no independent ground truth to recognize it as wrong, and self-critique can
-even degrade correct answers. Huang et al. (ICLR 2024) found LLMs *cannot* reliably
+even degrade correct answers. Huang et al. (ICLR 2024) found LLMs cannot reliably
 self-correct reasoning without external feedback. So self-reflection raises `p` only
 marginally — not enough to change the `1/ε` story.
 
-What *does* change `p` is an **external, objective** check.
+What changes `p` is an external, objective check.
 
 ## 3. Verification is easier than generation — so gate on it
 
@@ -72,7 +72,7 @@ every step on a verifiable check, and only advance when it passes.**
 A verifier with good recall `r` that triggers a repair turns per-step error `ε`
 into something closer to `ε·(1 − r)` (the errors it catches get fixed instead of
 propagating). Because the horizon scales like `1/ε`, multiplying `ε` down
-multiplies the reliable horizon up. That is the whole bet.
+multiplies the reliable horizon up. That is the mechanism.
 
 ## 4. How this project embodies it
 
@@ -82,21 +82,21 @@ multiplies the reliable horizon up. That is the whole bet.
 - Verifiers **recompute** rather than trust. The PSNR/SSIM verifiers recompute the
   metric from the saved arrays, so a fabricated `metrics.json` is caught — not just
   a missing one.
-- A verifier that *cannot* run its check returns a **failing** check. "Couldn't
-  verify" must never read as "verified."
-- The harness **refuses unverifiable success**: the `verification-ablation`
+- A verifier that cannot run its check returns a failing check; it does not pass by
+  default.
+- The harness refuses unverifiable success: the `verification-ablation`
   benchmark sets an unreachable metric bar and the run is reported `FAILED` — see
   [BENCHMARKS.md](BENCHMARKS.md).
 
 ## 5. Honest limits
 
 - **Not every step has an objective oracle.** Where one doesn't, this project uses
-  the strongest *available* signal (freshness, citation-resolution) — weaker than a
+  the strongest available signal (freshness, citation-resolution) — weaker than a
   test suite, and clearly labelled as a context-family check rather than ground truth.
 - **The oracle bounds the loop.** A loop is only as reliable as its verifier: a
   flaky test or a too-loose threshold caps the gain. The design response is to make
   verifiers objective, recompute-from-source, and fail-closed.
-- **This is a harness, not a model.** It reduces *compounding*; it does not make a
+- **This is a harness, not a model.** It reduces compounding; it does not make a
   weak step-policy strong. It pairs best with a capable implementer.
 
 ## Key references

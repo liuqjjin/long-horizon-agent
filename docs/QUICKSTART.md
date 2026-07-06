@@ -41,7 +41,7 @@ uv run lha eval        # first run downloads a small embedding model (one-time)
 Expected:
 
 ```
-# ResearchAgentBench-Lite — 5/5
+# Self-eval — 5/5
 ...
 score: 5/5
 ```
@@ -74,5 +74,5 @@ The run is checkpointed to `runs/<run_id>/graph.sqlite` between the two commands
 
 - [VERIFICATION_FIRST.md](VERIFICATION_FIRST.md) — why the loop is built around an
   objective oracle.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — the spine, the facade, the verifier families.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — the loop, the facade, the verifier families.
 - [../CONTRIBUTING.md](../CONTRIBUTING.md) — dev setup and the full gate.

@@ -1,4 +1,4 @@
-"""The verification loop — the spine of the harness.
+"""The verification loop.
 
     context -> tool/execute -> verify -> repair -> checkpoint -> repeat
 
@@ -208,8 +208,8 @@ class Harness:
                 from ..memory import SkillMemory
 
                 if SkillMemory(Path(self.config.data_dir) / "skills").record(state) is not None:
-                    # Re-index so the new skill is retrievable on the next run — without
-                    # this the Voyager-lite memory loop stays open for issue_to_pr runs.
+                    # Re-index so the new skill is retrievable on the next run; otherwise
+                    # the memory loop stays open for issue_to_pr runs.
                     live_context.index_docs(("skill",))
             except Exception:  # skill recording is best-effort
                 logger.debug("skill recording failed", exc_info=True)

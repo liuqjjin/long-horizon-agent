@@ -54,7 +54,7 @@ class Config(BaseModel):
     # Run the selected verifiers concurrently
     parallel_verify: bool = True
 
-    # Record verified successes as retrievable skills (Voyager-lite)
+    # Record verified successes as retrievable skills
     use_skill_memory: bool = True
 
     # Let the LLM backend (re)plan the task instead of the deterministic template.

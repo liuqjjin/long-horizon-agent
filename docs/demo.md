@@ -1,7 +1,6 @@
 # Recording the demo GIF
 
-A short terminal GIF is the single highest-leverage asset for the README. This
-file is the exact, reproducible script to record it.
+A short terminal GIF for the README. This file is the script to record it.
 
 > **NOTE (for a human):** recording needs an interactive TTY and screen-recording
 > tools, so it must be run on a workstation — not by the headless autonomous

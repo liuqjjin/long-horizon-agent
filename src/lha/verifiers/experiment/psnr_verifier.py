@@ -1,9 +1,9 @@
 """Experiment verifier: independently recompute PSNR and gate on a threshold.
 
-Recomputing from the saved arrays (rather than trusting the experiment's
-self-reported number) is the point — it catches a fabricated metric. A non-finite
-result (NaN/inf, e.g. a degenerate or diverged run) or a failed experiment is a
-verification FAILURE, never a silent pass.
+Recomputing from the saved arrays, rather than trusting the experiment's
+self-reported number, catches a fabricated metric. A non-finite result (NaN/inf,
+e.g. a degenerate or diverged run) or a failed experiment is a verification failure,
+never a silent pass.
 """
 
 from __future__ import annotations

@@ -21,7 +21,7 @@ Run the canonical self-test in the container:
 docker run --rm lha uv run lha eval
 ```
 
-Expected result: `ResearchAgentBench-Lite` reports `5/5`. The first `eval` run
+Expected result: the self-eval reports `5/5`. The first `eval` run
 downloads a small Hugging Face embedding model (tens of MB) into
 `/home/lha/.cache/huggingface`.
 

@@ -1,10 +1,10 @@
 # Architecture
 
-A small, readable core. One spine (the verification loop), one door to indexed
-context (the facade), three verifier families behind one interface, and an opt-in
-durable runtime. Everything else composes those.
+The core is a verification loop, one facade for indexed context, three verifier
+families behind one interface, and an opt-in durable runtime. Everything else composes
+those.
 
-## The spine — the verification loop
+## The verification loop
 
 `src/lha/harness/loop.py` drives, for each step of a plan:
 
@@ -39,7 +39,7 @@ flowchart TD
     CK -->|done| FIN[finalize: pr_summary.md / experiment_summary.md / skill note]
 ```
 
-## Structured artifacts (not chat)
+## Structured artifacts
 
 Each role emits a typed pydantic artifact, persisted under `runs/<id>/`:
 
@@ -101,9 +101,8 @@ flowchart LR
 | experiment | `psnr`, `ssim`, `reproducibility` | metrics **recomputed** from output (scikit-image) + a re-run |
 | context | `freshness`, `citation` | index-vs-source freshness; every claim resolves to a source |
 
-A verifier that *cannot* run its check returns a failing `Check` — "couldn't verify"
-never reads as "verified". PSNR is one member among many; the core has no
-metric-specific assumptions.
+A verifier that cannot run its check returns a failing `Check`. PSNR is one member
+among many; the core has no metric-specific assumptions.
 
 ## Agent team
 
@@ -122,7 +121,7 @@ LangGraph `StateGraph` checkpointed by `SqliteSaver` (`runs/<id>/graph.sqlite`),
 execute/finalize helpers, so there is one implementation of the actual work. Enable
 with `lha run --runtime langgraph`.
 
-## Skill memory (Voyager-lite)
+## Skill memory
 
 After a verified-`DONE` run, `src/lha/memory.py` distills the success to a markdown
 note under `data/skills/`; `index_docs` indexes it (`kind="skill"`) and the Context

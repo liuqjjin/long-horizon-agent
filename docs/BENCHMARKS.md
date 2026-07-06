@@ -1,8 +1,8 @@
-# ResearchAgentBench-Lite
+# Self-eval
 
-The harness measuring itself. Five tasks, each with an **objective** pass/fail —
-no LLM judges the outcome. It is the executable form of the project's thesis: a
-step is only "done" when an external oracle says so.
+The harness checking itself: five workflows, each with an objective pass/fail. It
+exercises the project's thesis end to end — a step is "done" only when an external
+oracle says so.
 
 ## Reproduce
 
@@ -21,7 +21,7 @@ under `data/tasks/`.
 Verbatim output of `uv run lha eval`:
 
 ```
-# ResearchAgentBench-Lite — 5/5
+# Self-eval — 5/5
 
 | dimension              | case                    | result | detail |
 |------------------------|-------------------------|--------|--------|
@@ -50,9 +50,9 @@ Tasks 1, 4, and 5 live in `data/tasks/*.yaml`; tasks 2 and 3 are driven directly
 in `src/lha/eval.py`. Verifier thresholds are explicit in the task specs
 (`psnr_min: 24.0`, `ssim_min: 0.80`, `data_range: 1.0`).
 
-## The centerpiece: verification-ablation
+## The verification-ablation case
 
-This case exists to prove the loop's verifier is **load-bearing**, not decorative.
+This case shows the verifier changes the outcome.
 
 The bundled experiment (`data/sample_experiment/experiment.py`) is a deterministic
 bicubic 4× super-resolution baseline on `skimage.data.astronaut()`. The
@@ -69,16 +69,16 @@ verifies and reports `DONE`. The ablation task
   `psnr` check fails, and the run is reported **`FAILED`** — the agent refuses to
   claim a result it cannot verify.
 - **Without** a verifier (a typical orchestrate-and-trust agent): the same run
-  would end "successfully" with a silently-wrong 25 dB result.
+  would end "successfully" with a wrong 25 dB result reported as a pass.
 
-That gap — `FAILED` vs. a false `DONE` — is the entire value proposition,
-demonstrated on a runnable task rather than asserted. It also guards against
-*fabricated* metrics: because the verifier recomputes from the arrays, a doctored
-`metrics.json` is caught (see `tests/test_experiment_verifiers.py::test_psnr_catches_fabricated_metric`).
+That gap (`FAILED` vs. a false `DONE`) is what the verifier buys, on a runnable task.
+It also guards against fabricated metrics: because the verifier recomputes from the
+arrays, a doctored `metrics.json` is caught (see
+`tests/test_experiment_verifiers.py::test_psnr_catches_fabricated_metric`).
 
 ## Honesty notes
 
-- **Scope.** This is a *lite* benchmark on small, bundled tasks — it measures that
+- **Scope.** This is a small self-check on bundled tasks — it measures that
   the harness's own workflows behave correctly end-to-end, not performance against
   an external SWE/agent benchmark. No external leaderboard numbers are claimed.
 - **Reproducibility.** From a clean checkout, `uv sync && uv run lha eval` (run from

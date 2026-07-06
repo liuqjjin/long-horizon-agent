@@ -46,12 +46,11 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-all-MiniLM-L6-v2
 
-      - name: Self-eval (lha eval — ResearchAgentBench-Lite, expects 5/5)
+      - name: Self-eval (lha eval, expects 5/5)
         run: uv run lha eval
 
   docker:
-    # Proves the container actually builds (the deployability claim is CI-verified,
-    # not asserted). Build only — no push.
+    # Proves the container actually builds. Build only — no push.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

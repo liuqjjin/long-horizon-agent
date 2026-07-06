@@ -119,7 +119,7 @@ def test_sanitize_keeps_only_source():
     assert s.touched_files == ["m.py"]
 
 
-# --- the paired headline paths ----------------------------------------------
+# --- the paired trust/gate paths --------------------------------------------
 def test_trust_false_gate_refuses_on_wrong_fix(tmp_path):
     rec = _by_cond(_run(tmp_path, _FixedLLM(3)))  # always wrong
     assert rec["trust"].claimed_success and not rec["trust"].true_success
@@ -136,7 +136,7 @@ def test_correct_fix_true_everywhere(tmp_path):
 
 def test_verify_repairs_to_success(tmp_path):
     rec = _by_cond(_run(tmp_path, _RepairLLM()))  # wrong, then correct
-    # trust/gate score the SAME first (wrong) attempt -> trust lies, gate refuses
+    # trust/gate score the same first (wrong) attempt: trust accepts it, gate refuses
     assert rec["trust"].false_success
     assert rec["gate"].status == "FAILED"
     # verify repairs the same attempt to a real success
@@ -144,7 +144,7 @@ def test_verify_repairs_to_success(tmp_path):
 
 
 def test_tamper_proof_grading(tmp_path):
-    # A wrong fix that ALSO rewrites the test to pass trivially — the test rewrite is
+    # A wrong fix that also rewrites the test to pass trivially: the test rewrite is
     # stripped, so the canonical oracle still catches the wrong source.
     rec = _by_cond(_run(tmp_path, _FixedLLM(3, tamper=True)))
     assert rec["trust"].false_success  # canonical test caught it despite the tamper
@@ -152,8 +152,8 @@ def test_tamper_proof_grading(tmp_path):
 
 
 # --- transient errors are not cached / resumable ----------------------------
-class _BoomLLM(LLMClient):
-    name = "boom"
+class _FailingLLM(LLMClient):
+    name = "failing"
 
     def complete(self, system: str, prompt: str) -> str:
         raise RuntimeError("backend down")
@@ -170,7 +170,7 @@ def test_transient_errors_excluded_and_not_cached(tmp_path, monkeypatch):
     src = _repo(tmp_path / "src")
     out = tmp_path / "out"
     rep = run_ablation(
-        _base(tmp_path), [_task(tmp_path, src)], reps=1, out_dir=out, llm_client=_BoomLLM()
+        _base(tmp_path), [_task(tmp_path, src)], reps=1, out_dir=out, llm_client=_FailingLLM()
     )
     assert all(r.status == "ERROR" for r in rep.records)
     # ERROR cells are NOT cached, so a later good run recomputes them.
@@ -186,7 +186,7 @@ def test_resumable_caches_real_outcomes(tmp_path):
     assert (out / "results" / "task__r0.json").exists()
 
     # A cached cell must NOT re-invoke the LLM.
-    rep2 = run_ablation(base, [task], reps=1, out_dir=out, llm_client=_BoomLLM())
+    rep2 = run_ablation(base, [task], reps=1, out_dir=out, llm_client=_FailingLLM())
     assert _by_cond(rep2)["trust"].true_success  # served from cache, no LLM call
 
 
@@ -206,7 +206,7 @@ def test_aggregate_and_markdown():
     assert stats["verify"].true_success_rate == 1.0
     report = AblationReport("stub", "", 1, ["t1", "t2"], records, list(stats.values()))
     md = report.to_markdown()
-    assert "Verification Ablation" in md and "Headline" in md and "⚠" in md
+    assert "Verification ablation" in md and "false success" in md and "false-pass" in md
 
 
 def test_errored_runs_excluded_from_rates():

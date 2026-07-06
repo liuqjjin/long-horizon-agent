@@ -1,11 +1,9 @@
-"""ResearchAgentBench-Lite: the harness measuring itself across its workflows.
+"""Self-eval: run the harness across its own workflows and check each outcome.
 
-Five dimensions:
-  issue-to-PR · paper-to-experiment · resume · freshness · verification-ablation
-
-Each case runs in-process (sequential, so the singleton facade isn't raced) under
-its own runs dir, and asserts the *expected* outcome — including that the harness
-correctly FAILS a result that doesn't meet the bar (verification is load-bearing).
+Five workflows: issue-to-PR, paper-to-experiment, resume, freshness, and
+verification-ablation. Each case runs in-process (sequential, so the singleton facade
+isn't raced) under its own runs dir and asserts the expected outcome, including that
+the harness reports FAILED when a result doesn't meet the bar.
 """
 
 from __future__ import annotations
@@ -44,7 +42,7 @@ class EvalReport:
         return all(r.passed for r in self.results)
 
     def to_markdown(self) -> str:
-        lines = [f"# ResearchAgentBench-Lite — {self.score}", ""]
+        lines = [f"# Self-eval — {self.score}", ""]
         lines += ["| dimension | case | result | detail |", "|---|---|---|---|"]
         for r in self.results:
             mark = "PASS" if r.passed else "FAIL"

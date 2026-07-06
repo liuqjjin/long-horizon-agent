@@ -1,47 +1,46 @@
 # Long-Horizon Research Agent
 
-**A verification-first agent harness: every step is gated by an _objective oracle_
-— real tests, PSNR/SSIM, reproducibility — not an LLM judging itself.**
+A verification-first agent harness. Every step is checked by an objective oracle —
+a real test run, an image metric, a reproducibility re-run — and the agent only
+advances when the check passes.
 
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![lint: ruff](https://img.shields.io/badge/lint-ruff-261230)
 ![tests](https://img.shields.io/badge/tests-pytest-0a9edc)
 
-Long-horizon agents fail because **errors compound**: at per-step reliability `p`
-over `n` steps, end-to-end success scales like `pⁿ`, so even a strong model drifts
-as tasks get longer. Asking the model to check its own work doesn't reliably break
-the spiral — there's no external signal. This harness dampens compounding by
-gating **every** step on an objective verifier and only advancing when the oracle
-says so:
+Long-horizon agents fail because errors compound. If each step succeeds with
+probability `p`, an `n`-step task succeeds with probability about `pⁿ`, so even a
+strong model drifts as the task gets longer. Asking the model to check its own work
+raises `p` only a little — there is no external signal. This harness gates every
+step on an objective verifier and advances only when the oracle passes:
 
-- **code** → a real `pytest` run + `ruff` (and the change is reverted if it can't be verified)
-- **experiment** → PSNR / SSIM **recomputed from the output** + a reproducibility re-run
-- **context** → freshness (is the index behind the source?) + citation (does every claim resolve to a source?)
+- **code** — a real `pytest` run plus `ruff`; the change is reverted if it can't be verified.
+- **experiment** — PSNR / SSIM recomputed from the output, plus a reproducibility re-run.
+- **context** — freshness (is the index behind the source?) and citation (does every claim resolve to a source?).
 
-The result is a loop you can trust to *refuse* unverifiable success.
+A step that cannot be verified fails.
 
-## Does verification actually help? A measured answer
+## Measured effect of the gate
 
-The bet above is testable, so I tested it. [`lha ablate`](docs/ABLATION.md) drives a
-**real LLM** through the *same* harness under three conditions and scores the
-**identical** first attempt under each, so the contrast is exact, not statistical:
+[`lha ablate`](docs/ABLATION.md) runs a real LLM through the same harness under three
+conditions and scores the identical first attempt under each, so the conditions differ
+only in the gate:
 
-_Implementer `claude_cli` on `haiku`, 11 bug-fix tasks × 3 reps, 0 transient errors:_
+Implementer `claude_cli` on `haiku`, 11 bug-fix tasks × 3 reps, 0 transient errors:
 
-| condition | claimed | **true success** | **false success** |
+| condition | claimed | true success | false success |
 |---|---|---|---|
-| `trust` — apply the fix, no gate          | 100% | 61% | **39%** |
-| `gate` — run the test gate, refuse on fail | 61%  | 61% | **0%**  |
-| `verify` — gate **+ repair loop**          | 85%  | **85%** | **0%**  |
+| `trust` — apply the fix, no gate | 100% | 61% | 39% |
+| `gate` — run the test gate, refuse on failure | 61% | 61% | 0% |
+| `verify` — gate plus repair loop | 85% | 85% | 0% |
 
-**Orchestrate-and-trust silently ships 39% wrong fixes; the objective gate drives that
-to 0%, and the repair loop lifts true success from 61% → 85%** — measured, not asserted.
-`trust` and `gate` run the same attempts, so the 39%→0% gap *is* the gate. The
-experiment is **paired**, **leak-free** (the implementer never sees the tests), and
-**tamper-proof** (a patch cannot touch the oracle); method and honest limits in
-[docs/ABLATION.md](docs/ABLATION.md).
+Without the gate, 39% of accepted fixes are wrong. `trust` and `gate` score the same
+attempts, so the 39% is exactly what the gate rejects. The repair loop then raises true
+success from 61% to 85%. The experiment is paired, leak-free (the
+implementer never sees the tests), and tamper-proof (a patch cannot touch the oracle);
+method and limits are in [docs/ABLATION.md](docs/ABLATION.md).
 
-## The spine
+## The loop
 
 ```mermaid
 flowchart LR
@@ -66,35 +65,35 @@ flowchart LR
     V --> VC[context: freshness · citation]
 ```
 
-The rest of the system reaches indexed context **only** through the
-`live_context` facade (`search_code` / `search_papers` / `search_experiments` /
-`search_skills` / `get_fresh_context` / `reject_stale`); CocoIndex and the code
-indexer live entirely behind it. A `grep` check enforces the boundary.
+The rest of the system reaches indexed context only through the `live_context`
+facade (`search_code` / `search_papers` / `search_experiments` / `search_skills` /
+`get_fresh_context` / `reject_stale`); CocoIndex and the code indexer live entirely
+behind it, and a `grep` check keeps them there.
 
-## Quickstart (30 seconds)
+## Quickstart
 
 ```bash
 uv sync                                        # install (Python 3.11+)
-uv run lha run data/tasks/fix_average.yaml     # find a bug, fix it, verify with REAL pytest
-uv run lha eval                                # self-evaluate across all 5 workflows
+uv run lha run data/tasks/fix_average.yaml     # find a bug, fix it, verify with real pytest
+uv run lha eval                                # run the self-eval across all five workflows
 ```
 
 Run from the repo root. `uv sync && uv run lha eval` reproduces `5/5` from a clean
-checkout (generated indexes/runs are gitignored and rebuilt on demand); the first
-`lha eval` downloads a small embedding model (~tens of MB, one-time) for the
+checkout (generated indexes and runs are gitignored and rebuilt on demand); the first
+`lha eval` downloads a small embedding model (tens of MB, one-time) for the
 paper/experiment/freshness cases.
 
-The walking skeleton runs with a **deterministic stub** implementer, so a real
-`pytest` verifies a real fix with no API key and no network. Swap in an LLM with
-`--llm claude_cli` (uses the authenticated `claude` CLI) or `--llm anthropic`.
+The default implementer is a deterministic stub, so a real `pytest` verifies a real
+fix with no API key and no network. Swap in an LLM with `--llm claude_cli` (the
+authenticated `claude` CLI) or `--llm anthropic`.
 
-## Results (`lha eval`)
+## Self-eval
 
-`lha eval` is the harness measuring itself — **ResearchAgentBench-Lite**, five
-tasks each with an objective pass/fail. Output, verbatim, from this repo:
+`lha eval` is the harness checking itself: five workflows, each with an objective
+pass/fail. Output from this repo:
 
 ```
-# ResearchAgentBench-Lite — 5/5
+# Self-eval — 5/5
 
 | dimension              | case                    | result | detail |
 |------------------------|-------------------------|--------|--------|
@@ -107,56 +106,53 @@ tasks each with an objective pass/fail. Output, verbatim, from this repo:
 score: 5/5
 ```
 
-Reproduce: `uv run lha eval`. The **verification-ablation** case is the point —
-the bicubic baseline reaches **PSNR ≈ 25.07 dB / SSIM ≈ 0.8246** (recomputed by
-the verifier with `data_range=1.0`), so when asked to clear a 40 dB bar the
-harness reports `FAILED`: it refuses to claim a result it cannot verify.
+Reproduce with `uv run lha eval`. In the verification-ablation case, the bicubic
+baseline reaches PSNR ≈ 25.07 dB / SSIM ≈ 0.8246 (recomputed by the verifier with
+`data_range=1.0`), so when the task asks for a 40 dB bar the harness reports `FAILED`
+instead of claiming a result it cannot verify.
 
 ## How it works
 
-- **The loop (spine).** `context → execute → verify → repair → checkpoint → repeat`,
-  with max-steps, durable checkpoint/resume, and a human-approval gate. State is a
-  JSON checkpoint plus an append-only `ledger.jsonl`.
-- **Structured artifacts, not chat.** Each role emits a typed artifact: Supervisor →
+- **The loop.** `context → execute → verify → repair → checkpoint → repeat`, with
+  max-steps, durable checkpoint/resume, and a human-approval gate. State is a JSON
+  checkpoint plus an append-only `ledger.jsonl`.
+- **Structured artifacts.** Each role emits a typed artifact: Supervisor →
   `Plan`, Context Engineer → `ContextBundle` (with provenance), Implementer → `Patch`,
-  Verifier → `Verdict` (`verify.json`).
+  Verifier → `Verdict`.
 - **Three verifier families behind one interface.** `code` (`pytest`, `ruff`),
   `experiment` (`psnr`, `ssim`, `reproducibility`), `context` (`freshness`,
-  `citation`). PSNR is just one verifier among many — the core has no metric-specific
-  assumptions, and a verifier that *can't* run a check fails rather than passing.
-- **Live context, isolated.** Code search goes through `ccc` (cocoindex-code) via its
-  MCP tool; paper/experiment/skill context comes from CocoIndex flows. All of it sits
-  behind the `live_context` facade.
+  `citation`). The core has no metric-specific assumptions, and a verifier that
+  cannot run its check fails.
+- **Live context, isolated.** Code search goes through `ccc` (cocoindex-code) over
+  its MCP tool; paper/experiment/skill context comes from CocoIndex flows. All of it
+  sits behind the `live_context` facade.
 - **Durable runtime (opt-in).** `lha run --runtime langgraph` drives the same plan
   through a LangGraph `StateGraph` checkpointed by `SqliteSaver`, using `interrupt()`
-  for the approval gate (run → `AWAITING_APPROVAL` → `lha approve` → `lha resume` → `DONE`).
-- **Skill memory.** Verified successes are distilled to retrievable notes and surfaced
-  as context for future tasks.
+  for the approval gate.
+- **Skill memory.** A verified run is distilled to a retrievable note and surfaced as
+  context for later tasks. Only verified successes are recorded.
 
-## Why it's different
+## Design notes
 
-Most agent frameworks orchestrate tool calls and, when they evaluate at all, use an
-LLM as judge. This project's bet is the opposite: **the loop is only as reliable as
-its verifier**, so the verifier is an *objective* oracle wherever one exists (a test
-suite, an image metric, a freshness check), and the harness is built to fail loudly
-when it can't verify. The core is small and readable (no heavy agent framework
-required), with the live-context machinery quarantined behind a facade — though the
-embedding/index stack does pull a GB-scale dependency set (torch, cocoindex) on the
-first `uv sync`.
+Most agent frameworks orchestrate tool calls and, if they evaluate at all, use an LLM
+as judge. This harness inverts that: the loop is only as reliable as its verifier, so
+the verifier is an objective oracle wherever one exists — a test suite, an image
+metric, a freshness check — and the harness fails loudly when it cannot verify. The
+core stays small and readable, with the live-context machinery quarantined behind a
+facade, though the embedding/index stack pulls a GB-scale dependency set (torch,
+cocoindex) on the first `uv sync`.
 
 ## Documentation
 
-- [docs/QUICKSTART.md](docs/QUICKSTART.md) — clone → verified run in a few minutes,
-  with expected output.
-- [docs/VERIFICATION_FIRST.md](docs/VERIFICATION_FIRST.md) — the thesis: why error
-  compounding makes an objective oracle the highest-leverage lever.
-- [docs/ABLATION.md](docs/ABLATION.md) — the thesis *measured*: a real LLM run with
+- [docs/QUICKSTART.md](docs/QUICKSTART.md) — clone to a verified run in a few minutes.
+- [docs/VERIFICATION_FIRST.md](docs/VERIFICATION_FIRST.md) — why error compounding
+  makes an objective oracle the highest-leverage place to intervene.
+- [docs/ABLATION.md](docs/ABLATION.md) — the measured effect: a real LLM with
   verification off vs. on, and what the gate and the repair loop each buy.
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the spine, the facade, the verifier
-  families, the durable runtime (with diagrams).
-- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — ResearchAgentBench-Lite, what each task
-  verifies, and how to reproduce `5/5`.
-- [docs/demo.md](docs/demo.md) — script to record the terminal demo GIF.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the loop, the facade, the verifier
+  families, the durable runtime.
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — the self-eval, what each case verifies,
+  and how to reproduce `5/5`.
 
 ## CLI
 
@@ -171,19 +167,17 @@ lha index <path>                lha index-docs                 lha ask <query> -
 `-v`/`--verbose` raises log verbosity; `lha trace <run_id>` renders a run's ledger
 timeline. To run in a container, see [docs/DEPLOY.md](docs/DEPLOY.md).
 
-## Requirements & install
+## Requirements
 
-- **Python 3.11+**, [`uv`](https://docs.astral.sh/uv/).
-- `uv sync` installs the harness and its deps.
+- Python 3.11+, [`uv`](https://docs.astral.sh/uv/).
+- `uv sync` installs the harness and its dependencies.
 - Code search uses [`cocoindex-code`](https://github.com/cocoindex-io/cocoindex-code)
-  (`pipx install 'cocoindex-code[full]'`, then `claude mcp add cocoindex-code -- ccc mcp`
-  for the outer agent). The harness talks to its MCP `search` tool directly; the
-  bundled demos run without it.
+  (`pipx install 'cocoindex-code[full]'`, then `claude mcp add cocoindex-code -- ccc mcp`).
+  The harness talks to its MCP `search` tool directly; the bundled demos run without it.
 
 ## Status
 
-Walking-skeleton through durable-runtime are implemented and exercised by
-`uv run pytest` and `uv run lha eval`. This repo is a portfolio/research artifact,
-not a production service. Run `lha eval` and the bundled demos from a source
-checkout — the wheel ships the harness, while the benchmark fixtures under `data/`
-live in the repo.
+Everything from the walking skeleton to the durable runtime is implemented and
+exercised by `uv run pytest` and `uv run lha eval`. This is a research and portfolio project, not a
+production service. Run `lha eval` and the bundled demos from a source checkout — the
+wheel ships the harness, while the benchmark fixtures under `data/` live in the repo.

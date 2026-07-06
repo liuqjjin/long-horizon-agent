@@ -1,4 +1,4 @@
-"""Skill memory (Voyager-lite): distill each verified success into a note.
+"""Skill memory: distill each verified success into a note.
 
 After a run is verified DONE, a markdown skill note is written under
 ``data/skills/`` (gitignored — it is accumulated runtime memory, not source).

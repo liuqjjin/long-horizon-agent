@@ -18,7 +18,7 @@
   "stats": [
     {
       "condition": "trust",
-      "blurb": "apply the first attempt and accept it \u2014 no objective gate, no repair",
+      "blurb": "apply the first attempt and accept it; no gate, no repair",
       "n": 33,
       "claimed_success_rate": 1.0,
       "true_success_rate": 0.6060606060606061,
@@ -27,7 +27,7 @@
     },
     {
       "condition": "gate",
-      "blurb": "apply it, run the test gate, refuse on failure \u2014 catch but don't fix",
+      "blurb": "apply it, run the test gate, refuse on failure",
       "n": 33,
       "claimed_success_rate": 0.6060606060606061,
       "true_success_rate": 0.6060606060606061,
@@ -36,7 +36,7 @@
     },
     {
       "condition": "verify",
-      "blurb": "the full harness: gate + repair loop",
+      "blurb": "gate plus repair loop",
       "n": 33,
       "claimed_success_rate": 0.8484848484848485,
       "true_success_rate": 0.8484848484848485,

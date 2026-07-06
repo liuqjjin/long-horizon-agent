@@ -6,31 +6,38 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+- Reworded documentation and code comments for a plainer, more consistent voice, and
+  renamed the self-eval suite (previously "ResearchAgentBench-Lite") to "self-eval".
+  No behavior change.
+- `lha ablate` report output is now a plain table plus a one-line factual summary,
+  without the editorial header line or emoji status legend.
+
+### Fixed
+- Untracked `.coverage`, a local artifact that had been committed.
 
 ## [0.3.0] — 2026-06-28
 
-### Added — the measured thesis
-- **Verification ablation** (`lha ablate`): the project's central claim, *measured*
-  against a real LLM. A **paired** design draws one first attempt per task and scores
-  the same attempt under `trust` (apply-and-accept), `gate` (apply, run the objective
-  test gate, refuse on failure), and `verify` (gate + repair loop), reporting `claimed`
-  vs `true` vs **`false` success**. It is leak-free (single-shot implementer with file
-  tools denied, shown only non-test source), tamper-proof (patches may edit source
-  only; the test oracle and config stay canonical), and honest (transient backend
-  errors are retried and excluded, never cached). A weaker implementer `--model`
-  calibrates difficulty so the gate can bite. See [docs/ABLATION.md](docs/ABLATION.md).
+### Added
+- **Verification ablation** (`lha ablate`): measures the project's central claim
+  against a real LLM. A paired design draws one first attempt per task and scores the
+  same attempt under `trust` (apply and accept), `gate` (apply, run the test gate,
+  refuse on failure), and `verify` (gate plus repair loop), reporting claimed vs true
+  vs false success. It is leak-free (single-shot implementer with file tools denied,
+  shown only non-test source), tamper-proof (patches may edit source only; the test
+  oracle and config stay canonical), and excludes transient backend errors (retried,
+  then recorded as ERROR, never counted). A weaker implementer `--model` calibrates
+  difficulty. See [docs/ABLATION.md](docs/ABLATION.md).
 - **Bug-fix benchmark corpus**: 11 small, self-contained Python repos
-  (`data/bench/*`, `data/tasks/bench_*.yaml`), each a planted bug with a comprehensive
-  pytest oracle, spanning arithmetic/strings/recursion/stack/search/parsing. Each was
-  authored and then **adversarially screened** (bug is real, oracle catches a naive
-  fix, issue stays symptom-level).
+  (`data/bench/*`, `data/tasks/bench_*.yaml`), each a planted bug with a pytest oracle,
+  spanning arithmetic/strings/recursion/stack/search/parsing. Each was screened so the
+  bug is real, the oracle catches a naive fix, and the issue stays symptom-level.
 
 ### Changed
 - **Whole-file rewrites in the LLM implementer.** Real backends now return the full
-  corrected file (`file_contents`, a robust direct write) rather than a unified diff —
-  the latter is the single most common way `git apply` throws away an otherwise-correct
-  fix on trivial context drift. A display diff is still recorded for the artifact.
+  corrected file (`file_contents`, a direct write) rather than a unified diff, which
+  `git apply` often rejects on minor context drift even when the fix is correct. A
+  display diff is still recorded for the artifact.
 - The **pytest verifier surfaces the failing assertion messages** (compact, ACI-style)
   so the repair loop fixes the real defect instead of guessing from "tests failed".
 - The **implementer no longer dumps test files into the prompt** — a fix is reasoned
@@ -46,8 +53,8 @@ _Nothing yet._
   rather than crashing the step.
 
 ### CI
-- The CI now **builds the Docker image** (`docker` job), so deployability is verified
-  rather than asserted.
+- The CI now **builds the Docker image** (`docker` job), so the Docker build is checked
+  on every change.
 
 ## [0.2.0] — 2026-06-22
 
@@ -59,7 +66,8 @@ _Nothing yet._
   reproducible.
 - **Per-step artifacts** under `runs/<id>/steps/<step_id>/` (verify/patch/experiment/
   context), so a multi-step plan keeps every step's provenance; the PR/experiment
-  finalizers report the load-bearing step rather than whichever file wrote last.
+  finalizers report the step that produced the result rather than whichever file wrote
+  last.
 
 ### Changed
 - The **LangGraph runtime now enforces `deadline_s`** in addition to `max_steps`.
@@ -73,7 +81,7 @@ _Nothing yet._
 
 ## [0.1.0] — 2026-06-22
 
-### Fixed — verification-first correctness
+### Fixed — verification correctness
 
 - **ruff verifier gated on exit code.** A ruff invocation that *failed to run* (config
   error, timeout, non-JSON output) silently passed; it now fails, upholding the
@@ -118,9 +126,9 @@ _Nothing yet._
 Documentation & engineering-rigor pass (no behavior change unless noted):
 
 ### Added
-- Top-tier README (differentiator tagline, error-compounding hook, mermaid spine
-  diagram, verbatim `lha eval` table) and a `docs/` set: `ARCHITECTURE`, `BENCHMARKS`,
-  `VERIFICATION_FIRST` (the thesis), and `demo` (GIF recording script).
+- README (tagline, error-compounding intro, mermaid diagram, `lha eval` table) and a
+  `docs/` set: `ARCHITECTURE`, `BENCHMARKS`, `VERIFICATION_FIRST` (why verification
+  comes first), and `demo` (GIF recording script).
 - GitHub Actions CI mirroring the local gate (ruff, pyright, facade-isolation grep,
   pytest, `lha eval`) with embedding-model caching.
 - `pyright` type-checking of `src/lha` (0 errors) as part of the gate and CI.
@@ -134,7 +142,7 @@ Documentation & engineering-rigor pass (no behavior change unless noted):
 ### The initial feature-complete harness
 
 ### Added
-- **Verification loop** (the spine): `context → execute → verify → repair →
+- **Verification loop:** `context → execute → verify → repair →
   checkpoint → repeat`, with max-steps, durable checkpoint/resume, and a
   human-approval gate. State is an atomic `state.json` plus an append-only
   `ledger.jsonl`.
@@ -148,8 +156,8 @@ Documentation & engineering-rigor pass (no behavior change unless noted):
   Experimenter, Verifier) and a process-isolated batch **orchestrator** (`lha batch`).
 - **Opt-in LangGraph durable runtime** (`--runtime langgraph`): a `StateGraph`
   checkpointed by `SqliteSaver` with `interrupt()`-based human approval.
-- **Skill memory** (Voyager-lite): verified successes recorded and retrieved as
+- **Skill memory:** verified successes recorded and retrieved as
   context for future tasks.
-- **ResearchAgentBench-Lite** (`lha eval`): self-evaluation across issue-to-PR,
+- **Self-eval** (`lha eval`): self-evaluation across issue-to-PR,
   paper-to-experiment, resume, freshness, and verification-ablation (currently 5/5).
 - **CLI:** `lha run|resume|batch|eval|trace|index|index-docs|ask|approve|reject`.

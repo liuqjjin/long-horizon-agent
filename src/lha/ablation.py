@@ -1,36 +1,33 @@
-"""Verification ablation: does the objective verifier loop make a real LLM more reliable?
+"""Verification ablation: measure whether the verifier loop makes a real LLM more reliable.
 
-This is the project's central, *measured* claim. For each bug-fix task we draw ONE
-first attempt from a real LLM and evaluate that SAME attempt under three conditions —
-a genuinely *paired* design, so the only thing that varies is the verification:
+For each bug-fix task, draw one first attempt from the LLM and score that same attempt
+under three conditions (a paired design, so only the verification varies):
 
-  - ``trust``  — apply the first attempt and accept it. No objective gate. This is how
-                 an "orchestrate-and-trust" agent operates.
-  - ``gate``   — apply it, run the objective test gate; refuse (revert, FAIL) if it
-                 doesn't pass. Catch, don't fix.
-  - ``verify`` — the full harness: gate, then repair (re-prompt with the failing-test
-                 feedback) up to a budget.
+  - ``trust``  — apply the first attempt and accept it; no gate, no repair.
+  - ``gate``   — apply it, run the test gate, refuse (revert, FAIL) on failure.
+  - ``verify`` — gate, then repair (re-prompt with the failing-test feedback) up to a budget.
 
-Because ``trust`` and ``gate`` score the identical first attempt, the contrast is
-exact, not statistical:
+Because trust and gate score the identical attempt, their difference isolates the
+gate. Per condition:
 
-  - **claimed success** — the condition declared success;
-  - **true success**    — the canonical test suite actually passes;
-  - **false success**   — ``claimed and not true``: a *silently wrong* answer;
-  - **mean repairs**    — repair rounds spent (verify only).
+  - claimed success — the condition declared success;
+  - true success    — the canonical test suite passes;
+  - false success   — claimed and not true (a wrong answer that went undetected);
+  - mean repairs    — repair rounds spent (verify only).
 
-By construction ``true_success(trust) == true_success(gate)`` (same attempt, same
-oracle); the gate's whole contribution is driving **false success to zero**, and the
-repair loop's is lifting **true success** above the first-try rate.
+By construction ``true_success(trust) == true_success(gate)``, so the gate shows up as
+lower false success and the repair loop as higher true success.
 
-Integrity properties (so the headline survives scrutiny):
-  - **Leak-free.** The implementer is a single-shot completion with file tools denied
-    (``no_tools``) and is shown only non-test source — it cannot read the oracle.
-  - **Tamper-proof.** A patch may only edit source; test files, ``conftest.py`` and
-    ``pyproject.toml`` are stripped from it, so the oracle the gate and the grade run
-    is always the canonical one. Difficulty is calibrated with a weaker ``model``.
-  - **Honest.** A transient backend error is retried and, if it persists, recorded as
-    ``ERROR`` (never cached, never counted) so infra flakiness can't pollute the rates.
+Integrity properties:
+  - Leak-free: the implementer is a single-shot completion with file tools denied
+    (``no_tools``) and sees only non-test source, so it cannot read the oracle.
+  - Tamper-proof: a patch may only edit source; test files, ``conftest.py`` and
+    ``pyproject.toml`` are stripped before it is applied, so the oracle stays canonical.
+  - Transient backend errors are retried and, if they persist, recorded as ``ERROR``
+    (never cached, never counted).
+
+A weaker ``model`` calibrates difficulty, so first-attempt success lands in a range
+where the gate has errors to catch.
 """
 
 from __future__ import annotations
@@ -58,9 +55,9 @@ from .verifiers.code.pytest_verifier import PytestVerifier
 logger = logging.getLogger(__name__)
 
 CONDITIONS = [
-    ("trust", "apply the first attempt and accept it — no objective gate, no repair"),
-    ("gate", "apply it, run the test gate, refuse on failure — catch but don't fix"),
-    ("verify", "the full harness: gate + repair loop"),
+    ("trust", "apply the first attempt and accept it; no gate, no repair"),
+    ("gate", "apply it, run the test gate, refuse on failure"),
+    ("verify", "gate plus repair loop"),
 ]
 
 _MAX_REPAIRS = 3
@@ -107,32 +104,35 @@ class AblationReport:
     def to_markdown(self) -> str:
         model = self.model or "(backend default)"
         lines = [
-            "# Verification Ablation",
+            "# Verification ablation",
             "",
             f"implementer: `{self.llm}` · model: `{model}` · tasks: {len(self.tasks)} · "
             f"repetitions: {self.reps} · paired (trust/gate score the same attempt)",
             "",
-            "| condition | claimed | **true success** | **false success** | mean repairs |",
+            "| condition | claimed | true success | false success | mean repairs |",
             "|---|---|---|---|---|",
         ]
         for s in self.stats:
             lines.append(
                 f"| `{s.condition}` | {_pct(s.claimed_success_rate)} | "
-                f"**{_pct(s.true_success_rate)}** | **{_pct(s.false_success_rate)}** | "
+                f"{_pct(s.true_success_rate)} | {_pct(s.false_success_rate)} | "
                 f"{s.mean_repairs:.2f} |"
             )
-        lines += ["", "_condition legend:_"]
+        lines += ["", "Conditions:"]
         for name, blurb in CONDITIONS:
-            lines.append(f"- `{name}` — {blurb}")
-        lines += ["", _headline(self.stats), "", "## Per-task outcomes", ""]
+            lines.append(f"- `{name}` — {blurb}.")
+        summary = _summary(self.stats)
+        if summary:
+            lines += ["", summary]
+        lines += ["", "## Per-task outcomes", ""]
         lines += ["| task | trust | gate | verify |", "|---|---|---|---|"]
         for task in self.tasks:
             cells = [_task_cell(self.records, task, c) for c in ("trust", "gate", "verify")]
             lines.append(f"| `{task}` | {cells[0]} | {cells[1]} | {cells[2]} |")
         lines += [
             "",
-            "Legend: ✓ true success · ✗ failed (refused) · ⚠ **false success** "
-            "(claimed but wrong). Modal outcome across repetitions.",
+            "Legend: pass = true success · fail = refused · false-pass = claimed but wrong. "
+            "Modal outcome across repetitions.",
             "",
         ]
         return "\n".join(lines)
@@ -148,23 +148,22 @@ def _task_cell(records: list[RunRecord], task: str, cond: str) -> str:
         return "—"
 
     def sym(r: RunRecord) -> str:
-        return "⚠" if r.false_success else ("✓" if r.true_success else "✗")
+        return "false-pass" if r.false_success else ("pass" if r.true_success else "fail")
 
     syms = [sym(r) for r in recs]
     return max(set(syms), key=syms.count)
 
 
-def _headline(stats: list[ConditionStats]) -> str:
+def _summary(stats: list[ConditionStats]) -> str:
     by = {s.condition: s for s in stats}
     trust, gate, verify = by.get("trust"), by.get("gate"), by.get("verify")
     if not (trust and gate and verify):
         return ""
     return (
-        f"**Headline.** On the same first attempts, orchestrate-and-trust ships "
-        f"**{_pct(trust.false_success_rate)}** silently-wrong fixes; the objective gate "
-        f"drives that to **{_pct(gate.false_success_rate)}**. The repair loop then lifts "
-        f"true success from **{_pct(gate.true_success_rate)}** (first try) to "
-        f"**{_pct(verify.true_success_rate)}** (full harness)."
+        f"Without the gate, {_pct(trust.false_success_rate)} of accepted fixes are wrong; "
+        f"the gate (same attempts) drives that to {_pct(gate.false_success_rate)}, and the "
+        f"repair loop raises true success from {_pct(gate.true_success_rate)} to "
+        f"{_pct(verify.true_success_rate)}."
     )
 
 
@@ -251,7 +250,7 @@ def _evaluate(
     name = task.inputs.get("_name", t)
     out: list[RunRecord] = []
 
-    # trust + gate score the SAME first attempt (paired).
+    # trust and gate score the same first attempt (paired).
     wd = scratch / "trust"
     _copy_repo(source, wd, include_tests=True)
     if patch.file_contents:

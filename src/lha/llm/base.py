@@ -1,7 +1,7 @@
 """LLM backend abstraction.
 
 The Implementer depends only on ``LLMClient``. The walking skeleton uses the
-``DeterministicStub`` so a REAL pytest verifies a REAL fix with no network. Real
+``DeterministicStub`` so a real pytest verifies a real fix with no network. Real
 runs swap in ``ClaudeCLIClient`` (default) or ``AnthropicClient`` via config.
 """
 
@@ -116,9 +116,9 @@ class LLMClient(ABC):
         """Prompt the model for whole-file rewrites and build a Patch.
 
         Whole-file ``file_contents`` apply cleanly (a direct write), unlike a unified
-        diff, which ``git apply`` rejects on the slightest context drift — an LLM's
-        single most common cause of a *correct* fix being thrown away. A display diff
-        is still recorded for the human-facing artifact.
+        diff, which ``git apply`` rejects on the slightest context drift — the most
+        common way an LLM's correct fix gets discarded. A display diff is still
+        recorded for the human-facing artifact.
         """
         workdir = Path(workdir)
         ctx_text = "\n\n".join(f"# {i.provenance.locator}\n{i.text}" for i in bundle.items[:8])
@@ -180,7 +180,7 @@ class LLMClient(ABC):
     @staticmethod
     def _is_test_file(rel: Path) -> bool:
         """Test files are the oracle. Keeping them out of the prompt forces a genuine
-        fix from the issue (the failing-test *summary* still returns via repair
+        fix from the issue (the failing-test summary still returns via repair
         feedback) instead of the model reverse-engineering the assertions — and it
         keeps the ACI context compact (a large test suite would crowd the budget)."""
         name = rel.name
