@@ -16,14 +16,15 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+    uv sync --frozen --no-dev --no-install-project --extra context
 
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-editable
+    uv sync --frozen --no-dev --no-editable --extra context
 
-# python:3.11-slim matches .python-version and keeps the CLI runtime smaller than
-# the full Debian image; torch still forces a roughly 1-2 GB image regardless.
+# The [context] extra ships the vector-index stack so `lha eval` reaches 5/5
+# in-container (docs/DEPLOY.md); its torch dependency is what makes the image
+# roughly 1-2 GB. python:3.11-slim matches .python-version.
 FROM python:3.11-slim AS runtime
 
 COPY --from=uv-provider /uv /uvx /usr/local/bin/

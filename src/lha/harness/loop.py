@@ -174,16 +174,17 @@ class Harness:
             prior_elapsed_s=state.elapsed_s,
         )
 
-        # PLAN (once)
-        if state.plan is None:
-            state.plan = Supervisor(self.config, self.llm).plan(state.task)
-            (run_dir / "plan.json").write_text(state.plan.model_dump_json(indent=2))
-            (run_dir / "plan.md").write_text(self._plan_md(state))
-            append_ledger(state, StepRecord(seq=state.next_seq(), step_id="-", phase="plan"))
-            save_state(state)
-
         in_flight = None  # the step currently executing, for revert on an unexpected fault
         try:
+            # PLAN (once) — inside the fault boundary, so a plan-time
+            # BudgetExceeded pauses the run instead of escaping as a traceback.
+            if state.plan is None:
+                state.plan = Supervisor(self.config, self.llm).plan(state.task)
+                (run_dir / "plan.json").write_text(state.plan.model_dump_json(indent=2))
+                (run_dir / "plan.md").write_text(self._plan_md(state))
+                append_ledger(state, StepRecord(seq=state.next_seq(), step_id="-", phase="plan"))
+                save_state(state)
+
             while not state.is_terminal():
                 step = state.next_step()
                 if step is None:
@@ -214,7 +215,7 @@ class Harness:
             # An unexpected fault mid-step (unknown action, failed patch apply, a
             # crashing tool) must not leave the run wedged at RUNNING with a
             # half-applied sandbox: revert the in-flight step, fail closed, checkpoint.
-            if in_flight is not None:
+            if in_flight is not None and in_flight.step_id not in state.completed_steps:
                 try:
                     self._revert_step(in_flight, workdir)
                 except Exception:  # a revert failure must not abort the fail-closed path
@@ -230,6 +231,8 @@ class Harness:
                 )
                 state.fail_current(in_flight)
             else:
+                # No step in flight, or the step itself completed and only its
+                # bookkeeping failed — never revert verified work.
                 state.status = "FAILED"
             state.elapsed_s = budget.elapsed()
             save_state(state)
@@ -434,6 +437,14 @@ class Harness:
         return None
 
     def _artifact_sha(self, state: RunState, step) -> str | None:
+        """The reviewable artifact hash for an approval — patches only.
+
+        Other actions regenerate their artifact on resume (a re-gathered bundle,
+        a re-run experiment), so byte-binding them would livelock the gate;
+        their approvals bind to the step id alone (``ApprovalDecision.binds``).
+        """
+        if step.action != "edit_code":
+            return None
         data = self._patch_bytes(state, step)
         return sha256_bytes(data) if data is not None else None
 
@@ -471,6 +482,12 @@ class Harness:
         gate = HumanApprovalGate(state.run_dir)
         decision = gate.decision()
         artifact_sha = self._artifact_sha(state, step)
+        if step.action == "edit_code" and artifact_sha is None:
+            # A patch step whose reviewed bytes are gone cannot be approved.
+            self._revert_step(step, Path(state.workdir))
+            raise ApprovalRejected(
+                f"step {step.step_id}: the patch under review is missing — refusing"
+            )
         if decision is not None and not decision.binds(step.step_id, artifact_sha):
             # A decision for a different step, a different artifact, or one that
             # names neither must not approve this change. Clear it and re-request.

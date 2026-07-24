@@ -32,15 +32,15 @@ scorer, not by the gate itself:
 
 | condition | claimed | true success (95% CI) | false success (95% CI) |
 |---|---|---|---|
-| `trust` — apply the fix, no gate | 100% | 94% (88–100%) | 6% (0–12%) |
-| `gate` — run the test gate, refuse on failure | 94% | 94% (88–100%) | 0% |
+| `trust` — apply the fix, no gate | 100% | 96% (90–100%) | 4% (0–10%) |
+| `gate` — run the test gate, refuse on failure | 96% | 96% (90–100%) | 0% |
 | `verify` — gate plus repair loop | 100% | 100% | 0% |
 
-Without the gate, 3 of 51 accepted fixes are wrong and ship silently. `trust` and
+Without the gate, 2 of 51 accepted fixes are wrong and ship silently. `trust` and
 `gate` score the same attempts, so the difference is exactly what the gate catches: it
-refused those same 3 cells and discarded no correct fix (TN=3, FP=0, FN=0 against the
-independent scorer). The repair loop then fixed all 3 refusals. The effect is real but
-small at this corpus difficulty — haiku-4.5's first attempt is already right 94% of the
+refused those same 2 cells and discarded no correct fix (TN=2, FP=0, FN=0 against the
+independent scorer). The repair loop then fixed both refusals. The effect is real but
+small at this corpus difficulty — haiku-4.5's first attempt is already right 96% of the
 time here; the numbers say what the gate buys on top of that, no more. The experiment is
 paired and leak-free (the implementer never sees the tests, a patch cannot touch the
 oracle); method, statistics, and limits are in [docs/ABLATION.md](docs/ABLATION.md),
@@ -172,6 +172,22 @@ lha index <path>                lha index-docs                 lha ask <query> -
 
 `-v`/`--verbose` raises log verbosity; `lha trace <run_id>` renders a run's ledger
 timeline. To run in a container, see [docs/DEPLOY.md](docs/DEPLOY.md).
+
+## Configuration (`LHA_*` environment variables)
+
+All configuration is environment variables read once at startup (`src/lha/config.py`):
+
+| variable | default | meaning |
+|---|---|---|
+| `LHA_LLM_BACKEND` | `stub` | `stub` \| `claude_cli` \| `anthropic` (`--llm` overrides) |
+| `LHA_CLAUDE_CLI` / `LHA_CLAUDE_MODEL` | `claude` / – | claude CLI path; pin a full model snapshot for reproducible runs |
+| `LHA_ANTHROPIC_MODEL_IMPL` / `_ORCH` | opus-4-8 / sonnet-4-6 | Anthropic SDK models |
+| `LHA_MAX_STEPS` / `LHA_MAX_REPAIRS` | 20 / 3 | loop budgets |
+| `LHA_DEADLINE_S` / `LHA_MAX_LLM_CALLS` | unlimited | wall-clock / LLM-call budgets (0 or unset = unlimited; the run pauses, resumable) |
+| `LHA_EXEC_BACKEND` / `LHA_EXEC_IMAGE` | `trusted-local` / `python:3.12-slim` | where target code executes (see [SECURITY.md](SECURITY.md)) |
+| `LHA_CODE_BACKEND` | `auto` | code search: `ccc` \| `null` \| `auto` |
+| context / misc | — | `LHA_FRESHNESS_MAX_AGE_S` (3600), `LHA_EMBEDDER_MODEL`, `LHA_SKILL_MEMORY` (1), `LHA_PARALLEL_VERIFY` (1), `LHA_DYNAMIC_PLANNING` (0) |
+| `LHA_RUNS_DIR` / `LHA_DATA_DIR` | `runs` / `data` | state locations |
 
 ## Requirements
 

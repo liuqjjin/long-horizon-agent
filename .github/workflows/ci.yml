@@ -62,6 +62,19 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: lha:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Smoke-test image (CLI + context extra present)
+        run: |
+          docker run --rm lha:ci lha --version
+          docker run --rm lha:ci python -c "import lha, cocoindex, sentence_transformers"
+      - name: Set up uv (+ Python 3.11 from .python-version)
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Docker execution-backend tests (real containers)
+        run: |
+          uv sync
+          LHA_DOCKER_TESTS=1 uv run pytest tests/test_sandbox.py -q

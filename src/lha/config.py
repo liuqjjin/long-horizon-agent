@@ -43,6 +43,24 @@ def _env_float_opt(key: str) -> float | None:
     return value
 
 
+def _env_int_opt(key: str) -> int | None:
+    """Optional positive-int env var: ``None`` when unset/blank/0 (= unlimited).
+
+    Rejects negatives so a typo bricks the run loudly at startup, not by raising
+    BudgetExceeded before the first LLM call.
+    """
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{key} must be an integer, got {raw!r}") from e
+    if value < 0:
+        raise ValueError(f"{key} must be >= 0 (0 or unset = unlimited), got {raw!r}")
+    return value or None
+
+
 class Config(BaseModel):
     """Harness configuration. Construct with ``Config.from_env()``."""
 
@@ -94,9 +112,7 @@ class Config(BaseModel):
             max_steps=int(_env("LHA_MAX_STEPS", "20")),
             max_repairs=int(_env("LHA_MAX_REPAIRS", "3")),
             deadline_s=_env_float_opt("LHA_DEADLINE_S"),
-            max_llm_calls=(
-                int(_env("LHA_MAX_LLM_CALLS", "0")) or None
-            ),
+            max_llm_calls=_env_int_opt("LHA_MAX_LLM_CALLS"),
             parallel_verify=_env("LHA_PARALLEL_VERIFY", "1") not in ("0", "false", "False"),
             use_skill_memory=_env("LHA_SKILL_MEMORY", "1") not in ("0", "false", "False"),
             dynamic_planning=_env("LHA_DYNAMIC_PLANNING", "0") not in ("0", "false", "False"),

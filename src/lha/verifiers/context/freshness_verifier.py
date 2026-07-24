@@ -49,6 +49,18 @@ class FreshnessVerifier(Verifier):
                 indexed_at=indexed_at,
             )
 
+        # status "ok" with items can still hide a dark backend: another kind
+        # answered while one the step asked for could not be searched at all.
+        # Skill memory is an optional augmentation and does not count.
+        dark = [k for k in bundle.unavailable_kinds if k != "skill"]
+        if dark:
+            return self._check(
+                passed=not required,
+                summary=f"backend unavailable for kind(s): {', '.join(dark)}"
+                + ("" if required else " (declared optional)"),
+                indexed_at=indexed_at,
+            )
+
         stale = bundle.freshness.is_stale()
         return self._check(
             passed=not stale,

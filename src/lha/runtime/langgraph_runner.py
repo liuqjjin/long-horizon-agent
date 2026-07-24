@@ -31,7 +31,7 @@ from ..artifacts import ExperimentResult, Patch
 from ..config import Config
 from ..harness.approval import HumanApprovalGate
 from ..harness.checkpoint import append_ledger, load_state_by_id, save_state
-from ..harness.errors import PolicyViolation
+from ..harness.errors import ApprovalRejected, BudgetExceeded, PolicyViolation
 from ..harness.loop import Harness, RunResult, _dump, _gen_run_id, _policy_verdict, _safe_seg
 from ..harness.manifest import sha256_bytes
 from ..harness.state import Phase, RunState, StepRecord
@@ -105,8 +105,15 @@ class LangGraphHarness:
             graph = self._compile(conn)
             gcfg: Any = {"configurable": {"thread_id": state.run_id}}  # LangGraph RunnableConfig
             snap = graph.get_state(gcfg)
+            has_interrupt = bool(snap.next) and bool(snap.interrupts or [])
 
-            if snap.next:  # graph is paused at an interrupt (awaiting approval)
+            if snap.next and not has_interrupt:
+                # A previous process died mid-node: the checkpoint stopped inside
+                # the graph with no interrupt pending. Invoking with no input
+                # resumes from the checkpoint and re-runs the pending node —
+                # this is a crash recovery, not an approval wait.
+                resume_input: Any = None
+            elif has_interrupt:  # paused at a real interrupt (awaiting approval)
                 gate = HumanApprovalGate(run_dir)
                 decision = gate.decision()
                 interrupted_step = None
@@ -124,7 +131,15 @@ class LangGraphHarness:
                 # The decision must bind the exact persisted artifact bytes. A
                 # mismatch means the artifact changed after review — tamper
                 # evidence, so the run fails closed with the change reverted.
-                current_sha = _current_artifact_sha(run_dir, interrupted_step)
+                action = next(
+                    (
+                        s.action
+                        for s in (state.plan.steps if state.plan else [])
+                        if s.step_id == interrupted_step
+                    ),
+                    "edit_code",  # unknown step: demand the strictest binding
+                )
+                current_sha = _current_artifact_sha(run_dir, interrupted_step, action)
                 if not decision.binds(interrupted_step or "", current_sha):
                     from types import SimpleNamespace
 
@@ -144,18 +159,52 @@ class LangGraphHarness:
                         "(hash mismatch) — refusing to execute",
                     )
                 gate.clear()
-                graph.invoke(Command(resume={"approved": decision.approved}), gcfg)
+                resume_input = Command(resume={"approved": decision.approved})
             else:
-                graph.invoke({"rs": state.model_dump(mode="json")}, gcfg)
+                resume_input = {"rs": state.model_dump(mode="json")}
+
+            try:
+                graph.invoke(resume_input, gcfg)
+            except BudgetExceeded as e:
+                final = load_state_by_id(self.config.runs_dir, state.run_id)
+                final.status = "PAUSED"
+                save_state(final)
+                return RunResult(final, "PAUSED", str(e))
+            except ApprovalRejected as e:
+                final = load_state_by_id(self.config.runs_dir, state.run_id)
+                final.status = "FAILED"
+                save_state(final)
+                return RunResult(final, "FAILED", str(e))
+            except Exception as e:
+                # Same fail-closed contract as the default loop: a mid-node fault
+                # must not leave the run wedged at RUNNING with an unverified
+                # patch in the sandbox.
+                final = load_state_by_id(self.config.runs_dir, state.run_id)
+                step = final.next_step()
+                if step is not None and step.step_id not in final.completed_steps:
+                    try:
+                        self._h._revert_step(step, workdir)
+                    except Exception:
+                        logger.exception("revert failed for step %s", step.step_id)
+                    final.fail_current(step)
+                else:
+                    final.status = "FAILED"
+                save_state(final)
+                return RunResult(final, "FAILED", f"{type(e).__name__}: {e}")
 
             # paused on a fresh interrupt?
             snap = graph.get_state(gcfg)
-            if snap.next:
+            if snap.next and (snap.interrupts or []):
                 final = load_state_by_id(self.config.runs_dir, state.run_id)
                 final.status = "AWAITING_APPROVAL"
                 save_state(final)
                 self._request_approval(snap, final)
                 return RunResult(final, "AWAITING_APPROVAL", "awaiting approval")
+            if snap.next:  # stopped mid-graph without an interrupt: wedged, fail closed
+                final = load_state_by_id(self.config.runs_dir, state.run_id)
+                final.status = "FAILED"
+                save_state(final)
+                return RunResult(final, "FAILED", "graph stopped mid-run without an interrupt")
         finally:
             conn.close()
 
@@ -267,7 +316,7 @@ class LangGraphHarness:
             return {"rs": state.model_dump(mode="json"), "next": "done"}
 
         run_dir = Path(state.run_dir)
-        sha = _current_artifact_sha(run_dir, step.step_id)
+        sha = _current_artifact_sha(run_dir, step.step_id, step.action)
         decision = interrupt({"step_id": step.step_id, "goal": step.goal, "artifact_sha256": sha})
         if not (isinstance(decision, dict) and decision.get("approved")):
             self._ledger(state, step, "approval", notes="rejected")
@@ -341,9 +390,13 @@ def _route_next(gstate: GraphState) -> str:
     return gstate.get("next", "done")
 
 
-def _current_artifact_sha(run_dir: Path, step_id: str | None) -> str | None:
-    """SHA-256 of the persisted patch.json for a step (per-step file first)."""
-    if not step_id:
+def _current_artifact_sha(run_dir: Path, step_id: str | None, action: str) -> str | None:
+    """SHA-256 of the persisted patch.json for a patch step (per-step file first).
+
+    Non-patch actions regenerate their artifact on resume, so their approvals
+    bind by step id alone (None here; see ``ApprovalDecision.binds``).
+    """
+    if not step_id or action != "edit_code":
         return None
     candidates = [run_dir / "steps" / _safe_seg(step_id) / "patch.json", run_dir / "patch.json"]
     for path in candidates:

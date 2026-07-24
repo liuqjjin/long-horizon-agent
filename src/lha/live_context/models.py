@@ -115,6 +115,10 @@ class ContextBundle(BaseModel):
     # unavailable bundle as verified context (see verifiers/context/*).
     status: ContextStatus = "ok"
     status_notes: list[str] = Field(default_factory=list)
+    # Kinds whose backend could not be searched at all. Even when OTHER kinds
+    # returned items (status "ok"), a required step must not proceed as
+    # "verified" while a kind it asked for was dark.
+    unavailable_kinds: list[str] = Field(default_factory=list)
 
     def locators(self) -> list[str]:
         return [i.provenance.locator for i in self.items]

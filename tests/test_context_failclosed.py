@@ -36,6 +36,19 @@ from lha.verifiers.context.citation_verifier import CitationVerifier
 from lha.verifiers.context.freshness_verifier import FreshnessVerifier
 
 
+@pytest.fixture(autouse=True)
+def _restore_facade_state():
+    """``configure`` mutates the module singleton; put it back so ordering
+    between test files stays irrelevant."""
+    from lha.live_context import facade
+
+    saved_root, saved_config = facade._state.code_root, facade._state.config
+    yield
+    facade._state.code_root = saved_root
+    facade._state.config = saved_config
+    facade._state.reset_cache()
+
+
 def _step(requirement: str = "required", verifiers: list[str] | None = None) -> Step:
     return Step(
         step_id="s1",

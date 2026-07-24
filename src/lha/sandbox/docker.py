@@ -6,8 +6,9 @@ scorer data) cannot be modified from inside; the environment starts empty; the
 network is off; CPU/memory/pids are capped; a timeout removes the container,
 which kills the entire process tree.
 
-The image must provide the tools the run needs (python, pytest,
-pytest-json-report, ruff for code tasks). See docs/SECURITY.md.
+The image must provide the tools the run needs — the default python:3.12-slim
+carries none of pytest/pytest-json-report/ruff, so code-verification tasks need
+a purpose-built image (see SECURITY.md, "Execution backends").
 """
 
 from __future__ import annotations
@@ -113,6 +114,8 @@ class DockerBackend(ExecutionBackend):
     ) -> ProcResult:
         name = f"lha-{uuid.uuid4().hex[:12]}"
         argv = self.build_argv(cmd, cwd=cwd, name=name, limits=limits)
+        if input is not None:  # keep stdin open so piped text reaches the container
+            argv.insert(argv.index("run") + 1, "-i")
         start = time.monotonic()
         try:
             proc = subprocess.run(

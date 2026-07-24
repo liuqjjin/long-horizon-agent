@@ -27,11 +27,18 @@ class ApprovalDecision(BaseModel):
     artifact_sha256: str | None = None
 
     def binds(self, step_id: str, artifact_sha256: str | None) -> bool:
-        """Whether this decision is bound to exactly this step + artifact."""
+        """Whether this decision is bound to exactly this step + artifact.
+
+        Patch steps bind by step id AND artifact hash. Actions that produce no
+        reviewable patch (context gathering, experiments — regenerated on every
+        resume) pass ``artifact_sha256=None`` and bind by step id alone; a
+        decision that carries a hash for such a step, or none for a patch step,
+        never binds.
+        """
         if self.step_id != step_id:
             return False
-        if self.artifact_sha256 is None or artifact_sha256 is None:
-            return False
+        if artifact_sha256 is None:
+            return self.artifact_sha256 is None
         return self.artifact_sha256 == artifact_sha256
 
 

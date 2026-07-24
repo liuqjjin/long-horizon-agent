@@ -152,17 +152,17 @@ def get_fresh_context(
     versions: list[str] = []
     indexed_ats = []
     notes: list[str] = []
-    unavailable = False
+    unavailable_kinds: list[str] = []
     for kind in kinds:
         be = _backend_for(kind)
         if isinstance(be, NullBackend):
-            unavailable = True
+            unavailable_kinds.append(kind)
             notes.append(f"{kind}: no backend available")
             continue
         try:
             hits = be.search(query, k=k)
         except BackendUnavailable as e:
-            unavailable = True
+            unavailable_kinds.append(kind)
             notes.append(f"{kind}: {e}")
             continue
         # Only backends that actually contributed context affect freshness, so an
@@ -185,9 +185,14 @@ def get_fresh_context(
         freshness.reasons.append(f"older than max_age_s={max_age_s}")
     status: ContextStatus = "ok"
     if not items:
-        status = "backend_unavailable" if unavailable else "empty"
+        status = "backend_unavailable" if unavailable_kinds else "empty"
     return ContextBundle(
-        query=query, items=items, freshness=freshness, status=status, status_notes=notes
+        query=query,
+        items=items,
+        freshness=freshness,
+        status=status,
+        status_notes=notes,
+        unavailable_kinds=unavailable_kinds,
     )
 
 

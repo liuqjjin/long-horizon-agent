@@ -41,11 +41,16 @@ _DIFF_GIT = re.compile(r"^diff --git a/(?P<a>[^ ]+) b/(?P<b>[^\n]+)", re.MULTILI
 
 
 def is_protected(rel: str) -> bool:
-    """Whether a (relative) path is part of the oracle/config surface."""
+    """Whether a (relative) path is part of the oracle/config surface.
+
+    Comparison is case-insensitive: on the case-insensitive filesystems of
+    macOS/Windows, writing ``Conftest.py`` overwrites ``conftest.py``, so a
+    case variant is the same attack surface.
+    """
     p = PurePosixPath(str(Path(rel).as_posix()))
-    name = p.name
+    name = p.name.casefold()
     return (
-        any(part in _PROTECTED_DIRS for part in p.parts[:-1])
+        any(part.casefold() in _PROTECTED_DIRS for part in p.parts[:-1])
         or name in _PROTECTED_NAMES
         or (name.startswith("test_") and name.endswith(".py"))
         or name.endswith("_test.py")
@@ -66,7 +71,9 @@ def diff_paths(unified_diff: str) -> list[str]:
         path = m.group("path").strip()
         if path and path != "/dev/null":
             paths.add(path)
-    return sorted(paths)
+    # git C-quotes unusual paths (`--- "a/conftest.py"`); unquote before any
+    # name check, or the trailing quote hides the protected name.
+    return sorted(p.strip('"') for p in paths)
 
 
 def patch_paths(patch: Patch) -> list[str]:

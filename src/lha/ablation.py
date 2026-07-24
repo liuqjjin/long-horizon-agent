@@ -46,7 +46,6 @@ import inspect
 import json
 import logging
 import os
-import random
 import shutil
 import tempfile
 import time
@@ -163,6 +162,9 @@ class AblationReport:
         gate_lines = _gate_quality_lines(self.stats)
         if gate_lines:
             lines += ["", "Internal gate vs final scorer (per attempt):", *gate_lines]
+        mcnemar_lines = _paired_mcnemar_lines(self.records)
+        if mcnemar_lines:
+            lines += ["", "Paired contrasts:", *mcnemar_lines]
         summary = _summary(self.stats)
         if summary:
             lines += ["", summary]
@@ -340,7 +342,8 @@ def _artifact_digest(frozen: dict[str, str | None]) -> str:
     for rel in sorted(frozen):
         h.update(rel.encode())
         h.update(b"\0")
-        h.update((frozen[rel] or "\0<deleted>").encode())
+        content = frozen[rel]
+        h.update(("\0<deleted>" if content is None else content).encode())
         h.update(b"\0")
     return h.hexdigest()
 
@@ -444,7 +447,7 @@ def _truth_detail(ok: bool) -> str:
     return "scorer: tests pass" if ok else "scorer: tests fail"
 
 
-def _make_llm(llm: str, model: str | None) -> LLMClient:
+def _make_llm(llm: str, model: str | None, *, cli_path: str = "claude") -> LLMClient:
     if llm == "stub":
         from .llm.stub import DeterministicStub
 
@@ -453,7 +456,7 @@ def _make_llm(llm: str, model: str | None) -> LLMClient:
         from .llm.claude_cli import ClaudeCLIClient
 
         # no_tools => single-shot completion; the implementer cannot read the oracle.
-        return ClaudeCLIClient(model=model, no_tools=True)
+        return ClaudeCLIClient(cli_path=cli_path, model=model, no_tools=True)
     if llm == "anthropic":
         from .llm.anthropic_client import AnthropicClient
 
@@ -477,7 +480,9 @@ def _repo_digest(source: Path) -> str:
     return h.hexdigest()
 
 
-def _fingerprint(task_path: str, source: Path, llm: str, model: str | None) -> str:
+def _fingerprint(
+    task_path: str, source: Path, llm: str, model: str | None, scorer: str = "trusted-local"
+) -> str:
     """Everything that determines a cell's outcome. Any change busts the cache."""
     from .llm import base as llm_base
 
@@ -486,6 +491,9 @@ def _fingerprint(task_path: str, source: Path, llm: str, model: str | None) -> s
     h.update(Path(task_path).read_bytes())
     h.update(_repo_digest(source).encode())
     h.update(f"|llm={llm}|model={model or ''}|repairs={_MAX_REPAIRS}".encode())
+    # The truth labels belong to a specific scorer: cached cells must never be
+    # relabeled as another backend's verdicts on a --scorer-backend change.
+    h.update(f"|scorer={scorer}".encode())
     # The prompt/parsing logic IS part of the experiment configuration.
     h.update(inspect.getsource(llm_base).encode())
     return h.hexdigest()
@@ -543,22 +551,46 @@ def _bootstrap_ci(
     records: list[RunRecord], metric: str, *, n: int = _BOOTSTRAP_N, seed: int = 0
 ) -> tuple[float, float] | None:
     """Task-cluster bootstrap 95% CI: tasks are resampled with replacement and
-    each task carries all its repetitions (reps are nested, not independent)."""
-    by_task: dict[str, list[RunRecord]] = {}
+    each task carries all its repetitions (reps are nested, not independent).
+    The resampling itself lives in ``bench.stats`` — one implementation."""
+    by_task: dict[str, list[float]] = {}
     for r in records:
-        by_task.setdefault(r.task, []).append(r)
-    tasks = sorted(by_task)
-    if len(tasks) < 2:
-        return None
-    rng = random.Random(seed)
-    means = []
-    for _ in range(n):
-        sample = [rec for _ in tasks for rec in by_task[rng.choice(tasks)]]
-        means.append(sum(getattr(r, metric) for r in sample) / len(sample))
-    means.sort()
-    lo = means[int(0.025 * (len(means) - 1))]
-    hi = means[int(0.975 * (len(means) - 1))]
-    return (lo, hi)
+        by_task.setdefault(r.task, []).append(float(getattr(r, metric)))
+    if len(by_task) < 2:
+        return None  # a single task cannot express between-task variation
+    from .bench.stats import cluster_bootstrap_ci
+
+    return cluster_bootstrap_ci(by_task, n=n, seed=seed)
+
+
+def _paired_mcnemar_lines(records: list[RunRecord]) -> list[str]:
+    """Exact McNemar on the paired (task, rep) cells for the headline contrasts."""
+    from .bench.stats import mcnemar_exact
+
+    def outcomes(cond: str, metric: str) -> dict[tuple[str, int], bool]:
+        return {
+            (r.task, r.rep): bool(getattr(r, metric))
+            for r in records
+            if r.condition == cond and r.status != "ERROR"
+        }
+
+    lines: list[str] = []
+    for a, b, metric in (
+        ("trust", "gate", "false_success"),
+        ("gate", "verify", "true_success"),
+    ):
+        oa, ob = outcomes(a, metric), outcomes(b, metric)
+        pairs = sorted(set(oa) & set(ob))
+        if not pairs:
+            continue
+        only_a = sum(oa[k] and not ob[k] for k in pairs)
+        only_b = sum(ob[k] and not oa[k] for k in pairs)
+        p = mcnemar_exact(only_a, only_b)
+        lines.append(
+            f"- `{a}` vs `{b}` on {metric.replace('_', ' ')}: "
+            f"discordant {only_a}/{only_b} of {len(pairs)} pairs · exact McNemar p = {p:.2f}"
+        )
+    return lines
 
 
 def _aggregate(records: list[RunRecord]) -> list[ConditionStats]:
@@ -611,7 +643,10 @@ def run_ablation(
 ) -> AblationReport:
     out = Path(out_dir) if out_dir else (Path(base.runs_dir) / "ablation")
     out.mkdir(parents=True, exist_ok=True)
-    client = llm_client or _make_llm(llm, model)
+    # LHA_CLAUDE_MODEL / LHA_CLAUDE_CLI apply here exactly as in `lha run`; an
+    # explicit --model wins. The resolved name feeds the provenance fingerprint.
+    model = model or (base.claude_cli_model or None)
+    client = llm_client or _make_llm(llm, model, cli_path=base.claude_cli_path)
     # The agent-side gate and the final scorer never share an execution backend
     # instance; the scorer can be a container while the gate stays local.
     agent_exec: ExecutionBackend = TrustedLocalBackend()
@@ -626,7 +661,9 @@ def run_ablation(
         spec = TaskSpec.from_file(tp)
         spec.inputs["_name"] = Path(tp).stem
         source = Path(spec.target_repo or ".")
-        tasks.append((Path(tp).stem, spec, source, _fingerprint(tp, source, llm, model)))
+        tasks.append(
+            (Path(tp).stem, spec, source, _fingerprint(tp, source, llm, model, scorer_backend))
+        )
 
     records: list[RunRecord] = []
     total = len(tasks) * reps

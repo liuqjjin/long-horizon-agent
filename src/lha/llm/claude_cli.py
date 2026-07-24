@@ -57,10 +57,12 @@ class ClaudeCLIClient(LLMClient):
             cmd += ["--model", self.model]
         if self.no_tools:
             cmd += ["--disallowed-tools", *_FILE_TOOLS]
+        # Reset before the call: on failure, stale usage from the previous call
+        # must not be re-counted by the tracer.
+        self.last_usage = None
         res = run(cmd, timeout=self.timeout, input=prompt)
         if not res.ok:
             raise RuntimeError(f"claude CLI failed ({res.returncode}): {res.stderr[:400]}")
-        self.last_usage = None
         try:
             data = json.loads(res.stdout)
         except json.JSONDecodeError:

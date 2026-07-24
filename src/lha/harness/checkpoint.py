@@ -104,6 +104,15 @@ def load_state_by_id(runs_dir: str | Path, run_id: str) -> RunState:
 
 def append_ledger(state: RunState, record: StepRecord) -> None:
     path = Path(state.run_dir) / LEDGER_FILE
+    # A crash can leave a torn final line. Appending after it would merge two
+    # records into one corrupt mid-file line (which read_ledger rightly refuses),
+    # so drop the fragment first — it was never durable, and read_ledger already
+    # treats it as lost.
+    if path.exists():
+        raw = path.read_bytes()
+        if raw and not raw.endswith(b"\n"):
+            with open(path, "rb+") as f:
+                f.truncate(raw.rfind(b"\n") + 1)
     with open(path, "a") as f:
         f.write(record.model_dump_json() + "\n")
         f.flush()

@@ -23,6 +23,7 @@ uv run ruff check .                         # lint
 uv run pyright src/lha                       # type-check
 uv run pytest -q                             # unit tests (hermetic)
 uv run lha eval                              # self-eval — must be 5/5
+LHA_DOCKER_TESTS=1 uv run pytest tests/test_sandbox.py -q   # opt-in: real containers (needs a docker daemon)
 
 # facade isolation: CocoIndex must never leak out of live_context (must print nothing)
 grep -rnE "^[[:space:]]*(import|from)[[:space:]]+(cocoindex|cocoindex_code)" \
