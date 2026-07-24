@@ -24,6 +24,11 @@ class ApprovalRejected(HarnessError):
     pass
 
 
+class CheckpointCorrupt(HarnessError):
+    """A checkpoint or ledger failed validation. Resuming from corrupt state
+    would silently replay or skip work, so loading fails closed instead."""
+
+
 class PolicyViolation(HarnessError):
     """A patch tried to touch protected oracle/config files. The patch is
     refused before it reaches the sandbox; the loop treats this as a failed

@@ -27,7 +27,6 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "cocoindex>=1.0.11",
     "langgraph>=1.2.6",
     "langgraph-checkpoint-sqlite>=3.1.0",
     "mcp>=1.28.0",
@@ -39,12 +38,12 @@ dependencies = [
     "pyyaml>=6.0.3",
     "ruff>=0.15.18",
     "scikit-image>=0.26.0",
-    "sentence-transformers>=5.6.0",
 ]
 
 [project.optional-dependencies]
-# scikit-image / numpy / cocoindex are already core deps; the only genuinely
-# optional backends are the Anthropic SDK and the pyright type-checker.
+# The doc/experiment/skill vector index is optional: without it, those context
+# backends report "unavailable" and required-context steps fail closed.
+context = ["cocoindex>=1.0.11", "sentence-transformers>=5.6.0"]
 llm = ["anthropic>=0.69"]  # needs the Opus-4.8 surface (adaptive thinking, output_config.effort)
 typecheck = ["pyright>=1.1"]
 
@@ -73,7 +72,10 @@ requires = ["uv_build>=0.11.16,<0.12.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+# dev installs the context extra's packages so the doc-context tests run for real.
 dev = [
+    "cocoindex>=1.0.11",
     "pyright>=1.1.410",
     "pytest-cov>=7.1.0",
+    "sentence-transformers>=5.6.0",
 ]

@@ -5,6 +5,9 @@ Calls ONLY ``live_context`` — never CocoIndex/ccc directly.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from ..artifacts import Step
 from ..config import Config
 from ..live_context import (
@@ -13,6 +16,7 @@ from ..live_context import (
     get_fresh_context,
     reject_stale,
 )
+from ..live_context.freshness import path_from_locator
 
 _KINDS_BY_STEP = {
     "code": ("code",),
@@ -25,7 +29,7 @@ class ContextEngineer:
     def __init__(self, config: Config):
         self.config = config
 
-    def gather(self, step: Step) -> ContextBundle:
+    def gather(self, step: Step, workdir: str | Path | None = None) -> ContextBundle:
         kinds = list(_KINDS_BY_STEP.get(step.kind, ("code", "paper", "experiment")))
         # Episodic memory: retrieve relevant past skills (cheap no-op until indexed).
         if self.config.use_skill_memory and "skill" not in kinds:
@@ -43,9 +47,34 @@ class ContextEngineer:
                 # freshness verifier fails it closed with a diagnosable reason.
                 bundle.status = "index_failed"
                 bundle.status_notes.append(str(e))
+        if workdir is not None and step.repair_of:
+            # A repair must reason over the CURRENT sandbox, not the pristine
+            # repo the index was built from — the failing state is the point.
+            self._overlay_workdir(bundle, Path(workdir))
         if step.action == "answer_query":
             bundle.answer = self._synthesize(bundle)
         return bundle
+
+    @staticmethod
+    def _overlay_workdir(bundle: ContextBundle, workdir: Path) -> None:
+        overlaid = 0
+        for item in bundle.items:
+            if item.provenance.source_kind != "code":
+                continue
+            rel = path_from_locator(item.provenance.locator)
+            path = workdir / rel
+            if not path.is_file():
+                continue
+            try:
+                current = path.read_text(errors="replace")
+            except OSError:
+                continue
+            if item.text and item.text in current:
+                continue  # chunk unchanged in the sandbox
+            item.text = _slice_by_locator(current, item.provenance.locator)
+            overlaid += 1
+        if overlaid:
+            bundle.status_notes.append(f"{overlaid} code item(s) refreshed from the run sandbox")
 
     @staticmethod
     def _synthesize(bundle: ContextBundle) -> str:
@@ -57,3 +86,14 @@ class ContextEngineer:
             snippet = " ".join(item.text.split())[:200]
             lines.append(f"- {snippet} [{item.provenance.locator}]")
         return "\n".join(lines)
+
+
+def _slice_by_locator(text: str, locator: str) -> str:
+    """The locator's line range from the current file (whole file if no range)."""
+    m = re.search(r":(\d+)(?:-(\d+))?$", locator)
+    if not m:
+        return text
+    start = int(m.group(1))
+    end = int(m.group(2) or m.group(1))
+    lines = text.splitlines()
+    return "\n".join(lines[max(start - 1, 0) : end])

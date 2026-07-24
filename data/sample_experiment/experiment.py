@@ -10,6 +10,7 @@ the --out directory so a verifier can INDEPENDENTLY recompute the metrics.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -67,6 +68,9 @@ def main() -> None:
                 "scale": args.scale,
                 "data_range": data_range,
                 "channel_axis": -1,
+                # digest of the exact input array, so a re-run on different data
+                # cannot masquerade as a reproduction
+                "input_sha256": hashlib.sha256(ref.tobytes()).hexdigest(),
                 "git_commit": git_commit(),
                 "versions": {
                     "python": platform.python_version(),

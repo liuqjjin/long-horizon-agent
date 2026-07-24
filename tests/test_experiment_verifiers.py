@@ -98,12 +98,34 @@ def test_repro_passes_when_deterministic_and_recorded(tmp_path):
         out_dir="out",
         command=[sys.executable, str(script), "--out", "out"],
         metrics={"psnr": 30.0, "ssim": 0.9},
-        repro={"seed": 1, "versions": {"numpy": "x"}, "git_commit": "abc"},
+        repro={
+            "seed": 1,
+            "versions": {"numpy": "x"},
+            "git_commit": "abc",
+            "input_sha256": "cafe",
+        },
     )
     check = ReproVerifier().verify(
         art, VerifyContext(workdir=tmp_path, step=_step("reproducibility", {}))
     )
     assert check.passed
+
+
+def test_repro_fails_without_input_digest(tmp_path):
+    script = tmp_path / "exp.py"
+    script.write_text(_DUMMY)
+    art = ExperimentResult(
+        step_id="s",
+        out_dir="out",
+        command=[sys.executable, str(script), "--out", "out"],
+        metrics={"psnr": 30.0, "ssim": 0.9},
+        repro={"seed": 1, "versions": {"numpy": "x"}, "git_commit": "abc"},  # no input digest
+    )
+    check = ReproVerifier().verify(
+        art, VerifyContext(workdir=tmp_path, step=_step("reproducibility", {}))
+    )
+    assert not check.passed
+    assert any("input digest" in r for r in check.detail["reasons"])
 
 
 def test_repro_fails_without_seed(tmp_path):

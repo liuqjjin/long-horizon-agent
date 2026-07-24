@@ -9,10 +9,12 @@ failures.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .artifacts import ExperimentResult, Patch
 from .clock import now
 from .verifiers.verdict import Verdict
@@ -53,20 +55,25 @@ class SkillMemory:
             approach.append("experiment command: " + " ".join(exp.command))
 
         task = state.task
-        body = self._render(task, approach, files, checks, state.run_id)
+        # Provenance: which exact verdict justified this note. A skill retrieved
+        # later can be traced back to (and re-checked against) its evidence.
+        verdict_sha = hashlib.sha256(verify_json.read_bytes()).hexdigest()
+        body = self._render(task, approach, files, checks, state.run_id, verdict_sha)
         self.skills_dir.mkdir(parents=True, exist_ok=True)
         path = self.skills_dir / f"{_slug(task.title)}.md"  # stable per task -> updated in place
         path.write_text(body)
         return path
 
     @staticmethod
-    def _render(task, approach, files, checks, skill_id) -> str:
+    def _render(task, approach, files, checks, skill_id, verdict_sha: str) -> str:
         lines = [
             "---",
             f'title: "{task.title}"',
             f"task_kind: {task.kind}",
             f"skill_id: {skill_id}",
             "verified: true",
+            f"verdict_sha256: {verdict_sha}",
+            f"harness_version: {__version__}",
             f'created: "{now():%Y-%m-%dT%H:%M:%SZ}"',
             "---",
             "",

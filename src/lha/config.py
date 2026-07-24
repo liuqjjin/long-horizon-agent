@@ -50,6 +50,9 @@ class Config(BaseModel):
     max_steps: int = 20
     max_repairs: int = 3
     deadline_s: float | None = None
+    # Model-call budget for a single process (None = unbounded). A run that
+    # would loop on a broken backend pauses instead of burning tokens.
+    max_llm_calls: int | None = None
 
     # Run the selected verifiers concurrently
     parallel_verify: bool = True
@@ -89,6 +92,9 @@ class Config(BaseModel):
             max_steps=int(_env("LHA_MAX_STEPS", "20")),
             max_repairs=int(_env("LHA_MAX_REPAIRS", "3")),
             deadline_s=_env_float_opt("LHA_DEADLINE_S"),
+            max_llm_calls=(
+                int(_env("LHA_MAX_LLM_CALLS", "0")) or None
+            ),
             parallel_verify=_env("LHA_PARALLEL_VERIFY", "1") not in ("0", "false", "False"),
             use_skill_memory=_env("LHA_SKILL_MEMORY", "1") not in ("0", "false", "False"),
             dynamic_planning=_env("LHA_DYNAMIC_PLANNING", "0") not in ("0", "false", "False"),

@@ -72,6 +72,12 @@ def test_skillmemory_writes_a_note_for_a_passed_run(tmp_path):
     assert path is not None and path.exists()
     body = path.read_text()
     assert "fix the off-by-one" in body and "pytest: 3 passed" in body and "m.py" in body
+    # provenance: the note names the exact verdict bytes that justified it
+    import hashlib
+
+    expected = hashlib.sha256((rd / "verify.json").read_bytes()).hexdigest()
+    assert f"verdict_sha256: {expected}" in body
+    assert "harness_version:" in body
 
 
 # --- orchestrator survives a per-task spawn failure -------------------------

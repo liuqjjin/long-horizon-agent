@@ -235,7 +235,7 @@ class LangGraphHarness:
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
 
-        bundle = ContextEngineer(self.config).gather(step)
+        bundle = ContextEngineer(self.config).gather(step, workdir=workdir)
         _dump(run_dir, step.step_id, "context_bundle.json", bundle.model_dump_json(indent=2))
         self._ledger(state, step, "context", artifact_ref="context_bundle.json")
         try:

@@ -117,7 +117,12 @@ class CocoFlowBackend(SearchBackend):
             app = self._build_app()
             with coco.runtime():
                 app.update_blocking(report_to_stdout=False)
-        except Exception as e:  # import failure, flow error, IO — all mean "not refreshed"
+        except ImportError as e:  # optional dependency not installed
+            return ReindexResult(
+                kind=self.kind, ok=False, version_before=version_before,
+                detail=f"cocoindex is not installed (pip install 'lha[context]'): {e}",
+            )
+        except Exception as e:  # flow error, IO — all mean "not refreshed"
             return ReindexResult(
                 kind=self.kind, ok=False, version_before=version_before,
                 detail=f"cocoindex flow failed: {type(e).__name__}: {e}",

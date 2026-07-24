@@ -6,6 +6,7 @@ Shaped so LangGraph can drop in later: ``thread_id`` (== run_id) and a reserved
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Literal
 
@@ -19,8 +20,17 @@ RunStatus = Literal["RUNNING", "AWAITING_APPROVAL", "DONE", "FAILED", "PAUSED"]
 Phase = Literal["plan", "context", "execute", "approval", "verify", "repair", "complete", "fail"]
 
 
+def _event_id() -> str:
+    return uuid.uuid4().hex
+
+
 class StepRecord(BaseModel):
-    """One append-only ledger entry."""
+    """One append-only ledger entry.
+
+    ``seq`` is the run's persisted step counter; after a crash-and-resume the
+    re-executed step appends new entries with the same seq — the unique
+    ``event_id`` tells retries apart.
+    """
 
     seq: int
     step_id: str
@@ -29,6 +39,7 @@ class StepRecord(BaseModel):
     verdict_ref: str | None = None
     timestamp: datetime = Field(default_factory=now)
     notes: str | None = None
+    event_id: str = Field(default_factory=_event_id)
 
 
 class RunState(BaseModel):

@@ -975,7 +975,6 @@ name = "lha"
 version = "0.3.0"
 source = { editable = "." }
 dependencies = [
-    { name = "cocoindex" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-sqlite" },
     { name = "mcp" },
@@ -987,10 +986,13 @@ dependencies = [
     { name = "pyyaml" },
     { name = "ruff" },
     { name = "scikit-image" },
-    { name = "sentence-transformers" },
 ]
 
 [package.optional-dependencies]
+context = [
+    { name = "cocoindex" },
+    { name = "sentence-transformers" },
+]
 llm = [
     { name = "anthropic" },
 ]
@@ -1000,14 +1002,16 @@ typecheck = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "cocoindex" },
     { name = "pyright" },
     { name = "pytest-cov" },
+    { name = "sentence-transformers" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "anthropic", marker = "extra == 'llm'", specifier = ">=0.69" },
-    { name = "cocoindex", specifier = ">=1.0.11" },
+    { name = "cocoindex", marker = "extra == 'context'", specifier = ">=1.0.11" },
     { name = "langgraph", specifier = ">=1.2.6" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.0" },
     { name = "mcp", specifier = ">=1.28.0" },
@@ -1020,14 +1024,16 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "ruff", specifier = ">=0.15.18" },
     { name = "scikit-image", specifier = ">=0.26.0" },
-    { name = "sentence-transformers", specifier = ">=5.6.0" },
+    { name = "sentence-transformers", marker = "extra == 'context'", specifier = ">=5.6.0" },
 ]
-provides-extras = ["llm", "typecheck"]
+provides-extras = ["context", "llm", "typecheck"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cocoindex", specifier = ">=1.0.11" },
     { name = "pyright", specifier = ">=1.1.410" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
+    { name = "sentence-transformers", specifier = ">=5.6.0" },
 ]
 
 [[package]]

@@ -10,6 +10,8 @@ cannot reach the test oracle on disk, which keeps the ablation leak-free.
 
 from __future__ import annotations
 
+import json
+
 from ..tools.shell import run
 from .base import LLMClient
 
@@ -43,11 +45,14 @@ class ClaudeCLIClient(LLMClient):
         self.timeout = timeout
         self.model = model
         self.no_tools = no_tools
+        # usage of the most recent call (tokens/cost), for the run trace
+        self.last_usage: dict | None = None
 
     def complete(self, system: str, prompt: str) -> str:
         # Pipe the prompt via stdin instead of argv: a large-repo prompt on argv
         # overflows ARG_MAX (E2BIG). `claude -p` reads the prompt from stdin.
-        cmd = [self.cli_path, "-p", "--append-system-prompt", system]
+        # JSON output carries token usage and cost alongside the result text.
+        cmd = [self.cli_path, "-p", "--output-format", "json", "--append-system-prompt", system]
         if self.model:
             cmd += ["--model", self.model]
         if self.no_tools:
@@ -55,4 +60,19 @@ class ClaudeCLIClient(LLMClient):
         res = run(cmd, timeout=self.timeout, input=prompt)
         if not res.ok:
             raise RuntimeError(f"claude CLI failed ({res.returncode}): {res.stderr[:400]}")
+        self.last_usage = None
+        try:
+            data = json.loads(res.stdout)
+        except json.JSONDecodeError:
+            return res.stdout  # older CLI / plain-text fallback
+        if isinstance(data, dict) and "result" in data:
+            usage = data.get("usage")
+            self.last_usage = {
+                "input_tokens": (usage or {}).get("input_tokens"),
+                "output_tokens": (usage or {}).get("output_tokens"),
+                "cost_usd": data.get("total_cost_usd"),
+                "model": (data.get("modelUsage") and next(iter(data["modelUsage"]), None))
+                or self.model,
+            }
+            return str(data["result"])
         return res.stdout

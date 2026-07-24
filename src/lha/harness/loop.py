@@ -108,7 +108,9 @@ class Harness:
     def __init__(self, config: Config | None = None, *, auto_approve: bool = False):
         self.config = config or Config.from_env()
         self.auto_approve = auto_approve
-        self.llm = get_llm(self.config)
+        from ..llm.trace import TracedLLM
+
+        self.llm = TracedLLM(get_llm(self.config), max_calls=self.config.max_llm_calls)
         self.exec = self._make_exec_backend(self.config)
         self._backups: dict[str, Backup] = {}
 
@@ -142,6 +144,10 @@ class Harness:
     def _drive(self, state: RunState) -> RunResult:
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
+        from ..llm.trace import TracedLLM
+
+        if isinstance(self.llm, TracedLLM):
+            self.llm.bind(run_dir)  # per-call records land in llm_trace.jsonl
 
         # Point code context at the stable target repo (indexed once, reused across
         # runs) rather than the ephemeral per-run workdir — the latter churns the
@@ -254,7 +260,7 @@ class Harness:
         workdir = Path(state.workdir)
 
         # 1. CONTEXT
-        bundle = ContextEngineer(self.config).gather(step)
+        bundle = ContextEngineer(self.config).gather(step, workdir=workdir)
         _dump(run_dir, step.step_id, "context_bundle.json", bundle.model_dump_json(indent=2))
         append_ledger(
             state,
