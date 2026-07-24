@@ -238,7 +238,29 @@ def _result_dict(result) -> dict:
         "run_dir": str(run_dir),
         "verified": verified,
         "summary": result.state.pr_summary_path,
+        "llm_usage": _usage_totals(run_dir),
     }
+
+
+def _usage_totals(run_dir: Path) -> dict | None:
+    """Sum the run's llm_trace.jsonl into {calls, input_tokens, output_tokens, cost_usd}."""
+    import json
+
+    trace = run_dir / "llm_trace.jsonl"
+    if not trace.exists():
+        return None
+    totals = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    for line in trace.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a torn tail must not hide the rest of the trace
+        totals["calls"] += 1
+        usage = rec.get("usage") or {}
+        totals["input_tokens"] += int(usage.get("input_tokens") or 0)
+        totals["output_tokens"] += int(usage.get("output_tokens") or 0)
+        totals["cost_usd"] += float(usage.get("cost_usd") or 0.0)
+    return totals
 
 
 def _emit(result, args) -> int:

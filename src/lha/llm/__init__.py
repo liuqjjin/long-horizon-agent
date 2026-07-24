@@ -14,7 +14,9 @@ def get_llm(config: Config) -> LLMClient:
     if backend == "claude_cli":
         from .claude_cli import ClaudeCLIClient
 
-        return ClaudeCLIClient(cli_path=config.claude_cli_path)
+        return ClaudeCLIClient(
+            cli_path=config.claude_cli_path, model=config.claude_cli_model or None
+        )
     if backend == "anthropic":
         from .anthropic_client import AnthropicClient
 

@@ -70,6 +70,8 @@ class Config(BaseModel):
     # LLM backend: "stub" | "claude_cli" | "anthropic"
     llm_backend: str = "stub"
     claude_cli_path: str = "claude"
+    # Pin a full model snapshot for reproducible runs; "" lets the CLI decide.
+    claude_cli_model: str = ""
     anthropic_model_impl: str = "claude-opus-4-8"
     anthropic_model_orchestration: str = "claude-sonnet-4-6"
 
@@ -101,6 +103,7 @@ class Config(BaseModel):
             freshness_max_age_s=float(_env("LHA_FRESHNESS_MAX_AGE_S", "3600")),
             llm_backend=_env("LHA_LLM_BACKEND", "stub"),
             claude_cli_path=_env("LHA_CLAUDE_CLI", "claude"),
+            claude_cli_model=_env("LHA_CLAUDE_MODEL", ""),
             anthropic_model_impl=_env("LHA_ANTHROPIC_MODEL_IMPL", "claude-opus-4-8"),
             anthropic_model_orchestration=_env("LHA_ANTHROPIC_MODEL_ORCH", "claude-sonnet-4-6"),
             code_backend=_env("LHA_CODE_BACKEND", "auto"),
