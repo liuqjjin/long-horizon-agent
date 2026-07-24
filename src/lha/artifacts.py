@@ -29,6 +29,10 @@ class Step(BaseModel):
     verifiers: list[str] = Field(default_factory=list)  # verifier names to run
     params: dict[str, Any] = Field(default_factory=dict)  # verifier/executor params
     requires_approval: bool = False
+    # "required": missing/unavailable context fails the context checks (default —
+    # fail closed). "optional": a task that genuinely needs no retrieval declares
+    # it, instead of passing on an empty result.
+    context_requirement: Literal["required", "optional"] = "required"
     # populated when a step is re-issued as a repair
     repair_of: str | None = None
     prior_failures: list[str] = Field(default_factory=list)

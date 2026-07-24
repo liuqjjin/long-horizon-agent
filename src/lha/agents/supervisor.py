@@ -46,6 +46,7 @@ class Supervisor:
 
     def _template(self, task: TaskSpec) -> Plan:
         cq = task.inputs.get("context_query") or task.title
+        creq = task.context_requirement
         if task.kind == "issue_to_pr":
             steps = [
                 Step(
@@ -56,6 +57,7 @@ class Supervisor:
                     context_query=cq,
                     verifiers=["freshness", "citation"],
                     success_criteria=["context retrieved with provenance"],
+                    context_requirement=creq,
                 ),
                 Step(
                     step_id="s2-fix",
@@ -66,6 +68,7 @@ class Supervisor:
                     verifiers=["pytest", "ruff"],
                     requires_approval=bool(task.inputs.get("require_approval", False)),
                     success_criteria=task.success or ["pytest passes", "ruff clean"],
+                    context_requirement=creq,
                 ),
             ]
             return Plan(
@@ -85,6 +88,7 @@ class Supervisor:
                     context_query=cq,
                     verifiers=["freshness", "citation"],
                     success_criteria=["answer cites fresh sources"],
+                    context_requirement=creq,
                 )
             ]
             return Plan(
@@ -108,6 +112,7 @@ class Supervisor:
                     context_query=cq,
                     verifiers=["freshness", "citation"],
                     success_criteria=["context retrieved with provenance"],
+                    context_requirement=creq,
                 ),
                 Step(
                     step_id="s2-run",
@@ -118,6 +123,7 @@ class Supervisor:
                     verifiers=["psnr", "ssim", "reproducibility"],
                     params=params,
                     success_criteria=task.success or ["metrics meet thresholds", "reproducible"],
+                    context_requirement=creq,
                 ),
             ]
             return Plan(

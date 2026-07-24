@@ -21,8 +21,8 @@ from typing import Any
 
 from ...clock import now
 from ..freshness import content_hash
-from ..models import CodeHit, Hit, Provenance
-from .base import SearchBackend
+from ..models import CodeHit, Hit, Provenance, ReindexResult
+from .base import BackendUnavailable, SearchBackend
 
 
 def find_ccc() -> str | None:
@@ -166,7 +166,7 @@ class CccBackend(SearchBackend):
 
     def search(self, query: str, *, k: int = 8, **filters) -> list[Hit]:
         if not self.available():
-            return []
+            raise BackendUnavailable(f"ccc backend unavailable (ccc={self._ccc}, root={self.root})")
         languages = filters.get("languages")
         paths = filters.get("paths")
         # Default to refreshing: ccc builds its vector target lazily on the first
@@ -177,8 +177,10 @@ class CccBackend(SearchBackend):
         _iv, indexed_at = self.index_meta()
         try:
             rows = asyncio.run(self._search_async(query, k, languages, paths, refresh))
-        except Exception:
-            return []
+        except Exception as e:
+            # A failed search is NOT an empty result — the caller must know the
+            # difference or missing context silently reads as "nothing relevant".
+            raise BackendUnavailable(f"ccc search failed: {type(e).__name__}: {e}") from e
         hits: list[Hit] = [_result_to_codehit(r, self.root, indexed_at) for r in rows]
         return hits[:k]
 
@@ -194,25 +196,56 @@ class CccBackend(SearchBackend):
             return (f"ccc@{int(mtime)}", ts)
         return ("ccc@uninitialized", now())
 
-    def reindex(self, paths: list[str] | None = None) -> None:
+    def reindex(self, paths: list[str] | None = None) -> ReindexResult:
+        version_before, _ = self.index_meta()
         if not self._ccc:
-            return
+            return ReindexResult(
+                kind=self.kind, ok=False, version_before=version_before,
+                detail="ccc executable not found",
+            )
         env = _env_with_local_bin()
-        # Auto-init a fresh project (e.g. a run sandbox) before indexing.
-        if not (self.root / ".cocoindex_code" / "settings.yml").exists():
-            subprocess.run(
-                [self._ccc, "init", "-f"],
+        try:
+            # Auto-init a fresh project (e.g. a run sandbox) before indexing.
+            if not (self.root / ".cocoindex_code" / "settings.yml").exists():
+                init = subprocess.run(
+                    [self._ccc, "init", "-f"],
+                    cwd=str(self.root),
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if init.returncode != 0:
+                    return ReindexResult(
+                        kind=self.kind, ok=False, version_before=version_before,
+                        detail=f"ccc init failed (exit {init.returncode}): {init.stderr[-300:]}",
+                    )
+            proc = subprocess.run(
+                [self._ccc, "index"],
                 cwd=str(self.root),
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=600,
             )
-        subprocess.run(
-            [self._ccc, "index"],
-            cwd=str(self.root),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=600,
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return ReindexResult(
+                kind=self.kind, ok=False, version_before=version_before,
+                detail=f"ccc index did not run: {type(e).__name__}: {e}",
+            )
+        version_after, _ = self.index_meta()
+        if proc.returncode != 0:
+            return ReindexResult(
+                kind=self.kind, ok=False,
+                version_before=version_before, version_after=version_after,
+                detail=f"ccc index failed (exit {proc.returncode}): {proc.stderr[-300:]}",
+            )
+        if not (self.root / ".cocoindex_code").exists():
+            return ReindexResult(
+                kind=self.kind, ok=False,
+                version_before=version_before, version_after=version_after,
+                detail="ccc index reported success but no index directory exists",
+            )
+        return ReindexResult(
+            kind=self.kind, ok=True, version_before=version_before, version_after=version_after
         )

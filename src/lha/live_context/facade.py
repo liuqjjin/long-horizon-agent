@@ -11,7 +11,7 @@ from pathlib import Path
 from ..clock import now
 from ..config import Config
 from . import freshness as _freshness
-from .backends.base import SearchBackend
+from .backends.base import BackendUnavailable, SearchBackend
 from .backends.ccc_backend import CccBackend
 from .backends.coco_flow import CocoFlowBackend
 from .backends.null_backend import NullBackend
@@ -19,15 +19,18 @@ from .models import (
     CodeHit,
     ContextBundle,
     ContextItem,
+    ContextStatus,
     ExperimentHit,
     PaperHit,
+    ReindexResult,
     SkillHit,
     SourceKind,
 )
 
 
 class StaleContextError(RuntimeError):
-    """Raised by ``reject_stale`` when context is stale and reindex is disabled."""
+    """Raised by ``reject_stale`` when stale context cannot be refreshed —
+    either reindexing is disabled or the reindex itself failed."""
 
 
 class _FacadeState:
@@ -69,24 +72,29 @@ def _code_backend() -> SearchBackend:
     return backend
 
 
-def index_code(path: str | Path) -> None:
+def index_code(path: str | Path) -> ReindexResult:
     """Build/refresh the code index for ``path`` and point the facade at it.
 
     Used to prime a run sandbox before the Context Engineer searches it.
+    Returns the structured reindex outcome; callers that require fresh context
+    must check ``.ok`` rather than assume success.
     """
     configure(code_root=path)
-    _code_backend().reindex()
+    result = _code_backend().reindex()
     _state.reset_cache()
+    return result
 
 
-def index_docs(kinds: tuple[SourceKind, ...] = ("paper", "experiment", "skill")) -> None:
+def index_docs(kinds: tuple[SourceKind, ...] = ("paper", "experiment", "skill")) -> list[ReindexResult]:
     """Run the CocoIndex BUILD flows to (re)index paper/experiment/skill notes."""
+    results: list[ReindexResult] = []
     for kind in kinds:
         sourcedir = _state.config.data_dir / f"{kind}s"
         if not sourcedir.exists():
             continue  # nothing to index for this kind yet
-        CocoFlowBackend(kind, _state.config.data_dir).reindex()
+        results.append(CocoFlowBackend(kind, _state.config.data_dir).reindex())
     _state.reset_cache()
+    return results
 
 
 def _backend_for(kind: SourceKind) -> SearchBackend:
@@ -134,13 +142,29 @@ def get_fresh_context(
     k: int = 8,
     max_age_s: float | None = None,
 ) -> ContextBundle:
-    """Multi-source search + provenance + freshness in one bundle."""
+    """Multi-source search + provenance + freshness + availability in one bundle.
+
+    The bundle's ``status`` distinguishes "searched and found nothing" (``empty``)
+    from "could not search" (``backend_unavailable``) — the two must never be
+    conflated, or missing infrastructure reads as verified-empty context.
+    """
     items: list[ContextItem] = []
     versions: list[str] = []
     indexed_ats = []
+    notes: list[str] = []
+    unavailable = False
     for kind in kinds:
         be = _backend_for(kind)
-        hits = be.search(query, k=k)
+        if isinstance(be, NullBackend):
+            unavailable = True
+            notes.append(f"{kind}: no backend available")
+            continue
+        try:
+            hits = be.search(query, k=k)
+        except BackendUnavailable as e:
+            unavailable = True
+            notes.append(f"{kind}: {e}")
+            continue
         # Only backends that actually contributed context affect freshness, so an
         # empty/uninitialized backend can't skew the bundle's indexed_at.
         if hits:
@@ -159,11 +183,21 @@ def get_fresh_context(
     if max_age_s is not None and freshness.is_stale(max_age_s) and not freshness.is_stale_flag:
         freshness.is_stale_flag = True
         freshness.reasons.append(f"older than max_age_s={max_age_s}")
-    return ContextBundle(query=query, items=items, freshness=freshness)
+    status: ContextStatus = "ok"
+    if not items:
+        status = "backend_unavailable" if unavailable else "empty"
+    return ContextBundle(
+        query=query, items=items, freshness=freshness, status=status, status_notes=notes
+    )
 
 
 def reject_stale(bundle: ContextBundle, *, reindex: bool = True) -> ContextBundle:
-    """Refresh a stale bundle: incrementally re-index its sources and re-search."""
+    """Refresh a stale bundle: incrementally re-index its sources and re-search.
+
+    Fails closed: if any source's reindex does not verifiably succeed, this
+    raises ``StaleContextError`` and the bundle stays stale — a failed refresh
+    must never clear the stale flag.
+    """
     if not bundle.freshness.is_stale():
         return bundle
     if not reindex:
@@ -173,13 +207,19 @@ def reject_stale(bundle: ContextBundle, *, reindex: bool = True) -> ContextBundl
     kinds: tuple[SourceKind, ...] = tuple(
         dict.fromkeys(i.provenance.source_kind for i in bundle.items)
     ) or ("code",)
-    for kind in kinds:
-        _backend_for(kind).reindex()
+    results = [_backend_for(kind).reindex() for kind in kinds]
+    failed = [r for r in results if not r.ok]
+    if failed:
+        raise StaleContextError(
+            "stale context could not be refreshed: "
+            + "; ".join(f"{r.kind}: {r.detail}" for r in failed)
+        )
     _state.reset_cache()
     k = max(len(bundle.items), 1)
     refreshed = get_fresh_context(bundle.query, kinds=kinds, k=k)
-    # We just reindexed, so the bundle is fresh by construction; mtime lag (e.g. a
-    # touched-but-unchanged source that memoization skipped) must not re-flag it.
+    # The reindex verifiably succeeded, so the bundle is fresh by construction;
+    # mtime lag (e.g. a touched-but-unchanged source that memoization skipped)
+    # must not re-flag it.
     refreshed.freshness.is_stale_flag = False
     refreshed.freshness.reasons = []
     refreshed.freshness.indexed_at = now()

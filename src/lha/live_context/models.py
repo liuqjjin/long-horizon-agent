@@ -15,6 +15,13 @@ from ..clock import now
 
 SourceKind = Literal["code", "paper", "experiment", "skill"]
 
+# Availability of the context that backs a bundle. Distinct from staleness:
+# ``empty`` means the backends ran and found nothing; ``backend_unavailable``
+# means at least one requested backend could not serve the query at all;
+# ``index_failed`` means a (re)index attempt failed, so the bundle cannot be
+# trusted to reflect the source.
+ContextStatus = Literal["ok", "empty", "backend_unavailable", "index_failed"]
+
 
 class Provenance(BaseModel):
     """Where a piece of context came from and when it was indexed."""
@@ -76,6 +83,16 @@ class Freshness(BaseModel):
         return False
 
 
+class ReindexResult(BaseModel):
+    """Structured outcome of a backend reindex — success must be checked, never assumed."""
+
+    kind: SourceKind
+    ok: bool
+    version_before: str = ""
+    version_after: str = ""
+    detail: str = ""
+
+
 class ContextItem(BaseModel):
     """One unit of context the rest of the system reasons over."""
 
@@ -94,6 +111,10 @@ class ContextBundle(BaseModel):
     items: list[ContextItem] = Field(default_factory=list)
     freshness: Freshness
     answer: str | None = None
+    # Availability of the backing context. A verifier must not treat an empty or
+    # unavailable bundle as verified context (see verifiers/context/*).
+    status: ContextStatus = "ok"
+    status_notes: list[str] = Field(default_factory=list)
 
     def locators(self) -> list[str]:
         return [i.provenance.locator for i in self.items]

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from conftest import hermetic_task
+
 from lha.config import Config
 from lha.harness import Harness
-from lha.tasks.spec import TaskSpec
 from lha.verifiers.verdict import Verdict
 
 
@@ -21,7 +22,7 @@ def _config(tmp_path: Path) -> Config:
 
 
 def test_issue_to_pr_reaches_verified_done(tmp_path):
-    task = TaskSpec.from_file("data/tasks/fix_average.yaml")
+    task = hermetic_task("data/tasks/fix_average.yaml")
     result = Harness(_config(tmp_path)).run(task)
 
     assert result.status == "DONE"

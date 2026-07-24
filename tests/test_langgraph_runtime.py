@@ -8,9 +8,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from conftest import hermetic_task
 
 from lha.config import Config
-from lha.tasks.spec import TaskSpec
 from lha.verifiers.verdict import Verdict
 
 pytest.importorskip("langgraph")
@@ -25,7 +25,7 @@ def test_langgraph_runtime_reaches_verified_done(tmp_path):
         runs_dir=tmp_path / "runs",
         data_dir=tmp_path / "nodata",
     )
-    result = LangGraphHarness(cfg).run(TaskSpec.from_file("data/tasks/fix_average.yaml"))
+    result = LangGraphHarness(cfg).run(hermetic_task("data/tasks/fix_average.yaml"))
     assert result.status == "DONE"
 
     run_dir = Path(result.state.run_dir)

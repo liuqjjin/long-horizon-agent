@@ -38,8 +38,11 @@ class ContextEngineer:
         if bundle.freshness.is_stale():
             try:
                 bundle = reject_stale(bundle)
-            except StaleContextError:
-                pass
+            except StaleContextError as e:
+                # Refresh failed: the bundle stays stale AND is marked so the
+                # freshness verifier fails it closed with a diagnosable reason.
+                bundle.status = "index_failed"
+                bundle.status_notes.append(str(e))
         if step.action == "answer_query":
             bundle.answer = self._synthesize(bundle)
         return bundle

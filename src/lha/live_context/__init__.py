@@ -3,6 +3,7 @@
 Import from here, never from ``cocoindex`` / ``cocoindex_code`` / ``ccc``.
 """
 
+from .backends.base import BackendUnavailable
 from .facade import (
     StaleContextError,
     configure,
@@ -19,10 +20,12 @@ from .models import (
     CodeHit,
     ContextBundle,
     ContextItem,
+    ContextStatus,
     ExperimentHit,
     Freshness,
     PaperHit,
     Provenance,
+    ReindexResult,
     SkillHit,
 )
 
@@ -37,6 +40,9 @@ __all__ = [
     "index_code",
     "index_docs",
     "StaleContextError",
+    "BackendUnavailable",
+    "ContextStatus",
+    "ReindexResult",
     "CodeHit",
     "PaperHit",
     "ExperimentHit",

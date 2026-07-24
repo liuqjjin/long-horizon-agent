@@ -125,8 +125,15 @@ def _cmd_ablate(args) -> int:
 
 def _cmd_index(args) -> int:
     live_context.configure(code_root=args.path, config=_config(args))
-    live_context.index_code(args.path)
-    hits = live_context.search_code("function", k=1)
+    result = live_context.index_code(args.path)
+    if not result.ok:
+        print(f"index FAILED for {args.path}: {result.detail}")
+        return 1
+    try:
+        hits = live_context.search_code("function", k=1)
+    except live_context.BackendUnavailable as e:
+        print(f"indexed {args.path}, but the smoke search failed: {e}")
+        return 1
     print(f"indexed {args.path} (smoke search returned {len(hits)} hit(s))")
     return 0
 

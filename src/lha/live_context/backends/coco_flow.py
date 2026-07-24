@@ -17,7 +17,15 @@ from pathlib import Path
 
 from ...clock import now
 from ..freshness import content_hash
-from ..models import ExperimentHit, Hit, PaperHit, Provenance, SkillHit, SourceKind
+from ..models import (
+    ExperimentHit,
+    Hit,
+    PaperHit,
+    Provenance,
+    ReindexResult,
+    SkillHit,
+    SourceKind,
+)
 from . import vector_query
 from .base import SearchBackend
 
@@ -37,7 +45,12 @@ class CocoFlowBackend(SearchBackend):
     def search(self, query: str, *, k: int = 5, **filters) -> list[Hit]:
         metric = filters.get("metric")
         _iv, indexed_at = self.index_meta()
-        rows = vector_query.search(self.index_dir, query, k, metric=metric)
+        try:
+            rows = vector_query.search(self.index_dir, query, k, metric=metric)
+        except Exception as e:  # embedder/IO failure is not an empty result
+            from .base import BackendUnavailable
+
+            raise BackendUnavailable(f"{self.name} search failed: {type(e).__name__}: {e}") from e
         # Drop malformed records with no resolvable source, so freshness never
         # silently passes on an unknown locator.
         rows = [r for r in rows if r.get("source_path") or r.get("locator")]
@@ -92,16 +105,27 @@ class CocoFlowBackend(SearchBackend):
         return (f"coco:{self.kind}@uninitialized", now())
 
     # --- build path (runs CocoIndex) ---------------------------------------
-    def reindex(self, paths: list[str] | None = None) -> None:
-        import cocoindex as coco
+    def reindex(self, paths: list[str] | None = None) -> ReindexResult:
+        version_before, _ = self.index_meta()
+        try:
+            import cocoindex as coco
 
-        state_dir = (self.data_dir / ".lha_index").resolve()
-        state_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["COCOINDEX_DB"] = str(state_dir / "state.db")
+            state_dir = (self.data_dir / ".lha_index").resolve()
+            state_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["COCOINDEX_DB"] = str(state_dir / "state.db")
 
-        app = self._build_app()
-        with coco.runtime():
-            app.update_blocking(report_to_stdout=False)
+            app = self._build_app()
+            with coco.runtime():
+                app.update_blocking(report_to_stdout=False)
+        except Exception as e:  # import failure, flow error, IO — all mean "not refreshed"
+            return ReindexResult(
+                kind=self.kind, ok=False, version_before=version_before,
+                detail=f"cocoindex flow failed: {type(e).__name__}: {e}",
+            )
+        version_after, _ = self.index_meta()
+        return ReindexResult(
+            kind=self.kind, ok=True, version_before=version_before, version_after=version_after
+        )
 
     def _build_app(self):
         _ensure_flows_importable()

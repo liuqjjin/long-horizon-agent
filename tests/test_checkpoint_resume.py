@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from conftest import hermetic_task
+
 from lha.config import Config
 from lha.harness import Harness
-from lha.tasks.spec import TaskSpec
 
 
 def test_pause_then_resume(tmp_path):
-    task = TaskSpec.from_file("data/tasks/fix_average.yaml")
+    task = hermetic_task("data/tasks/fix_average.yaml")
     runs = tmp_path / "runs"
 
     nodata = tmp_path / "nodata"

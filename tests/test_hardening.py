@@ -11,6 +11,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from conftest import hermetic_task
 
 from lha.agents.verifier_agent import VerifierAgent
 from lha.artifacts import Patch, Step
@@ -18,7 +19,6 @@ from lha.config import Config
 from lha.harness import Harness
 from lha.harness.approval import ApprovalDecision, HumanApprovalGate
 from lha.llm.anthropic_client import AnthropicClient, AnthropicResponseError
-from lha.tasks.spec import TaskSpec
 from lha.tools.shell import ProcResult
 from lha.verifiers import VerifyContext, registry
 from lha.verifiers.base import Verifier
@@ -94,7 +94,7 @@ def test_unregistered_verifier_fails_closed(tmp_path):
 
 # --- budget bounds the whole run, not a single process ----------------------
 def test_budget_is_per_run_across_resume(tmp_path):
-    task = TaskSpec.from_file("data/tasks/fix_average.yaml")
+    task = hermetic_task("data/tasks/fix_average.yaml")
 
     paused = Harness(_cfg(tmp_path, max_steps=1)).run(task)
     assert paused.status == "PAUSED"
@@ -226,7 +226,7 @@ def _force_failing_pytest(monkeypatch):
 def test_loop_reverts_unverified_patch(tmp_path, monkeypatch):
     _force_failing_pytest(monkeypatch)
     result = Harness(_cfg(tmp_path, max_repairs=0)).run(
-        TaskSpec.from_file("data/tasks/fix_average.yaml")
+        hermetic_task("data/tasks/fix_average.yaml")
     )
     assert result.status == "FAILED"
     # the stub applied its fix, verification failed, so the change must be reverted:
@@ -241,7 +241,7 @@ def test_langgraph_reverts_unverified_patch(tmp_path, monkeypatch):
     from lha.runtime.langgraph_runner import LangGraphHarness
 
     result = LangGraphHarness(_cfg(tmp_path, max_repairs=0)).run(
-        TaskSpec.from_file("data/tasks/fix_average.yaml")
+        hermetic_task("data/tasks/fix_average.yaml")
     )
     assert result.status == "FAILED"
     # without the revert fix, langgraph would leave the unverified patch in place.
@@ -254,7 +254,7 @@ def test_langgraph_budget_caps_steps(tmp_path):
     from lha.runtime.langgraph_runner import LangGraphHarness
 
     paused = LangGraphHarness(_cfg(tmp_path, max_steps=1)).run(
-        TaskSpec.from_file("data/tasks/fix_average.yaml")
+        hermetic_task("data/tasks/fix_average.yaml")
     )
     assert paused.status == "PAUSED"  # max_steps bounds the durable runtime too
     assert paused.state.steps_used == 1
@@ -266,14 +266,14 @@ def test_langgraph_deadline_pauses(tmp_path):
     from lha.runtime.langgraph_runner import LangGraphHarness
 
     paused = LangGraphHarness(_cfg(tmp_path, deadline_s=0.0)).run(
-        TaskSpec.from_file("data/tasks/fix_average.yaml")
+        hermetic_task("data/tasks/fix_average.yaml")
     )
     assert paused.status == "PAUSED"  # deadline_s now bounds the durable runtime too
 
 
 def test_loop_reverts_on_approval_rejection(tmp_path):
     cfg = _cfg(tmp_path)  # auto_approve defaults to False -> non-interactive pause
-    paused = Harness(cfg).run(TaskSpec.from_file("data/tasks/fix_average_approval.yaml"))
+    paused = Harness(cfg).run(hermetic_task("data/tasks/fix_average_approval.yaml"))
     assert paused.status == "AWAITING_APPROVAL"
     mathutils = Path(paused.state.run_dir) / "workdir" / "mathutils.py"
     assert "len(values) - 1" not in mathutils.read_text()  # patch applied, pending approval
@@ -288,7 +288,7 @@ def test_approval_reuses_the_reviewed_patch_on_resume(tmp_path, monkeypatch):
     from lha.agents import implementer
 
     cfg = _cfg(tmp_path)
-    paused = Harness(cfg).run(TaskSpec.from_file("data/tasks/fix_average_approval.yaml"))
+    paused = Harness(cfg).run(hermetic_task("data/tasks/fix_average_approval.yaml"))
     assert paused.status == "AWAITING_APPROVAL"
     HumanApprovalGate(paused.state.run_dir).resolve(approved=True, note="ok")
 
@@ -306,7 +306,7 @@ def test_approval_reuses_the_reviewed_patch_on_resume(tmp_path, monkeypatch):
 
 def test_stale_approval_decision_is_ignored(tmp_path):
     cfg = _cfg(tmp_path)
-    paused = Harness(cfg).run(TaskSpec.from_file("data/tasks/fix_average_approval.yaml"))
+    paused = Harness(cfg).run(hermetic_task("data/tasks/fix_average_approval.yaml"))
     assert paused.status == "AWAITING_APPROVAL"
     # an approval left for a DIFFERENT step must not resume the current one.
     (Path(paused.state.run_dir) / "approval.json").write_text(

@@ -21,6 +21,14 @@ class TaskSpec(BaseModel):
     target_repo: str | None = None
     inputs: dict[str, Any] = Field(default_factory=dict)
     success: list[str] = Field(default_factory=list)
+    # Whether the plan's context-gathering must produce verifiable context
+    # ("required", the fail-closed default) or the task can proceed without any
+    # ("optional" — an explicit declaration, never an implicit fallback).
+    context_requirement: Literal["required", "optional"] = "required"
+    # Files the task explicitly authorizes the agent to modify even though the
+    # oracle-protection policy would refuse them (e.g. a task whose goal IS to
+    # fix a test). Relative paths, exact matches against patch entries.
+    allowed_protected_files: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_file(cls, path: str | Path) -> "TaskSpec":

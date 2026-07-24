@@ -11,13 +11,14 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from conftest import hermetic_task
+
 from lha import eval as lha_eval
 from lha import orchestrator
 from lha.artifacts import ExperimentResult, Patch, Step
 from lha.config import Config
 from lha.harness import Harness
 from lha.memory import SkillMemory
-from lha.tasks.spec import TaskSpec
 from lha.verifiers import VerifyContext
 from lha.verifiers.context import CitationVerifier
 from lha.verifiers.verdict import Check, Verdict
@@ -104,7 +105,7 @@ def test_loop_fails_closed_on_midstep_exception(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Harness, "_execute", boom)
     # run() must return a clean FAILED, not propagate the exception or wedge at RUNNING.
-    result = Harness(_cfg(tmp_path)).run(TaskSpec.from_file("data/tasks/fix_average.yaml"))
+    result = Harness(_cfg(tmp_path)).run(hermetic_task("data/tasks/fix_average.yaml"))
     assert result.status == "FAILED"
     # the fault is ledgered as a fail (not silently dropped).
     ledger = (Path(result.state.run_dir) / "ledger.jsonl").read_text()
@@ -122,7 +123,7 @@ def test_loop_reverts_applied_patch_on_midstep_fault(tmp_path, monkeypatch):
         return real(self, step, artifact, ctx)
 
     monkeypatch.setattr(verifier_agent.VerifierAgent, "verify", boom_on_edit)
-    result = Harness(_cfg(tmp_path)).run(TaskSpec.from_file("data/tasks/fix_average.yaml"))
+    result = Harness(_cfg(tmp_path)).run(hermetic_task("data/tasks/fix_average.yaml"))
     assert result.status == "FAILED"
     # the in-flight patch must be reverted — the original bug is back in the sandbox.
     restored = (Path(result.state.run_dir) / "workdir" / "mathutils.py").read_text()
@@ -131,7 +132,7 @@ def test_loop_reverts_applied_patch_on_midstep_fault(tmp_path, monkeypatch):
 
 # --- per-step artifacts preserve every step's provenance --------------------
 def test_per_step_artifacts_written_and_finalizer_reads_the_edit_step(tmp_path):
-    result = Harness(_cfg(tmp_path)).run(TaskSpec.from_file("data/tasks/fix_average.yaml"))
+    result = Harness(_cfg(tmp_path)).run(hermetic_task("data/tasks/fix_average.yaml"))
     assert result.status == "DONE"
     run_dir = Path(result.state.run_dir)
     # both steps keep their own verify.json; the edit step keeps its patch.json
@@ -178,5 +179,10 @@ def test_citation_verifies_experiment_result(tmp_path):
     unresolved = ExperimentResult(step_id="s", based_on_context=["paper:does-not-resolve"])
     assert not CitationVerifier().verify(unresolved, ctx).passed  # was silently passed before
 
+    # zero citations: fails closed when the step requires context, passes only
+    # under an explicit optional declaration
     clean = ExperimentResult(step_id="s", based_on_context=[])
-    assert CitationVerifier().verify(clean, ctx).passed
+    assert not CitationVerifier().verify(clean, ctx).passed
+    opt_step = step.model_copy(update={"context_requirement": "optional"})
+    opt_ctx = VerifyContext(workdir=tmp_path, step=opt_step, bundle=None)
+    assert CitationVerifier().verify(clean, opt_ctx).passed
