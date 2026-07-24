@@ -218,3 +218,118 @@ def test_errored_runs_excluded_from_rates():
     assert stats["trust"].n == 1 and stats["trust"].false_success_rate == 1.0
     assert isinstance(stats["trust"], ConditionStats)
     assert CONDITIONS[0][0] == "trust"
+
+
+# --- P0-D: independent truth (prediction vs scorer) ---------------------------
+def test_gate_rejected_correct_fix_is_scored_as_false_negative(tmp_path, monkeypatch):
+    """The internal gate is a prediction, not truth: a correct fix the gate
+    wrongly refuses must be graded by the scorer and counted as a false
+    negative (measurable recall), not vanish."""
+    import lha.ablation as abl
+    from lha.tools.shell import ProcResult
+
+    class _BrokenGateExec:
+        """Agent-side backend whose pytest always 'fails' (e.g. broken local env)."""
+
+        name = "broken-gate"
+
+        def run(self, cmd, *, cwd, timeout=300.0, input=None, limits=None):
+            return ProcResult(1, "", "simulated agent-env failure", 0.0)
+
+        def python(self):
+            return "python"
+
+        def tool(self, name):
+            return name
+
+    monkeypatch.setattr(abl, "TrustedLocalBackend", _BrokenGateExec)
+    report = _run(tmp_path, _FixedLLM(2))  # a CORRECT fix
+    rec = _by_cond(report)
+    # gate: claimed False (internal gate failed) but truth True (scorer passed)
+    assert rec["gate"].claimed_success is False
+    assert rec["gate"].true_success is True
+    assert rec["gate"].false_success is False
+    stats = {s.condition: s for s in report.stats}
+    assert stats["gate"].fn == 1 and stats["gate"].recall == 0.0
+
+
+def test_frozen_diff_excludes_oracle_and_junk(tmp_path):
+    from lha.ablation import _frozen_diff
+
+    src = _repo(tmp_path / "src")
+    wd = tmp_path / "wd"
+    import shutil as _sh
+
+    _sh.copytree(src, wd)
+    (wd / "m.py").write_text("def f():\n    return 2\n")  # source change
+    (wd / "new_helper.py").write_text("x = 1\n")  # added file
+    (wd / "tests" / "test_m.py").write_text("tampered")  # protected -> excluded
+    (wd / "__pycache__").mkdir()
+    (wd / "__pycache__" / "m.cpython-311.pyc").write_bytes(b"junk")
+
+    frozen = _frozen_diff(src, wd)
+    assert set(frozen) == {"m.py", "new_helper.py"}
+
+
+def test_frozen_diff_records_deletions(tmp_path):
+    from lha.ablation import _frozen_diff
+
+    src = _repo(tmp_path / "src")
+    (src / "todelete.py").write_text("gone = 1\n")
+    wd = tmp_path / "wd"
+    import shutil as _sh
+
+    _sh.copytree(src, wd)
+    (wd / "todelete.py").unlink()
+    frozen = _frozen_diff(src, wd)
+    assert frozen == {"todelete.py": None}
+
+
+def test_confusion_matrix_measures_false_positives():
+    """A gate that passes a wrong fix (flaky oracle, dirty env) shows up as FP;
+    nothing in the aggregation forces FP to zero."""
+    records = [
+        RunRecord("t1", "gate", 0, "DONE", True, False, True, 0, "", True, "sha1"),
+        RunRecord("t2", "gate", 0, "DONE", True, True, False, 0, "", True, "sha2"),
+        RunRecord("t3", "gate", 0, "FAILED", False, True, False, 0, "", False, "sha3"),
+    ]
+    stats = {s.condition: s for s in _aggregate(records)}
+    g = stats["gate"]
+    assert (g.tp, g.fp, g.tn, g.fn) == (1, 1, 0, 1)
+    assert g.precision == 0.5 and g.recall == 0.5
+    assert g.false_success_rate == 1 / 3  # the FP is a counted false success
+
+
+def test_cache_busts_when_task_changes(tmp_path):
+    out = tmp_path / "out"
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    base = _base(tmp_path)
+    run_ablation(base, [task], reps=1, out_dir=out, llm_client=_FixedLLM(2))
+    assert (out / "results" / "task__r0.json").exists()
+
+    # same cache dir, but the task definition changed -> fingerprint mismatch ->
+    # the cell recomputes (and here the failing LLM makes that observable).
+    Path(task).write_text(Path(task).read_text().replace("wrong value", "other value"))
+    rep2 = run_ablation(base, [task], reps=1, out_dir=out, llm_client=_FailingLLM())
+    assert all(r.status == "ERROR" for r in rep2.records)
+
+
+def test_legacy_cache_format_is_recomputed(tmp_path):
+    out = tmp_path / "out"
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    (out / "results").mkdir(parents=True)
+    # pre-fingerprint cache format: a bare list
+    (out / "results" / "task__r0.json").write_text("[]")
+    rep = run_ablation(_base(tmp_path), [task], reps=1, out_dir=out, llm_client=_FixedLLM(2))
+    assert _by_cond(rep)["trust"].true_success  # recomputed, not served stale
+
+
+def test_report_shows_gate_quality_and_scorer(tmp_path):
+    report = _run(tmp_path, _FixedLLM(2))
+    md = report.to_markdown()
+    assert "final scorer" in md
+    assert "precision" in md and "recall" in md and "FP=" in md
+    assert report.scorer == "trusted-local"
+    assert report.fingerprint

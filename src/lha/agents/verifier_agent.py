@@ -28,13 +28,18 @@ def _env_record(workdir: str | Path) -> dict[str, Any]:
             pkgs[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             pass
-    rev = run(["git", "rev-parse", "HEAD"])
-    commit = rev.stdout.strip() if rev.returncode == 0 else None
+    # The TARGET repo's commit (run in workdir — the harness's own commit would
+    # be a wrong provenance record for the code under verification). Run
+    # sandboxes are copied without .git, so None means "not a git checkout".
+    rev = run(["git", "rev-parse", "HEAD"], cwd=workdir)
+    target_commit = rev.stdout.strip() if rev.returncode == 0 else None
+    harness_rev = run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent)
     return {
         "python": sys.version.split()[0],
         "platform": platform.platform(),
         "packages": pkgs,
-        "git_commit": commit,
+        "target_git_commit": target_commit,
+        "harness_git_commit": harness_rev.stdout.strip() if harness_rev.returncode == 0 else None,
     }
 
 

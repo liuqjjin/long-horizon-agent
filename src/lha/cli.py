@@ -116,7 +116,15 @@ def _cmd_ablate(args) -> int:
         f"verification ablation: {len(tasks)} task(s) x 3 conditions x {args.reps} rep(s), "
         f"llm={llm} model={model or '(default)'}"
     )
-    report = run_ablation(cfg, tasks, llm=llm, model=model, reps=args.reps, out_dir=out)
+    report = run_ablation(
+        cfg,
+        tasks,
+        llm=llm,
+        model=model,
+        reps=args.reps,
+        out_dir=out,
+        scorer_backend=args.scorer_backend,
+    )
     print()
     print(report.to_markdown())
     print(f"report: {out / 'ablation_report.md'}")
@@ -308,6 +316,12 @@ def build_parser() -> argparse.ArgumentParser:
     pab.add_argument("--reps", type=int, default=1, help="repetitions per condition")
     pab.add_argument("--model", default="", help="implementer model (e.g. haiku) to calibrate difficulty")
     pab.add_argument("--out", default="", help="output dir (default: <runs>/ablation)")
+    pab.add_argument(
+        "--scorer-backend",
+        choices=["trusted-local", "docker"],
+        default="trusted-local",
+        help="where the independent final scorer runs (docker for untrusted repos)",
+    )
     pab.set_defaults(func=_cmd_ablate)
 
     pi = sub.add_parser("index", help="build the code index for a path")
