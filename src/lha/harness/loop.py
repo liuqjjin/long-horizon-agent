@@ -109,7 +109,16 @@ class Harness:
         self.config = config or Config.from_env()
         self.auto_approve = auto_approve
         self.llm = get_llm(self.config)
+        self.exec = self._make_exec_backend(self.config)
         self._backups: dict[str, Backup] = {}
+
+    @staticmethod
+    def _make_exec_backend(config: Config):
+        from ..sandbox import make_backend
+
+        if config.exec_backend == "docker":
+            return make_backend("docker", image=config.exec_image)
+        return make_backend(config.exec_backend)
 
     # --- public entry points ------------------------------------------------
     def run(self, task: TaskSpec, *, run_id: str | None = None) -> RunResult:
@@ -294,7 +303,9 @@ class Harness:
 
         # 4. VERIFY
         verdict = VerifierAgent(parallel=self.config.parallel_verify).verify(
-            step, artifact, VerifyContext(workdir=workdir, step=step, bundle=bundle)
+            step,
+            artifact,
+            VerifyContext(workdir=workdir, step=step, bundle=bundle, exec=self.exec),
         )
         _dump(run_dir, step.step_id, "verify.json", verdict.model_dump_json(indent=2))
         append_ledger(
@@ -387,7 +398,7 @@ class Harness:
             return patch, "patch.diff"
 
         if step.action == "run_experiment":
-            result: ExperimentResult = Experimenter().run(step, bundle, workdir)
+            result: ExperimentResult = Experimenter(self.exec).run(step, bundle, workdir)
             _dump(run_dir, step.step_id, "experiment.json", result.model_dump_json(indent=2))
             return result, "experiment.json"
 

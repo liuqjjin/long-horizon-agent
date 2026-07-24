@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import json
 import shutil
-import sys
 from pathlib import Path
 from typing import Any
 
-from ...tools.shell import run
 from ..base import Verifier, VerifyContext
 from ..verdict import Check
 
@@ -21,8 +19,9 @@ class PytestVerifier(Verifier):
         self.timeout = timeout
 
     def verify(self, artifact: Any, ctx: VerifyContext) -> Check:
-        # Absolute path: pytest runs with cwd=workdir, so a relative report path
-        # would resolve nested under the workdir and be unreadable here.
+        # The report path is relative so it works identically on the host and
+        # inside a container (cwd is the workdir either way); it is read back
+        # from the host side of the workdir mount.
         report = Path(ctx.workdir).resolve() / ".lha_pytest.json"
         report.unlink(missing_ok=True)
         # Clear bytecode caches first: a repair often rewrites a file to the same
@@ -31,13 +30,13 @@ class PytestVerifier(Verifier):
         # the repair loop never converge. Recompiling from source keeps verify honest.
         for cache in Path(ctx.workdir).rglob("__pycache__"):
             shutil.rmtree(cache, ignore_errors=True)
-        res = run(
+        res = ctx.exec.run(
             [
-                sys.executable,
+                ctx.exec.python(),
                 "-m",
                 "pytest",
                 "--json-report",
-                f"--json-report-file={report}",
+                "--json-report-file=.lha_pytest.json",
                 "-q",
             ],
             cwd=ctx.workdir,

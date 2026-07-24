@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ...tools.shell import run
 from ..base import Verifier, VerifyContext
 from ..verdict import Check
 from .common import is_finite
@@ -61,7 +60,7 @@ class ReproVerifier(Verifier):
             return False, "no command or metrics to re-run"
 
         repro_out = (getattr(artifact, "out_dir", "out") or "out") + "_repro"
-        res = run(command + ["--out", repro_out], cwd=ctx.workdir, timeout=600)
+        res = ctx.exec.run(command + ["--out", repro_out], cwd=ctx.workdir, timeout=600)
         if res.returncode != 0:
             return False, f"re-run exit {res.returncode}: {res.stderr[-200:]}"
         try:

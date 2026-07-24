@@ -74,6 +74,11 @@ class Config(BaseModel):
     code_backend: str = "auto"
     embedder_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
+    # Where target/model-influenced code executes: "trusted-local" (this repo's
+    # own dev/self-eval only) or "docker" (external target repos).
+    exec_backend: str = "trusted-local"
+    exec_image: str = "python:3.12-slim"
+
     # Paths
     runs_dir: Path = Path("runs")
     data_dir: Path = Path("data")
@@ -94,6 +99,8 @@ class Config(BaseModel):
             anthropic_model_orchestration=_env("LHA_ANTHROPIC_MODEL_ORCH", "claude-sonnet-4-6"),
             code_backend=_env("LHA_CODE_BACKEND", "auto"),
             embedder_model=_env("LHA_EMBEDDER_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+            exec_backend=_env("LHA_EXEC_BACKEND", "trusted-local"),
+            exec_image=_env("LHA_EXEC_IMAGE", "python:3.12-slim"),
             runs_dir=Path(_env("LHA_RUNS_DIR", "runs")),
             data_dir=Path(_env("LHA_DATA_DIR", "data")),
         )

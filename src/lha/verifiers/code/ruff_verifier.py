@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ...tools.shell import run, venv_tool
 from ..base import Verifier, VerifyContext
 from ..verdict import Check
 
@@ -15,8 +14,8 @@ class RuffVerifier(Verifier):
     family = "code"
 
     def verify(self, artifact: Any, ctx: VerifyContext) -> Check:
-        ruff = venv_tool("ruff")
-        res = run(
+        ruff = ctx.exec.tool("ruff")
+        res = ctx.exec.run(
             [ruff, "check", "--output-format", "json", "--exclude", ".cocoindex_code", "."],
             cwd=ctx.workdir,
         )

@@ -292,7 +292,9 @@ class LangGraphHarness:
         artifact, bundle = _load_step_artifacts(run_dir, step)
 
         verdict = VerifierAgent(parallel=self.config.parallel_verify).verify(
-            step, artifact, VerifyContext(workdir=workdir, step=step, bundle=bundle)
+            step,
+            artifact,
+            VerifyContext(workdir=workdir, step=step, bundle=bundle, exec=self._h.exec),
         )
         _dump(run_dir, step.step_id, "verify.json", verdict.model_dump_json(indent=2))
         self._ledger(state, step, "verify", verdict_ref="verify.json")

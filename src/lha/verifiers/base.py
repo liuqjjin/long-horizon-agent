@@ -8,12 +8,13 @@ assumptions.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..artifacts import Step
 from ..live_context.models import ContextBundle
+from ..sandbox import ExecutionBackend, TrustedLocalBackend
 from .verdict import Check, VerifierFamily
 
 
@@ -24,6 +25,8 @@ class VerifyContext:
     workdir: Path
     step: Step
     bundle: ContextBundle | None = None
+    # Where target code (pytest, experiments, re-runs) actually executes.
+    exec: ExecutionBackend = field(default_factory=TrustedLocalBackend)
 
 
 class Verifier(ABC):

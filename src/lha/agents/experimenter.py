@@ -13,15 +13,18 @@ from pathlib import Path
 
 from ..artifacts import ExperimentResult, Step
 from ..live_context.models import ContextBundle
-from ..tools.shell import run
+from ..sandbox import ExecutionBackend, TrustedLocalBackend
 
 
 class Experimenter:
+    def __init__(self, exec_backend: ExecutionBackend | None = None):
+        self.exec = exec_backend or TrustedLocalBackend()
+
     def run(self, step: Step, bundle: ContextBundle, workdir: str | Path) -> ExperimentResult:
         workdir = Path(workdir)
         out_dir = step.params.get("out_dir", "out")
         cmd = build_cmd(step)
-        res = run(cmd, cwd=workdir, timeout=float(step.params.get("timeout", 600)))
+        res = self.exec.run(cmd, cwd=workdir, timeout=float(step.params.get("timeout", 600)))
 
         out_path = workdir / out_dir
         metrics_raw = _read_json(out_path / "metrics.json")

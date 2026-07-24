@@ -42,34 +42,50 @@ def _cfg(tmp_path: Path, **over) -> Config:
 
 
 # --- ruff verifier must fail when ruff could not run ------------------------
-def test_ruff_fails_when_it_cannot_run(tmp_path, monkeypatch):
-    from lha.verifiers.code import ruff_verifier
+class _CannedExec:
+    """Execution-backend stub returning a scripted result (verifier tests)."""
 
+    def __init__(self, result: ProcResult):
+        self._result = result
+
+    def run(self, cmd, *, cwd, timeout=300.0, input=None, limits=None):
+        return self._result
+
+    def python(self):
+        return "python"
+
+    def tool(self, name):
+        return name
+
+
+def test_ruff_fails_when_it_cannot_run(tmp_path):
     # rc=2 (config/internal error) with empty stdout: ruff produced no lint pass.
-    monkeypatch.setattr(
-        ruff_verifier, "run", lambda *a, **k: ProcResult(2, "", "ruff: config error", 0.0)
-    )
+    exec_stub = _CannedExec(ProcResult(2, "", "ruff: config error", 0.0))
     check = RuffVerifier().verify(
-        Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=_step("ruff"))
+        Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=_step("ruff"), exec=exec_stub)
     )
     assert not check.passed  # "couldn't verify" must not read as "verified"
     assert "failed to run" in check.detail["summary"]
 
 
-def test_ruff_fails_on_inconsistent_exit_codes(tmp_path, monkeypatch):
-    from lha.verifiers.code import ruff_verifier
-
+def test_ruff_fails_on_inconsistent_exit_codes(tmp_path):
     # rc=1 means "violations found" but stdout is empty -> inconsistent -> fail.
-    monkeypatch.setattr(ruff_verifier, "run", lambda *a, **k: ProcResult(1, "", "", 0.0))
     c1 = RuffVerifier().verify(
-        Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=_step("ruff"))
+        Patch(step_id="s"),
+        VerifyContext(
+            workdir=tmp_path, step=_step("ruff"), exec=_CannedExec(ProcResult(1, "", "", 0.0))
+        ),
     )
     assert not c1.passed
 
     # non-JSON on the success channel -> ruff did not run cleanly -> fail.
-    monkeypatch.setattr(ruff_verifier, "run", lambda *a, **k: ProcResult(0, "not json", "", 0.0))
     c2 = RuffVerifier().verify(
-        Patch(step_id="s"), VerifyContext(workdir=tmp_path, step=_step("ruff"))
+        Patch(step_id="s"),
+        VerifyContext(
+            workdir=tmp_path,
+            step=_step("ruff"),
+            exec=_CannedExec(ProcResult(0, "not json", "", 0.0)),
+        ),
     )
     assert not c2.passed
 
