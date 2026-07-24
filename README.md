@@ -26,19 +26,25 @@ A step that cannot be verified fails.
 conditions and scores the identical first attempt under each, so the conditions differ
 only in the gate:
 
-Implementer `claude_cli` on `haiku`, 11 bug-fix tasks × 3 reps, 0 transient errors:
+Implementer `claude_cli` on `claude-haiku-4-5-20251001`, 17 bug-fix tasks × 3 reps
+(51 paired cells per condition, 0 transient errors), graded by an independent final
+scorer, not by the gate itself:
 
-| condition | claimed | true success | false success |
+| condition | claimed | true success (95% CI) | false success (95% CI) |
 |---|---|---|---|
-| `trust` — apply the fix, no gate | 100% | 61% | 39% |
-| `gate` — run the test gate, refuse on failure | 61% | 61% | 0% |
-| `verify` — gate plus repair loop | 85% | 85% | 0% |
+| `trust` — apply the fix, no gate | 100% | 94% (88–100%) | 6% (0–12%) |
+| `gate` — run the test gate, refuse on failure | 94% | 94% (88–100%) | 0% |
+| `verify` — gate plus repair loop | 100% | 100% | 0% |
 
-Without the gate, 39% of accepted fixes are wrong. `trust` and `gate` score the same
-attempts, so the 39% is exactly what the gate rejects. The repair loop then raises true
-success from 61% to 85%. The experiment is paired, leak-free (the
-implementer never sees the tests), and tamper-proof (a patch cannot touch the oracle);
-method and limits are in [docs/ABLATION.md](docs/ABLATION.md).
+Without the gate, 3 of 51 accepted fixes are wrong and ship silently. `trust` and
+`gate` score the same attempts, so the difference is exactly what the gate catches: it
+refused those same 3 cells and discarded no correct fix (TN=3, FP=0, FN=0 against the
+independent scorer). The repair loop then fixed all 3 refusals. The effect is real but
+small at this corpus difficulty — haiku-4.5's first attempt is already right 94% of the
+time here; the numbers say what the gate buys on top of that, no more. The experiment is
+paired and leak-free (the implementer never sees the tests, a patch cannot touch the
+oracle); method, statistics, and limits are in [docs/ABLATION.md](docs/ABLATION.md),
+raw data in [benchmarks/ablation_report.json](benchmarks/ablation_report.json).
 
 ## The loop
 

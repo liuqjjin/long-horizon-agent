@@ -6,12 +6,85 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Execution backends** (`lha.sandbox`): a single seam for everywhere
+  target/model-influenced code runs. `trusted-local` (scrubbed environment,
+  process-group kill, opt-in rlimits) for this repo's own dev loop;
+  `docker` (`--network none`, empty env, memory/pids caps, read-only source
+  mounts) for external code. Selected via `LHA_EXEC_BACKEND`/`LHA_EXEC_IMAGE`;
+  verifiers, the experimenter, and the ablation scorer all run through it.
+- **Independent final scorer in `lha ablate`**: the internal gate is now only a
+  *prediction*; the *truth* comes from applying the frozen source diff (SHA-256
+  recorded) to a fresh canonical copy and running the canonical tests on a
+  separate backend. Reports gained a per-condition confusion matrix
+  (TP/FP/TN/FN, precision/recall), task-cluster bootstrap 95% CIs (10k
+  resamples), a provenance fingerprint that also keys the resume cache, and an
+  explicit ERROR column (transient cells are shown, excluded from rates, and
+  never cached).
+- **Six harder corpus tasks** (`data/bench/{lru,csvlite,spans,slugify,runstats,
+  urljoin}`): the issue names one symptom, the docstring pins the contract, the
+  oracle enforces edge cases a symptom-only fix misses. Authored and calibrated
+  (planted bug fails, hand-written reference fix passes) before any model saw
+  them. Corpus is now 17 tasks.
+- **Public-benchmark adapters** (`lha.bench`): SWE-bench Verified predictions
+  writer + official invocation + report parser (errors stay in the
+  denominator), a Harbor `BaseInstalledAgent` for Terminal-Bench 2 that only
+  copies verified (`DONE`) workdirs onto the graded filesystem, and exact
+  McNemar + cluster-bootstrap statistics. Contract tests only — no runs, no
+  claimed numbers. `[bench]` extra.
+- **Durable checkpoints**: `state.json` is a checksummed, fsynced envelope;
+  loading verifies integrity and semantic bounds and refuses to resume from
+  damage (`CheckpointCorrupt`). Ledger records carry unique `event_id`s and are
+  fsynced; a torn final line is dropped as a crash artifact, mid-file
+  corruption raises. Crash-injection tests cover kills during
+  context/execute/verify, tampered/truncated state, and duplicate-side-effect
+  freedom on resume.
+- **LLM call accounting** (`TracedLLM`): per-call `llm_trace.jsonl` (duration,
+  tokens, cost from the claude CLI's JSON output), an `LHA_MAX_LLM_CALLS`
+  budget that pauses the run instead of looping on a broken backend, and
+  `llm_usage` totals in `lha run --json`. `LHA_CLAUDE_MODEL` pins a model
+  snapshot.
+- **Artifact-bound approvals**: an approval now binds to the SHA-256 of the
+  exact patch bytes (recorded in a per-step manifest with pre-apply file
+  hashes and verifier/policy config). On resume, a decision whose hash no
+  longer matches is treated as tamper evidence: the change is reverted and the
+  run fails closed. The LangGraph runner splits prepare/gate/verify into
+  separate nodes so the reviewed artifact is checkpointed before the
+  interrupt.
+- **Oracle protection in normal runs** (`lha.tools.policy`): a patch that
+  touches test files, `conftest.py`, or build/CI config is refused before it
+  reaches the sandbox and the refusal is fed to the repair loop; a task
+  manifest may allowlist specific protected paths.
+
 ### Changed
+- **Context failures now fail closed.** Bundles carry a status
+  (`ok`/`empty`/`backend_unavailable`/`index_failed`); search backends raise
+  `BackendUnavailable` instead of returning an empty list; reindex returns a
+  structured result and a failed refresh keeps the stale flag set. Steps
+  declare `context_requirement` (default `required`) and the freshness/citation
+  verifiers fail a required step with no usable context.
+- **Repair steps re-gather context from the run sandbox** (workdir overlay),
+  so the second attempt reasons over the failing state, not the pristine index.
+- The **reproducibility verifier requires an input digest**
+  (`input_sha256`/`inputs`) and, in a git checkout, a commit; a re-run must
+  reproduce the same input digest, so matching metrics on different data no
+  longer count as reproduction.
+- **cocoindex/sentence-transformers moved to the `[context]` extra.** Without
+  it the vector backends report "unavailable" (fail-closed for required
+  context) with an install hint; the dev group still installs both.
+- The ablation headline was re-measured under the new method (pinned
+  `claude-haiku-4-5-20251001`, independent scorer, 17 tasks × 3 reps): trust
+  ships 3/51 wrong fixes (6%, CI 0–12%); the gate refuses exactly those three
+  with zero false negatives; repair fixes all three (100% true success). The
+  previously published 39%→0%→85% numbers came from the old gate-graded design
+  and a floating model alias and are superseded.
 - Reworded documentation and code comments for a plainer, more consistent voice, and
   renamed the self-eval suite (previously "ResearchAgentBench-Lite") to "self-eval".
   No behavior change.
 - `lha ablate` report output is now a plain table plus a one-line factual summary,
   without the editorial header line or emoji status legend.
+- Skill notes record provenance: the SHA-256 of the verdict that justified
+  them and the harness version.
 
 ### Fixed
 - Untracked `.coverage`, a local artifact that had been committed.
@@ -24,7 +97,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same attempt under `trust` (apply and accept), `gate` (apply, run the test gate,
   refuse on failure), and `verify` (gate plus repair loop), reporting claimed vs true
   vs false success. It is leak-free (single-shot implementer with file tools denied,
-  shown only non-test source), tamper-proof (patches may edit source only; the test
+  shown only non-test source), oracle-protected (patches may edit source only; the test
   oracle and config stay canonical), and excludes transient backend errors (retried,
   then recorded as ERROR, never counted). A weaker implementer `--model` calibrates
   difficulty. See [docs/ABLATION.md](docs/ABLATION.md).

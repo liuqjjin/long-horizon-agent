@@ -1,47 +1,107 @@
 {
   "llm": "claude_cli",
-  "model": "haiku",
+  "model": "claude-haiku-4-5-20251001",
   "reps": 3,
   "tasks": [
     "bench_basen",
     "bench_brackets",
     "bench_bsearch",
     "bench_caesar",
+    "bench_csvlite",
     "bench_flatten",
+    "bench_lru",
     "bench_median",
     "bench_merge_intervals",
     "bench_paginate",
     "bench_roman",
     "bench_rpn",
+    "bench_runstats",
+    "bench_slugify",
+    "bench_spans",
+    "bench_urljoin",
     "bench_window"
   ],
+  "scorer": "trusted-local",
+  "fingerprint": "be4e53ccf8f515ac64a576e0205ae525e652365198f71a386962b4b968500dc2",
+  "harness_version": "0.3.0",
   "stats": [
     {
       "condition": "trust",
       "blurb": "apply the first attempt and accept it; no gate, no repair",
-      "n": 33,
+      "n": 51,
       "claimed_success_rate": 1.0,
-      "true_success_rate": 0.6060606060606061,
-      "false_success_rate": 0.3939393939393939,
-      "mean_repairs": 0.0
+      "true_success_rate": 0.9411764705882353,
+      "false_success_rate": 0.058823529411764705,
+      "mean_repairs": 0.0,
+      "errors": 0,
+      "tp": null,
+      "fp": null,
+      "tn": null,
+      "fn": null,
+      "precision": null,
+      "recall": null,
+      "fpr": null,
+      "fnr": null,
+      "true_ci": [
+        0.8823529411764706,
+        1.0
+      ],
+      "false_ci": [
+        0.0,
+        0.11764705882352941
+      ]
     },
     {
       "condition": "gate",
-      "blurb": "apply it, run the test gate, refuse on failure",
-      "n": 33,
-      "claimed_success_rate": 0.6060606060606061,
-      "true_success_rate": 0.6060606060606061,
+      "blurb": "apply it, run the internal test gate, refuse on failure",
+      "n": 51,
+      "claimed_success_rate": 0.9411764705882353,
+      "true_success_rate": 0.9411764705882353,
       "false_success_rate": 0.0,
-      "mean_repairs": 0.0
+      "mean_repairs": 0.0,
+      "errors": 0,
+      "tp": 48,
+      "fp": 0,
+      "tn": 3,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "fpr": 0.0,
+      "fnr": 0.0,
+      "true_ci": [
+        0.8823529411764706,
+        1.0
+      ],
+      "false_ci": [
+        0.0,
+        0.0
+      ]
     },
     {
       "condition": "verify",
       "blurb": "gate plus repair loop",
-      "n": 33,
-      "claimed_success_rate": 0.8484848484848485,
-      "true_success_rate": 0.8484848484848485,
+      "n": 51,
+      "claimed_success_rate": 1.0,
+      "true_success_rate": 1.0,
       "false_success_rate": 0.0,
-      "mean_repairs": 0.3939393939393939
+      "mean_repairs": 0.058823529411764705,
+      "errors": 0,
+      "tp": 51,
+      "fp": 0,
+      "tn": 0,
+      "fn": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "fpr": null,
+      "fnr": 0.0,
+      "true_ci": [
+        1.0,
+        1.0
+      ],
+      "false_ci": [
+        0.0,
+        0.0
+      ]
     }
   ],
   "records": [
@@ -51,21 +111,25 @@
       "rep": 0,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "474ccffb272785aa602c33ee2461e51bdf810536e8780db5812c7cc10a7b04ba"
     },
     {
       "task": "bench_basen",
       "condition": "gate",
       "rep": 0,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "474ccffb272785aa602c33ee2461e51bdf810536e8780db5812c7cc10a7b04ba"
     },
     {
       "task": "bench_basen",
@@ -75,8 +139,10 @@
       "claimed_success": true,
       "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests pass"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "474ccffb272785aa602c33ee2461e51bdf810536e8780db5812c7cc10a7b04ba"
     },
     {
       "task": "bench_brackets",
@@ -84,21 +150,25 @@
       "rep": 0,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "d4b41ba439e5a76be3d9109ac6f46f60dc5a15c203da344fdcfa8a710d652381"
     },
     {
       "task": "bench_brackets",
       "condition": "gate",
       "rep": 0,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "d4b41ba439e5a76be3d9109ac6f46f60dc5a15c203da344fdcfa8a710d652381"
     },
     {
       "task": "bench_brackets",
@@ -108,8 +178,10 @@
       "claimed_success": true,
       "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests pass"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "d4b41ba439e5a76be3d9109ac6f46f60dc5a15c203da344fdcfa8a710d652381"
     },
     {
       "task": "bench_bsearch",
@@ -120,7 +192,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "e00d6addd163f3a7f61b2650865532e0576fd29f052c49aae1d9a8a07ff69e32"
     },
     {
       "task": "bench_bsearch",
@@ -131,7 +205,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "e00d6addd163f3a7f61b2650865532e0576fd29f052c49aae1d9a8a07ff69e32"
     },
     {
       "task": "bench_bsearch",
@@ -142,7 +218,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "e00d6addd163f3a7f61b2650865532e0576fd29f052c49aae1d9a8a07ff69e32"
     },
     {
       "task": "bench_caesar",
@@ -153,7 +231,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "34c31c2f6ba85ceab987b4903cf58dd8ac05b0458bc258d6fc1ce312152013a9"
     },
     {
       "task": "bench_caesar",
@@ -164,7 +244,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "34c31c2f6ba85ceab987b4903cf58dd8ac05b0458bc258d6fc1ce312152013a9"
     },
     {
       "task": "bench_caesar",
@@ -175,10 +257,129 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "34c31c2f6ba85ceab987b4903cf58dd8ac05b0458bc258d6fc1ce312152013a9"
+    },
+    {
+      "task": "bench_csvlite",
+      "condition": "trust",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "49cc087a575cfae84e90c5815fe681958bd0eb21b5d944e902f39b737895dc06"
+    },
+    {
+      "task": "bench_csvlite",
+      "condition": "gate",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "49cc087a575cfae84e90c5815fe681958bd0eb21b5d944e902f39b737895dc06"
+    },
+    {
+      "task": "bench_csvlite",
+      "condition": "verify",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "49cc087a575cfae84e90c5815fe681958bd0eb21b5d944e902f39b737895dc06"
     },
     {
       "task": "bench_flatten",
+      "condition": "trust",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "84443c1ceafb9b6574b9e742d90fe38119cef5631d33bf9d926f5fe4db9b2d5c"
+    },
+    {
+      "task": "bench_flatten",
+      "condition": "gate",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "84443c1ceafb9b6574b9e742d90fe38119cef5631d33bf9d926f5fe4db9b2d5c"
+    },
+    {
+      "task": "bench_flatten",
+      "condition": "verify",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "84443c1ceafb9b6574b9e742d90fe38119cef5631d33bf9d926f5fe4db9b2d5c"
+    },
+    {
+      "task": "bench_lru",
+      "condition": "trust",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "2e18a4eaa7f9e92a105191e487a386ae1f0d0509f60914792cfe06fef0299246"
+    },
+    {
+      "task": "bench_lru",
+      "condition": "gate",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "2e18a4eaa7f9e92a105191e487a386ae1f0d0509f60914792cfe06fef0299246"
+    },
+    {
+      "task": "bench_lru",
+      "condition": "verify",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "2e18a4eaa7f9e92a105191e487a386ae1f0d0509f60914792cfe06fef0299246"
+    },
+    {
+      "task": "bench_median",
       "condition": "trust",
       "rep": 0,
       "status": "DONE",
@@ -186,10 +387,12 @@
       "true_success": false,
       "false_success": true,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests fail",
+      "gate_prediction": null,
+      "artifact_sha256": "0f9a27d1b7604a196678f489d60ec30da93fbc6a08db79e61f23b51ec659f9b5"
     },
     {
-      "task": "bench_flatten",
+      "task": "bench_median",
       "condition": "gate",
       "rep": 0,
       "status": "FAILED",
@@ -197,21 +400,25 @@
       "true_success": false,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
-    },
-    {
-      "task": "bench_flatten",
-      "condition": "verify",
-      "rep": 0,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
-      "false_success": false,
-      "repairs": 1,
-      "detail": "tests fail"
+      "detail": "scorer: tests fail",
+      "gate_prediction": false,
+      "artifact_sha256": "0f9a27d1b7604a196678f489d60ec30da93fbc6a08db79e61f23b51ec659f9b5"
     },
     {
       "task": "bench_median",
+      "condition": "verify",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 1,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "917e9d201abbc14c829ad9778d85c87d065fd45c3803293f040e4186ec266b0b"
+    },
+    {
+      "task": "bench_merge_intervals",
       "condition": "trust",
       "rep": 0,
       "status": "DONE",
@@ -219,10 +426,12 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "c29d08fb30c245666ea42cc01b053f90bfe862cba36d8f5b1d5c1a869bb947ed"
     },
     {
-      "task": "bench_median",
+      "task": "bench_merge_intervals",
       "condition": "gate",
       "rep": 0,
       "status": "DONE",
@@ -230,10 +439,12 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "c29d08fb30c245666ea42cc01b053f90bfe862cba36d8f5b1d5c1a869bb947ed"
     },
     {
-      "task": "bench_median",
+      "task": "bench_merge_intervals",
       "condition": "verify",
       "rep": 0,
       "status": "DONE",
@@ -241,40 +452,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
-    },
-    {
-      "task": "bench_merge_intervals",
-      "condition": "trust",
-      "rep": 0,
-      "status": "DONE",
-      "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
-      "repairs": 0,
-      "detail": "tests fail"
-    },
-    {
-      "task": "bench_merge_intervals",
-      "condition": "gate",
-      "rep": 0,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
-      "false_success": false,
-      "repairs": 0,
-      "detail": "tests fail"
-    },
-    {
-      "task": "bench_merge_intervals",
-      "condition": "verify",
-      "rep": 0,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
-      "false_success": false,
-      "repairs": 1,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "c29d08fb30c245666ea42cc01b053f90bfe862cba36d8f5b1d5c1a869bb947ed"
     },
     {
       "task": "bench_paginate",
@@ -285,7 +465,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "30c3045bdc39be64e99bc785c5604cf5a129281e3b4394cb25b2e1ffdf1c0e55"
     },
     {
       "task": "bench_paginate",
@@ -296,7 +478,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "30c3045bdc39be64e99bc785c5604cf5a129281e3b4394cb25b2e1ffdf1c0e55"
     },
     {
       "task": "bench_paginate",
@@ -307,7 +491,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "30c3045bdc39be64e99bc785c5604cf5a129281e3b4394cb25b2e1ffdf1c0e55"
     },
     {
       "task": "bench_roman",
@@ -315,21 +501,25 @@
       "rep": 0,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "bf0322326e6b2ae7747cb77abea6613306dd4c6d5d9ab0e5a09296e4ae693229"
     },
     {
       "task": "bench_roman",
       "condition": "gate",
       "rep": 0,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bf0322326e6b2ae7747cb77abea6613306dd4c6d5d9ab0e5a09296e4ae693229"
     },
     {
       "task": "bench_roman",
@@ -339,8 +529,10 @@
       "claimed_success": true,
       "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests pass"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bf0322326e6b2ae7747cb77abea6613306dd4c6d5d9ab0e5a09296e4ae693229"
     },
     {
       "task": "bench_rpn",
@@ -351,7 +543,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
     },
     {
       "task": "bench_rpn",
@@ -362,7 +556,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
     },
     {
       "task": "bench_rpn",
@@ -373,7 +569,165 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
+    },
+    {
+      "task": "bench_runstats",
+      "condition": "trust",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "37de583c141810755f4a67d2083d7fc894047cac9a9acc0ec1af617a4bbb0cfd"
+    },
+    {
+      "task": "bench_runstats",
+      "condition": "gate",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "37de583c141810755f4a67d2083d7fc894047cac9a9acc0ec1af617a4bbb0cfd"
+    },
+    {
+      "task": "bench_runstats",
+      "condition": "verify",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "37de583c141810755f4a67d2083d7fc894047cac9a9acc0ec1af617a4bbb0cfd"
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "trust",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "3c36d23764b3eebafb6f97ee55d08c9b44c7c62d015e17047f5f27460efe91ba"
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "gate",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "3c36d23764b3eebafb6f97ee55d08c9b44c7c62d015e17047f5f27460efe91ba"
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "verify",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "3c36d23764b3eebafb6f97ee55d08c9b44c7c62d015e17047f5f27460efe91ba"
+    },
+    {
+      "task": "bench_spans",
+      "condition": "trust",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "1c48b5d45460728fd5a0204b4f0a1b5548789fa5e81524efb50f736cca9ead35"
+    },
+    {
+      "task": "bench_spans",
+      "condition": "gate",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "1c48b5d45460728fd5a0204b4f0a1b5548789fa5e81524efb50f736cca9ead35"
+    },
+    {
+      "task": "bench_spans",
+      "condition": "verify",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "1c48b5d45460728fd5a0204b4f0a1b5548789fa5e81524efb50f736cca9ead35"
+    },
+    {
+      "task": "bench_urljoin",
+      "condition": "trust",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "cac479db04f06126bbf855c89464139e8d108e0c89e6e40a42cb904fd23cd350"
+    },
+    {
+      "task": "bench_urljoin",
+      "condition": "gate",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "cac479db04f06126bbf855c89464139e8d108e0c89e6e40a42cb904fd23cd350"
+    },
+    {
+      "task": "bench_urljoin",
+      "condition": "verify",
+      "rep": 0,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "cac479db04f06126bbf855c89464139e8d108e0c89e6e40a42cb904fd23cd350"
     },
     {
       "task": "bench_window",
@@ -381,32 +735,38 @@
       "rep": 0,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "07789a29bdbc568afe87d910ff8a3859e8675aecbd9a9855fd204afb830955e2"
     },
     {
       "task": "bench_window",
       "condition": "gate",
       "rep": 0,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "07789a29bdbc568afe87d910ff8a3859e8675aecbd9a9855fd204afb830955e2"
     },
     {
       "task": "bench_window",
       "condition": "verify",
       "rep": 0,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests fail"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "07789a29bdbc568afe87d910ff8a3859e8675aecbd9a9855fd204afb830955e2"
     },
     {
       "task": "bench_basen",
@@ -417,7 +777,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "0bfc1b1af2b0ddaed89c1bbddeb3e80c8ee9e8f8f7a423708d7118e39701f38b"
     },
     {
       "task": "bench_basen",
@@ -428,7 +790,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "0bfc1b1af2b0ddaed89c1bbddeb3e80c8ee9e8f8f7a423708d7118e39701f38b"
     },
     {
       "task": "bench_basen",
@@ -439,7 +803,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "0bfc1b1af2b0ddaed89c1bbddeb3e80c8ee9e8f8f7a423708d7118e39701f38b"
     },
     {
       "task": "bench_brackets",
@@ -450,7 +816,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "16e4529d126cf6fd7a91eefa69e5830a11fe5e119dca1c2a2cd10f794b293e18"
     },
     {
       "task": "bench_brackets",
@@ -461,7 +829,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "16e4529d126cf6fd7a91eefa69e5830a11fe5e119dca1c2a2cd10f794b293e18"
     },
     {
       "task": "bench_brackets",
@@ -472,7 +842,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "16e4529d126cf6fd7a91eefa69e5830a11fe5e119dca1c2a2cd10f794b293e18"
     },
     {
       "task": "bench_bsearch",
@@ -483,7 +855,9 @@
       "true_success": false,
       "false_success": true,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests fail",
+      "gate_prediction": null,
+      "artifact_sha256": "d5ef2b92b01dc820a17d75af2c0677c0bd0826336396fc5601e6abdb46a33b96"
     },
     {
       "task": "bench_bsearch",
@@ -494,7 +868,9 @@
       "true_success": false,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests fail",
+      "gate_prediction": false,
+      "artifact_sha256": "d5ef2b92b01dc820a17d75af2c0677c0bd0826336396fc5601e6abdb46a33b96"
     },
     {
       "task": "bench_bsearch",
@@ -505,7 +881,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 1,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
     },
     {
       "task": "bench_caesar",
@@ -516,7 +894,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "e9e1cc158381f78a4e20c74c19b17ccca1e0cf55685dc3e01f954c5bb94bed0c"
     },
     {
       "task": "bench_caesar",
@@ -527,7 +907,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "e9e1cc158381f78a4e20c74c19b17ccca1e0cf55685dc3e01f954c5bb94bed0c"
     },
     {
       "task": "bench_caesar",
@@ -538,7 +920,48 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "e9e1cc158381f78a4e20c74c19b17ccca1e0cf55685dc3e01f954c5bb94bed0c"
+    },
+    {
+      "task": "bench_csvlite",
+      "condition": "trust",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "eeb287c1e228a5aca4561d9b332fae636f8ae02c49f0dc49e24995326f09304d"
+    },
+    {
+      "task": "bench_csvlite",
+      "condition": "gate",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "eeb287c1e228a5aca4561d9b332fae636f8ae02c49f0dc49e24995326f09304d"
+    },
+    {
+      "task": "bench_csvlite",
+      "condition": "verify",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "eeb287c1e228a5aca4561d9b332fae636f8ae02c49f0dc49e24995326f09304d"
     },
     {
       "task": "bench_flatten",
@@ -549,7 +972,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "84443c1ceafb9b6574b9e742d90fe38119cef5631d33bf9d926f5fe4db9b2d5c"
     },
     {
       "task": "bench_flatten",
@@ -560,7 +985,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "84443c1ceafb9b6574b9e742d90fe38119cef5631d33bf9d926f5fe4db9b2d5c"
     },
     {
       "task": "bench_flatten",
@@ -571,43 +998,12 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "84443c1ceafb9b6574b9e742d90fe38119cef5631d33bf9d926f5fe4db9b2d5c"
     },
     {
-      "task": "bench_median",
-      "condition": "trust",
-      "rep": 1,
-      "status": "DONE",
-      "claimed_success": true,
-      "true_success": true,
-      "false_success": false,
-      "repairs": 0,
-      "detail": "tests pass"
-    },
-    {
-      "task": "bench_median",
-      "condition": "gate",
-      "rep": 1,
-      "status": "DONE",
-      "claimed_success": true,
-      "true_success": true,
-      "false_success": false,
-      "repairs": 0,
-      "detail": "tests pass"
-    },
-    {
-      "task": "bench_median",
-      "condition": "verify",
-      "rep": 1,
-      "status": "DONE",
-      "claimed_success": true,
-      "true_success": true,
-      "false_success": false,
-      "repairs": 0,
-      "detail": "tests pass"
-    },
-    {
-      "task": "bench_merge_intervals",
+      "task": "bench_lru",
       "condition": "trust",
       "rep": 1,
       "status": "DONE",
@@ -615,29 +1011,113 @@
       "true_success": false,
       "false_success": true,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests fail",
+      "gate_prediction": null,
+      "artifact_sha256": "5f147ac4ec13544939289a4425a5c8bc5c7253becdb2dc092dccf230f7cc3f3e"
+    },
+    {
+      "task": "bench_lru",
+      "condition": "gate",
+      "rep": 1,
+      "status": "FAILED",
+      "claimed_success": false,
+      "true_success": false,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests fail",
+      "gate_prediction": false,
+      "artifact_sha256": "5f147ac4ec13544939289a4425a5c8bc5c7253becdb2dc092dccf230f7cc3f3e"
+    },
+    {
+      "task": "bench_lru",
+      "condition": "verify",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 1,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "7962f916ae5d1095981a0ff2ec5d06cc8172af1e71732f02bac0df82dfa62a37"
+    },
+    {
+      "task": "bench_median",
+      "condition": "trust",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "bc5dddbdb30ad86c576dca1da443a507111fe0733707e9b34107afb055f27344"
+    },
+    {
+      "task": "bench_median",
+      "condition": "gate",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bc5dddbdb30ad86c576dca1da443a507111fe0733707e9b34107afb055f27344"
+    },
+    {
+      "task": "bench_median",
+      "condition": "verify",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bc5dddbdb30ad86c576dca1da443a507111fe0733707e9b34107afb055f27344"
+    },
+    {
+      "task": "bench_merge_intervals",
+      "condition": "trust",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "c29d08fb30c245666ea42cc01b053f90bfe862cba36d8f5b1d5c1a869bb947ed"
     },
     {
       "task": "bench_merge_intervals",
       "condition": "gate",
       "rep": 1,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "c29d08fb30c245666ea42cc01b053f90bfe862cba36d8f5b1d5c1a869bb947ed"
     },
     {
       "task": "bench_merge_intervals",
       "condition": "verify",
       "rep": 1,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests fail"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "c29d08fb30c245666ea42cc01b053f90bfe862cba36d8f5b1d5c1a869bb947ed"
     },
     {
       "task": "bench_paginate",
@@ -648,7 +1128,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "30c3045bdc39be64e99bc785c5604cf5a129281e3b4394cb25b2e1ffdf1c0e55"
     },
     {
       "task": "bench_paginate",
@@ -659,7 +1141,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "30c3045bdc39be64e99bc785c5604cf5a129281e3b4394cb25b2e1ffdf1c0e55"
     },
     {
       "task": "bench_paginate",
@@ -670,7 +1154,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "30c3045bdc39be64e99bc785c5604cf5a129281e3b4394cb25b2e1ffdf1c0e55"
     },
     {
       "task": "bench_roman",
@@ -681,7 +1167,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "bf0322326e6b2ae7747cb77abea6613306dd4c6d5d9ab0e5a09296e4ae693229"
     },
     {
       "task": "bench_roman",
@@ -692,7 +1180,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bf0322326e6b2ae7747cb77abea6613306dd4c6d5d9ab0e5a09296e4ae693229"
     },
     {
       "task": "bench_roman",
@@ -703,7 +1193,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bf0322326e6b2ae7747cb77abea6613306dd4c6d5d9ab0e5a09296e4ae693229"
     },
     {
       "task": "bench_rpn",
@@ -714,7 +1206,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "825f3bf121e7370616bef139ac2b6909d1c6f3c2c070258fbbcaec4e9b2b704f"
     },
     {
       "task": "bench_rpn",
@@ -725,7 +1219,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "825f3bf121e7370616bef139ac2b6909d1c6f3c2c070258fbbcaec4e9b2b704f"
     },
     {
       "task": "bench_rpn",
@@ -736,7 +1232,165 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "825f3bf121e7370616bef139ac2b6909d1c6f3c2c070258fbbcaec4e9b2b704f"
+    },
+    {
+      "task": "bench_runstats",
+      "condition": "trust",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "37de583c141810755f4a67d2083d7fc894047cac9a9acc0ec1af617a4bbb0cfd"
+    },
+    {
+      "task": "bench_runstats",
+      "condition": "gate",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "37de583c141810755f4a67d2083d7fc894047cac9a9acc0ec1af617a4bbb0cfd"
+    },
+    {
+      "task": "bench_runstats",
+      "condition": "verify",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "37de583c141810755f4a67d2083d7fc894047cac9a9acc0ec1af617a4bbb0cfd"
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "trust",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "e5ac4f72e490b52b0bd55ca6e174df005dde4645141e5e3ef1d8d0b37787bec6"
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "gate",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "e5ac4f72e490b52b0bd55ca6e174df005dde4645141e5e3ef1d8d0b37787bec6"
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "verify",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "e5ac4f72e490b52b0bd55ca6e174df005dde4645141e5e3ef1d8d0b37787bec6"
+    },
+    {
+      "task": "bench_spans",
+      "condition": "trust",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "1c48b5d45460728fd5a0204b4f0a1b5548789fa5e81524efb50f736cca9ead35"
+    },
+    {
+      "task": "bench_spans",
+      "condition": "gate",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "1c48b5d45460728fd5a0204b4f0a1b5548789fa5e81524efb50f736cca9ead35"
+    },
+    {
+      "task": "bench_spans",
+      "condition": "verify",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "1c48b5d45460728fd5a0204b4f0a1b5548789fa5e81524efb50f736cca9ead35"
+    },
+    {
+      "task": "bench_urljoin",
+      "condition": "trust",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "434fa64ca31135929b6088a3ce98c6554779066d0d7a457be12554fd02f365ae"
+    },
+    {
+      "task": "bench_urljoin",
+      "condition": "gate",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "434fa64ca31135929b6088a3ce98c6554779066d0d7a457be12554fd02f365ae"
+    },
+    {
+      "task": "bench_urljoin",
+      "condition": "verify",
+      "rep": 1,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "434fa64ca31135929b6088a3ce98c6554779066d0d7a457be12554fd02f365ae"
     },
     {
       "task": "bench_window",
@@ -744,32 +1398,38 @@
       "rep": 1,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "0d692f62b5bd9f9ef9eb3b752a5dd0d4f414b81c87ddc7f99b9295fb32911377"
     },
     {
       "task": "bench_window",
       "condition": "gate",
       "rep": 1,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "0d692f62b5bd9f9ef9eb3b752a5dd0d4f414b81c87ddc7f99b9295fb32911377"
     },
     {
       "task": "bench_window",
       "condition": "verify",
       "rep": 1,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests fail"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "0d692f62b5bd9f9ef9eb3b752a5dd0d4f414b81c87ddc7f99b9295fb32911377"
     },
     {
       "task": "bench_basen",
@@ -777,21 +1437,25 @@
       "rep": 2,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "474ccffb272785aa602c33ee2461e51bdf810536e8780db5812c7cc10a7b04ba"
     },
     {
       "task": "bench_basen",
       "condition": "gate",
       "rep": 2,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "474ccffb272785aa602c33ee2461e51bdf810536e8780db5812c7cc10a7b04ba"
     },
     {
       "task": "bench_basen",
@@ -801,8 +1465,10 @@
       "claimed_success": true,
       "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests pass"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "474ccffb272785aa602c33ee2461e51bdf810536e8780db5812c7cc10a7b04ba"
     },
     {
       "task": "bench_brackets",
@@ -813,7 +1479,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "d4b41ba439e5a76be3d9109ac6f46f60dc5a15c203da344fdcfa8a710d652381"
     },
     {
       "task": "bench_brackets",
@@ -824,7 +1492,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "d4b41ba439e5a76be3d9109ac6f46f60dc5a15c203da344fdcfa8a710d652381"
     },
     {
       "task": "bench_brackets",
@@ -835,7 +1505,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "d4b41ba439e5a76be3d9109ac6f46f60dc5a15c203da344fdcfa8a710d652381"
     },
     {
       "task": "bench_bsearch",
@@ -846,7 +1518,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
     },
     {
       "task": "bench_bsearch",
@@ -857,7 +1531,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
     },
     {
       "task": "bench_bsearch",
@@ -868,7 +1544,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
     },
     {
       "task": "bench_caesar",
@@ -876,21 +1554,25 @@
       "rep": 2,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "d7f85dc19042ce56888b1052123107371e33799afccdaf36969f8536dfcd8ffa"
     },
     {
       "task": "bench_caesar",
       "condition": "gate",
       "rep": 2,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "d7f85dc19042ce56888b1052123107371e33799afccdaf36969f8536dfcd8ffa"
     },
     {
       "task": "bench_caesar",
@@ -900,8 +1582,49 @@
       "claimed_success": true,
       "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests pass"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "d7f85dc19042ce56888b1052123107371e33799afccdaf36969f8536dfcd8ffa"
+    },
+    {
+      "task": "bench_csvlite",
+      "condition": "trust",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "eeb287c1e228a5aca4561d9b332fae636f8ae02c49f0dc49e24995326f09304d"
+    },
+    {
+      "task": "bench_csvlite",
+      "condition": "gate",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "eeb287c1e228a5aca4561d9b332fae636f8ae02c49f0dc49e24995326f09304d"
+    },
+    {
+      "task": "bench_csvlite",
+      "condition": "verify",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "eeb287c1e228a5aca4561d9b332fae636f8ae02c49f0dc49e24995326f09304d"
     },
     {
       "task": "bench_flatten",
@@ -912,7 +1635,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "84443c1ceafb9b6574b9e742d90fe38119cef5631d33bf9d926f5fe4db9b2d5c"
     },
     {
       "task": "bench_flatten",
@@ -923,7 +1648,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "84443c1ceafb9b6574b9e742d90fe38119cef5631d33bf9d926f5fe4db9b2d5c"
     },
     {
       "task": "bench_flatten",
@@ -934,7 +1661,48 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "84443c1ceafb9b6574b9e742d90fe38119cef5631d33bf9d926f5fe4db9b2d5c"
+    },
+    {
+      "task": "bench_lru",
+      "condition": "trust",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "2e18a4eaa7f9e92a105191e487a386ae1f0d0509f60914792cfe06fef0299246"
+    },
+    {
+      "task": "bench_lru",
+      "condition": "gate",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "2e18a4eaa7f9e92a105191e487a386ae1f0d0509f60914792cfe06fef0299246"
+    },
+    {
+      "task": "bench_lru",
+      "condition": "verify",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "2e18a4eaa7f9e92a105191e487a386ae1f0d0509f60914792cfe06fef0299246"
     },
     {
       "task": "bench_median",
@@ -945,7 +1713,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "bc5dddbdb30ad86c576dca1da443a507111fe0733707e9b34107afb055f27344"
     },
     {
       "task": "bench_median",
@@ -956,7 +1726,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bc5dddbdb30ad86c576dca1da443a507111fe0733707e9b34107afb055f27344"
     },
     {
       "task": "bench_median",
@@ -967,7 +1739,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bc5dddbdb30ad86c576dca1da443a507111fe0733707e9b34107afb055f27344"
     },
     {
       "task": "bench_merge_intervals",
@@ -975,21 +1749,25 @@
       "rep": 2,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "c29d08fb30c245666ea42cc01b053f90bfe862cba36d8f5b1d5c1a869bb947ed"
     },
     {
       "task": "bench_merge_intervals",
       "condition": "gate",
       "rep": 2,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "c29d08fb30c245666ea42cc01b053f90bfe862cba36d8f5b1d5c1a869bb947ed"
     },
     {
       "task": "bench_merge_intervals",
@@ -999,8 +1777,10 @@
       "claimed_success": true,
       "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests pass"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "c29d08fb30c245666ea42cc01b053f90bfe862cba36d8f5b1d5c1a869bb947ed"
     },
     {
       "task": "bench_paginate",
@@ -1011,7 +1791,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "30c3045bdc39be64e99bc785c5604cf5a129281e3b4394cb25b2e1ffdf1c0e55"
     },
     {
       "task": "bench_paginate",
@@ -1022,7 +1804,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "30c3045bdc39be64e99bc785c5604cf5a129281e3b4394cb25b2e1ffdf1c0e55"
     },
     {
       "task": "bench_paginate",
@@ -1033,7 +1817,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "30c3045bdc39be64e99bc785c5604cf5a129281e3b4394cb25b2e1ffdf1c0e55"
     },
     {
       "task": "bench_roman",
@@ -1041,21 +1827,25 @@
       "rep": 2,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "bf0322326e6b2ae7747cb77abea6613306dd4c6d5d9ab0e5a09296e4ae693229"
     },
     {
       "task": "bench_roman",
       "condition": "gate",
       "rep": 2,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests fail"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bf0322326e6b2ae7747cb77abea6613306dd4c6d5d9ab0e5a09296e4ae693229"
     },
     {
       "task": "bench_roman",
@@ -1065,8 +1855,10 @@
       "claimed_success": true,
       "true_success": true,
       "false_success": false,
-      "repairs": 1,
-      "detail": "tests pass"
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "bf0322326e6b2ae7747cb77abea6613306dd4c6d5d9ab0e5a09296e4ae693229"
     },
     {
       "task": "bench_rpn",
@@ -1077,7 +1869,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "cef259e36e1af1bcabbe93e25317a710f62fe07ca4229211cdc5d58ac5440725"
     },
     {
       "task": "bench_rpn",
@@ -1088,7 +1882,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "cef259e36e1af1bcabbe93e25317a710f62fe07ca4229211cdc5d58ac5440725"
     },
     {
       "task": "bench_rpn",
@@ -1099,7 +1895,165 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "cef259e36e1af1bcabbe93e25317a710f62fe07ca4229211cdc5d58ac5440725"
+    },
+    {
+      "task": "bench_runstats",
+      "condition": "trust",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "37de583c141810755f4a67d2083d7fc894047cac9a9acc0ec1af617a4bbb0cfd"
+    },
+    {
+      "task": "bench_runstats",
+      "condition": "gate",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "37de583c141810755f4a67d2083d7fc894047cac9a9acc0ec1af617a4bbb0cfd"
+    },
+    {
+      "task": "bench_runstats",
+      "condition": "verify",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "37de583c141810755f4a67d2083d7fc894047cac9a9acc0ec1af617a4bbb0cfd"
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "trust",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "c9fbff1e7d5755d8f43d731c821104530de701c02c61d981d0b8d9818ff0c3a7"
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "gate",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "c9fbff1e7d5755d8f43d731c821104530de701c02c61d981d0b8d9818ff0c3a7"
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "verify",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "c9fbff1e7d5755d8f43d731c821104530de701c02c61d981d0b8d9818ff0c3a7"
+    },
+    {
+      "task": "bench_spans",
+      "condition": "trust",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "1c48b5d45460728fd5a0204b4f0a1b5548789fa5e81524efb50f736cca9ead35"
+    },
+    {
+      "task": "bench_spans",
+      "condition": "gate",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "1c48b5d45460728fd5a0204b4f0a1b5548789fa5e81524efb50f736cca9ead35"
+    },
+    {
+      "task": "bench_spans",
+      "condition": "verify",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "1c48b5d45460728fd5a0204b4f0a1b5548789fa5e81524efb50f736cca9ead35"
+    },
+    {
+      "task": "bench_urljoin",
+      "condition": "trust",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "f1fe0413dd75117e63a4f44c2d56e3126e004e60b05e6aff2e41c8bf12f8ddc2"
+    },
+    {
+      "task": "bench_urljoin",
+      "condition": "gate",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "f1fe0413dd75117e63a4f44c2d56e3126e004e60b05e6aff2e41c8bf12f8ddc2"
+    },
+    {
+      "task": "bench_urljoin",
+      "condition": "verify",
+      "rep": 2,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "f1fe0413dd75117e63a4f44c2d56e3126e004e60b05e6aff2e41c8bf12f8ddc2"
     },
     {
       "task": "bench_window",
@@ -1110,7 +2064,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": null,
+      "artifact_sha256": "07789a29bdbc568afe87d910ff8a3859e8675aecbd9a9855fd204afb830955e2"
     },
     {
       "task": "bench_window",
@@ -1121,7 +2077,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "07789a29bdbc568afe87d910ff8a3859e8675aecbd9a9855fd204afb830955e2"
     },
     {
       "task": "bench_window",
@@ -1132,7 +2090,9 @@
       "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "tests pass"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "07789a29bdbc568afe87d910ff8a3859e8675aecbd9a9855fd204afb830955e2"
     }
   ]
 }

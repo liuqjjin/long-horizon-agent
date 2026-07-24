@@ -1,3 +1,17 @@
+# Benchmarks
+
+Three layers, by who grades the work:
+
+1. **Self-eval** (below) — the harness checking its own five workflows on a
+   deterministic stub. Runs in CI.
+2. **Verification ablation** ([ABLATION.md](ABLATION.md)) — a real LLM through the
+   harness, graded by an independent scorer. Committed snapshot in
+   [`benchmarks/`](../benchmarks/).
+3. **Public benchmarks** (bottom of this page) — SWE-bench Verified and
+   Terminal-Bench 2 adapters, graded by their official harnesses. **No runs have
+   been executed yet; no numbers are claimed.** The adapters and their contract
+   tests are in `src/lha/bench/` and `tests/test_bench_adapters.py`.
+
 # Self-eval
 
 The harness checking itself: five workflows, each with an objective pass/fail. It
@@ -90,3 +104,68 @@ arrays, a doctored `metrics.json` is caught (see
   checkout with a fresh `ccc` daemon reproduces `5/5`; a daemon heavily churned by
   many prior ad-hoc runs can briefly report a transient code-context miss — re-run
   on a fresh daemon.
+
+# Public benchmarks (adapters ready, not yet run)
+
+`src/lha/bench/` connects the harness to two public evaluators. In both, the
+grading is done by the official harness on frozen predictions — the same
+prediction/truth separation the ablation uses. **No evaluation runs have been
+executed; the tables above contain the only measured numbers in this repo.**
+Running either benchmark costs real model calls and needs Docker.
+
+## SWE-bench Verified
+
+Dataset `SWE-bench/SWE-bench_Verified` (500 instances), evaluated by
+`swebench` ≥ 4.1. The adapter writes predictions in the official three-field
+JSONL (`instance_id`, `model_name_or_path`, `model_patch`), refuses duplicate
+instance ids, and parses the official `schema_version: 2` report with
+evaluation ERRORs kept in the denominator (`resolved_rate = resolved /
+submitted`, never `resolved / completed`).
+
+```bash
+uv sync --extra bench
+# 1. produce predictions with the harness (one lha run per instance), then:
+python -c "
+from lha.bench import write_predictions, eval_command
+from lha.bench.swebench import prediction_from_run
+preds = [prediction_from_run('runs/<run_id>', '<instance_id>', 'lha+claude-haiku-4-5-20251001')]
+print(' '.join(eval_command(write_predictions(preds, 'preds.jsonl'), run_id='lha-v0')))
+"
+# 2. run the printed official command; on Apple silicon add namespace='' so
+#    images build locally (upstream images are x86_64).
+```
+
+The internal gate may run the target repo's own tests, but it never sees
+SWE-bench's held-out FAIL_TO_PASS tests — those are applied by the official
+harness inside its own containers.
+
+## Terminal-Bench 2 (Harbor)
+
+Dataset `terminal-bench/terminal-bench-2` (89 frozen tasks; TB 2.1 exists and
+is newer — 2.0 is pinned for comparability), driven by the `harbor` framework.
+The adapter (`lha.bench.terminal_bench.build_agent()`) is a Harbor
+`BaseInstalledAgent` that installs lha from a wheel plus the claude CLI into
+the task container, maps the instruction to a `TaskSpec`, and copies the
+workdir onto the graded filesystem only when the run ends `DONE` — an edit
+that failed verification never reaches the grader.
+
+```bash
+uv build                                # dist/lha-<version>-py3-none-any.whl
+# harbor needs Python >= 3.12 (lha itself supports 3.11):
+LHA_WHEEL=dist/lha-*.whl uvx --python 3.12 --with 'harbor>=0.20' \
+  harbor run -d terminal-bench/terminal-bench-2 \
+  -a module=lha.bench.terminal_bench:build_agent -l 5
+```
+
+Honest constraints, stated up front: the container has no code-search backend
+(tasks run with `context_requirement: optional`), the loop targets
+file-editing tasks (service/OS-state tasks will simply fail their checks), and
+`ANTHROPIC_API_KEY` must be provided to the container by harbor's env
+passthrough.
+
+## Paired statistics
+
+`lha.bench.stats` carries the comparison tools for when runs exist: an exact
+McNemar test on discordant pairs (two conditions on the same instances) and a
+seeded task-cluster bootstrap for CIs. The ablation already reports with the
+same cluster-bootstrap method.

@@ -9,7 +9,7 @@ re-running (generated output under `runs/` is gitignored).
   reproduce: [`docs/ABLATION.md`](../docs/ABLATION.md). Regenerate with:
 
   ```bash
-  uv run lha --llm claude_cli ablate --model haiku --reps 3
+  uv run lha --llm claude_cli ablate --model claude-haiku-4-5-20251001 --reps 3
   cp runs/ablation/ablation_report.* benchmarks/
   ```
 

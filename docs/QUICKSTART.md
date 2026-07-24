@@ -10,6 +10,11 @@ repo root.
 uv sync
 ```
 
+(`uv sync` includes the dev group, which carries the optional vector-index
+dependencies. A plain `pip install lha` gets the loop and code verifiers only;
+add `lha[context]` for paper/experiment/skill search — without it those
+backends report "unavailable" and required-context steps fail closed.)
+
 ## 2. Run the toy issue→PR task
 
 The harness finds a planted off-by-one bug, fixes it, and verifies the fix with a

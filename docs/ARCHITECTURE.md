@@ -126,20 +126,55 @@ with `lha run --runtime langgraph`.
 After a verified-`DONE` run, `src/lha/memory.py` distills the success to a markdown
 note under `data/skills/`; `index_docs` indexes it (`kind="skill"`) and the Context
 Engineer retrieves relevant skills as additional context for future tasks. Only
-verified successes are recorded.
+verified successes are recorded, and each note names the SHA-256 of the verdict
+that justified it.
+
+## Execution boundary and threat model
+
+Everywhere target or model-influenced code executes goes through one seam,
+`lha.sandbox.ExecutionBackend` (verifiers, the experimenter, the ablation's gate
+and scorer):
+
+| backend | isolation | intended for |
+|---|---|---|
+| `trusted-local` | scrubbed env (PATH/HOME/locale only), process-group SIGKILL on timeout, opt-in rlimits | this repo's own dev loop and self-eval, where the code is already trusted |
+| `docker` | `--network none`, empty env, memory/pids caps, read-only source mounts, container removed on timeout | external target repos and scoring model-written patches |
+
+What the harness defends against, by layer:
+
+- **A patch that rewrites its oracle** — `tools.policy` refuses patches touching
+  tests/`conftest.py`/build config before they reach the sandbox (a task manifest
+  can allowlist specific paths).
+- **An approval that no longer matches the artifact** — approvals bind to the
+  SHA-256 of the reviewed patch bytes (per-step manifest); a mismatch on resume
+  reverts and fails the run.
+- **A grader grading its own prediction** — in `lha ablate`, the internal gate
+  predicts; an independent scorer re-applies the frozen diff to a pristine copy
+  and grades on its own backend.
+- **Resuming from damage** — checkpoints are checksummed envelopes; corruption
+  refuses to resume (`CheckpointCorrupt`) instead of guessing.
+- **Silent context rot** — context failures carry status and fail required steps
+  closed; stale indexes must refresh or the step fails.
+
+Out of scope, stated plainly: `trusted-local` is not a sandbox against malicious
+code (use `docker` there), and prompt-injection through indexed content is
+mitigated only by verification (a poisoned suggestion still has to pass the
+oracle), not prevented.
 
 ## Module map
 
 ```
 src/lha/
-  harness/        loop · state · checkpoint · budget · approval · errors
+  harness/        loop · state · checkpoint · budget · approval · manifest · errors
   live_context/   facade + models + freshness + backends/ (the only door to indexers)
   agents/         supervisor · context_engineer · implementer · experimenter · verifier_agent
   verifiers/      base · registry · verdict · code/ · experiment/ · context/
-  llm/            base · stub · claude_cli · anthropic   (one interface)
+  llm/            base · stub · claude_cli · anthropic · trace (budget + per-call log)
+  sandbox/        ExecutionBackend: trusted-local · docker (the execution seam)
+  bench/          swebench · terminal_bench · stats (public-benchmark adapters)
   runtime/        langgraph_runner   (opt-in durable execution)
-  tasks/ tools/   task specs · sandbox patch/shell helpers
-  memory.py  orchestrator.py  eval.py  cli.py  config.py
+  tasks/ tools/   task specs · policy (protected oracle paths) · patch/shell helpers
+  memory.py  orchestrator.py  eval.py  ablation.py  cli.py  config.py
 flows/            papers · experiments · skills CocoIndex apps (imported only by coco_flow)
 data/             sample repo (toy bug) · paper note · experiment log · experiment script · tasks
 runs/<id>/        state.json · ledger.jsonl · plan · patch · verify.json · summaries · graph.sqlite · workdir/

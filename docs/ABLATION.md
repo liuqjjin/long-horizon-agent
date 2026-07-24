@@ -14,9 +14,15 @@ first. This ablation separates them and measures what the verifier changes.
 
 ## Method: paired ablation
 
-A corpus of 11 small Python repos, each with one planted bug and a pytest oracle
-(`data/bench/*`, driven by `data/tasks/bench_*.yaml`), spanning arithmetic, strings,
-recursion, stack logic, search, parsing, base conversion, and interval merging.
+A corpus of 17 small Python repos, each with one planted bug and a pytest oracle
+(`data/bench/*`, driven by `data/tasks/bench_*.yaml`). The first 11 span arithmetic,
+strings, recursion, stack logic, search, parsing, base conversion, and interval
+merging; 6 more were added after the model saturated those (see calibration below) —
+bugs where the issue names one symptom but the docstring contract has edge cases a
+symptom-only fix misses (LRU recency on update, CSV quote escaping, half-open span
+merging, separator collapse, catastrophic cancellation, slash-boundary URL joins).
+All 6 were authored and committed before any model output on them was observed, and
+every result is reported — no post-hoc task selection.
 
 For each task we draw one first attempt from the LLM and score that same attempt under
 three conditions, so the only thing that varies is the verification:
@@ -34,55 +40,75 @@ a paired one.)
 
 Per condition:
 
-- claimed success — the condition declared success;
-- true success — the canonical test suite passes;
+- claimed success — the condition declared success (this is the *prediction*);
+- true success — an **independent final scorer** applies the frozen source diff
+  (SHA-256 recorded) to a fresh copy of the pristine repo, including the canonical
+  tests, and runs them on its own execution backend (this is the *truth* — the
+  internal gate's verdict is never reused as the grade);
 - false success — claimed and not true (a wrong answer that went undetected);
 - mean repairs — repair rounds spent.
 
-By construction `true_success(trust) == true_success(gate)` (same attempt, same oracle),
-so the gate's contribution appears in the false-success column and the repair loop's in
-the true-success change from `gate` to `verify`.
+Because prediction and truth are decoupled, the internal gate gets a confusion matrix
+(TP/FP/TN/FN, precision/recall) against the scorer — including false negatives, i.e.
+correct fixes the gate wrongly discarded, which a gate-graded design cannot even see.
+Uncertainty is a task-cluster bootstrap: 95% CIs from 10,000 resamples of tasks (not
+cells), since repetitions of one task are correlated.
 
 ### Integrity properties
 
 - **Leak-free.** The implementer is a single-shot completion with the file tools denied
   (`claude -p --disallowed-tools …`) and is shown only non-test source. It cannot open
   the oracle and read off the assertions; it has to fix the bug from the issue.
-- **Tamper-proof.** A patch may only edit source; test files, `conftest.py`, and
+- **Oracle-protected.** A patch may only edit source; test files, `conftest.py`, and
   `pyproject.toml` are stripped before it is applied. The gate and the grade always run
   the canonical suite, so a "fix" that rewrites the tests cannot fake a pass.
-- **Transient errors excluded.** A transient backend error (a dropped connection, a
-  rate limit) is retried; if it persists the cell is recorded as `ERROR` and never
-  counted, so infrastructure flakiness does not show up as a verification failure.
+- **Transient errors visible, never counted.** A transient backend error (a dropped
+  connection, a rate limit) is retried; if it persists the cell is recorded as `ERROR`,
+  shown in the report, excluded from the rates, and never written to the resume cache —
+  infrastructure flakiness neither poses as a verification failure nor silently
+  disappears.
+- **Pinned model.** Runs name a full snapshot (`claude-haiku-4-5-20251001`), never a
+  floating alias, and the report records a provenance fingerprint (task bytes, corpus
+  digest, model, prompt source, harness version) that also keys the resume cache.
 
 ### Difficulty calibration
 
 A frontier model fixes these one-file bugs on the first try almost every time, which
-leaves the gate nothing to catch. To bring first-attempt success into a range where the
-gate matters, the implementer runs on a weaker model (`--model`); the harness is
-unchanged. This is the usual way to exercise a reliability mechanism: lower the input
-quality until errors appear.
+leaves the gate nothing to catch, so the implementer runs on a weaker pinned model
+(`--model claude-haiku-4-5-20251001`); the harness is unchanged. Even so, haiku-4.5
+first-attempts 94% of this corpus correctly — the 6 harder tasks were added for exactly
+that reason, and moved the false-success rate only from 2/33 to 3/51. The honest
+reading: on self-contained single-file bugs with the contract in the docstring, current
+models rarely need the gate; the gate's measured value here is catching the residual 6%
+and costing nothing (zero false negatives).
 
 <!-- RESULTS:BEGIN -->
 ## Result
 
-Implementer `claude_cli` on `haiku`, 11 tasks × 3 repetitions, 0 transient errors
-(from [`benchmarks/ablation_report.md`](../benchmarks/ablation_report.md)):
+Implementer `claude_cli` on `claude-haiku-4-5-20251001`, 17 tasks × 3 repetitions
+(51 cells per condition), 0 transient errors, graded by the independent scorer
+(from [`benchmarks/ablation_report.md`](../benchmarks/ablation_report.md), raw data
+in [`benchmarks/ablation_report.json`](../benchmarks/ablation_report.json)):
 
-| condition | claimed | true success | false success | mean repairs |
+| condition | claimed | true success (95% CI) | false success (95% CI) | mean repairs |
 |---|---|---|---|---|
-| `trust`  | 100% | 61% | 39% | 0.00 |
-| `gate`   | 61%  | 61% | 0%  | 0.00 |
-| `verify` | 85%  | 85% | 0%  | 0.39 |
+| `trust`  | 100% | 94% (88–100%) | 6% (0–12%) | 0.00 |
+| `gate`   | 94%  | 94% (88–100%) | 0% (0–0%)  | 0.00 |
+| `verify` | 100% | 100% (100–100%) | 0% (0–0%) | 0.06 |
 
-On the same first attempts, trust accepts 39% wrong fixes; the gate drives that to 0%.
-The repair loop then raises true success from 61% (first try) to 85%.
+Internal gate vs scorer, per attempt: `gate` TP=48 FP=0 TN=3 FN=0
+(precision 100%, recall 100%); `verify` TP=51 FP=0 TN=0 FN=0.
 
-trust and gate score the identical attempts, so their equal 61% true success and the
-39% → 0% false-success gap come only from the gate: it refuses the four tasks (basen,
-merge_intervals, roman, window) where haiku's first answer was wrong instead of shipping
-them. verify repairs two of those four to a real pass (basen, roman); the other two it
-cannot fix and reports `FAILED`.
+trust and gate score the identical attempts, so the 6% → 0% false-success gap comes
+only from the gate. The three wrong first attempts (`bench_median` rep 0,
+`bench_bsearch` rep 1, `bench_lru` rep 1) trace through all three conditions: trust
+ships each as a silent false success, gate refuses exactly those three (and discards
+no correct fix), and verify repairs each in one round to a scorer-verified pass.
+
+Three events in 51 cells is a small effect measured honestly: with this model and
+corpus, the first attempt is usually right, and the CIs above say so. What the numbers
+support is the mechanism claim — every wrong fix was caught, every catch was repaired,
+and no correct fix was lost — not a large headline delta.
 <!-- RESULTS:END -->
 
 ## Reading it
@@ -101,9 +127,14 @@ cannot fix and reports `FAILED`.
   (deliberately weakened) model and the corpus; the gaps between conditions are the
   result. The paired design makes the trust↔gate gap exact; the gate↔verify gap still
   carries LLM noise, which `reps` averages.
-- The corpus is hand-built. Eleven self-contained bugs, each screened so the bug is
-  real, the oracle catches a plausible-but-naive fix, and the issue stays symptom-level.
-  Realistic, but not sampled from production history like SWE-bench.
+- The corpus is hand-built. Seventeen self-contained bugs, each screened so the bug is
+  real, the oracle catches a plausible-but-naive fix, and the issue stays symptom-level;
+  each oracle is calibrated to fail the planted bug and pass a hand-written reference
+  fix. Realistic, but not sampled from production history like SWE-bench (adapters for
+  that are in [`BENCHMARKS.md`](BENCHMARKS.md)).
+- The effect is small at this difficulty. 3 wrong first attempts in 51 cells bounds
+  what any gate could show here; the value of the design is that the confusion matrix
+  and CIs make that limit visible instead of hiding it behind a percentage.
 - The oracle is the test suite. "True success" is defined by the same kind of objective
   check the gate uses (pytest). trust never runs it, and patches cannot touch it.
 - Single-file, short-horizon. These are one-step fixes; they show the per-step effect
@@ -112,13 +143,17 @@ cannot fix and reports `FAILED`.
 ## Reproduce
 
 ```bash
-uv run lha --llm claude_cli ablate --reps 3 --model haiku    # 11 tasks x 3 conditions
-uv run lha --llm claude_cli ablate data/tasks/bench_rpn.yaml --model haiku   # one task
+# 17 tasks x 3 conditions x 3 reps, pinned snapshot
+uv run lha --llm claude_cli ablate --reps 3 --model claude-haiku-4-5-20251001
+# one task
+uv run lha --llm claude_cli ablate data/tasks/bench_rpn.yaml --model claude-haiku-4-5-20251001
+# score in a container instead of on the host
+uv run lha --llm claude_cli ablate --reps 3 --model claude-haiku-4-5-20251001 --scorer-backend docker
 ```
 
 Writes `runs/ablation/ablation_report.{md,json}` and one JSON per (task, rep) under
 `runs/ablation/results/`, so an interrupted run resumes. The committed snapshot lives in
 [`benchmarks/ablation_report.md`](../benchmarks/ablation_report.md). The deterministic
-mechanics — paired scoring, tamper-proof grading, the false-success path, repair
+mechanics — paired scoring, oracle-protected grading, the false-success path, repair
 convergence, transient-error handling — are pinned in `tests/test_ablation.py` (no
 network), so CI exercises the logic without a live model.
