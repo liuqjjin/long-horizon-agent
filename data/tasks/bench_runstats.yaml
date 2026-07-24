@@ -1,0 +1,11 @@
+kind: issue_to_pr
+title: "OnlineStats.variance goes negative for nearly-constant data"
+description: >
+  Feeding 1e9+0.001, 1e9+0.002, 1e9+0.003 into OnlineStats yields a negative
+  variance; a variance can never be negative.
+target_repo: data/bench/runstats
+inputs:
+  context_query: "online variance numerical stability"
+success:
+  - "pytest passes"
+  - "ruff clean"

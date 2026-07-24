@@ -1,0 +1,12 @@
+kind: issue_to_pr
+title: "merge_spans() misses overlaps when input is unsorted"
+description: >
+  merge_spans([(5, 7), (1, 3), (2, 4)]) returns [(5, 7)] — the (1, 3) and
+  (2, 4) spans are swallowed into an unrelated span instead of merging with
+  each other. It should return [(1, 4), (5, 7)].
+target_repo: data/bench/spans
+inputs:
+  context_query: "merge overlapping intervals half-open"
+success:
+  - "pytest passes"
+  - "ruff clean"

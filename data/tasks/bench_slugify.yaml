@@ -1,0 +1,11 @@
+kind: issue_to_pr
+title: "slugify() emits a hyphen per punctuation character"
+description: >
+  slugify("Hello, World!") returns "hello--world-" — one hyphen for the comma,
+  one for the space, one dangling at the end. It should return "hello-world".
+target_repo: data/bench/slugify
+inputs:
+  context_query: "slugify separator collapse hyphen"
+success:
+  - "pytest passes"
+  - "ruff clean"
