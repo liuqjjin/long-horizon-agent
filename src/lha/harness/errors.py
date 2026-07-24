@@ -22,3 +22,16 @@ class ApprovalPending(HarnessError):
 
 class ApprovalRejected(HarnessError):
     pass
+
+
+class PolicyViolation(HarnessError):
+    """A patch tried to touch protected oracle/config files. The patch is
+    refused before it reaches the sandbox; the loop treats this as a failed
+    verification so the repair loop gets the reason as feedback."""
+
+    def __init__(self, step_id: str, violations: list[str]):
+        super().__init__(
+            f"patch for step {step_id} touches protected files: {', '.join(violations)}"
+        )
+        self.step_id = step_id
+        self.violations = violations

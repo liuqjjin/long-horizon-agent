@@ -21,7 +21,8 @@ from ..agents import ContextEngineer, Supervisor, VerifierAgent
 from ..config import Config
 from ..harness.approval import HumanApprovalGate
 from ..harness.checkpoint import append_ledger, load_state_by_id, save_state
-from ..harness.loop import Harness, RunResult, _dump, _gen_run_id
+from ..harness.errors import PolicyViolation
+from ..harness.loop import Harness, RunResult, _dump, _gen_run_id, _policy_verdict
 from ..harness.state import Phase, RunState, StepRecord
 from ..verifiers import VerifyContext
 
@@ -179,7 +180,24 @@ class LangGraphHarness:
         bundle = ContextEngineer(self.config).gather(step)
         _dump(run_dir, step.step_id, "context_bundle.json", bundle.model_dump_json(indent=2))
         ledger("context", artifact_ref="context_bundle.json")
-        artifact, ref = self._h._execute(state, step, bundle)
+        try:
+            artifact, ref = self._h._execute(state, step, bundle)
+        except PolicyViolation as e:
+            # Same oracle protection as the default loop: the patch was refused
+            # before it reached the sandbox; feed the reason to the repair loop.
+            verdict = _policy_verdict(step.step_id, e)
+            _dump(run_dir, step.step_id, "verify.json", verdict.model_dump_json(indent=2))
+            ledger("verify", verdict_ref="verify.json", notes=str(e)[:300])
+            if state.repairs_for(step) < self.config.max_repairs:
+                state.record_repair(step)
+                assert state.plan is not None  # plan set before stepping
+                state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
+                ledger("repair", notes="; ".join(verdict.failures)[:300])
+            else:
+                state.fail_current(step)
+                ledger("fail")
+            save_state(state)
+            return {"rs": state.model_dump(mode="json")}
         ledger("execute", artifact_ref=ref)
 
         if step.requires_approval and not self.auto_approve:

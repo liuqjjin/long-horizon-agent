@@ -21,12 +21,19 @@ def _safe_target(workdir: Path, rel: str) -> Path:
 
     A patch is model/LLM output; an absolute or ``../`` key must never let a write
     land outside the run sandbox. (``git apply`` already rejects out-of-tree paths;
-    this guards the direct ``file_contents`` write path.)
+    this guards the direct ``file_contents`` write path.) A symlink anywhere on
+    the path is refused too: a link created by an earlier write could otherwise
+    redirect this one into a protected path that policy checks by name.
     """
     root = workdir.resolve()
     target = (root / rel).resolve()
     if Path(rel).is_absolute() or not target.is_relative_to(root):
         raise ValueError(f"refusing to write outside the sandbox: {rel!r}")
+    probe = root / rel
+    while probe != root:
+        if probe.is_symlink():
+            raise ValueError(f"refusing to write through a symlink: {rel!r}")
+        probe = probe.parent
     return target
 
 

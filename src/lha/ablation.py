@@ -48,6 +48,7 @@ from .config import Config
 from .live_context.models import ContextBundle, Freshness
 from .llm.base import LLMClient
 from .tasks.spec import TaskSpec
+from .tools import policy
 from .tools.patch import apply_patch
 from .verifiers import VerifyContext
 from .verifiers.code.pytest_verifier import PytestVerifier
@@ -173,25 +174,14 @@ _IGNORE = shutil.ignore_patterns(
 )
 
 
-def _is_protected(rel: str) -> bool:
-    """Files a source fix may NOT touch — the oracle and its config stay canonical."""
-    p = Path(rel)
-    name = p.name
-    return (
-        "tests" in p.parts
-        or name.startswith("test_")
-        or name.endswith("_test.py")
-        or name == "conftest.py"
-        or name == "pyproject.toml"
-    )
-
-
 def _sanitize(patch: Patch) -> Patch:
-    """Keep only source edits, so a patch can never rewrite the test oracle or config."""
-    fc = {k: v for k, v in patch.file_contents.items() if not _is_protected(k)}
-    return patch.model_copy(
-        update={"file_contents": fc, "touched_files": list(fc), "unified_diff": ""}
-    )
+    """Keep only source edits, so a patch can never rewrite the test oracle or config.
+
+    Uses the same protected-file policy the run loop enforces (tools.policy);
+    the ablation strips rather than rejects because the paired design scores
+    whatever source edits the first attempt made.
+    """
+    return policy.strip_protected(patch)
 
 
 def _empty_bundle() -> ContextBundle:

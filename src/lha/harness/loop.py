@@ -30,13 +30,14 @@ from ..clock import now
 from ..config import Config
 from ..llm import get_llm
 from ..tasks.spec import TaskSpec
+from ..tools import policy
 from ..tools.patch import Backup, apply_patch, load_backup, revert_patch, save_backup
 from ..verifiers import VerifyContext
-from ..verifiers.verdict import Verdict
+from ..verifiers.verdict import Check, Verdict
 from .approval import HumanApprovalGate
 from .budget import StepBudget
 from .checkpoint import append_ledger, load_state_by_id, save_state
-from .errors import ApprovalPending, ApprovalRejected, BudgetExceeded
+from .errors import ApprovalPending, ApprovalRejected, BudgetExceeded, PolicyViolation
 from .state import RunState, StepRecord
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,27 @@ def _dump(run_dir: Path, step_id: str, name: str, text: str) -> None:
 
 def _gen_run_id(task: TaskSpec) -> str:
     return f"{now():%Y%m%d-%H%M%S}-{_slug(task.title)}-{uuid.uuid4().hex[:4]}"
+
+
+def _policy_verdict(step_id: str, e: PolicyViolation) -> Verdict:
+    """A failing verdict for a policy-refused patch (never applied)."""
+    return Verdict.from_checks(
+        step_id,
+        [
+            Check(
+                name="oracle-policy",
+                family="code",
+                passed=False,
+                detail={
+                    "summary": (
+                        "patch refused: it modifies protected oracle/config files "
+                        f"({', '.join(e.violations)}); fix the source instead"
+                    ),
+                    "violations": e.violations,
+                },
+            )
+        ],
+    )
 
 
 class Harness:
@@ -235,7 +257,26 @@ class Harness:
         )
 
         # 2/3. EXECUTE (dispatch by action)
-        artifact, artifact_ref = self._execute(state, step, bundle)
+        try:
+            artifact, artifact_ref = self._execute(state, step, bundle)
+        except PolicyViolation as e:
+            # The patch never reached the sandbox. Record a failing verdict so
+            # the repair loop is told exactly why, instead of aborting the run.
+            verdict = _policy_verdict(step.step_id, e)
+            _dump(run_dir, step.step_id, "verify.json", verdict.model_dump_json(indent=2))
+            append_ledger(
+                state,
+                StepRecord(
+                    seq=state.next_seq(),
+                    step_id=step.step_id,
+                    phase="verify",
+                    verdict_ref="verify.json",
+                    notes=str(e)[:300],
+                ),
+            )
+            self._repair_or_fail(state, step, verdict, budget, workdir)
+            save_state(state)
+            return
         append_ledger(
             state,
             StepRecord(
@@ -271,7 +312,15 @@ class Harness:
             append_ledger(
                 state, StepRecord(seq=state.next_seq(), step_id=step.step_id, phase="complete")
             )
-        elif state.repairs_for(step) < budget.max_repairs:
+        else:
+            self._repair_or_fail(state, step, verdict, budget, workdir)
+
+        # 6. CHECKPOINT
+        save_state(state)
+
+    def _repair_or_fail(self, state: RunState, step, verdict: Verdict, budget, workdir) -> None:
+        """Re-issue the step as a repair with the verdict's failures, or fail the run."""
+        if state.repairs_for(step) < budget.max_repairs:
             state.record_repair(step)
             assert state.plan is not None  # set before the loop body runs
             state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
@@ -291,9 +340,6 @@ class Harness:
                 state, StepRecord(seq=state.next_seq(), step_id=step.step_id, phase="fail")
             )
 
-        # 6. CHECKPOINT
-        save_state(state)
-
     # --- execute dispatch ---------------------------------------------------
     def _execute(self, state: RunState, step, bundle) -> tuple[Any, str]:
         run_dir = Path(state.run_dir)
@@ -312,6 +358,12 @@ class Harness:
                 patch = Implementer(self.llm).implement(step, bundle, workdir)
             (run_dir / "patch.diff").write_text(patch.unified_diff or "(no diff)\n")
             _dump(run_dir, step.step_id, "patch.json", patch.model_dump_json(indent=2))
+            # Oracle protection: a patch that touches the test suite or the
+            # verifier/build config is refused BEFORE it can reach the sandbox,
+            # unless the task manifest explicitly authorizes those exact paths.
+            violations = policy.check_patch(patch, state.task.allowed_protected_files)
+            if violations:
+                raise PolicyViolation(step.step_id, violations)
             # Only touch the sandbox if there is a new patch. On a repair pass an
             # idempotent implementer may return an empty patch (already fixed) —
             # keep the prior fix rather than reverting it.
