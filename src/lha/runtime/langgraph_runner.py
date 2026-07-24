@@ -5,6 +5,14 @@ Runs the same plan/agents/verifiers as the default loop, but drives them through
 with ``interrupt()`` for the human-approval gate. It reuses the Harness's
 execute/finalize helpers, so there is one implementation of the actual work.
 
+The graph is split into three nodes precisely so approval cannot re-execute
+work: ``prepare`` (context + execute, checkpointed BEFORE the interrupt),
+``gate`` (only the interrupt), and ``verify``. A LangGraph interrupt replays
+its node from the top on resume — with a single node that replay would call the
+implementer again and could apply a patch the human never saw. With the split,
+resume replays only ``gate``, and ``verify`` grades the artifact persisted by
+``prepare``, whose SHA-256 the approval decision is bound to.
+
 Enable with ``lha run --runtime langgraph`` (and ``lha resume --runtime langgraph``).
 """
 
@@ -13,17 +21,21 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from collections.abc import Hashable
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from .. import live_context
 from ..agents import ContextEngineer, Supervisor, VerifierAgent
+from ..artifacts import ExperimentResult, Patch
 from ..config import Config
 from ..harness.approval import HumanApprovalGate
 from ..harness.checkpoint import append_ledger, load_state_by_id, save_state
 from ..harness.errors import PolicyViolation
-from ..harness.loop import Harness, RunResult, _dump, _gen_run_id, _policy_verdict
+from ..harness.loop import Harness, RunResult, _dump, _gen_run_id, _policy_verdict, _safe_seg
+from ..harness.manifest import sha256_bytes
 from ..harness.state import Phase, RunState, StepRecord
+from ..live_context.models import ContextBundle
 from ..verifiers import VerifyContext
 
 logger = logging.getLogger(__name__)
@@ -31,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 class GraphState(TypedDict):
     rs: dict  # RunState.model_dump(mode="json")
+    # routing hint set by each node: "gate" | "verify" | "continue" | "done"
+    next: NotRequired[str]
 
 
 class LangGraphHarness:
@@ -98,7 +112,7 @@ class LangGraphHarness:
                 interrupted_step = None
                 for intr in snap.interrupts or []:
                     interrupted_step = (getattr(intr, "value", {}) or {}).get("step_id")
-                if decision is not None and decision.step_id not in (None, interrupted_step):
+                if decision is not None and decision.step_id != interrupted_step:
                     gate.clear()  # a decision for a different step must not resume this one
                     decision = None
                 if decision is None:
@@ -106,6 +120,28 @@ class LangGraphHarness:
                         load_state_by_id(self.config.runs_dir, state.run_id),
                         "AWAITING_APPROVAL",
                         "approval pending",
+                    )
+                # The decision must bind the exact persisted artifact bytes. A
+                # mismatch means the artifact changed after review — tamper
+                # evidence, so the run fails closed with the change reverted.
+                current_sha = _current_artifact_sha(run_dir, interrupted_step)
+                if not decision.binds(interrupted_step or "", current_sha):
+                    from types import SimpleNamespace
+
+                    gate.clear()
+                    final = load_state_by_id(self.config.runs_dir, state.run_id)
+                    step = final.next_step() or SimpleNamespace(step_id=interrupted_step or "?")
+                    try:
+                        self._h._revert_step(step, workdir)
+                    except Exception:
+                        logger.exception("revert failed for step %s", interrupted_step)
+                    final.status = "FAILED"
+                    save_state(final)
+                    return RunResult(
+                        final,
+                        "FAILED",
+                        "approved artifact does not match the persisted patch "
+                        "(hash mismatch) — refusing to execute",
                     )
                 gate.clear()
                 graph.invoke(Command(resume={"approved": decision.approved}), gcfg)
@@ -141,22 +177,49 @@ class LangGraphHarness:
         saver = SqliteSaver(conn)
         saver.setup()
         builder = StateGraph(GraphState)
-        builder.add_node("step", self._step_node)  # type: ignore[arg-type]
-        builder.add_edge(START, "step")
-        builder.add_conditional_edges("step", _route, {"continue": "step", "done": END})
+        builder.add_node("prepare", self._prepare_node)  # type: ignore[arg-type]
+        builder.add_node("gate", self._gate_node)  # type: ignore[arg-type]
+        builder.add_node("verify", self._verify_node)  # type: ignore[arg-type]
+        builder.add_edge(START, "prepare")
+        routes: dict[Hashable, str] = {
+            "gate": "gate",
+            "verify": "verify",
+            "continue": "prepare",
+            "done": END,
+        }
+        builder.add_conditional_edges("prepare", _route_next, routes)
+        builder.add_conditional_edges("gate", _route_next, routes)
+        builder.add_conditional_edges("verify", _route_next, routes)
         return builder.compile(checkpointer=saver)
 
-    def _step_node(self, gstate: GraphState) -> GraphState:
-        from langgraph.types import interrupt
+    def _ledger(self, state: RunState, step, phase: Phase, **kw) -> None:
+        append_ledger(
+            state, StepRecord(seq=state.next_seq(), step_id=step.step_id, phase=phase, **kw)
+        )
 
+    def _repair_or_fail(self, state: RunState, step, verdict, workdir: Path) -> None:
+        if state.repairs_for(step) < self.config.max_repairs:
+            state.record_repair(step)
+            assert state.plan is not None  # plan set before stepping
+            state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
+            self._ledger(state, step, "repair", notes="; ".join(verdict.failures)[:300])
+        else:
+            # A step that exhausts its repairs is reverted so an unverified
+            # change never survives in the sandbox (same as the default loop).
+            self._h._revert_step(step, workdir)
+            state.fail_current(step)
+            self._ledger(state, step, "fail")
+
+    def _prepare_node(self, gstate: GraphState) -> GraphState:
+        """Context + execute. Checkpointed BEFORE any approval interrupt, so a
+        resume can never re-run the implementer."""
         state = RunState.model_validate(gstate["rs"])
         step = state.next_step()
         if step is None or state.is_terminal():
-            return {"rs": state.model_dump(mode="json")}
+            return {"rs": state.model_dump(mode="json"), "next": "done"}
 
-        # Bound the run: max_steps caps total node executions and deadline_s caps
-        # wall-clock, both persisted so they survive resume. (max_steps is conservative
-        # across approval re-runs — it may count a paused-then-resumed step twice.)
+        # Bound the run: max_steps caps prepare executions and deadline_s caps
+        # wall-clock, both persisted so they survive resume.
         elapsed = self._prior_elapsed + (time.monotonic() - self._t0)
         deadline = self.config.deadline_s
         if state.steps_used >= self.config.max_steps or (
@@ -165,74 +228,83 @@ class LangGraphHarness:
             state.status = "PAUSED"
             state.elapsed_s = elapsed
             save_state(state)
-            return {"rs": state.model_dump(mode="json")}
+            return {"rs": state.model_dump(mode="json"), "next": "done"}
         state.steps_used += 1
         state.elapsed_s = elapsed
 
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
 
-        def ledger(phase: Phase, **kw):
-            append_ledger(
-                state, StepRecord(seq=state.next_seq(), step_id=step.step_id, phase=phase, **kw)
-            )
-
         bundle = ContextEngineer(self.config).gather(step)
         _dump(run_dir, step.step_id, "context_bundle.json", bundle.model_dump_json(indent=2))
-        ledger("context", artifact_ref="context_bundle.json")
+        self._ledger(state, step, "context", artifact_ref="context_bundle.json")
         try:
-            artifact, ref = self._h._execute(state, step, bundle)
+            _artifact, ref = self._h._execute(state, step, bundle)
         except PolicyViolation as e:
             # Same oracle protection as the default loop: the patch was refused
             # before it reached the sandbox; feed the reason to the repair loop.
             verdict = _policy_verdict(step.step_id, e)
             _dump(run_dir, step.step_id, "verify.json", verdict.model_dump_json(indent=2))
-            ledger("verify", verdict_ref="verify.json", notes=str(e)[:300])
-            if state.repairs_for(step) < self.config.max_repairs:
-                state.record_repair(step)
-                assert state.plan is not None  # plan set before stepping
-                state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
-                ledger("repair", notes="; ".join(verdict.failures)[:300])
-            else:
-                state.fail_current(step)
-                ledger("fail")
+            self._ledger(state, step, "verify", verdict_ref="verify.json", notes=str(e)[:300])
+            self._repair_or_fail(state, step, verdict, workdir)
             save_state(state)
-            return {"rs": state.model_dump(mode="json")}
-        ledger("execute", artifact_ref=ref)
+            nxt = "done" if state.is_terminal() else "continue"
+            return {"rs": state.model_dump(mode="json"), "next": nxt}
+        self._ledger(state, step, "execute", artifact_ref=ref)
+        save_state(state)
 
-        if step.requires_approval and not self.auto_approve:
-            decision = interrupt({"step_id": step.step_id, "goal": step.goal})
-            if not (isinstance(decision, dict) and decision.get("approved")):
-                ledger("approval", notes="rejected")
-                self._h._revert_step(step, workdir)  # rejected change must not survive
-                state.fail_current(step)
-                ledger("fail")
-                save_state(state)
-                return {"rs": state.model_dump(mode="json")}
-            ledger("approval", notes="approved")
+        needs_gate = step.requires_approval and not self.auto_approve
+        return {"rs": state.model_dump(mode="json"), "next": "gate" if needs_gate else "verify"}
+
+    def _gate_node(self, gstate: GraphState) -> GraphState:
+        """Only the approval interrupt lives here. On resume this node replays
+        from the top, which re-raises the interrupt — nothing else re-runs."""
+        from langgraph.types import interrupt
+
+        state = RunState.model_validate(gstate["rs"])
+        step = state.next_step()
+        if step is None or state.is_terminal():
+            return {"rs": state.model_dump(mode="json"), "next": "done"}
+
+        run_dir = Path(state.run_dir)
+        sha = _current_artifact_sha(run_dir, step.step_id)
+        decision = interrupt({"step_id": step.step_id, "goal": step.goal, "artifact_sha256": sha})
+        if not (isinstance(decision, dict) and decision.get("approved")):
+            self._ledger(state, step, "approval", notes="rejected")
+            self._h._revert_step(step, Path(state.workdir))  # rejected change must not survive
+            state.fail_current(step)
+            self._ledger(state, step, "fail")
+            save_state(state)
+            return {"rs": state.model_dump(mode="json"), "next": "done"}
+        self._ledger(state, step, "approval", notes="approved")
+        save_state(state)
+        return {"rs": state.model_dump(mode="json"), "next": "verify"}
+
+    def _verify_node(self, gstate: GraphState) -> GraphState:
+        """Grade the artifact ``prepare`` persisted — never a regenerated one."""
+        state = RunState.model_validate(gstate["rs"])
+        step = state.next_step()
+        if step is None or state.is_terminal():
+            return {"rs": state.model_dump(mode="json"), "next": "done"}
+
+        run_dir = Path(state.run_dir)
+        workdir = Path(state.workdir)
+        artifact, bundle = _load_step_artifacts(run_dir, step)
 
         verdict = VerifierAgent(parallel=self.config.parallel_verify).verify(
             step, artifact, VerifyContext(workdir=workdir, step=step, bundle=bundle)
         )
         _dump(run_dir, step.step_id, "verify.json", verdict.model_dump_json(indent=2))
-        ledger("verify", verdict_ref="verify.json")
+        self._ledger(state, step, "verify", verdict_ref="verify.json")
 
         if verdict.passed:
             state.complete_step(step)
-            ledger("complete")
-        elif state.repairs_for(step) < self.config.max_repairs:
-            state.record_repair(step)
-            assert state.plan is not None  # plan set before stepping
-            state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
-            ledger("repair", notes="; ".join(verdict.failures)[:300])
+            self._ledger(state, step, "complete")
         else:
-            # Match the default loop: a step that exhausts its repairs is reverted
-            # so an unverified change never survives in the sandbox (loop.py:_revert_step).
-            self._h._revert_step(step, workdir)
-            state.fail_current(step)
-            ledger("fail")
+            self._repair_or_fail(state, step, verdict, workdir)
         save_state(state)
-        return {"rs": state.model_dump(mode="json")}
+        nxt = "done" if (state.is_terminal() or state.next_step() is None) else "continue"
+        return {"rs": state.model_dump(mode="json"), "next": nxt}
 
     # --- helpers -----------------------------------------------------------
     def _request_approval(self, snap, state: RunState) -> None:
@@ -242,7 +314,11 @@ class LangGraphHarness:
         for intr in snap.interrupts or []:
             payload = getattr(intr, "value", {}) or {}
         step = SimpleNamespace(step_id=payload.get("step_id", "?"), goal=payload.get("goal", ""))
-        HumanApprovalGate(state.run_dir).request(step, "awaiting approval (langgraph interrupt)")
+        HumanApprovalGate(state.run_dir).request(
+            step,
+            "awaiting approval (langgraph interrupt)",
+            artifact_sha256=payload.get("artifact_sha256"),
+        )
 
     def _finalize(self, state: RunState) -> None:
         if state.task.kind == "issue_to_pr":
@@ -259,8 +335,55 @@ class LangGraphHarness:
                 pass
 
 
-def _route(gstate: GraphState) -> str:
-    state = RunState.model_validate(gstate["rs"])
-    if state.is_terminal() or state.status == "PAUSED" or state.next_step() is None:
-        return "done"
-    return "continue"
+def _route_next(gstate: GraphState) -> str:
+    return gstate.get("next", "done")
+
+
+def _current_artifact_sha(run_dir: Path, step_id: str | None) -> str | None:
+    """SHA-256 of the persisted patch.json for a step (per-step file first)."""
+    if not step_id:
+        return None
+    candidates = [run_dir / "steps" / _safe_seg(step_id) / "patch.json", run_dir / "patch.json"]
+    for path in candidates:
+        if path.exists():
+            try:
+                return sha256_bytes(path.read_bytes())
+            except OSError:
+                return None
+    return None
+
+
+def _load_step_artifacts(run_dir: Path, step) -> tuple[Any, ContextBundle | None]:
+    """Reload the artifacts ``prepare`` persisted for this step.
+
+    The verify node grades exactly what was executed (and, for gated steps,
+    approved) — a missing artifact fails closed rather than passing vacuously.
+    """
+    sdir = run_dir / "steps" / _safe_seg(step.step_id)
+    bundle: ContextBundle | None = None
+    bpath = sdir / "context_bundle.json"
+    if bpath.exists():
+        try:
+            bundle = ContextBundle.model_validate_json(bpath.read_text())
+        except Exception:
+            bundle = None
+    if step.action == "edit_code":
+        ppath = sdir / "patch.json"
+        if ppath.exists():
+            try:
+                return Patch.model_validate_json(ppath.read_text()), bundle
+            except Exception:
+                pass
+        return Patch(step_id=step.step_id), bundle
+    if step.action == "run_experiment":
+        epath = sdir / "experiment.json"
+        if epath.exists():
+            try:
+                return ExperimentResult.model_validate_json(epath.read_text()), bundle
+            except Exception:
+                pass
+        return (
+            ExperimentResult(step_id=step.step_id, returncode=1, stdout_tail="artifact missing"),
+            bundle,
+        )
+    return bundle, bundle  # gather_context / answer_query: the bundle IS the artifact

@@ -38,6 +38,7 @@ from .approval import HumanApprovalGate
 from .budget import StepBudget
 from .checkpoint import append_ledger, load_state_by_id, save_state
 from .errors import ApprovalPending, ApprovalRejected, BudgetExceeded, PolicyViolation
+from .manifest import build_manifest, sha256_bytes
 from .state import RunState, StepRecord
 
 logger = logging.getLogger(__name__)
@@ -357,13 +358,24 @@ class Harness:
             if patch is None:
                 patch = Implementer(self.llm).implement(step, bundle, workdir)
             (run_dir / "patch.diff").write_text(patch.unified_diff or "(no diff)\n")
-            _dump(run_dir, step.step_id, "patch.json", patch.model_dump_json(indent=2))
+            patch_json = patch.model_dump_json(indent=2)
+            _dump(run_dir, step.step_id, "patch.json", patch_json)
             # Oracle protection: a patch that touches the test suite or the
             # verifier/build config is refused BEFORE it can reach the sandbox,
             # unless the task manifest explicitly authorizes those exact paths.
             violations = policy.check_patch(patch, state.task.allowed_protected_files)
             if violations:
                 raise PolicyViolation(step.step_id, violations)
+            # Immutable artifact manifest: what an approval binds to (exact
+            # bytes, touched files, pre-apply base state, verifier/policy config).
+            manifest = build_manifest(
+                step=step,
+                patch=patch,
+                patch_json_bytes=patch_json.encode("utf-8"),
+                workdir=workdir,
+                policy_overrides=list(state.task.allowed_protected_files),
+            )
+            _dump(run_dir, step.step_id, "manifest.json", manifest.model_dump_json(indent=2))
             # Only touch the sandbox if there is a new patch. On a repair pass an
             # idempotent implementer may return an empty patch (already fixed) —
             # keep the prior fix rather than reverting it.
@@ -390,23 +402,50 @@ class Harness:
         if backup is not None:
             revert_patch(backup, workdir)
 
+    def _patch_bytes(self, state: RunState, step) -> bytes | None:
+        """The persisted patch.json bytes for this step (per-step file first)."""
+        candidates = [
+            Path(state.run_dir) / "steps" / _safe_seg(step.step_id) / "patch.json",
+            Path(state.run_dir) / "patch.json",
+        ]
+        for path in candidates:
+            if path.exists():
+                try:
+                    return path.read_bytes()
+                except OSError:
+                    return None
+        return None
+
+    def _artifact_sha(self, state: RunState, step) -> str | None:
+        data = self._patch_bytes(state, step)
+        return sha256_bytes(data) if data is not None else None
+
     def _approved_patch(self, state: RunState, step) -> Patch | None:
         """The persisted patch a human already approved for this step, if any.
 
-        Binds the approval to the artifact: on resume, an approval-gated step reuses
-        the exact patch the human reviewed instead of regenerating one that could
-        differ under a non-deterministic backend.
+        Binds the approval to the artifact: on resume, an approval-gated step
+        may only execute the exact bytes the human reviewed. A decision whose
+        artifact hash no longer matches the persisted patch is tamper evidence
+        and fails the run rather than executing an unreviewed change.
         """
         if not step.requires_approval:
             return None
         decision = HumanApprovalGate(state.run_dir).decision()
-        if decision is None or decision.step_id not in (None, step.step_id):
+        if decision is None or decision.step_id != step.step_id:
+            return None  # no decision, or one for a different step (gate clears it)
+        data = self._patch_bytes(state, step)
+        if data is None:
             return None
-        patch_json = Path(state.run_dir) / "patch.json"
-        if not patch_json.exists():
-            return None
+        if not decision.binds(step.step_id, sha256_bytes(data)):
+            # The decision names this step but not these bytes: the artifact
+            # changed after review. Never execute it; revert and fail closed.
+            self._revert_step(step, Path(state.workdir))
+            raise ApprovalRejected(
+                f"approved artifact for step {step.step_id} does not match the "
+                "persisted patch (hash mismatch) — refusing to execute"
+            )
         try:
-            return Patch.model_validate_json(patch_json.read_text())
+            return Patch.model_validate_json(data)
         except Exception:
             return None
 
@@ -414,8 +453,11 @@ class Harness:
     def _approval_gate(self, state: RunState, step, artifact_ref: str) -> None:
         gate = HumanApprovalGate(state.run_dir)
         decision = gate.decision()
-        if decision is not None and decision.step_id not in (None, step.step_id):
-            gate.clear()  # a decision left for a different step must not approve this one
+        artifact_sha = self._artifact_sha(state, step)
+        if decision is not None and not decision.binds(step.step_id, artifact_sha):
+            # A decision for a different step, a different artifact, or one that
+            # names neither must not approve this change. Clear it and re-request.
+            gate.clear()
             decision = None
         if decision is not None:
             gate.clear()
@@ -433,8 +475,13 @@ class Harness:
                 self._revert_step(step, Path(state.workdir))
                 raise ApprovalRejected(f"step {step.step_id} rejected interactively")
             return
-        # non-interactive: pause for async approval
-        gate.request(step, f"awaiting approval to apply {artifact_ref}")
+        # non-interactive: pause for async approval, binding the request to the
+        # exact artifact bytes under review
+        gate.request(
+            step,
+            f"awaiting approval to apply {artifact_ref}",
+            artifact_sha256=artifact_sha,
+        )
         state.status = "AWAITING_APPROVAL"
         append_ledger(
             state, StepRecord(seq=state.next_seq(), step_id=step.step_id, phase="approval")
