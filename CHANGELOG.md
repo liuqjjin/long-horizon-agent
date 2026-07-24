@@ -74,8 +74,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   context) with an install hint; the dev group still installs both.
 - The ablation headline was re-measured under the new method (pinned
   `claude-haiku-4-5-20251001`, independent scorer, 17 tasks × 3 reps): trust
-  ships 3/51 wrong fixes (6%, CI 0–12%); the gate refuses exactly those three
-  with zero false negatives; repair fixes all three (100% true success). The
+  ships 2/51 wrong fixes (4%, CI 0–10%); the gate refuses exactly those two
+  with zero false negatives; repair fixes both (100% true success). The
   previously published 39%→0%→85% numbers came from the old gate-graded design
   and a floating model alias and are superseded.
 - Reworded documentation and code comments for a plainer, more consistent voice, and

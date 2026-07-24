@@ -56,9 +56,13 @@ cells), since repetitions of one task are correlated.
 
 ### Integrity properties
 
-- **Leak-free.** The implementer is a single-shot completion with the file tools denied
-  (`claude -p --disallowed-tools …`) and is shown only non-test source. It cannot open
-  the oracle and read off the assertions; it has to fix the bug from the issue.
+- **Leak-free first attempt.** The implementer is a single-shot completion with the
+  file tools denied (`claude -p --disallowed-tools …`) and is shown only non-test
+  source — tests are deleted from its copy of the repo. It cannot open the oracle and
+  read off the assertions; it has to fix the bug from the issue. Repair rounds (the
+  `verify` condition only) do quote up to 10 one-line pytest failure excerpts — that
+  feedback is the mechanism being measured, it is disclosed here, and a repaired fix
+  still has to pass the whole canonical suite, not just the quoted lines.
 - **Oracle-protected.** A patch may only edit source; test files, `conftest.py`, and
   `pyproject.toml` are stripped before it is applied. The gate and the grade always run
   the canonical suite, so a "fix" that rewrites the tests cannot fake a pass.
@@ -76,10 +80,11 @@ cells), since repetitions of one task are correlated.
 A frontier model fixes these one-file bugs on the first try almost every time, which
 leaves the gate nothing to catch, so the implementer runs on a weaker pinned model
 (`--model claude-haiku-4-5-20251001`); the harness is unchanged. Even so, haiku-4.5
-first-attempts 94% of this corpus correctly — the 6 harder tasks were added for exactly
-that reason, and moved the false-success rate only from 2/33 to 3/51. The honest
+first-attempts 96% of this corpus correctly — the 6 harder tasks were added for exactly
+that reason, and the committed run's two false successes split one/one between the
+original corpus and the additions (an earlier 11-task run had 2/33). The honest
 reading: on self-contained single-file bugs with the contract in the docstring, current
-models rarely need the gate; the gate's measured value here is catching the residual 6%
+models rarely need the gate; the gate's measured value here is catching the residual 4%
 and costing nothing (zero false negatives).
 
 <!-- RESULTS:BEGIN -->
@@ -92,23 +97,31 @@ in [`benchmarks/ablation_report.json`](../benchmarks/ablation_report.json)):
 
 | condition | claimed | true success (95% CI) | false success (95% CI) | mean repairs |
 |---|---|---|---|---|
-| `trust`  | 100% | 94% (88–100%) | 6% (0–12%) | 0.00 |
-| `gate`   | 94%  | 94% (88–100%) | 0% (0–0%)  | 0.00 |
-| `verify` | 100% | 100% (100–100%) | 0% (0–0%) | 0.06 |
+| `trust`  | 100% | 96% (90–100%) | 4% (0–10%) | 0.00 |
+| `gate`   | 96%  | 96% (90–100%) | 0% (0–0%)  | 0.00 |
+| `verify` | 100% | 100% (100–100%) | 0% (0–0%) | 0.04 |
 
-Internal gate vs scorer, per attempt: `gate` TP=48 FP=0 TN=3 FN=0
+Internal gate vs scorer, per attempt: `gate` TP=49 FP=0 TN=2 FN=0
 (precision 100%, recall 100%); `verify` TP=51 FP=0 TN=0 FN=0.
 
-trust and gate score the identical attempts, so the 6% → 0% false-success gap comes
-only from the gate. The three wrong first attempts (`bench_median` rep 0,
-`bench_bsearch` rep 1, `bench_lru` rep 1) trace through all three conditions: trust
-ships each as a silent false success, gate refuses exactly those three (and discards
-no correct fix), and verify repairs each in one round to a scorer-verified pass.
+trust and gate score the identical attempts, so the 4% → 0% false-success gap comes
+only from the gate. The two wrong first attempts (`bench_median` rep 0 from the
+original corpus, `bench_lru` rep 1 from the added tasks) trace through all three
+conditions: trust ships each as a silent false success, gate refuses exactly those
+two (and discards no correct fix), and verify repairs each in one round to a
+scorer-verified pass.
 
-Three events in 51 cells is a small effect measured honestly: with this model and
+Two events in 51 cells is a small effect measured honestly: with this model and
 corpus, the first attempt is usually right, and the CIs above say so. What the numbers
 support is the mechanism claim — every wrong fix was caught, every catch was repaired,
-and no correct fix was lost — not a large headline delta.
+and no correct fix was lost — not a large headline delta. Two statistical notes,
+stated rather than hidden (both are printed by the report itself, "Paired
+contrasts"): the boundary CIs (`0% (0–0%)`, `100% (100–100%)`) are degenerate
+percentile-bootstrap artifacts — observing 0 events in 51 cells is compatible with a
+true rate up to about 6% (rule of three); and the paired trust↔gate difference
+(2 discordant cells, both one direction) gives an exact McNemar p = 0.50, i.e. not
+significant at this sample size. The claim is the traced mechanism, not a
+significance test.
 <!-- RESULTS:END -->
 
 ## Reading it
@@ -135,6 +148,14 @@ and no correct fix was lost — not a large headline delta.
 - The effect is small at this difficulty. 3 wrong first attempts in 51 cells bounds
   what any gate could show here; the value of the design is that the confusion matrix
   and CIs make that limit visible instead of hiding it behind a percentage.
+- Scorer independence is state-level, not environment-level, in the committed run:
+  the scorer uses a separate backend *instance* and a fresh copy, but the same
+  `trusted-local` backend type on the same host. `--scorer-backend docker` moves the
+  grade into a container.
+- The implementer's tool denial is a deny-list (`--disallowed-tools` naming the file
+  tools), and the claude CLI version is not part of the provenance fingerprint; a
+  future CLI could rename a read tool and silently weaken the leak-freedom. Checked
+  manually against the CLI version used for the committed run.
 - The oracle is the test suite. "True success" is defined by the same kind of objective
   check the gate uses (pytest). trust never runs it, and patches cannot touch it.
 - Single-file, short-horizon. These are one-step fixes; they show the per-step effect

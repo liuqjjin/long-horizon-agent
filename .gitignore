@@ -30,3 +30,6 @@ htmlcov/
 .DS_Store
 .claude/
 .mcp.json
+
+# generated inside bench fixture repos by ad-hoc uv invocations
+data/bench/*/uv.lock

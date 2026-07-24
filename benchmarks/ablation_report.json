@@ -22,7 +22,7 @@
     "bench_window"
   ],
   "scorer": "trusted-local",
-  "fingerprint": "be4e53ccf8f515ac64a576e0205ae525e652365198f71a386962b4b968500dc2",
+  "fingerprint": "15b2dac1b9813684d3acd2bf60a534470c73e3693c80a1ddf9bee5d6fcd5806c",
   "harness_version": "0.3.0",
   "stats": [
     {
@@ -30,8 +30,8 @@
       "blurb": "apply the first attempt and accept it; no gate, no repair",
       "n": 51,
       "claimed_success_rate": 1.0,
-      "true_success_rate": 0.9411764705882353,
-      "false_success_rate": 0.058823529411764705,
+      "true_success_rate": 0.9607843137254902,
+      "false_success_rate": 0.0392156862745098,
       "mean_repairs": 0.0,
       "errors": 0,
       "tp": null,
@@ -43,33 +43,33 @@
       "fpr": null,
       "fnr": null,
       "true_ci": [
-        0.8823529411764706,
+        0.9019607843137255,
         1.0
       ],
       "false_ci": [
         0.0,
-        0.11764705882352941
+        0.09803921568627451
       ]
     },
     {
       "condition": "gate",
       "blurb": "apply it, run the internal test gate, refuse on failure",
       "n": 51,
-      "claimed_success_rate": 0.9411764705882353,
-      "true_success_rate": 0.9411764705882353,
+      "claimed_success_rate": 0.9607843137254902,
+      "true_success_rate": 0.9607843137254902,
       "false_success_rate": 0.0,
       "mean_repairs": 0.0,
       "errors": 0,
-      "tp": 48,
+      "tp": 49,
       "fp": 0,
-      "tn": 3,
+      "tn": 2,
       "fn": 0,
       "precision": 1.0,
       "recall": 1.0,
       "fpr": 0.0,
       "fnr": 0.0,
       "true_ci": [
-        0.8823529411764706,
+        0.9019607843137255,
         1.0
       ],
       "false_ci": [
@@ -84,7 +84,7 @@
       "claimed_success_rate": 1.0,
       "true_success_rate": 1.0,
       "false_success_rate": 0.0,
-      "mean_repairs": 0.058823529411764705,
+      "mean_repairs": 0.0392156862745098,
       "errors": 0,
       "tp": 51,
       "fp": 0,
@@ -194,7 +194,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": null,
-      "artifact_sha256": "e00d6addd163f3a7f61b2650865532e0576fd29f052c49aae1d9a8a07ff69e32"
+      "artifact_sha256": "132538e5674a0414b820a57ac1b6b6c3ac035beaa1b704421b057b6abb249011"
     },
     {
       "task": "bench_bsearch",
@@ -207,7 +207,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "e00d6addd163f3a7f61b2650865532e0576fd29f052c49aae1d9a8a07ff69e32"
+      "artifact_sha256": "132538e5674a0414b820a57ac1b6b6c3ac035beaa1b704421b057b6abb249011"
     },
     {
       "task": "bench_bsearch",
@@ -220,7 +220,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "e00d6addd163f3a7f61b2650865532e0576fd29f052c49aae1d9a8a07ff69e32"
+      "artifact_sha256": "132538e5674a0414b820a57ac1b6b6c3ac035beaa1b704421b057b6abb249011"
     },
     {
       "task": "bench_caesar",
@@ -545,7 +545,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": null,
-      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
+      "artifact_sha256": "cef259e36e1af1bcabbe93e25317a710f62fe07ca4229211cdc5d58ac5440725"
     },
     {
       "task": "bench_rpn",
@@ -558,7 +558,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
+      "artifact_sha256": "cef259e36e1af1bcabbe93e25317a710f62fe07ca4229211cdc5d58ac5440725"
     },
     {
       "task": "bench_rpn",
@@ -571,7 +571,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
+      "artifact_sha256": "cef259e36e1af1bcabbe93e25317a710f62fe07ca4229211cdc5d58ac5440725"
     },
     {
       "task": "bench_runstats",
@@ -852,25 +852,25 @@
       "rep": 1,
       "status": "DONE",
       "claimed_success": true,
-      "true_success": false,
-      "false_success": true,
+      "true_success": true,
+      "false_success": false,
       "repairs": 0,
-      "detail": "scorer: tests fail",
+      "detail": "scorer: tests pass",
       "gate_prediction": null,
-      "artifact_sha256": "d5ef2b92b01dc820a17d75af2c0677c0bd0826336396fc5601e6abdb46a33b96"
+      "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
     },
     {
       "task": "bench_bsearch",
       "condition": "gate",
       "rep": 1,
-      "status": "FAILED",
-      "claimed_success": false,
-      "true_success": false,
+      "status": "DONE",
+      "claimed_success": true,
+      "true_success": true,
       "false_success": false,
       "repairs": 0,
-      "detail": "scorer: tests fail",
-      "gate_prediction": false,
-      "artifact_sha256": "d5ef2b92b01dc820a17d75af2c0677c0bd0826336396fc5601e6abdb46a33b96"
+      "detail": "scorer: tests pass",
+      "gate_prediction": true,
+      "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
     },
     {
       "task": "bench_bsearch",
@@ -880,7 +880,7 @@
       "claimed_success": true,
       "true_success": true,
       "false_success": false,
-      "repairs": 1,
+      "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
       "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
@@ -1208,7 +1208,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": null,
-      "artifact_sha256": "825f3bf121e7370616bef139ac2b6909d1c6f3c2c070258fbbcaec4e9b2b704f"
+      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
     },
     {
       "task": "bench_rpn",
@@ -1221,7 +1221,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "825f3bf121e7370616bef139ac2b6909d1c6f3c2c070258fbbcaec4e9b2b704f"
+      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
     },
     {
       "task": "bench_rpn",
@@ -1234,7 +1234,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "825f3bf121e7370616bef139ac2b6909d1c6f3c2c070258fbbcaec4e9b2b704f"
+      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
     },
     {
       "task": "bench_runstats",
@@ -1520,7 +1520,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": null,
-      "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
+      "artifact_sha256": "e00d6addd163f3a7f61b2650865532e0576fd29f052c49aae1d9a8a07ff69e32"
     },
     {
       "task": "bench_bsearch",
@@ -1533,7 +1533,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
+      "artifact_sha256": "e00d6addd163f3a7f61b2650865532e0576fd29f052c49aae1d9a8a07ff69e32"
     },
     {
       "task": "bench_bsearch",
@@ -1546,7 +1546,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "a5b59e1c633860fa7e70176809ce5e223b4a91f00224efbbd61ea31881c0bdd3"
+      "artifact_sha256": "e00d6addd163f3a7f61b2650865532e0576fd29f052c49aae1d9a8a07ff69e32"
     },
     {
       "task": "bench_caesar",
@@ -1871,7 +1871,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": null,
-      "artifact_sha256": "cef259e36e1af1bcabbe93e25317a710f62fe07ca4229211cdc5d58ac5440725"
+      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
     },
     {
       "task": "bench_rpn",
@@ -1884,7 +1884,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "cef259e36e1af1bcabbe93e25317a710f62fe07ca4229211cdc5d58ac5440725"
+      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
     },
     {
       "task": "bench_rpn",
@@ -1897,7 +1897,7 @@
       "repairs": 0,
       "detail": "scorer: tests pass",
       "gate_prediction": true,
-      "artifact_sha256": "cef259e36e1af1bcabbe93e25317a710f62fe07ca4229211cdc5d58ac5440725"
+      "artifact_sha256": "43072d1c5f9a00ba168e8f3cee2fcbec5c38d3de939e492dba3fb1c6b57d02c2"
     },
     {
       "task": "bench_runstats",
