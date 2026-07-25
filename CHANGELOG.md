@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-25
+
 ### Added
 - **Horizon analysis** (`lha horizon`, `src/lha/horizon.py`): carries the measured
   per-step effect onto the axis the thesis argues about. An *episode* is `k`
