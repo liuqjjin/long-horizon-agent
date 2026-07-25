@@ -80,8 +80,9 @@ class VerifierAgent:
                         detail={"summary": f"verifier '{name}' is not registered"},
                     )
                 )
-        # Defense in depth: a step that produced zero checks verified nothing, so it
-        # must not pass vacuously (Verdict.from_checks treats an empty list as pass).
+        # A step that produced zero checks verified nothing. Verdict.from_checks
+        # already fails an empty list closed; this names the reason in the verdict
+        # instead of leaving the repair loop with nothing to act on.
         if not checks:
             checks.append(
                 Check(

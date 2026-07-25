@@ -44,7 +44,10 @@ class Verdict(BaseModel):
         artifact_ref: str | None = None,
         env: dict[str, Any] | None = None,
     ) -> "Verdict":
-        passed = all(c.passed for c in checks) if checks else True
+        # An empty check list verified nothing, so it must not pass. The rule
+        # "a check that cannot run fails" has to hold for the aggregate too —
+        # enforced here rather than only by convention at each call site.
+        passed = bool(checks) and all(c.passed for c in checks)
         failures = [
             f"{c.name}: " + (str(c.detail.get("summary")) if c.detail.get("summary") else "failed")
             for c in checks
