@@ -4,6 +4,7 @@ lha run <task.yaml>      run a task through the verification loop
 lha resume <run_id>      resume a paused/awaiting run
 lha eval [--quick]       self-evaluate across the five workflows
 lha ablate [tasks...]    verification ablation: trust vs gate vs verify (real LLM)
+lha horizon              error compounding: the per-step effect across n steps
 lha batch <task>...      run multiple tasks in parallel (process-isolated)
 lha trace <run_id>       render a run's ledger timeline
 lha index <path>         (re)build the code index for a repo
@@ -128,6 +129,21 @@ def _cmd_ablate(args) -> int:
     print()
     print(report.to_markdown())
     print(f"report: {out / 'ablation_report.md'}")
+    return 0
+
+
+def _cmd_horizon(args) -> int:
+    from .horizon import HorizonDataError, run_horizon
+
+    cfg = _config(args)
+    out = Path(args.out) if args.out else Path(cfg.runs_dir) / "horizon"
+    try:
+        report = run_horizon(args.from_report, out, seed=args.seed)
+    except HorizonDataError as e:
+        print(f"cannot build the horizon analysis: {e}")
+        return 1
+    print(report.to_markdown())
+    print(f"report: {out / 'horizon_report.md'}")
     return 0
 
 
@@ -345,6 +361,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="where the independent final scorer runs (docker for untrusted repos)",
     )
     pab.set_defaults(func=_cmd_ablate)
+
+    ph = sub.add_parser(
+        "horizon", help="error compounding: what the per-step gate buys over n steps"
+    )
+    ph.add_argument(
+        "--from-report",
+        default="benchmarks/ablation_report.json",
+        help="measured ablation report to compose from (default: the committed snapshot)",
+    )
+    ph.add_argument("--out", default="", help="output dir (default: <runs>/horizon)")
+    ph.add_argument("--seed", type=int, default=0, help="bootstrap seed")
+    ph.set_defaults(func=_cmd_horizon)
 
     pi = sub.add_parser("index", help="build the code index for a path")
     pi.add_argument("path")
