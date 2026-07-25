@@ -62,8 +62,11 @@ rm docs/demo.cast              # keep the repo light; the GIF is the artifact
 It renders in this doc once `docs/demo.gif` exists (below); add the same line to
 the README with the path `docs/demo.gif`:
 
-<!-- once docs/demo.gif exists, it renders below -->
-![demo: approval-gated run, resume, and lha eval 5/5](demo.gif)
+Once `docs/demo.gif` exists, uncomment the line below (and add the same one to the
+README) so it renders here:
+
+<!-- ![demo: approval-gated run, resume, and lha eval 5/5](demo.gif) -->
+
 
 Tips for a clean recording: keep the window ~100×30, run each command and let its
 output settle before the next, and trim dead time afterward with

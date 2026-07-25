@@ -29,7 +29,12 @@ htmlcov/
 # OS / editor / local agent tooling (machine-specific)
 .DS_Store
 .claude/
+.agents/
+.codex/
 .mcp.json
+
+# Build artifacts (rebuild with `uv build` when a wheel is actually needed)
+dist/
 
 # generated inside bench fixture repos by ad-hoc uv invocations
 data/bench/*/uv.lock

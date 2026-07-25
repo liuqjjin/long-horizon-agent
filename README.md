@@ -1,24 +1,48 @@
 # Long-Horizon Research Agent
 
-A verification-first agent harness. Every step is checked by an objective oracle —
-a real test run, an image metric, a reproducibility re-run — and the agent only
-advances when the check passes.
+**A verification-first agent harness — and a method for measuring how good its own
+verifier actually is.**
 
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![lint: ruff](https://img.shields.io/badge/lint-ruff-261230)
 ![tests](https://img.shields.io/badge/tests-pytest-0a9edc)
 
-Long-horizon agents fail because errors compound. If each step succeeds with
-probability `p`, an `n`-step task succeeds with probability about `pⁿ`, so even a
-strong model drifts as the task gets longer. Asking the model to check its own work
-raises `p` only a little — there is no external signal. This harness gates every
-step on an objective verifier and advances only when the oracle passes:
+Long-horizon agents fail because errors compound: if each step succeeds with
+probability `p`, an `n`-step task succeeds with about `pⁿ`. Asking the model to check
+its own work raises `p` only a little — there is no external signal. This harness
+gates every step on an objective oracle (a real test run, a metric recomputed from
+the output, a reproducibility re-run) and **a step that cannot be verified fails**.
 
-- **code** — a real `pytest` run plus `ruff`; the change is reverted if it can't be verified.
-- **experiment** — PSNR / SSIM recomputed from the output, plus a reproducibility re-run.
-- **context** — freshness (is the index behind the source?) and citation (does every claim resolve to a source?).
+The unusual part is the measurement. The internal gate only *predicts*; truth comes
+from an independent scorer that re-applies the frozen diff to a pristine repository on
+a separate execution backend. That decoupling is what makes the gate's own **false-negative
+rate** observable — the correct fixes a gate wrongly throws away, which a gate-graded
+design cannot see by construction.
 
-A step that cannot be verified fails.
+Honest headline, stated before the good part: at single-step difficulty the effect is
+small and **not statistically significant** (2 of 51 paired cells, exact McNemar
+p = 0.50). Carried onto the horizon the thesis is actually about, the same per-step
+effect compounds to **44% → 100%** over 17 steps — a bigger effect, on the same
+evidence, and [the report says so itself](docs/HORIZON.md).
+
+---
+
+**验证优先的 Agent 执行框架 —— 以及一套量化「验证器自身有多差」的方法。**
+
+长程 agent 失败于误差复利：单步成功率为 `p` 时，`n` 步任务约为 `pⁿ`。让模型自查只能
+把 `p` 抬高一点点——没有外部信号。本框架把每一步都压在客观 oracle 上（真实测试运行、
+从输出重算的指标、可复现性重跑），**无法验证的步骤判失败，而不是默认通过**。
+
+不常见的部分是测量方法。内部门禁只给出*预测*；真值来自独立评分器——把冻结的 diff
+重新施加到全新仓库副本、恢复原始测试、用另一套执行后端打分。正是这个解耦让门禁
+**自身的假阴性率**变得可观测，即被门禁误杀的正确修复；而用门禁自己的判决当真值的
+设计，在构造上永远看不到这个量。
+
+先说不利的一半：单步难度下这个效应很小且**不显著**（51 个配对单元中 2 个，精确
+McNemar p = 0.50）。把同一个效应放到论点真正针对的多步 horizon 上，17 步端到端
+成功率是 **44% → 100%**——效应更大，证据不变，[报告本身会指出这一点](docs/HORIZON.md)。
+
+---
 
 ## Measured effect of the gate
 
@@ -45,6 +69,25 @@ time here; the numbers say what the gate buys on top of that, no more. The exper
 paired and leak-free (the implementer never sees the tests, a patch cannot touch the
 oracle); method, statistics, and limits are in [docs/ABLATION.md](docs/ABLATION.md),
 raw data in [benchmarks/ablation_report.json](benchmarks/ablation_report.json).
+
+## What that compounds to
+
+A 4% per-step error rate is easy to dismiss, so `lha horizon` carries it onto the axis
+the thesis argues about. An *episode* is `k` independent subtasks; it is correct
+through step `k` only if every one of steps `1..k` truly succeeded:
+
+| k | `trust-chain` (no gate) | `verify-chain` (gate + repair) | gap |
+|---:|---|---|---:|
+| 1 | 96% (90–100%) | 100% | +3.9 pp |
+| 8 | 71% (42–100%) | 100% | +29.1 pp |
+| 17 | **44% (13–100%)** | **100%** | **+55.6 pp** |
+
+The curve is the compounding model evaluated at the measured per-task `p`, computed
+exactly rather than sampled. It changes the effect *size*, not the *confidence*:
+composing measured cells into more orderings cannot create information, so the paired
+test at 17 steps returns the same `p = 0.50` as the single-step test on the same
+cells. Only more repetitions change that — the number needed (and a registered
+prediction, fixed before running them) is in [docs/HORIZON.md](docs/HORIZON.md).
 
 ## The loop
 
@@ -155,6 +198,9 @@ cocoindex) on the first `uv sync`.
   makes an objective oracle the highest-leverage place to intervene.
 - [docs/ABLATION.md](docs/ABLATION.md) — the measured effect: a real LLM with
   verification off vs. on, and what the gate and the repair loop each buy.
+- [docs/HORIZON.md](docs/HORIZON.md) — what that per-step effect compounds to over a
+  horizon, a registered prediction, and why composition changes the effect size but
+  not the confidence.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the loop, the facade, the verifier
   families, the durable runtime.
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — the self-eval, what each case verifies,
@@ -167,6 +213,7 @@ lha run <task.yaml> [--runtime loop|langgraph] [--llm stub|claude_cli|anthropic]
 lha resume <run_id>             lha approve|reject <run_id>    lha trace <run_id>
 lha eval [--quick]              lha batch <task.yaml> ...      # parallel, process-isolated
 lha ablate [task.yaml ...]      # verification ablation: trust vs gate vs verify (real LLM)
+lha horizon                     # error compounding: the per-step effect across n steps
 lha index <path>                lha index-docs                 lha ask <query> --kinds code,paper,...
 ```
 

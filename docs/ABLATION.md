@@ -145,7 +145,7 @@ significance test.
   each oracle is calibrated to fail the planted bug and pass a hand-written reference
   fix. Realistic, but not sampled from production history like SWE-bench (adapters for
   that are in [`BENCHMARKS.md`](BENCHMARKS.md)).
-- The effect is small at this difficulty. 3 wrong first attempts in 51 cells bounds
+- The effect is small at this difficulty. Two wrong first attempts in 51 cells bounds
   what any gate could show here; the value of the design is that the confusion matrix
   and CIs make that limit visible instead of hiding it behind a percentage.
 - Scorer independence is state-level, not environment-level, in the committed run:

@@ -7,6 +7,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Horizon analysis** (`lha horizon`, `src/lha/horizon.py`): carries the measured
+  per-step effect onto the axis the thesis argues about. An *episode* is `k`
+  independent subtasks and is correct through step `k` only if all of `1..k`
+  truly succeeded, as graded by the ablation's independent scorer. The curve is
+  the compounding model evaluated at the measured per-task `p`, computed exactly
+  (elementary symmetric polynomial over random orderings, no sampling noise) with
+  a task-cluster bootstrap CI. Composed from the committed run: `trust-chain`
+  falls to 44% (13–100%) at 17 steps while `verify-chain` stays at 100%.
+  The report states in its own body that composition changes the effect size and
+  not the confidence — one repetition of the corpus is one episode, so the paired
+  test at the terminal step returns the same `p = 0.50` as the single-step test on
+  the same cells, and it names how many repetitions would clear `p < 0.05`.
+  Registered prediction and stopping rule in [docs/HORIZON.md](docs/HORIZON.md).
+- `bench.stats.wilson_interval`: a score interval for boundary proportions, where a
+  percentile bootstrap degenerates to a zero-width `0%–0%` artifact.
 - **Execution backends** (`lha.sandbox`): a single seam for everywhere
   target/model-influenced code runs. `trusted-local` (scrubbed environment,
   process-group kill, opt-in rlimits) for this repo's own dev loop;
@@ -87,6 +102,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   them and the harness version.
 
 ### Fixed
+- **`Verdict.from_checks` now fails an empty check list closed.** It returned
+  `passed=True`, so the harness's first rule — a check that cannot run fails —
+  held for the parts but not for the aggregate. Every call site already guarded
+  it, so no run ever passed vacuously, but the guard was a convention rather than
+  a property of the type. Pinned by `tests/test_verdict_failclosed.py`.
+- Documentation drift caught by re-running the gate: `docs/ABLATION.md` said "3
+  wrong first attempts" where the committed run measured two, `CONTRIBUTING.md`
+  quoted 73% coverage over 65 tests against an actual 80% over 192,
+  `docs/demo.md` embedded a `demo.gif` that does not exist, and `.env.example`
+  listed 9 of the 18 environment variables the harness reads.
 - Untracked `.coverage`, a local artifact that had been committed.
 
 ## [0.3.0] — 2026-06-28
