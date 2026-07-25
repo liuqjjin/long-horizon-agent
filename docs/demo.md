@@ -12,7 +12,7 @@ A short terminal GIF for the README. This file is the script to record it.
 1. The **durable human-approval gate** on the LangGraph runtime:
    `run → AWAITING_APPROVAL → approve → resume → DONE` (the run is checkpointed to
    `graph.sqlite` between the two processes).
-2. The harness **self-evaluating** with `lha eval` → `5/5`.
+2. The harness **self-evaluating** with `lha eval` → `6/6`.
 
 Both are objective: the fix is accepted only after a real `pytest` passes.
 
@@ -46,7 +46,7 @@ uv run lha approve "$RID"
 # 3) resume: LangGraph replays from the SqliteSaver checkpoint, verifies, finishes
 uv run lha resume --runtime langgraph "$RID"
 
-# 4) the harness grades itself across all five workflows
+# 4) the harness grades itself across all six workflows
 uv run lha eval
 
 exit   # ends the asciinema recording
@@ -65,7 +65,7 @@ the README with the path `docs/demo.gif`:
 Once `docs/demo.gif` exists, uncomment the line below (and add the same one to the
 README) so it renders here:
 
-<!-- ![demo: approval-gated run, resume, and lha eval 5/5](demo.gif) -->
+<!-- ![demo: approval-gated run, resume, and lha eval 6/6](demo.gif) -->
 
 
 Tips for a clean recording: keep the window ~100×30, run each command and let its

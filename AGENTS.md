@@ -39,7 +39,7 @@ resolve `data/...` relative to the cwd.
 ```bash
 uv sync                                       # install (dev group incl. context extra)
 uv run lha run data/tasks/fix_average.yaml    # verified fix of a planted bug, no API key
-uv run lha eval                               # self-eval across the five workflows -> 5/5
+uv run lha eval                               # self-eval across the six workflows -> 6/6
 uv run lha eval --quick                       # the three fast cases only
 uv run pytest -q                              # unit suite
 ```
@@ -237,7 +237,7 @@ at branch HEAD `7631612`:
 uv run ruff check .           # All checks passed!
 uv run pyright src/lha        # 0 errors, 0 warnings, 0 informations
 uv run pytest -q              # 210 passed, 1 skipped   (~190 s; the skip is docker, opt-in)
-uv run lha eval               # score: 5/5              (~46 s)
+uv run lha eval               # score: 6/6              (~85 s)
 
 # facade isolation — must print nothing
 grep -rnE "^[[:space:]]*(import|from)[[:space:]]+(cocoindex|cocoindex_code)" \

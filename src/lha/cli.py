@@ -2,7 +2,7 @@
 
 lha run <task.yaml>      run a task through the verification loop
 lha resume <run_id>      resume a paused/awaiting run
-lha eval [--quick]       self-evaluate across the five workflows
+lha eval [--quick]       self-evaluate across the six workflows
 lha ablate [tasks...]    verification ablation: trust vs gate vs verify (real LLM)
 lha horizon              error compounding: the per-step effect across n steps
 lha batch <task>...      run multiple tasks in parallel (process-isolated)
@@ -30,7 +30,7 @@ from .tasks.spec import TaskSpec
 _EPILOG = """\
 examples:
   lha run data/tasks/fix_average.yaml            fix a bug, verified by real pytest
-  lha eval                                       self-evaluate across the five workflows
+  lha eval                                       self-evaluate across the six workflows
   lha run --runtime langgraph <task>             durable run with an approval gate
   lha ask "how is average computed" --kinds code answer with fresh, cited context
 """
@@ -345,7 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--workers", type=int, default=4)
     pb.set_defaults(func=_cmd_batch)
 
-    pev = sub.add_parser("eval", help="self-evaluate across the five workflows")
+    pev = sub.add_parser("eval", help="self-evaluate across the six workflows")
     pev.add_argument("--quick", action="store_true", help="skip the slow experiment cases")
     pev.set_defaults(func=_cmd_eval)
 

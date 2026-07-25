@@ -2,7 +2,7 @@
 
 Three layers, by who grades the work:
 
-1. **Self-eval** (below) — the harness checking its own five workflows on a
+1. **Self-eval** (below) — the harness checking its own six workflows on a
    deterministic stub. Runs in CI.
 2. **Verification ablation** ([ABLATION.md](ABLATION.md)) — a real LLM through the
    harness, graded by an independent scorer. Committed snapshot in
@@ -14,7 +14,7 @@ Three layers, by who grades the work:
 
 # Self-eval
 
-The harness checking itself: five workflows, each with an objective pass/fail. It
+The harness checking itself: six workflows, each with an objective pass/fail. It
 exercises the project's thesis end to end — a step is "done" only when an external
 oracle says so.
 
@@ -22,7 +22,7 @@ oracle says so.
 
 ```bash
 uv sync
-uv run lha eval            # all five tasks; writes runs/eval_report.json
+uv run lha eval            # all six tasks; writes runs/eval_report.json
 uv run lha eval --quick    # the three fast cases (skips the experiment runs)
 ```
 
@@ -35,17 +35,18 @@ under `data/tasks/`.
 Verbatim output of `uv run lha eval`:
 
 ```
-# Self-eval — 5/5
+# Self-eval — 6/6
 
-| dimension              | case                    | result | detail |
-|------------------------|-------------------------|--------|--------|
-| issue-to-PR            | fix_average             | PASS   | status=DONE verified=True |
-| resume                 | pause_resume            | PASS   | first=PAUSED resumed=DONE |
-| freshness              | edit_reindex            | PASS   | initial_fresh=True stale_after_edit=True fresh_after_reject=True |
-| paper-to-experiment    | bicubic_sr              | PASS   | status=DONE verified=True |
-| verification-ablation  | strict_threshold_caught | PASS   | status=FAILED psnr_correctly_rejected=True reached_psnr_step=True |
+| dimension | case | result | detail |
+|---|---|---|---|
+| issue-to-PR | fix_average | PASS | status=DONE verified=True |
+| resume | pause_resume | PASS | first=PAUSED resumed=DONE |
+| freshness | edit_reindex | PASS | initial_fresh=True stale_after_edit=True fresh_after_reject=True |
+| fail-closed context | required_context_unavailable | PASS | status=FAILED verdict_named_the_reason=True |
+| paper-to-experiment | bicubic_sr | PASS | status=DONE verified=True |
+| verification-ablation | strict_threshold_caught | PASS | status=FAILED psnr_correctly_rejected=True reached_psnr_step=True |
 
-score: 5/5
+score: 6/6
 ```
 
 The companion unit suite is green too (`uv run pytest`).
@@ -59,8 +60,9 @@ The companion unit suite is green too (`uv run pytest`).
 | 3 | freshness | `edit_reindex` | mtime/index-generation vs. source, then incremental reindex | context `fresh → stale (after edit) → fresh (after reject_stale)` |
 | 4 | paper-to-experiment | `bicubic_sr` | PSNR/SSIM **recomputed from the saved arrays** + a reproducibility re-run | `DONE` + verified (PSNR ≥ 24 dB, SSIM ≥ 0.80, deterministic re-run, seed/versions recorded) |
 | 5 | verification-ablation | `strict_threshold_caught` | the PSNR verifier against an unreachable bar | run is `FAILED`, the `psnr` check failed, and the experiment step was actually reached |
+| 6 | fail-closed context | `required_context_unavailable` | a step that requires context against a backend forced dark | run is `FAILED` **and** the `freshness` check names the unavailable context — a failure for the right reason, not any failure |
 
-Tasks 1, 4, and 5 live in `data/tasks/*.yaml`; tasks 2 and 3 are driven directly
+Tasks 1, 4, 5, and 6 live in `data/tasks/*.yaml`; tasks 2 and 3 are driven directly
 in `src/lha/eval.py`. Verifier thresholds are explicit in the task specs
 (`psnr_min: 24.0`, `ssim_min: 0.80`, `data_range: 1.0`).
 
@@ -96,14 +98,18 @@ arrays, a doctored `metrics.json` is caught (see
   the harness's own workflows behave correctly end-to-end, not performance against
   an external SWE/agent benchmark. No external leaderboard numbers are claimed.
 - **Reproducibility.** From a clean checkout, `uv sync && uv run lha eval` (run from
-  the repo root) reproduces `5/5` — verified by deleting all gitignored generated
+  the repo root) reproduces `6/6` — verified by deleting all gitignored generated
   state (`runs/`, `data/.lha_index/`, `data/skills/`) and re-running. The first run
   downloads a small sentence-transformers model (~tens of MB, one-time).
-- **Determinism.** The experiment is seeded and deterministic; the freshness case
-  is tested via index-generation timestamps (not wall-clock races). A clean
-  checkout with a fresh `ccc` daemon reproduces `5/5`; a daemon heavily churned by
-  many prior ad-hoc runs can briefly report a transient code-context miss — re-run
-  on a fresh daemon.
+- **Environment independence.** Every case asserts the same thing with or without a
+  code-search backend. The loop cases (1, 2) declare retrieval optional and are
+  graded by a real `pytest` run; case 4 forces the backend dark rather than
+  depending on whether `ccc` is installed. An earlier version loaded task 1 with
+  its default `context_requirement: required`, so it scored 5/5 on a machine with
+  `ccc` and 3/5 on CI — the harness was right to fail closed, and the claim was
+  the thing that was wrong.
+- **Determinism.** The experiment is seeded and deterministic, and the freshness
+  case is tested via index-generation timestamps rather than wall-clock races.
 
 # Public benchmarks (adapters ready, not yet run)
 

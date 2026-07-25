@@ -6,7 +6,7 @@ on:
   pull_request:
 
 # Mirrors the local closing gate exactly:
-#   ruff check . · facade-isolation grep · pyright src/lha · uv run pytest · uv run lha eval (5/5)
+#   ruff check . · facade-isolation grep · pyright src/lha · uv run pytest · uv run lha eval (6/6)
 jobs:
   gate:
     runs-on: ubuntu-latest
@@ -46,7 +46,7 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-${{ runner.os }}-all-MiniLM-L6-v2
 
-      - name: Self-eval (lha eval, expects 5/5)
+      - name: Self-eval (lha eval, expects 6/6)
         run: uv run lha eval
 
   docker:

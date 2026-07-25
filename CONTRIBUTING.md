@@ -22,7 +22,7 @@ Every change must keep all of these green — this is exactly what CI runs:
 uv run ruff check .                         # lint
 uv run pyright src/lha                       # type-check
 uv run pytest -q                             # unit tests (hermetic)
-uv run lha eval                              # self-eval — must be 5/5
+uv run lha eval                              # self-eval — must be 6/6
 LHA_DOCKER_TESTS=1 uv run pytest tests/test_sandbox.py -q   # opt-in: real containers (needs a docker daemon)
 
 # facade isolation: CocoIndex must never leak out of live_context (must print nothing)
@@ -30,9 +30,11 @@ grep -rnE "^[[:space:]]*(import|from)[[:space:]]+(cocoindex|cocoindex_code)" \
   --include='*.py' src/lha | grep -v "src/lha/live_context/"
 ```
 
-`lha eval` downloads a small embedding model on first run (one-time). It is
-reliably `5/5` from a clean checkout; if it shows a transient code-context miss,
-restart the `ccc` daemon (`ccc daemon restart`) and re-run.
+`lha eval` downloads a small embedding model on first run (one-time). Every case
+is environment-independent — the loop cases declare retrieval optional and are
+graded by a real `pytest` run, and the fail-closed case forces the code backend
+dark — so `6/6` holds with or without `cocoindex-code` installed, on a laptop and
+on a CI runner alike.
 
 ### Coverage
 

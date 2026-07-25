@@ -1,9 +1,16 @@
 """Self-eval: run the harness across its own workflows and check each outcome.
 
-Five workflows: issue-to-PR, paper-to-experiment, resume, freshness, and
-verification-ablation. Each case runs in-process (sequential, so the singleton facade
-isn't raced) under its own runs dir and asserts the expected outcome, including that
-the harness reports FAILED when a result doesn't meet the bar.
+Six workflows: issue-to-PR, resume, freshness, fail-closed context,
+paper-to-experiment, and verification-ablation. Each case runs in-process
+(sequential, so the singleton facade isn't raced) under its own runs dir and
+asserts the expected outcome — including the two cases that pass only when the
+harness reports FAILED, because refusing to claim an unverifiable result is the
+behaviour under test.
+
+Every case is environment-independent by construction: the loop cases declare
+retrieval optional and are graded by a real ``pytest`` run, and the fail-closed
+case forces the code backend dark instead of depending on whether ``ccc`` is
+installed. The score means the same thing on a laptop and on a CI runner.
 """
 
 from __future__ import annotations
@@ -61,8 +68,23 @@ def _verified(result) -> bool:
     return Verdict.model_validate_json(vj.read_text()).passed
 
 
+def _loop_task(path: str) -> TaskSpec:
+    """A bundled task loaded for the loop-focused cases.
+
+    Their oracle is the real ``pytest`` run on the patched sandbox, and that
+    oracle is available with or without a code-search backend. Retrieval is
+    declared optional here so the case measures the loop rather than whether
+    ``ccc`` happens to be installed on this machine — the same judgement, and the
+    same explicit declaration, that ``tests/conftest.py`` makes for the unit
+    suite. Fail-closed context is not thereby untested: it is a case of its own
+    (``_case_context_fail_closed``), which forces the backend dark in every
+    environment instead of relying on one.
+    """
+    return TaskSpec.from_file(path).model_copy(update={"context_requirement": "optional"})
+
+
 def _case_issue_to_pr(base: Config) -> EvalResult:
-    r = Harness(_cfg(base, "issue_to_pr")).run(TaskSpec.from_file("data/tasks/fix_average.yaml"))
+    r = Harness(_cfg(base, "issue_to_pr")).run(_loop_task("data/tasks/fix_average.yaml"))
     ok = r.status == "DONE" and _verified(r)
     return EvalResult(
         "fix_average", "issue-to-PR", ok, f"status={r.status} verified={_verified(r)}"
@@ -71,12 +93,47 @@ def _case_issue_to_pr(base: Config) -> EvalResult:
 
 def _case_resume(base: Config) -> EvalResult:
     paused = Harness(_cfg(base, "resume", max_steps=1)).run(
-        TaskSpec.from_file("data/tasks/fix_average.yaml")
+        _loop_task("data/tasks/fix_average.yaml")
     )
     resumed = Harness(_cfg(base, "resume")).resume(paused.state.run_id)
     ok = paused.status == "PAUSED" and resumed.status == "DONE" and _verified(resumed)
     return EvalResult(
         "pause_resume", "resume", ok, f"first={paused.status} resumed={resumed.status}"
+    )
+
+
+def _case_context_fail_closed(base: Config) -> EvalResult:
+    """A step that requires context and cannot get it must fail, and say why.
+
+    The backend is forced dark (``code_backend="null"``) rather than left to the
+    machine, so this asserts the same thing on a laptop with ``ccc`` installed
+    and on a CI runner without it. Passing here means the run failed *for the
+    right reason*: the verdict has to name the unavailable context, not merely
+    be a failure of some other kind.
+    """
+    cfg = _cfg(base, "context_fail_closed", code_backend="null", max_repairs=0)
+    task = TaskSpec.from_file("data/tasks/fix_average.yaml")  # context_requirement: required
+    r = Harness(cfg).run(task)
+
+    named_the_reason = False
+    vj = Path(r.state.run_dir) / "verify.json"
+    if vj.exists():
+        verdict = Verdict.model_validate_json(vj.read_text())
+        named_the_reason = any(
+            c.name == "freshness"
+            and not c.passed
+            and (
+                "unavailable" in str(c.detail.get("summary", ""))
+                or "no context found" in str(c.detail.get("summary", ""))
+            )
+            for c in verdict.checks
+        )
+    ok = r.status == "FAILED" and named_the_reason
+    return EvalResult(
+        "required_context_unavailable",
+        "fail-closed context",
+        ok,
+        f"status={r.status} verdict_named_the_reason={named_the_reason}",
     )
 
 
@@ -148,7 +205,7 @@ def _case_verification_ablation(base: Config) -> EvalResult:
     )
 
 
-_FAST = [_case_issue_to_pr, _case_resume, _case_freshness]
+_FAST = [_case_issue_to_pr, _case_resume, _case_freshness, _case_context_fail_closed]
 _SLOW = [_case_paper_to_experiment, _case_verification_ablation]
 
 

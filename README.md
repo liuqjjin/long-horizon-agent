@@ -3,9 +3,11 @@
 **A verification-first agent harness — and a method for measuring how good its own
 verifier actually is.**
 
+[![CI](https://github.com/liuqjjin/long-horizon-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/liuqjjin/long-horizon-agent/actions/workflows/ci.yml)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![lint: ruff](https://img.shields.io/badge/lint-ruff-261230)
 ![tests](https://img.shields.io/badge/tests-pytest-0a9edc)
+![license](https://img.shields.io/badge/license-MIT-green)
 
 Long-horizon agents fail because errors compound: if each step succeeds with
 probability `p`, an `n`-step task succeeds with about `pⁿ`. Asking the model to check
@@ -124,10 +126,10 @@ behind it, and a `grep` check keeps them there.
 ```bash
 uv sync                                        # install (Python 3.11+)
 uv run lha run data/tasks/fix_average.yaml     # find a bug, fix it, verify with real pytest
-uv run lha eval                                # run the self-eval across all five workflows
+uv run lha eval                                # run the self-eval across all six workflows
 ```
 
-Run from the repo root. `uv sync && uv run lha eval` reproduces `5/5` from a clean
+Run from the repo root. `uv sync && uv run lha eval` reproduces `6/6` from a clean
 checkout (generated indexes and runs are gitignored and rebuilt on demand); the first
 `lha eval` downloads a small embedding model (tens of MB, one-time) for the
 paper/experiment/freshness cases.
@@ -138,21 +140,22 @@ authenticated `claude` CLI) or `--llm anthropic`.
 
 ## Self-eval
 
-`lha eval` is the harness checking itself: five workflows, each with an objective
+`lha eval` is the harness checking itself: six workflows, each with an objective
 pass/fail. Output from this repo:
 
 ```
-# Self-eval — 5/5
+# Self-eval — 6/6
 
-| dimension              | case                    | result | detail |
-|------------------------|-------------------------|--------|--------|
-| issue-to-PR            | fix_average             | PASS   | status=DONE verified=True |
-| resume                 | pause_resume            | PASS   | first=PAUSED resumed=DONE |
-| freshness              | edit_reindex            | PASS   | initial_fresh=True stale_after_edit=True fresh_after_reject=True |
-| paper-to-experiment    | bicubic_sr              | PASS   | status=DONE verified=True |
-| verification-ablation  | strict_threshold_caught | PASS   | status=FAILED psnr_correctly_rejected=True reached_psnr_step=True |
+| dimension | case | result | detail |
+|---|---|---|---|
+| issue-to-PR | fix_average | PASS | status=DONE verified=True |
+| resume | pause_resume | PASS | first=PAUSED resumed=DONE |
+| freshness | edit_reindex | PASS | initial_fresh=True stale_after_edit=True fresh_after_reject=True |
+| fail-closed context | required_context_unavailable | PASS | status=FAILED verdict_named_the_reason=True |
+| paper-to-experiment | bicubic_sr | PASS | status=DONE verified=True |
+| verification-ablation | strict_threshold_caught | PASS | status=FAILED psnr_correctly_rejected=True reached_psnr_step=True |
 
-score: 5/5
+score: 6/6
 ```
 
 Reproduce with `uv run lha eval`. In the verification-ablation case, the bicubic
@@ -204,7 +207,7 @@ cocoindex) on the first `uv sync`.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the loop, the facade, the verifier
   families, the durable runtime.
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — the self-eval, what each case verifies,
-  and how to reproduce `5/5`.
+  and how to reproduce `6/6`.
 
 ## CLI
 

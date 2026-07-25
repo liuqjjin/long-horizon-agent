@@ -6,6 +6,30 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-07-25
+
+### Fixed
+- **`lha eval` now asserts the same thing in every environment.** The first CI run
+  this repository ever executed scored `3/5`, not `5/5`: `data/tasks/fix_average.yaml`
+  carries the fail-closed default `context_requirement: required`, and a runner
+  without `cocoindex-code` has no code-search backend, so the issue-to-PR and resume
+  cases failed closed. The harness was right and the claim was wrong — the
+  documented "`5/5` from a clean checkout" quietly depended on `ccc` being installed
+  on the developer's machine, and CI had never run before because the project had no
+  remote.
+
+  Rather than relax the assertion, the two loop cases now declare retrieval optional
+  (their oracle is the real `pytest` run, the same judgement `tests/conftest.py`
+  already makes for the unit suite) and fail-closed context became **a case of its
+  own** that forces the backend dark instead of depending on the machine. Net
+  coverage goes up, not down: the self-eval is now `6/6`, verified both with a code
+  backend available and with `LHA_CODE_BACKEND=null`.
+
+### Added
+- CI badge, and a `fail-closed context` dimension in the self-eval
+  (`required_context_unavailable`) that passes only when the run fails **and** the
+  verdict names the unavailable context — a failure for the right reason.
+
 ## [0.4.0] — 2026-07-25
 
 ### Added

@@ -46,12 +46,12 @@ uv run lha eval        # first run downloads a small embedding model (one-time)
 Expected:
 
 ```
-# Self-eval — 5/5
+# Self-eval — 6/6
 ...
-score: 5/5
+score: 6/6
 ```
 
-See [BENCHMARKS.md](BENCHMARKS.md) for what each of the five tasks verifies.
+See [BENCHMARKS.md](BENCHMARKS.md) for what each of the six tasks verifies.
 
 ## 4. Ask a question with fresh, cited context
 

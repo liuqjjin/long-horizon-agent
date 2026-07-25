@@ -9,7 +9,7 @@
 - [ ] `uv run ruff check .` clean
 - [ ] `uv run pyright src/lha` clean
 - [ ] `uv run pytest -q` passes
-- [ ] `uv run lha eval` is `5/5`
+- [ ] `uv run lha eval` is `6/6`
 - [ ] facade isolation grep prints nothing (no CocoIndex import outside `live_context/`)
 - [ ] no test was weakened/skipped and no threshold loosened to pass
 - [ ] docs updated if behavior/claims changed
