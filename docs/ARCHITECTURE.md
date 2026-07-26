@@ -1,181 +1,270 @@
 # Architecture
 
-The core is a verification loop, one facade for indexed context, three verifier
-families behind one interface, and an opt-in durable runtime. Everything else composes
-those.
+LHA is a state-machine runner with executable checks. The model proposes work;
+the harness owns state transitions, persistence, policy, approval, verification,
+and rollback.
 
-## The verification loop
+## One run
 
-`src/lha/harness/loop.py` drives, for each step of a plan:
-
-```
-context → execute → [approval gate] → verify → (repair | advance) → checkpoint → repeat
+```text
+plan → context → execute → [approval] → verify → repair or advance → checkpoint
 ```
 
-- **Budget.** `max_steps`, `max_repairs`, optional wall-clock — the loop always terminates.
-- **Checkpoint/resume.** Each step writes `runs/<id>/state.json` (atomic) and appends
-  `ledger.jsonl`. `lha resume <id>` re-enters at the saved cursor; a fresh process
-  resumes because patch backups are persisted to disk.
-- **Approval gate.** A step may require human approval before its result is accepted
-  (`AWAITING_APPROVAL` → `lha approve|reject` → `lha resume`).
+`src/lha/harness/loop.py` implements the default runtime:
+
+1. The Supervisor selects a typed `Plan`.
+2. The Context Engineer returns a `ContextBundle` with source locators, digests,
+   freshness, status, and unavailable reasons.
+3. The Implementer returns a `Patch`, the Experimenter returns an
+   `ExperimentResult`, or a `RepoAdapter` runs a declared repository stage.
+4. A protected-path policy checks the write set computed from the actual patch.
+5. An optional approval pauses the run and binds the decision to the reviewed
+   `patch.json` bytes.
+6. Registered verifiers return one `Verdict`.
+7. Passing work advances; failing work enters a bounded repair attempt or is
+   rolled back.
+8. State and ledger evidence are written before the next step begins.
 
 ```mermaid
 flowchart TD
-    P[Supervisor → Plan] --> STEP
-    subgraph STEP[per step]
-        direction TB
-        CTX[Context Engineer → ContextBundle] --> EXE[Implementer → Patch<br/>or Experimenter → ExperimentResult]
-        EXE --> APR{requires approval?}
-        APR -- yes --> GATE[(pause: AWAITING_APPROVAL)]
-        GATE --> VER
-        APR -- no --> VER{Verifier → Verdict}
-        VER -- passed --> ADV[advance cursor]
-        VER -- failed & budget --> REP[repair: feed failures back]
-        VER -- failed & exhausted --> FAIL[fail step]
-        REP --> CTX
-    end
-    ADV --> CK[(checkpoint: state.json + ledger.jsonl)]
-    CK -->|more steps| STEP
-    CK -->|done| FIN[finalize: pr_summary.md / experiment_summary.md / skill note]
+    PLAN["Supervisor: Plan"] --> CTX["ContextBundle"]
+    CTX --> EXEC{"step action"}
+    EXEC --> PATCH["Patch"]
+    EXEC --> EXP["ExperimentResult"]
+    EXEC --> STAGE["RepoStageResult"]
+    PATCH --> POLICY{"path policy"}
+    POLICY --> TX["PatchTransaction"]
+    TX --> APPROVE{"approval required?"}
+    EXP --> APPROVE
+    STAGE --> APPROVE
+    APPROVE -- "yes" --> PAUSE["AWAITING_APPROVAL"]
+    PAUSE --> VERIFY
+    APPROVE -- "no" --> VERIFY["VerifierAgent: Verdict"]
+    VERIFY -- "pass" --> ADVANCE["advance and checkpoint"]
+    VERIFY -- "fail, budget left" --> REPAIR["repair"]
+    VERIFY -- "fail, exhausted" --> REVERT["rollback and FAILED"]
+    REPAIR --> CTX
 ```
+
+## State, ledger, and locks
+
+`RunState` schema v2 persists the cursor, completed and failed steps, repair
+counters, stable attempt IDs, elapsed time, consumed steps, and model usage.
+`state.json` is a checksummed envelope written with `fsync` and atomic
+replacement. `ledger.jsonl` is append-only; a torn non-newline-terminated tail is
+treated as an interrupted write, while corruption in durable records fails.
+
+Every run has a file lock. A second process cannot resume the same `run_id`
+concurrently. Ledger records carry attempt IDs and idempotency keys so recovery
+does not duplicate approval or completion events. Schema-v1 runs can be inspected
+but are not resumed as schema v2.
+
+## Patch transaction
+
+Patch handling is a transaction rather than a sequence of unrelated file writes.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PREPARED
+    PREPARED --> APPLIED
+    PREPARED --> REVERTED
+    APPLIED --> VERIFIED
+    APPLIED --> REVERTED
+    VERIFIED --> REVERTED
+```
+
+`ResolvedPatch` computes one canonical write set from the unified diff or direct
+file contents. Policy checks, backups, the artifact manifest, application,
+approval, verification, and rollback all consume that same set. The patch,
+manifest, primary backup, redundant backup, and transaction journal are durable
+before `PREPARED` is recorded.
+
+Recovery behavior depends on evidence:
+
+- `PREPARED`: restore the known pre-apply state, then apply the same patch bytes;
+- `APPLIED` or `VERIFIED`: validate the recorded worktree hashes instead of
+  applying again;
+- `REVERTED`: never apply the attempt again;
+- missing, contradictory, or damaged evidence: fail closed and preserve or
+  restore the last trustworthy state.
+
+Backups retain original bytes, file modes, and directories created by a patch.
+Rollback rejects path traversal and writes through symbolic links.
+
+## Human approval
+
+An approval names the step and SHA-256 of the exact persisted `patch.json`.
+Resume checks that hash before using the artifact. Rejection, hash mismatch, or
+artifact corruption rolls the change back.
+
+`src/lha/runtime/langgraph_runner.py` drives the same helpers through a LangGraph
+`StateGraph` and `SqliteSaver`. Prepare, interrupt, and verify are separate nodes:
+the patch is checkpointed before `interrupt()`, so resume cannot regenerate work
+after a person reviewed it.
+
+## Long repository tasks
+
+`src/lha/repo_adapter.py` provides typed repository stages. Commands are declared
+as argument vectors and executed through an `ExecutionBackend`; arbitrary shell
+strings are not accepted.
+
+Five fixed cases live under `data/long_tasks/`: configuration parsing, SQLite
+migration, concurrency failure, CLI contracts, and experiment reproducibility.
+Each has immutable repository/reference digests and a 10-step plan:
+
+```text
+integrity → setup → baseline → reproduce → context → approved edit
+          → targeted tests → full tests → lint → build
+```
+
+The test protocol includes a failing first patch, repair, approval resume,
+process interruption at a safe boundary, and comparison with an uninterrupted
+run. Repository stages write intent before execution and completion evidence
+afterward. If a stage may have run but completion is missing, recovery refuses to
+repeat a possibly non-idempotent side effect.
 
 ## Structured artifacts
 
-Each role emits a typed pydantic artifact, persisted under `runs/<id>/`:
+Boundary data uses Pydantic models. Major persisted artifacts include:
 
-| Role | Artifact | File |
-|------|----------|------|
-| Supervisor | `Plan` (steps, success criteria, chosen verifiers) | `plan.json` |
-| Context Engineer | `ContextBundle` (items + provenance + freshness) | `context_bundle.json` |
-| Implementer | `Patch` (unified diff / file contents + rationale) | `patch.diff`, `patch.json` |
-| Experimenter | `ExperimentResult` (command, metrics, output paths) | `experiment.json` |
-| Verifier | `Verdict` (per-check results, env) | `verify.json` |
+| producer | artifact | typical path |
+|---|---|---|
+| Supervisor | `Plan` | `plan.json` |
+| Context Engineer | `ContextBundle` | `steps/<step>/context_bundle.json` |
+| Implementer | `Patch` | `steps/<step>/attempts/<attempt>/patch.json` |
+| patch layer | manifest, backups, transaction journal | `steps/`, `backups/`, `transactions/` |
+| Experimenter | `ExperimentResult` | `steps/<step>/experiment.json` |
+| RepoAdapter | `RepoStageResult` | `steps/<step>/repo_stage.json` |
+| VerifierAgent | `Verdict` | `steps/<step>/verify.json` |
+| LLM tracing | usage and call records | `state.json`, `llm_trace.jsonl` |
 
-Definitions live in `src/lha/artifacts.py` and `src/lha/verifiers/verdict.py`.
+Flat compatibility files at the run root point readers to the latest applicable
+artifact; per-step and per-attempt paths preserve the full history.
 
-## The live-context facade
+## Verification families
 
-The **only** way the rest of the system reaches indexed context is
-`src/lha/live_context/` (imported as `lha.live_context`):
+`select_verifiers(step)` resolves names through the registry. An unknown
+verifier, empty verifier set, crashing verifier, or unusable subprocess produces
+a failing check.
 
-```
-search_code · search_papers · search_experiments · search_skills · get_fresh_context · reject_stale
-```
+| family | checks | evidence |
+|---|---|---|
+| code | pytest, Ruff, repository stages | actual command result |
+| experiment | PSNR, SSIM, reproducibility | recomputed arrays and fresh rerun |
+| context | freshness, citation | source digests, index status, locators |
 
-Behind it, swappable backends do the real work; nothing outside the facade imports
-CocoIndex or calls `ccc`. The boundary is enforced by a grep (run it locally / in CI):
+Experiment artifacts bind array path, shape, dtype, SHA-256, input digest, and
+metrics. Reproducibility runs in a fresh directory and rejects old files,
+missing arrays, non-finite values, and digest mismatches.
 
-```bash
-grep -rnE "^[[:space:]]*(import|from)[[:space:]]+(cocoindex|cocoindex_code)" \
-  --include='*.py' src/lha | grep -v "src/lha/live_context/"   # must be empty
+Context status distinguishes `ok`, `empty`, `backend_unavailable`, and
+`index_failed`; unavailable kinds and reasons survive partial success. Required
+context fails closed.
+
+## Indexed-context facade
+
+All indexed context passes through `src/lha/live_context/`:
+
+```text
+search_code · search_papers · search_experiments · search_skills
+get_fresh_context · reject_stale
 ```
 
 ```mermaid
 flowchart LR
-    CALLER[harness · agents · verifiers] --> FAC[[live_context facade]]
-    FAC --> CCB[CccBackend<br/>code]
-    FAC --> COB[CocoFlowBackend<br/>papers · experiments · skills]
-    FAC --> NB[NullBackend<br/>graceful fallback]
-    CCB -. MCP stdio .-> CCC[(ccc / cocoindex-code)]
-    COB --> VQ[vector_query + embedder]
-    COB -. build .-> FLOWS[flows/*.py<br/>CocoIndex apps]
-    FLOWS --> IDX[(data/.lha_index/*.json)]
-    VQ --> IDX
+    CALLER["harness / agents / verifiers"] --> FACADE["lha.live_context"]
+    FACADE --> CCC["CccBackend: code"]
+    FACADE --> COCO["CocoFlowBackend: papers / experiments / skills"]
+    FACADE --> NULL["NullBackend"]
+    CCC --> MCP["ccc MCP process"]
+    COCO --> FLOW["lha.live_context.flows"]
+    FLOW --> INDEX["data/.lha_index"]
 ```
 
-- **Code** (`backends/ccc_backend.py`): talks to `ccc mcp`'s structured `search` tool
-  over stdio — the only supported structured surface (`ccc search` has no JSON API).
-- **Papers / experiments / skills** (`backends/coco_flow.py` + `flows/`): CocoIndex
-  flows (`@coco.fn(memo=True)`, incremental) embed markdown notes to local JSON; the
-  query path is a dependency-light numpy cosine search (`backends/vector_query.py`).
-- **Freshness** (`live_context/freshness.py`): compares source mtime / content hash
-  against index-generation time; `reject_stale` triggers an incremental reindex.
+Nothing outside this package may import `cocoindex` or `cocoindex_code`, or
+invoke `ccc`. CI enforces the boundary with both tests and a source scan.
 
-## Three verifier families
+## LLM backends and Codex isolation
 
-`src/lha/verifiers/` — one `Verifier` interface, a registry, and `select_verifiers(step)`:
+LLM calls go through one interface and `TracedLLM`. The deterministic stub is
+used for hermetic tests and self-eval; Claude CLI, Codex CLI, and the Anthropic
+SDK are optional execution paths.
 
-| Family | Verifiers | Oracle |
-|--------|-----------|--------|
-| code | `pytest`, `ruff` | a real test run + lint on the patched sandbox |
-| experiment | `psnr`, `ssim`, `reproducibility` | metrics **recomputed** from output (scikit-image) + a re-run |
-| context | `freshness`, `citation` | index-vs-source freshness; every claim resolves to a source |
+The Codex CLI backend creates an attempt-local `HOME`, `CODEX_HOME`, temporary
+directory, and empty workspace. It copies only the authentication material the
+CLI requires and passes a small environment allowlist, not the caller's secrets.
+The CLI runs in a new process group; timeout, failure, or interruption terminates
+descendants before temporary credentials are removed.
 
-A verifier that cannot run its check returns a failing `Check`. PSNR is one member
-among many; the core has no metric-specific assumptions.
+Its JSONL protocol is strict. Invalid JSON, unknown event types, error events,
+an incomplete turn, or unfinished/disallowed tool use fails the call. Successful
+metadata includes CLI version, configured model and reasoning effort, event
+summary, usage, and outcome.
 
-## Agent team
+## Execution boundary
 
-Four small, focused roles plus an experiment executor, each emitting one artifact
-(`src/lha/agents/`): **Supervisor** (plan), **Context Engineer** (gather), **Implementer**
-(code edits) / **Experimenter** (run experiments), **Verifier Agent** (aggregate the
-selected verifiers — concurrently, order-preserving). For independent tasks,
-`orchestrator.py` fans out to **process-isolated** workers (`lha batch`), since the
-facade is a process-global singleton.
+Target or model-influenced commands use `lha.sandbox.ExecutionBackend`.
 
-## Durable runtime (opt-in)
-
-`src/lha/runtime/langgraph_runner.py` runs the same plan/agents/verifiers through a
-LangGraph `StateGraph` checkpointed by `SqliteSaver` (`runs/<id>/graph.sqlite`), with
-`interrupt()` / `Command(resume=...)` for the approval gate. It reuses the Harness's
-execute/finalize helpers, so there is one implementation of the actual work. Enable
-with `lha run --runtime langgraph`.
-
-## Skill memory
-
-After a verified-`DONE` run, `src/lha/memory.py` distills the success to a markdown
-note under `data/skills/`; `index_docs` indexes it (`kind="skill"`) and the Context
-Engineer retrieves relevant skills as additional context for future tasks. Only
-verified successes are recorded, and each note names the SHA-256 of the verdict
-that justified it.
-
-## Execution boundary and threat model
-
-Everywhere target or model-influenced code executes goes through one seam,
-`lha.sandbox.ExecutionBackend` (verifiers, the experimenter, the ablation's gate
-and scorer):
-
-| backend | isolation | intended for |
+| backend | controls | intended use |
 |---|---|---|
-| `trusted-local` | scrubbed env (PATH/HOME/locale only), process-group SIGKILL on timeout, opt-in rlimits | this repo's own dev loop and self-eval, where the code is already trusted |
-| `docker` | `--network none`, empty env, memory/pids caps, read-only source mounts, container removed on timeout | external target repos and scoring model-written patches |
+| `trusted-local` | small environment, process-group cleanup, optional limits | trusted repository development and self-eval |
+| `docker` | no network, empty environment, resource limits, read-only source mounts | external repositories and independent scoring |
 
-What the harness defends against, by layer:
+`trusted-local` is not a hostile-code sandbox. The Docker backend image must
+contain every command the task declares; the default slim Python image does not
+include pytest or Ruff.
 
-- **A patch that rewrites its oracle** — `tools.policy` refuses patches touching
-  tests/`conftest.py`/build config before they reach the sandbox (a task manifest
-  can allowlist specific paths).
-- **An approval that no longer matches the artifact** — approvals bind to the
-  SHA-256 of the reviewed patch bytes (per-step manifest); a mismatch on resume
-  reverts and fails the run.
-- **A grader grading its own prediction** — in `lha ablate`, the internal gate
-  predicts; an independent scorer re-applies the frozen diff to a pristine copy
-  and grades on its own backend.
-- **Resuming from damage** — checkpoints are checksummed envelopes; corruption
-  refuses to resume (`CheckpointCorrupt`) instead of guessing.
-- **Silent context rot** — context failures carry status and fail required steps
-  closed; stale indexes must refresh or the step fails.
+## Ablation and horizon analysis
 
-Out of scope, stated plainly: `trusted-local` is not a sandbox against malicious
-code (use `docker` there), and prompt-injection through indexed content is
-mitigated only by verification (a poisoned suggestion still has to pass the
-oracle), not prevented.
+`lha ablate` draws one first attempt per `(task, repetition)` and evaluates that
+attempt under `trust`, `gate`, and `verify`. The gate's acceptance is a
+prediction. Truth is obtained by freezing the effective source change, applying
+it to a fresh canonical copy with original tests, and running a separate scorer
+backend. Error cells remain visible, are not cached, and are excluded from rate
+estimation.
+
+`lha horizon` reports three estimands:
+
+1. paired task/repetition cells;
+2. paired complete-corpus repetitions;
+3. a descriptive composition over empirical per-task rates.
+
+The cell and episode McNemar tests use different units and may have different
+p-values. Composition adds zero observations and has no McNemar p-value. Wilson
+intervals are used for boundary proportions.
+
+## Reports and retention
+
+`src/lha/reporting.py` validates a run before displaying or deleting it.
+
+```bash
+uv run lha trace <run_id>
+uv run lha trace <run_id> --html
+uv run lha runs list
+uv run lha runs show <run_id>
+uv run lha runs prune --older-than-days 30
+```
+
+The static HTML report includes the step timeline, patches, approval history,
+verdicts, repair events, and model usage. Persisted checksummed totals are
+authoritative when the optional trace is incomplete. Pruning is a dry run by
+default and can delete only unlocked, validated, terminal runs.
 
 ## Module map
 
-```
+```text
 src/lha/
-  harness/        loop · state · checkpoint · budget · approval · manifest · errors
-  live_context/   facade + models + freshness + backends/ (the only door to indexers)
+  harness/        loop · state · checkpoint · approval · manifest · transaction
+  live_context/   facade · models · freshness · backends · packaged flows
   agents/         supervisor · context_engineer · implementer · experimenter · verifier_agent
   verifiers/      base · registry · verdict · code/ · experiment/ · context/
-  llm/            base · stub · claude_cli · anthropic · trace (budget + per-call log)
-  sandbox/        ExecutionBackend: trusted-local · docker (the execution seam)
-  bench/          swebench · terminal_bench · stats (public-benchmark adapters)
-  runtime/        langgraph_runner   (opt-in durable execution)
-  tasks/ tools/   task specs · policy (protected oracle paths) · patch/shell helpers
-  memory.py  orchestrator.py  eval.py  ablation.py  cli.py  config.py
-flows/            papers · experiments · skills CocoIndex apps (imported only by coco_flow)
-data/             sample repo (toy bug) · paper note · experiment log · experiment script · tasks
-runs/<id>/        state.json · ledger.jsonl · plan · patch · verify.json · summaries · graph.sqlite · workdir/
+  llm/            base · stub · claude_cli · codex_cli · anthropic_client · trace
+  sandbox/        ExecutionBackend · trusted_local · docker
+  runtime/        langgraph_runner
+  bench/          swebench · terminal_bench · stats
+  tasks/ tools/   task specs · patch resolution · policy · shell
+  reporting.py    run inspection, HTML, retention
+  repo_adapter.py typed long-task stages and evidence
+data/long_tasks/  five fixed multi-file cases
+runs/<id>/        state · ledger · transactions · artifacts · worktree · reports
 ```

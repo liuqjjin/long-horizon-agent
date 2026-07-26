@@ -1,354 +1,317 @@
 # AGENTS.md — repository guide for coding agents
 
-Authoritative working notes for Cursor / Codex / any agent editing this repo.
-Everything here was checked against the code and against commands that were
-actually run. There is no `CLAUDE.md` in this repository, so nothing here
-overrides one; `docs/ARCHITECTURE.md` and `CONTRIBUTING.md` remain the prose
-sources and this file is the operational summary.
+These are operational notes for anyone editing this repository. They summarize
+the checked implementation; `docs/ARCHITECTURE.md`, `CONTRIBUTING.md`, and
+`SECURITY.md` contain the longer explanations.
 
-The repo's own rule applies to you as much as to a human contributor:
+The repository has one non-negotiable rule:
 
-> **No claim without a runnable check.** To state a behavior, number, or
-> benchmark result, run it and quote the real output.
+> **No claim without a runnable check.** Do not publish a behavior, benchmark
+> number, test count, or coverage figure until a command in this checkout has
+> produced it.
 
-## 1. What this project is
+## 1. Project scope
 
-`lha` (package `lha`, distribution name `lha`, Python 3.11+) is a
-**verification-first long-horizon agent harness**. Every step of an agent run is
-gated on an *objective oracle* — a real `pytest` run, an image metric recomputed
-from the output arrays, a reproducibility re-run, an index-freshness check — and
-the loop only advances when the oracle passes. A step that cannot be verified
-**fails**; it never passes by default.
+`lha` is a Python 3.11+ task runner for code changes, experiments, and
+retrieval-backed work. A run follows:
 
-It is a research/portfolio project, not a production service. The three things
-that make it what it is:
+```
+context → execute → [approval] → verify → (repair | advance) → checkpoint
+```
 
-1. **The loop**: `context → execute → [approval gate] → verify → (repair | advance) → checkpoint`.
-2. **The facade**: everything indexed (code / papers / experiments / skills) is
-   reachable only through `lha.live_context`.
-3. **Prediction ≠ truth**: wherever the harness grades itself (`lha ablate`, the
-   bench adapters), the internal gate only *predicts*; an independent scorer or
-   an official third-party harness supplies the *truth*.
+A step advances only after its registered checks pass. A check that cannot run
+fails; it is never treated as a pass or an implicit skip.
 
-## 2. Environment and commands
+This is a research and portfolio project, not a production service. Its main
+implementation boundaries are:
 
-Package manager is [`uv`](https://docs.astral.sh/uv/); Python is pinned by
-`.python-version` (3.11). **Always run from the repo root** — several commands
-resolve `data/...` relative to the cwd.
+1. The harness owns state transitions, budgets, approval, recovery, and rollback.
+2. `lha.live_context` is the only entry point to code and document indexes.
+3. The internal gate predicts whether to accept work; an independent scorer
+   supplies truth in ablation and public-benchmark adapters.
+
+## 2. Setup and commands
+
+Use [`uv`](https://docs.astral.sh/uv/) from the repository root. Python is pinned
+by `.python-version`.
 
 ```bash
-uv sync                                       # install (dev group incl. context extra)
-uv run lha run data/tasks/fix_average.yaml    # verified fix of a planted bug, no API key
-uv run lha eval                               # self-eval across the six workflows -> 6/6
-uv run lha eval --quick                       # the three fast cases only
-uv run pytest -q                              # unit suite
+uv sync
+uv run lha run data/tasks/fix_average.yaml
+LHA_RUNS_DIR=runs/_scratch uv run lha eval
+uv run pytest -q
 ```
 
-CLI surface (`src/lha/cli.py`):
+Current CLI surface:
 
-```
+```text
 lha run <task.yaml> [--runtime loop|langgraph] [--auto-approve] [--json]
-lha resume <run_id> [--runtime …]      lha approve|reject <run_id> [--note …]
-lha trace <run_id>                     lha batch <task.yaml>… [--workers N]
-lha eval [--quick]                     lha ablate [task.yaml…] [--reps N] [--model M] [--scorer-backend trusted-local|docker]
-lha horizon [--from-report PATH] [--out DIR] [--seed S]   # compounding curve; no model calls
-lha index <path>                       lha index-docs        lha ask <query…> [--root R] [--kinds code,paper,…] [--k N]
-Global: --llm {stub,claude_cli,anthropic}   -v/-vv   --version
+lha resume <run_id> [--runtime loop|langgraph] [--auto-approve] [--json]
+lha approve|reject <run_id> [--note TEXT]
+lha trace <run_id> [--html] [--out PATH]
+lha runs list
+lha runs show <run_id>
+lha runs prune --older-than-days N [--apply]
+lha batch <task.yaml>... [--workers N]
+lha eval [--quick]
+lha ablate [task.yaml...] [--reps N] [--model MODEL]
+           [--scorer-backend trusted-local|docker] [--out DIR]
+lha horizon [--from-report PATH] [--out DIR] [--seed N]
+lha index <path>
+lha index-docs
+lha ask <query...> [--root PATH] [--kinds code,paper,...] [--k N]
+
+Global: --llm {stub,claude_cli,codex_cli,anthropic}  -v/-vv  --version
 ```
 
-Configuration is environment variables read once at startup
-(`src/lha/config.py`); `README.md` has the full table. The ones that change
-agent behavior most:
+Configuration is read once at startup in `src/lha/config.py`. `.env.example`
+lists every supported `LHA_*` variable. The settings that most affect behavior
+are:
 
-| variable | default | effect |
+| variable | default | purpose |
 |---|---|---|
-| `LHA_LLM_BACKEND` | `stub` | `stub` is deterministic and offline — keep it for tests/eval |
-| `LHA_CLAUDE_MODEL` | – | pin a full model snapshot; a floating alias breaks reproducibility |
-| `LHA_MAX_STEPS` / `LHA_MAX_REPAIRS` | 20 / 3 | loop budgets |
-| `LHA_DEADLINE_S` / `LHA_MAX_LLM_CALLS` | unset = unlimited | pause (resumable) instead of burning time/tokens |
-| `LHA_EXEC_BACKEND` / `LHA_EXEC_IMAGE` | `trusted-local` / `python:3.12-slim` | where target code executes |
-| `LHA_CODE_BACKEND` | `auto` | `ccc` \| `null` \| `auto` |
-| `LHA_RUNS_DIR` / `LHA_DATA_DIR` | `runs` / `data` | state locations |
+| `LHA_LLM_BACKEND` | `stub` | deterministic offline backend for tests and self-eval |
+| `LHA_MAX_STEPS` / `LHA_MAX_REPAIRS` | `20` / `3` | persisted run budgets |
+| `LHA_DEADLINE_S` / `LHA_MAX_LLM_CALLS` | unset | resumable time and call limits |
+| `LHA_EXEC_BACKEND` | `trusted-local` | `trusted-local` or `docker` execution |
+| `LHA_EXEC_IMAGE` | `python:3.12-slim` | image used by the Docker execution backend |
+| `LHA_CODE_BACKEND` | `auto` | `ccc`, `null`, or automatic selection |
+| `LHA_RUNS_DIR` / `LHA_DATA_DIR` | `runs` / `data` | durable state locations |
+| `LHA_CODEX_MODEL` / `LHA_CODEX_EFFORT` | unset / `medium` | Codex run provenance |
 
-Optional extras: `context` (cocoindex + sentence-transformers, needed for
-paper/experiment/skill search), `bench` (swebench, harbor — harbor needs
-Python ≥ 3.12), `llm` (anthropic SDK), `typecheck` (pyright).
+Optional extras are `context`, `bench`, `llm`, and `typecheck`. Harbor requires
+Python 3.12 or newer even though the core package supports Python 3.11.
 
-**`uv` traps that have already cost a session:**
+### `uv` pitfalls
 
-- `uv run --python X.Y …` or `uv run --with pkg …` *inside this project* deletes
-  and recreates `.venv` at that Python. For a throwaway probe always use
-  `uv run --no-project` from a scratch directory; if the swap happened,
-  `uv sync` restores the pinned env.
-- `uv` treats the *nearest* `pyproject.toml` as the project. The bench fixtures
-  under `data/bench/*` each have one, so a `uv run` issued from inside a fixture
-  directory silently targets that fixture (creating stray `.venv`/`uv.lock`, and
-  exiting 0 as a no-op). Pin the cwd explicitly before any `uv run`.
+- Running `uv run --python X.Y` or `uv run --with ...` inside this project can
+  recreate `.venv`. For an isolated package probe, change to a scratch directory
+  and use `uv run --no-project`.
+- Every benchmark fixture has its own `pyproject.toml`. Run project commands from
+  this repository root so `uv` does not select a fixture as the active project.
 
 ## 3. Directory map
 
-```
+```text
 src/lha/
-  harness/        loop · state · checkpoint · budget · approval · manifest · errors
-  live_context/   facade + models + freshness + backends/   <- the ONLY door to indexers
-  agents/         supervisor · context_engineer · implementer · experimenter · verifier_agent
-  verifiers/      base · registry · verdict · code/ · experiment/ · context/
-  llm/            base · stub · claude_cli · anthropic_client · trace (budget + per-call log)
-  sandbox/        ExecutionBackend: trusted-local · docker   <- the execution seam
-  bench/          swebench · terminal_bench · stats          <- public-benchmark adapters
-  runtime/        langgraph_runner                           <- opt-in durable runtime
-  tasks/ tools/   task specs · policy (protected oracle paths) · patch/shell helpers
-  ablation.py  horizon.py  eval.py  memory.py  orchestrator.py  cli.py  config.py  clock.py  artifacts.py
-flows/            papers · experiments · skills CocoIndex apps (imported only by coco_flow)
-tests/            23 test modules + conftest; hermetic (stub LLM, null code backend, tmp_path)
-data/tasks/       task specs: fix_average(_approval) · run_sr_experiment(_strict) · bench_*.yaml (17)
-data/bench/<n>/   17 fixture repos: one planted bug + a pytest oracle each
-data/sample_repo/ toy off-by-one bug (the stub's scripted fix target)
-data/sample_experiment/  deterministic bicubic 4x SR baseline
-benchmarks/       committed ablation snapshot (json + md)
-docs/             ARCHITECTURE · VERIFICATION_FIRST · ABLATION · BENCHMARKS · QUICKSTART · DEPLOY · demo
-runs/<id>/        state.json · ledger.jsonl · plan · patch · verify.json · steps/<id>/ · backups/ · llm_trace.jsonl · graph.sqlite · workdir/
+  harness/        loop, state, checkpoint, approval, manifest, transaction
+  live_context/   facade, freshness, backends, packaged CocoIndex flows
+  agents/         supervisor, context engineer, implementer, experimenter, verifier
+  verifiers/      code, experiment, and context verifier families
+  llm/            stub, Claude CLI, Codex CLI, Anthropic, tracing
+  sandbox/        trusted-local and Docker execution backends
+  runtime/        opt-in LangGraph runner
+  bench/          SWE-bench and Terminal-Bench adapters, statistics
+  tasks/ tools/   task models, patch resolution, policy, shell helpers
+  reporting.py    validated inspection, static HTML, run retention
+  repo_adapter.py typed repository stages for long tasks
+data/
+  tasks/          normal tasks and the 17 fixed ablation tasks
+  bench/          planted-bug repositories and their pytest oracles
+  long_tasks/     five fixed multi-file repositories and reference evidence
+tests/            hermetic unit, integration, recovery, and packaging checks
+benchmarks/       committed measured reports; regenerate, never hand-edit numbers
+runs/<id>/        state, ledger, transactions, artifacts, reports, worktree
 ```
 
-Generated and gitignored, safe to delete and rebuild: `runs/`,
-`data/.lha_index/`, `data/skills/`, `.cocoindex_code/`, `.venv`, caches.
+Generated state is ignored by Git: `runs/`, `data/.lha_index/`, `data/skills/`,
+`.cocoindex_code/`, caches, coverage output, and build output.
 
-## 4. Architecture and data flow
+## 4. Runtime and recovery
 
-**One run.** `Harness.run` (`src/lha/harness/loop.py`) copies `task.target_repo`
-into `runs/<id>/workdir/`, plans once via `Supervisor`, then per step:
+`Harness.run` copies `task.target_repo` into a per-run worktree and creates
+schema-v2 `RunState`. The state persists the cursor, attempts, repair counters,
+the original step/repair/deadline/model-call limits, their consumption, and model
+usage. Resume rejects any change to those four limits. `state.json` is a
+checksummed envelope written with `fsync` and atomic replacement;
+`ledger.jsonl` is append-only.
 
-1. `ContextEngineer.gather` → `ContextBundle` (items + provenance + freshness +
-   `status`). On a repair step the bundle's code items are overlaid from the
-   *current* sandbox, so the second attempt reasons over the failing state.
-2. `Harness._execute` dispatches on `step.action`:
-   `gather_context`/`answer_query` → the bundle itself; `edit_code` →
-   `Implementer` → `Patch` → **policy check** → `ArtifactManifest` →
-   `apply_patch` (+ persisted `Backup`); `run_experiment` → `Experimenter` →
-   `ExperimentResult`.
-3. If `step.requires_approval`: pause `AWAITING_APPROVAL`, binding the request
-   to the SHA-256 of the reviewed `patch.json` bytes.
-4. `VerifierAgent.verify` runs the step's registered verifiers (concurrently,
-   order-preserving) → one `Verdict`.
-5. Pass → advance the cursor; fail → re-issue the step as a repair carrying
-   `verdict.failures`, or (budget exhausted) revert and fail the run.
-6. `save_state` (checksummed envelope) + `append_ledger` (unique `event_id`).
+Code edits use two typed values:
 
-**Artifacts** are pydantic models in `src/lha/artifacts.py` /
-`verifiers/verdict.py` / `live_context/models.py`, persisted both flat and under
-`runs/<id>/steps/<step_id>/` so a multi-step plan keeps per-step provenance.
+- `ResolvedPatch` computes the write set from the actual diff or file contents.
+  Policy, backup, apply, approval, manifest, and rollback use this same set.
+- `PatchTransaction` records `PREPARED`, `APPLIED`, `VERIFIED`, or `REVERTED`.
+  Recovery validates the patch, manifest, transaction journal, and redundant
+  backups before replaying or rolling back.
 
-**Verifier families** (`select_verifiers(step)` over `verifiers/registry.py`):
+A per-run file lock rejects concurrent resume. Stable attempt IDs and ledger
+idempotency keys prevent duplicate completion and approval events. State schema
+v1 remains inspectable but is not resumed as schema v2.
 
-| family | verifiers | oracle |
+The LangGraph runtime uses the same execute and verification helpers. Its
+prepare, approval interrupt, and verify nodes are separate so resume cannot
+regenerate an artifact after a person reviewed it.
+
+## 5. Long-task fixtures
+
+`data/long_tasks/` contains five pre-fixed multi-file cases:
+
+- configuration parsing and precedence;
+- SQLite migration and persistence;
+- concurrent update and exception propagation;
+- CLI stdout/stderr/exit-code contracts;
+- seeded experiment and artifact digests.
+
+Each case has `task.yaml`, `adapter.yaml`, a repository, a reference patch, and
+a reference manifest with source and oracle digests. The Supervisor emits a
+fixed 10-step plan: integrity, setup, baseline, reproduction, context, approved
+edit, targeted tests, full tests, lint, and build.
+
+Tests exercise an initial rejected patch, repair, two approval resumptions, a
+process interruption at a safe boundary, and equality with an uninterrupted
+terminal state. A repository stage that may have started but lacks durable
+completion evidence fails closed instead of replaying a possible side effect.
+
+Reference patches and their oracles are corpus evidence. Do not edit them to
+improve a result.
+
+## 6. Codex CLI backend
+
+`src/lha/llm/codex_cli.py` runs `codex exec --json` in a temporary home and
+workspace. Authentication is copied into the attempt-local `CODEX_HOME`; parent
+secrets are not inherited. The process runs in its own group, descendants are
+terminated on timeout or interruption, and temporary credentials and files are
+removed on every exit path.
+
+The JSONL parser fails closed on malformed JSON, unknown events, incomplete
+turns, error events, and unfinished or disallowed tool use. Provenance records
+the selected model, reasoning effort, CLI version, event summary, usage, and
+outcome. In the no-tools ablation path, any tool item invalidates the attempt.
+
+Do not log `auth.json`, API keys, session cookies, or direct credential paths.
+
+## 7. Verification and statistics
+
+Registered verifier families are:
+
+| family | checks | source of evidence |
 |---|---|---|
-| code | `pytest`, `ruff` | real subprocess run on the patched sandbox |
-| experiment | `psnr`, `ssim`, `reproducibility` | metrics **recomputed** from saved arrays + a re-run whose `input_sha256` must match |
-| context | `freshness`, `citation` | index-vs-source drift; every citation resolves to a bundle locator |
+| code | pytest, Ruff, repository stages | real subprocess output |
+| experiment | PSNR, SSIM, reproducibility | arrays, hashes, and a fresh rerun |
+| context | freshness, citation | source digests and resolvable locators |
 
-**Durable runtime** (`--runtime langgraph`) drives the same agents through a
-`StateGraph` with `SqliteSaver`. It is deliberately split into three nodes —
-`prepare` (context + execute, checkpointed *before* the interrupt), `gate` (only
-`interrupt()`), `verify` — because LangGraph replays a node from the top on
-resume; a single node would re-run the implementer and could apply a patch the
-human never saw.
+Experiment reruns use fresh directories and reject missing, stale, non-finite,
+or digest-mismatched arrays. Context bundles distinguish `empty`,
+`backend_unavailable`, `index_failed`, and stale or partially unavailable kinds.
 
-**Ablation** (`lha ablate`) scores one first attempt under `trust` / `gate` /
-`verify` (paired). The internal gate predicts; truth comes from freezing the
-effective source diff, applying it to a fresh canonical copy (tests restored),
-and running pytest through a *separate* execution backend.
+`lha ablate` pairs the same first attempt under `trust`, `gate`, and `verify`.
+The internal gate is a prediction. Truth comes from applying the frozen source
+change to a fresh canonical repository and running an independent scorer.
 
-## 5. Key invariants — do not break these
+`lha horizon` keeps three units separate:
 
-These are the load-bearing properties. Each has a test; changing behavior here
-means changing the test on purpose, with a reason.
+1. paired `(task, repetition)` cells;
+2. observed whole-corpus repetitions;
+3. a descriptive independent-step composition.
 
-1. **A check that cannot run must fail.** `ruff` exiting 2/124/127, non-JSON on
-   stdout, `pytest` collecting 0 tests, an unregistered verifier, an empty
-   verifier list, a crashing verifier, an artifact the citation verifier does
-   not understand — all produce a *failing* `Check`. Never a pass, never a skip.
-2. **Context fails closed.** `ContextBundle.status` distinguishes `ok` / `empty`
-   / `backend_unavailable` / `index_failed`, and `unavailable_kinds` records a
-   kind that was dark even when another kind returned hits. Steps default to
-   `context_requirement="required"`; only an explicit `"optional"` lets a step
-   proceed without retrieval. Backends raise `BackendUnavailable` — they must
-   never return `[]` to signal failure.
-3. **`reject_stale` only clears the stale flag after a verifiably successful
-   reindex.** A failed refresh raises `StaleContextError` and the bundle stays
-   stale.
-4. **A patch may never touch the oracle.** `lha.tools.policy` refuses patches
-   touching `tests/`, `test_*.py`, `*_test.py`, `conftest.py`, `pyproject.toml`,
-   `setup.py|cfg`, `tox.ini`, `noxfile.py`, `pytest.ini`, `ruff.toml`,
-   `.github/`, `.ci/` — case-insensitively, parsed from the diff headers (with
-   git C-quoting stripped), not from the patch's self-declared `touched_files`.
-   Only `TaskSpec.allowed_protected_files` may authorize an exact path.
-5. **An approval binds to bytes.** A decision carries `step_id` *and* the
-   SHA-256 of the reviewed `patch.json`. On resume the harness executes those
-   exact bytes; a mismatch reverts the change and fails the run. Actions with no
-   reviewable patch bind by `step_id` alone (a hash would livelock the gate,
-   since they regenerate on every resume).
-6. **An unverified change never survives in the sandbox.** Failed verification
-   with the repair budget exhausted, an approval rejection, a tampered artifact,
-   or an unexpected mid-step fault all revert via the persisted `Backup` — in
-   *both* runtimes.
-7. **Checkpoints refuse damage.** `state.json` is a `{schema_version, sha256,
-   payload}` envelope written fsync + atomic-rename; a checksum mismatch, an
-   unreadable file, or a cursor outside the plan raises `CheckpointCorrupt`
-   rather than resuming from a guess. In `ledger.jsonl` a torn *final* line is
-   dropped as a crash artifact; corruption anywhere else raises.
-8. **Budgets bound the whole run, not one process.** `steps_used` / `elapsed_s`
-   are persisted and re-seeded on resume, and limits are checked *before* the
-   step is consumed so a pause records an exact count.
-9. **Prediction and truth never share a mechanism.** In `lha ablate` the scorer
-   uses a fresh directory, canonical tests, and its own backend instance; a
-   correct fix the gate wrongly refused is counted as a false negative. `ERROR`
-   cells are reported, excluded from rates, and **never cached**. The cache
-   fingerprint covers task bytes, corpus digest, model, scorer, repair budget,
-   harness version, and the source of `lha/llm/base.py` — so editing the prompt
-   re-samples.
-10. **Re-expressing evidence must never inflate it.** `lha horizon` composes
-    measured cells onto a longer horizon. One repetition of the corpus is one
-    independent episode, so `R` repetitions give exactly `R` episodes and the
-    paired test at the terminal step must return what the same cells return at
-    the step level. Averaging over more orderings changes the effect size, never
-    the p-value. Pinned by
-    `tests/test_horizon.py::test_composition_does_not_manufacture_significance`;
-    if you touch `horizon.py`, that test is the one that matters.
-11. **Boundary proportions use Wilson, not a percentile bootstrap.** Resampling
-    an all-identical sample reports `0%–0%`, which is an artifact of the method
-    rather than certainty.
-12. **Only verified successes become memory.** `SkillMemory.record` requires
-    `status == "DONE"` *and* a passing `verify.json`, and the note names the
-    SHA-256 of that verdict.
-13. **Nothing escapes the sandbox.** `_safe_target` refuses absolute paths,
-    `..`, and writes through a symlink; `_safe_seg` collapses a malicious
-    `step_id` into one path segment; dynamic plans with unsafe step ids or
-    unregistered verifiers are rejected in favor of the template.
-14. **Facade isolation.** Nothing outside `src/lha/live_context/` may import
-    `cocoindex`/`cocoindex_code` or invoke `ccc`. Enforced twice: a grep in CI
-    and an AST walk in `tests/test_hardening.py`.
+Cell- and episode-level McNemar tests may differ. Composition adds no independent
+samples and has no McNemar p-value. Boundary proportions use Wilson intervals.
+Do not replace them with a percentile bootstrap that reports a zero-width
+interval for all-zero or all-one samples.
 
-## 6. The gate — run all of it before finishing
+### Current measured baseline
 
-This is exactly what `.github/workflows/ci.yml` runs. Measured on this machine
-at branch HEAD `7631612`:
+The committed schema-v2 report fixes the protocol at 17 tasks × 12 repetitions,
+Codex CLI 0.141.0, `gpt-5.4-mini`, low reasoning effort, read-only mode, and a
+Docker independent scorer. All 204 paired cells have truth labels; there are
+zero `ERROR` cells.
+
+| condition | independently correct | delivery decision |
+|---|---:|---|
+| `trust` | 194/204 | delivered all 204, including 10 incorrect patches |
+| `gate` | 194/204 | accepted 194 correct patches and rejected 10 incorrect patches |
+| `verify` | 204/204 | repaired the 10 rejected attempts, then passed independent scoring |
+
+For `trust` versus `verify`, the exact two-sided McNemar result is
+`p = 0.00195` (`10` versus `0` discordant cells). At the observed
+whole-corpus level, `trust` completes 2/12 episodes and `verify` completes
+12/12. The composition curve adds zero independent samples and is only a
+model-based projection. The raw source is `benchmarks/ablation_report.json`;
+never reconstruct these numbers from prose.
+
+## 8. Reporting and retention
 
 ```bash
-uv run ruff check .           # All checks passed!
-uv run pyright src/lha        # 0 errors, 0 warnings, 0 informations
-uv run pytest -q              # 210 passed, 1 skipped   (~190 s; the skip is docker, opt-in)
-uv run lha eval               # score: 6/6              (~85 s)
-
-# facade isolation — must print nothing
-grep -rnE "^[[:space:]]*(import|from)[[:space:]]+(cocoindex|cocoindex_code)" \
-  --include='*.py' src/lha | grep -v "src/lha/live_context/"
+uv run lha trace <run_id>
+uv run lha trace <run_id> --html
+uv run lha runs list
+uv run lha runs show <run_id>
+uv run lha runs prune --older-than-days 30
 ```
 
-Opt-in, needs a Docker daemon:
+The HTML trace is a self-contained rendering of steps, patches, approvals,
+verdicts, repairs, and recorded model usage. Reporting validates persisted
+evidence and refuses damaged runs. Pruning is a dry run unless `--apply` is
+present, deletes only validated `DONE` or `FAILED` runs, and refuses locked or
+corrupt state.
+
+## 9. Required gate
+
+Run the release gate from the repository root:
 
 ```bash
-LHA_DOCKER_TESTS=1 uv run pytest tests/test_sandbox.py -q   # real containers
-docker build -t lha . && docker run --rm lha lha --version
+uv run ruff check .
+uv run pyright src/lha
+uv run pytest -q
+LHA_RUNS_DIR=runs/_release uv run lha eval
+
+if grep -rnE "^[[:space:]]*(import|from)[[:space:]]+(cocoindex|cocoindex_code)" \
+     --include='*.py' src/lha | grep -v "src/lha/live_context/"; then
+  exit 1
+fi
+
+uv build
+docker build -t lha:release .
+LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
+  uv run pytest tests/test_sandbox.py -q
+docker run --rm lha:release lha --version
 ```
 
-Notes that matter in practice:
+Also install both `dist/*.whl` and `dist/*.tar.gz` from scratch directories with
+`uv run --no-project --with ...`, then import
+`lha.live_context.flows.common`. `.github/workflows/ci.yml` contains the exact
+package and container smoke checks.
 
-- `lha eval` writes only to `LHA_RUNS_DIR` and `data/.lha_index/` (both
-  gitignored). To keep an audit run out of the normal tree:
-  `LHA_RUNS_DIR=runs/_scratch uv run lha eval`.
-- The first `lha eval` downloads a small sentence-transformers model (tens of
-  MB, one-time).
-- `lha eval` also rewrites `data/skills/*.md` (gitignored skill memory) as a
-  normal consequence of a verified `DONE` run.
-- Tests are hermetic by design: `tests/conftest.py::hermetic_task` flips tasks
-  to `context_requirement="optional"` and configs use `code_backend="null"` with
-  a `tmp_path` `data_dir`. Keep new tests that way — no network, no `ccc`, no
-  model download.
-- Coverage, if you want it: `uv run pytest --cov=lha --cov-report=term`. It was
-  **81%** (3969 statements, 771 uncovered) over 211 tests. The
-  uncovered lines are mostly the network/CLI-bound backends (`ccc` MCP I/O, the
-  `claude_cli`/`anthropic` clients) that cannot be exercised hermetically. Add a
-  meaningful test, never padding to move the number.
+Do not write a final test count, coverage percentage, ablation result, or public
+benchmark score into docs until these commands have run on the release candidate.
+For the current release candidate, the measured local baseline is
+`523 passed, 3 skipped`, 83% statement coverage, and `lha eval` at 6/6.
 
-## 7. Coding conventions
+## 10. Coding rules
 
-- **ruff**, line length 100, `extend-select = ["I"]` (import sorting).
-  `runs`, `data`, `.cocoindex_code`, `flows/_scratch` are excluded.
-- **pyright** must stay at 0 errors over `src/lha` (Python 3.11 target). Prefer
-  an explicit `None`-guard or `Literal` narrowing over a blanket `# type: ignore`.
-- `from __future__ import annotations` at the top of every module.
-- Data that crosses a boundary is a **pydantic model**; internal value objects
-  are `@dataclass`. Never pass free-form dicts between roles.
-- Timestamps come from `lha.clock.now()` (tz-aware UTC) — never
-  `datetime.now()`.
-- Subprocesses go through `lha.tools.shell.run` or, for anything
-  target/model-influenced, `lha.sandbox.ExecutionBackend`.
-- Optional dependencies (`cocoindex`, `anthropic`, `harbor`, `sentence_transformers`,
-  `skimage`) are imported **inside** the function that needs them, so the core
-  imports cleanly without the extras.
-- Comments explain *why* a line is the way it is (usually the failure mode it
-  prevents). The existing code does this consistently; match it and do not add
-  narration of what the code obviously does.
-- Conventional commits: `feat:` / `fix:` / `docs:` / `test:` / `ci:` / `chore:` /
-  `refactor:`, with a scope where it helps (`fix(policy): …`).
-- New objective checks belong in a verifier family under
-  `src/lha/verifiers/<family>/` and are registered in `registry.py` — not
-  special-cased in the loop.
+- Ruff line length is 100 with import sorting enabled; Pyright targets Python 3.11.
+- Put `from __future__ import annotations` at the top of Python modules.
+- Use Pydantic models for boundary data and dataclasses for internal value objects.
+- Use `lha.clock.now()` for timestamps.
+- Route target/model-influenced subprocesses through `ExecutionBackend`.
+- Import optional dependencies inside the function that needs them.
+- Comments explain the failure mode a decision prevents, not the obvious syntax.
+- Use conventional commit subjects: `feat:`, `fix:`, `docs:`, `test:`, `ci:`,
+  `chore:`, or `refactor:`.
+- Add a registered verifier rather than a special case in the harness loop.
 
-## 8. Prohibited
+## 11. Prohibited changes
 
-- **Never weaken a check to make the gate green.** No skipping, `xfail`ing,
-  deleting, or commenting out a test; no lowering a threshold; no loosening a
-  verifier. Fix the cause or revert.
-- **Never import `cocoindex`/`cocoindex_code` or shell out to `ccc` outside
-  `src/lha/live_context/`.**
-- **Never let "could not verify" become "verified"** — the single most important
-  rule in the codebase.
-- **Never reuse the internal gate's verdict as ground truth** in the ablation or
-  a bench adapter.
-- **Never publish a number that was not produced by a command in this repo.** If
-  a measurement changes, regenerate `benchmarks/ablation_report.{json,md}` and
-  update every doc that quotes it (`README.md`, `docs/ABLATION.md`,
-  `CHANGELOG.md`) in the same change.
-- **Never commit generated state**: `runs/`, `data/.lha_index/`, `data/skills/`,
-  `.coverage`, `.cocoindex_code/`, or a `uv.lock` inside `data/bench/*`.
-- **Never run `git push`, create a tag, or cut a release without being asked.**
-  There is currently no configured git remote.
-- **Do not edit the bench corpus or its oracles to improve a result.** Fixtures
-  were authored and calibrated before any model output on them was observed;
-  changing a fixture's bytes also busts the ablation cache fingerprint and
-  re-samples every cell.
-- `trusted-local` is **not** a sandbox against hostile code. Use
-  `LHA_EXEC_BACKEND=docker` for any external target repo.
+- Never skip, delete, weaken, or mark a test `xfail` to make the gate green.
+- Never turn “could not verify” into success.
+- Never import CocoIndex or execute `ccc` outside `src/lha/live_context/`.
+- Never let an internal gate verdict serve as ablation ground truth.
+- Never edit the ablation or long-task corpus after observing model output.
+- Never commit generated run, index, cache, coverage, or nested fixture-lock state.
+- Never publish a benchmark number without its raw report and provenance.
+- Never store Codex, Anthropic, GitHub, SSH, or cloud credentials in the repository,
+  a container image, an artifact, or a log.
 
-## 9. Known limitations
+## 12. Known limits
 
-- **`trusted-local` isolation is environment-scrubbing only** (no inherited
-  secrets, process-group kill, opt-in rlimits). On macOS `RLIMIT_NPROC` is
-  per-user, so host rlimits are off by default.
-- **Prompt injection through indexed content is mitigated, not prevented** — a
-  poisoned suggestion still has to pass the objective gate.
-- **The `docker` backend's image must carry the tools**: the default
-  `python:3.12-slim` has no `pytest`/`pytest-json-report`/`ruff`, so
-  code-verification tasks need a purpose-built image.
-- **Public benchmarks are adapters only.** SWE-bench Verified and Terminal-Bench 2
-  are wired and contract-tested; **no evaluation run has been executed and no
-  number is claimed.** Both need Docker and paid model calls. The
-  Terminal-Bench path also needs a freshly built wheel (`uv build`) and
-  `uvx --python 3.12` because `harbor` requires Python ≥ 3.12.
-- **The ablation measures a mechanism, not a leaderboard.** At the committed
-  snapshot the effect is 2 false successes in 51 paired cells (exact McNemar
-  p = 0.50); the boundary CIs (`0% (0–0%)`, `100% (100–100%)`) are degenerate
-  percentile-bootstrap artifacts. Scorer independence is state-level, not
-  environment-level, unless `--scorer-backend docker` is used. The implementer's
-  tool denial is a deny-list and the `claude` CLI version is not in the
-  provenance fingerprint.
-- **The context family is a weaker oracle than a test suite.** Freshness and
-  citation-resolution are the best available signal where no objective oracle
-  exists; they are labelled as context-family checks, not ground truth.
-- **`ccc` code search is optional and stateful.** A daemon churned by many
-  ad-hoc runs can report a transient code-context miss; `ccc daemon restart`
-  and re-run. Ephemeral per-run workdirs are deliberately *not* indexed — the
-  loop indexes the stable `target_repo` instead.
-- **The facade is a process-global singleton**, which is why cross-task
-  parallelism (`lha batch`) uses worker subprocesses rather than threads.
+- `trusted-local` scrubs the environment and manages process groups, but it is not
+  isolation against hostile code. Use Docker for external repositories.
+- The default Docker execution image does not include pytest or Ruff; supply a
+  task image containing every required tool.
+- Prompt injection from indexed content is reduced by objective checks, not
+  eliminated.
+- Context freshness and citations are weaker evidence than an executable oracle.
+- Public benchmark adapters are not leaderboard results. No Terminal-Bench or
+  SWE-bench score is claimed until an official run is completed and committed.
+- A horizon composition is a projection over measured cells, not an additional
+  long-task experiment.

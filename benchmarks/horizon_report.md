@@ -1,37 +1,49 @@
 # Error compounding over a horizon
 
-corpus: 17 independent subtasks · model: `claude-haiku-4-5-20251001` · repetitions: 3 → **3 independent episodes** · per-step truth from `benchmarks/ablation_report.json`
+corpus: 17 independent subtasks · model: `gpt-5.4-mini` · complete paired repetitions: 12 → **12 independent observed episodes** · per-step truth from `benchmarks/ablation_report.json`
 
-An episode is correct through step k only if every one of steps 1..k truly succeeded, as graded by the ablation's independent scorer.
+This report keeps three estimands separate. The cell and episode tests use different paired units; the composition is a descriptive model projection and adds no observations.
 
-| k | `trust-chain` (95% CI) | `verify-chain` (95% CI) | gap |
+## Estimand 1 — paired cells
+
+Unit: `task × repetition cell` · pairs: **204** · `trust` true success: 194/204 · `verify` true success: 204/204.
+
+Discordant cells (verify-only / trust-only): 10/0 · exact McNemar p = 0.0020
+
+## Estimand 2 — observed episodes
+
+An episode is one complete corpus repetition and is correct only if every subtask in that repetition truly succeeded. Multiple failed cells in the same repetition still make one failed episode.
+
+| condition | end-to-end correct | first failing subtask(s) |
+|---|---|---|
+| `trust-chain` | 2/12 (5%–45%, Wilson) | `bench_caesar`, `bench_urljoin` |
+| `verify-chain` | 12/12 (76%–100%, Wilson) | — |
+
+Discordant episodes (verify-only / trust-only): 10/0 of 12 paired episodes · exact McNemar p = 0.0020
+
+The cell- and episode-level p-values may coincide for a particular dataset, but equality is not a statistical contract: aggregation changes the paired unit and can collapse many cell disagreements into one episode disagreement.
+
+## Estimand 3 — descriptive composition
+
+The curve inserts empirical per-task success rates into an independent-step, uniform-random-order model. Its task-bootstrap interval describes sensitivity to the observed task mix; it is not an episode confidence interval and has no McNemar p-value.
+
+Independent samples added by composition: **0**.
+
+| k | `trust-chain` (95% task-bootstrap interval) | `verify-chain` (95% task-bootstrap interval) | gap |
 |---:|---|---|---:|
-| 1 | 96% (90%–100%) | 100% (100%–100%) | +3.9 pp |
-| 2 | 92% (81%–100%) | 100% (100%–100%) | +7.8 pp |
-| 4 | 85% (65%–100%) | 100% (100%–100%) | +15.2 pp |
-| 6 | 78% (52%–100%) | 100% (100%–100%) | +22.3 pp |
-| 8 | 71% (42%–100%) | 100% (100%–100%) | +29.1 pp |
-| 10 | 64% (33%–100%) | 100% (100%–100%) | +35.5 pp |
-| 12 | 58% (26%–100%) | 100% (100%–100%) | +41.7 pp |
-| 14 | 53% (20%–100%) | 100% (100%–100%) | +47.5 pp |
-| 16 | 47% (15%–100%) | 100% (100%–100%) | +52.9 pp |
-| 17 | 44% (13%–100%) | 100% (100%–100%) | +55.6 pp |
+| 1 | 95% (87%–100%) | 100% (100%–100%) | +4.9 pp |
+| 2 | 90% (76%–100%) | 100% (100%–100%) | +9.7 pp |
+| 4 | 81% (57%–100%) | 100% (100%–100%) | +19.0 pp |
+| 6 | 72% (42%–100%) | 100% (100%–100%) | +27.8 pp |
+| 8 | 64% (30%–100%) | 100% (100%–100%) | +36.2 pp |
+| 10 | 56% (22%–100%) | 100% (100%–100%) | +44.2 pp |
+| 12 | 48% (15%–100%) | 100% (100%–100%) | +51.7 pp |
+| 14 | 41% (10%–100%) | 100% (100%–100%) | +58.9 pp |
+| 16 | 34% (7%–100%) | 100% (100%–100%) | +65.6 pp |
+| 17 | 31% (5%–100%) | 100% (100%–100%) | +68.8 pp |
 
 Conditions:
 - `trust-chain` — no gate: a wrong step is accepted silently.
 - `verify-chain` — gate plus repair at every step.
 
-## Observed episodes
-
-| condition | end-to-end correct | first failing subtask(s) |
-|---|---|---|
-| `trust-chain` | 1/3 (6%–79%, Wilson) | `bench_lru`, `bench_median` |
-| `verify-chain` | 3/3 (44%–100%, Wilson) | — |
-
-Paired at the terminal step: discordant 2/0 of 3 episodes · exact McNemar p = 0.5000 — **not significant**
-
-## What this does and does not show
-
-The curve is the compounding model evaluated at the measured per-task p. Independence holds by construction (each subtask is its own repository and its own model call), so the composition is exact — but it is a re-expression of the per-step measurement, not a second experiment. Composing cells into more orderings cannot create information.
-
-The evidence is the 3 observed episodes. To reach p < 0.05 at the observed discordance rate, re-run `lha ablate` with about **9 repetitions** and regenerate this report.
+Only new complete repetitions increase the episode sample count. Reordering or composing the existing cells changes the projected effect size, not the number of independent observed episodes.
