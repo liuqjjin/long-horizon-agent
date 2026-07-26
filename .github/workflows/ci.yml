@@ -25,6 +25,9 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check .
 
+      - name: Published benchmark claims match committed evidence
+        run: uv run python -m lha.release_claims
+
       - name: Facade isolation (CocoIndex must not leak out of live_context)
         run: |
           if grep -rnE "^[[:space:]]*(import|from)[[:space:]]+(cocoindex|cocoindex_code)" \
@@ -39,6 +42,28 @@ jobs:
 
       - name: Tests (pytest)
         run: uv run pytest -q
+
+      - name: Build wheel and source distribution
+        run: |
+          uv build
+          unzip -l dist/*.whl | grep 'lha/live_context/flows/common.py'
+          tar -tf dist/*.tar.gz | grep 'src/lha/live_context/flows/common.py'
+
+      - name: Smoke-test wheel and source distribution outside the checkout
+        run: |
+          ROOT="$PWD"
+          WHEEL_TMP="$(mktemp -d)"
+          cd "$WHEEL_TMP"
+          uv run --no-project --with "$ROOT"/dist/*.whl lha --version
+          uv run --no-project --with "$ROOT"/dist/*.whl \
+            python -c "from lha.live_context.flows import common, experiments_flow, papers_flow, skills_flow"
+          uv run --no-project --with "$ROOT"/dist/*.whl lha eval --quick
+          SDIST_TMP="$(mktemp -d)"
+          cd "$SDIST_TMP"
+          uv run --no-project --with "$ROOT"/dist/*.tar.gz lha --version
+          uv run --no-project --with "$ROOT"/dist/*.tar.gz \
+            python -c "from lha.live_context.flows import common, experiments_flow, papers_flow, skills_flow"
+          uv run --no-project --with "$ROOT"/dist/*.tar.gz lha eval --quick
 
       - name: Cache embedding model (HuggingFace)
         uses: actions/cache@v4
@@ -69,7 +94,10 @@ jobs:
       - name: Smoke-test image (CLI + context extra present)
         run: |
           docker run --rm lha:ci lha --version
+          docker run --rm lha:ci git --version
           docker run --rm lha:ci python -c "import lha, cocoindex, sentence_transformers"
+          docker run --rm lha:ci lha eval --quick
+          docker run --rm lha:ci python -c "from pathlib import Path; assert not any((Path('/app') / p).exists() for p in ('.env', '.codex', '.claude', '.mcp.json', 'auth.json', '.ssh', '.aws', '.config/gcloud', '.netrc', '.pypirc', 'dist'))"
       - name: Set up uv (+ Python 3.11 from .python-version)
         uses: astral-sh/setup-uv@v5
         with:
@@ -77,4 +105,5 @@ jobs:
       - name: Docker execution-backend tests (real containers)
         run: |
           uv sync
-          LHA_DOCKER_TESTS=1 uv run pytest tests/test_sandbox.py -q
+          LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:ci \
+            uv run pytest tests/test_sandbox.py -q

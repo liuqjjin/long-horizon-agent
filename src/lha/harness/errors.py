@@ -29,6 +29,18 @@ class CheckpointCorrupt(HarnessError):
     would silently replay or skip work, so loading fails closed instead."""
 
 
+class RunLocked(HarnessError):
+    """Another process already owns this run.
+
+    Concurrent resume is rejected because two writers cannot safely share a
+    checkpoint, ledger, or sandbox.
+    """
+
+
+class TransactionCorrupt(HarnessError):
+    """A persisted patch transaction or backup failed validation."""
+
+
 class PolicyViolation(HarnessError):
     """A patch tried to touch protected oracle/config files. The patch is
     refused before it reaches the sandbox; the loop treats this as a failed

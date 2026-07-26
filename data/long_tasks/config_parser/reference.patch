@@ -1,0 +1,63 @@
+diff --git a/src/config_service/loader.py b/src/config_service/loader.py
+index 11f86b1..ef84d5f 100644
+--- a/src/config_service/loader.py
++++ b/src/config_service/loader.py
+@@ -13,10 +13,10 @@ def load_config(
+     file_values: Mapping[str, Any],
+     environ: Mapping[str, str],
+ ) -> ServiceConfig:
+-    values = dict(file_values)
+-    values.update(defaults)
++    values = dict(defaults)
++    values.update(file_values)
+     if "APP_DEBUG" in environ:
+         values["debug"] = environ["APP_DEBUG"]
+     if "APP_PORTS" in environ:
+-        values["ports"] = environ["APP_PORTS"].split(",")
++        values["ports"] = environ["APP_PORTS"]
+     return ServiceConfig.from_mapping(values)
+diff --git a/src/config_service/model.py b/src/config_service/model.py
+index 4089a43..36e642b 100644
+--- a/src/config_service/model.py
++++ b/src/config_service/model.py
+@@ -6,6 +6,31 @@ from dataclasses import dataclass
+ from typing import Any
+ 
+ 
++def _parse_bool(value: Any) -> bool:
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, str):
++        normalized = value.strip().lower()
++        if normalized in {"1", "true", "yes", "on"}:
++            return True
++        if normalized in {"0", "false", "no", "off"}:
++            return False
++    raise ValueError(f"invalid boolean value: {value!r}")
++
++
++def _parse_ports(value: Any) -> tuple[int, ...]:
++    if isinstance(value, str):
++        raw = value.split(",")
++    elif isinstance(value, (list, tuple)):
++        raw = value
++    else:
++        raise ValueError(f"invalid ports value: {value!r}")
++    ports = tuple(int(item.strip() if isinstance(item, str) else item) for item in raw)
++    if any(not 1 <= port <= 65535 for port in ports):
++        raise ValueError("ports must be between 1 and 65535")
++    return ports
++
++
+ @dataclass(frozen=True)
+ class ServiceConfig:
+     debug: bool
+@@ -14,6 +39,6 @@ class ServiceConfig:
+     @classmethod
+     def from_mapping(cls, values: dict[str, Any]) -> "ServiceConfig":
+         return cls(
+-            debug=bool(values.get("debug", False)),
+-            ports=tuple(values.get("ports", ())),
++            debug=_parse_bool(values.get("debug", False)),
++            ports=_parse_ports(values.get("ports", ())),
+         )

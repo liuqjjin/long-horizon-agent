@@ -1,0 +1,51 @@
+diff --git a/src/note_store/migrations.py b/src/note_store/migrations.py
+index fbc19e4..05ef041 100644
+--- a/src/note_store/migrations.py
++++ b/src/note_store/migrations.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import sqlite3
++from datetime import UTC, datetime
+ 
+ 
+ def migrate(connection: sqlite3.Connection) -> None:
+@@ -14,6 +15,11 @@ def migrate(connection: sqlite3.Connection) -> None:
+         connection.execute("PRAGMA user_version = 1")
+         connection.commit()
+     if version < 2:
+-        connection.execute("ALTER TABLE notes ADD COLUMN updated_at TEXT")
+-        connection.commit()
++        timestamp = datetime.now(UTC).isoformat()
++        with connection:
++            connection.execute("ALTER TABLE notes ADD COLUMN updated_at TEXT")
++            connection.execute(
++                "UPDATE notes SET updated_at = ? WHERE updated_at IS NULL", (timestamp,)
++            )
++            connection.execute("PRAGMA user_version = 2")
+ 
+diff --git a/src/note_store/repository.py b/src/note_store/repository.py
+index 6f0462d..e7dc1c4 100644
+--- a/src/note_store/repository.py
++++ b/src/note_store/repository.py
+@@ -4,7 +4,7 @@ from __future__ import annotations
+ 
+ import sqlite3
+ from dataclasses import dataclass
+-from datetime import datetime
++from datetime import UTC, datetime
+ 
+ 
+ @dataclass(frozen=True)
+@@ -19,7 +19,10 @@ class NoteRepository:
+         self.connection = connection
+ 
+     def add(self, body: str) -> Note:
+-        cursor = self.connection.execute("INSERT INTO notes(body) VALUES (?)", (body,))
++        updated_at = datetime.now(UTC).isoformat()
++        cursor = self.connection.execute(
++            "INSERT INTO notes(body, updated_at) VALUES (?, ?)", (body, updated_at)
++        )
+         self.connection.commit()
+         return self.get(int(cursor.lastrowid))
+ 

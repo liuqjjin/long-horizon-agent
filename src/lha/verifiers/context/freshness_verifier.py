@@ -33,7 +33,23 @@ class FreshnessVerifier(Verifier):
             )
 
         indexed_at = bundle.freshness.indexed_at.isoformat()
-        if bundle.status in ("backend_unavailable", "index_failed"):
+        # Optional means the step may proceed without context. It never means
+        # known-stale or failed-index evidence becomes safe to use.
+        if bundle.freshness.is_stale():
+            return self._check(
+                passed=False,
+                summary=f"stale: {bundle.freshness.reasons}",
+                indexed_at=indexed_at,
+            )
+
+        if bundle.status == "index_failed":
+            return self._check(
+                passed=False,
+                summary=f"context index_failed: {'; '.join(bundle.status_notes) or 'no detail'}",
+                indexed_at=indexed_at,
+            )
+
+        if bundle.status == "backend_unavailable":
             return self._check(
                 passed=not required,
                 summary=f"context {bundle.status}: {'; '.join(bundle.status_notes) or 'no detail'}"
@@ -61,10 +77,9 @@ class FreshnessVerifier(Verifier):
                 indexed_at=indexed_at,
             )
 
-        stale = bundle.freshness.is_stale()
         return self._check(
-            passed=not stale,
-            summary="fresh" if not stale else f"stale: {bundle.freshness.reasons}",
+            passed=True,
+            summary="fresh",
             indexed_at=indexed_at,
         )
 

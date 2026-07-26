@@ -1,0 +1,52 @@
+diff --git a/src/tiny_experiment/artifacts.py b/src/tiny_experiment/artifacts.py
+index d5ed1ef..5bc9c11 100644
+--- a/src/tiny_experiment/artifacts.py
++++ b/src/tiny_experiment/artifacts.py
+@@ -3,5 +3,6 @@
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ from pathlib import Path
+ from typing import Any
+@@ -16,12 +17,18 @@ def write_artifacts(
+ ) -> dict[str, Any]:
+     destination = Path(output_dir)
+     destination.mkdir(parents=True, exist_ok=True)
+-    (destination / "values.json").write_text(json.dumps(values))
++    values_path = destination / "values.json"
++    values_path.write_text(json.dumps(values, separators=(",", ":")))
++    canonical_inputs = json.dumps(
++        parameters, sort_keys=True, separators=(",", ":")
++    ).encode()
+     manifest = {
+         "seed": parameters["seed"],
+         "count": parameters["count"],
+         "mean": mean(values),
++        "input_sha256": hashlib.sha256(canonical_inputs).hexdigest(),
++        "output_sha256": hashlib.sha256(values_path.read_bytes()).hexdigest(),
+     }
+     (destination / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+     return manifest
+ 
+diff --git a/src/tiny_experiment/run.py b/src/tiny_experiment/run.py
+index eaa1e6e..af462ec 100644
+--- a/src/tiny_experiment/run.py
++++ b/src/tiny_experiment/run.py
+@@ -10,7 +10,14 @@ from .artifacts import write_artifacts
+ 
+ 
+ def run_experiment(output_dir: str | Path, seed: int, count: int) -> dict[str, Any]:
+-    generator = random.Random()
++    if count <= 0:
++        raise ValueError("count must be positive")
++    generator = random.Random(seed)
+     values = [generator.random() for _ in range(count)]
+-    return write_artifacts(output_dir, values, {"seed": seed, "count": count})
++    parameters = {
++        "algorithm": "python-random-v1",
++        "count": count,
++        "seed": seed,
++    }
++    return write_artifacts(output_dir, values, parameters)
+ 

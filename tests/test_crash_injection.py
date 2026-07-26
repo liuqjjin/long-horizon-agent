@@ -164,3 +164,12 @@ def test_ledger_mid_file_corruption_raises(tmp_path):
 
     with pytest.raises(CheckpointCorrupt, match="corrupt"):
         read_ledger(run_dir)
+
+
+def test_complete_corrupt_final_ledger_line_is_damage_not_a_torn_tail(tmp_path):
+    run_dir = _paused_run(tmp_path)
+    with open(run_dir / "ledger.jsonl", "a") as stream:
+        stream.write("{bad}\n")
+
+    with pytest.raises(CheckpointCorrupt, match="corrupt"):
+        read_ledger(run_dir)

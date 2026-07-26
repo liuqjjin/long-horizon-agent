@@ -33,6 +33,13 @@ class SSIMVerifier(Verifier):
         from skimage.metrics import structural_similarity
 
         data_range_v, dr_conflict = metric_param(artifact, ctx.step, "data_range", 1.0)
+        if not is_finite(data_range_v) or float(data_range_v) <= 0:
+            return Check(
+                name=self.name,
+                family=self.family,
+                passed=False,
+                detail={"summary": f"invalid data_range: {data_range_v!r}"},
+            )
         data_range = float(data_range_v)
         channel_axis, ca_conflict = metric_param(
             artifact, ctx.step, "channel_axis", -1 if ref.ndim == 3 else None
@@ -61,8 +68,11 @@ class SSIMVerifier(Verifier):
         if not is_finite(value):
             reasons.append(f"non-finite SSIM ({value}) — degenerate result")
         else:
-            if threshold is not None and value < float(threshold):
-                reasons.append(f"SSIM {value:.4f} < threshold {threshold}")
+            if threshold is not None:
+                if not is_finite(threshold):
+                    reasons.append(f"SSIM threshold is non-finite ({threshold})")
+                elif value < float(threshold):
+                    reasons.append(f"SSIM {value:.4f} < threshold {threshold}")
             if reported is not None:
                 if not is_finite(reported):
                     reasons.append(f"self-reported SSIM is non-finite ({reported})")
@@ -78,7 +88,7 @@ class SSIMVerifier(Verifier):
             family=self.family,
             passed=not reasons,
             score=score,
-            threshold=float(threshold) if threshold is not None else None,
+            threshold=float(threshold) if threshold is not None and is_finite(threshold) else None,
             detail={
                 "summary": f"SSIM={shown} (reported={reported}, threshold={threshold})",
                 "reasons": reasons,

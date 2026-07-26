@@ -1,0 +1,17 @@
+kind: issue_to_pr
+title: "Configuration precedence and environment values are parsed incorrectly"
+description: >
+  Repair the multi-source configuration loader. File values must override defaults,
+  environment values must override both, boolean text must be parsed explicitly, and
+  comma-separated ports must become integers without weakening the tests.
+target_repo: data/long_tasks/config_parser/repo
+context_requirement: optional
+inputs:
+  context_query: "configuration precedence boolean environment parsing"
+  repo_adapter: data/long_tasks/config_parser/adapter.yaml
+  reference_manifest: data/long_tasks/config_parser/reference_manifest.json
+success:
+  - "targeted configuration tests pass"
+  - "the full fixture test suite passes"
+  - "ruff and compileall pass"
+

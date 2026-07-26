@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from ..artifacts import _reject_non_finite
 
 TaskKind = Literal["issue_to_pr", "paper_to_experiment", "freshness"]
 
@@ -29,6 +31,12 @@ class TaskSpec(BaseModel):
     # oracle-protection policy would refuse them (e.g. a task whose goal IS to
     # fix a test). Relative paths, exact matches against patch entries.
     allowed_protected_files: list[str] = Field(default_factory=list)
+
+    @field_validator("inputs")
+    @classmethod
+    def _finite_inputs(cls, value: dict[str, Any]) -> dict[str, Any]:
+        _reject_non_finite(value, "inputs")
+        return value
 
     @classmethod
     def from_file(cls, path: str | Path) -> "TaskSpec":

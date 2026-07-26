@@ -16,7 +16,16 @@ class RuffVerifier(Verifier):
     def verify(self, artifact: Any, ctx: VerifyContext) -> Check:
         ruff = ctx.exec.tool("ruff")
         res = ctx.exec.run(
-            [ruff, "check", "--output-format", "json", "--exclude", ".cocoindex_code", "."],
+            [
+                ruff,
+                "check",
+                "--no-cache",
+                "--output-format",
+                "json",
+                "--exclude",
+                ".cocoindex_code",
+                ".",
+            ],
             cwd=ctx.workdir,
         )
         # ruff exits 0 (clean) or 1 (violations found, JSON on stdout). Anything

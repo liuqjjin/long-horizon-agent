@@ -1,0 +1,17 @@
+kind: issue_to_pr
+title: "Concurrent increments are lost and worker failures are swallowed"
+description: >
+  Make counter updates atomic without serializing the pre-write rendezvous, and make
+  the thread-pool boundary propagate worker exceptions to the caller. Preserve the
+  public run_workers API and deterministic regression tests.
+target_repo: data/long_tasks/concurrency_failure/repo
+context_requirement: optional
+inputs:
+  context_query: "thread pool lost update exception propagation lock boundary"
+  repo_adapter: data/long_tasks/concurrency_failure/adapter.yaml
+  reference_manifest: data/long_tasks/concurrency_failure/reference_manifest.json
+success:
+  - "eight synchronized increments produce eight"
+  - "worker exceptions cross the executor boundary"
+  - "full tests, lint, and compileall pass"
+

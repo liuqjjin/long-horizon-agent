@@ -1,0 +1,43 @@
+diff --git a/src/concurrent_counter/store.py b/src/concurrent_counter/store.py
+index 4fc69a4..69331f7 100644
+--- a/src/concurrent_counter/store.py
++++ b/src/concurrent_counter/store.py
+@@ -3,12 +3,14 @@
+ from __future__ import annotations
+ 
+ from collections.abc import Callable
++from threading import Lock
+ 
+ 
+ class CounterStore:
+     def __init__(self, before_write: Callable[[], object] | None = None):
+         self._value = 0
+         self._before_write = before_write
++        self._lock = Lock()
+ 
+     @property
+     def value(self) -> int:
+@@ -16,7 +18,7 @@ class CounterStore:
+ 
+     def increment(self) -> None:
+-        current = self._value
+         if self._before_write is not None:
+             self._before_write()
+-        self._value = current + 1
++        with self._lock:
++            self._value += 1
+ 
+diff --git a/src/concurrent_counter/worker.py b/src/concurrent_counter/worker.py
+index 21a7f87..23764ab 100644
+--- a/src/concurrent_counter/worker.py
++++ b/src/concurrent_counter/worker.py
+@@ -14,6 +14,7 @@ def _increment_many(store: CounterStore, count: int) -> None:
+ 
+ def run_workers(store: CounterStore, workers: int, increments: int) -> int:
+     with ThreadPoolExecutor(max_workers=workers) as pool:
+-        for _ in range(workers):
+-            pool.submit(_increment_many, store, increments)
++        futures = [pool.submit(_increment_many, store, increments) for _ in range(workers)]
++        for future in futures:
++            future.result()
+     return store.value

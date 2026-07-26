@@ -16,7 +16,7 @@ from ..live_context import (
     get_fresh_context,
     reject_stale,
 )
-from ..live_context.freshness import path_from_locator
+from ..live_context.freshness import content_hash, file_sha256, path_from_locator
 
 _KINDS_BY_STEP = {
     "code": ("code",),
@@ -58,23 +58,48 @@ class ContextEngineer:
     @staticmethod
     def _overlay_workdir(bundle: ContextBundle, workdir: Path) -> None:
         overlaid = 0
+        dropped = 0
+        root = workdir.resolve()
+        kept = []
         for item in bundle.items:
             if item.provenance.source_kind != "code":
+                kept.append(item)
                 continue
             rel = path_from_locator(item.provenance.locator)
-            path = workdir / rel
-            if not path.is_file():
+            rel_path = Path(rel)
+            if rel_path.is_absolute() or ".." in rel_path.parts:
+                dropped += 1
+                continue
+            path = root / rel_path
+            try:
+                path.relative_to(root)
+            except ValueError:
+                dropped += 1
+                continue
+            source_sha256 = file_sha256(rel_path, root=root)
+            if source_sha256 is None:
+                dropped += 1
                 continue
             try:
                 current = path.read_text(errors="replace")
             except OSError:
+                dropped += 1
                 continue
-            if item.text and item.text in current:
-                continue  # chunk unchanged in the sandbox
             item.text = _slice_by_locator(current, item.provenance.locator)
+            item.provenance.source_root = str(root)
+            item.provenance.content_hash = content_hash(item.text)
+            item.provenance.source_sha256 = source_sha256
+            kept.append(item)
             overlaid += 1
+        bundle.items = kept
         if overlaid:
             bundle.status_notes.append(f"{overlaid} code item(s) refreshed from the run sandbox")
+        if dropped:
+            bundle.status_notes.append(
+                f"{dropped} unsafe or missing code item(s) dropped during sandbox refresh"
+            )
+        if not bundle.items and bundle.status == "ok":
+            bundle.status = "empty"
 
     @staticmethod
     def _synthesize(bundle: ContextBundle) -> str:

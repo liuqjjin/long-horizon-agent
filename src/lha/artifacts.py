@@ -9,12 +9,22 @@ Each role emits one of these (never free-form chat):
 
 from __future__ import annotations
 
+import math
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, FiniteFloat, field_validator, model_validator
+
+from .step_ids import validate_plan_step_ids, validate_step_id
 
 StepKind = Literal["code", "experiment", "context"]
-StepAction = Literal["edit_code", "run_experiment", "gather_context", "answer_query"]
+StepAction = Literal[
+    "edit_code",
+    "run_experiment",
+    "gather_context",
+    "answer_query",
+    "repo_integrity",
+    "repo_stage",
+]
 
 
 class Step(BaseModel):
@@ -37,6 +47,17 @@ class Step(BaseModel):
     repair_of: str | None = None
     prior_failures: list[str] = Field(default_factory=list)
 
+    @field_validator("step_id")
+    @classmethod
+    def _canonical_step_id(cls, value: str) -> str:
+        return validate_step_id(value)
+
+    @field_validator("params")
+    @classmethod
+    def _finite_params(cls, value: dict[str, Any]) -> dict[str, Any]:
+        _reject_non_finite(value, "params")
+        return value
+
     def as_repair(self, failures: list[str]) -> "Step":
         return self.model_copy(update={"repair_of": self.step_id, "prior_failures": failures})
 
@@ -49,6 +70,13 @@ class Plan(BaseModel):
     steps: list[Step] = Field(default_factory=list)
     overall_success: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _unique_nonempty_steps(self) -> "Plan":
+        if not self.steps:
+            raise ValueError("plan must contain at least one step")
+        validate_plan_step_ids(step.step_id for step in self.steps)
+        return self
+
 
 class Patch(BaseModel):
     """The Implementer's artifact: a code change."""
@@ -60,6 +88,14 @@ class Patch(BaseModel):
     file_contents: dict[str, str] = Field(default_factory=dict)
     rationale: str = ""
     based_on_context: list[str] = Field(default_factory=list)  # provenance locators used
+
+    @model_validator(mode="after")
+    def _one_executable_payload(self) -> "Patch":
+        if self.unified_diff.strip() and self.file_contents:
+            raise ValueError(
+                "patch must use either unified_diff or file_contents, not both"
+            )
+        return self
 
     def is_empty(self) -> bool:
         return not self.unified_diff and not self.file_contents
@@ -100,7 +136,7 @@ class ExperimentResult(BaseModel):
     step_id: str
     out_dir: str = "out"  # relative to the run sandbox (workdir)
     command: list[str] = Field(default_factory=list)  # re-runnable
-    metrics: dict[str, float] = Field(default_factory=dict)  # self-reported
+    metrics: dict[str, FiniteFloat] = Field(default_factory=dict)  # self-reported
     reference_path: str | None = None  # relative to workdir (e.g. out/reference.npy)
     prediction_path: str | None = None
     repro: dict[str, Any] = Field(default_factory=dict)  # seed, versions, git_commit, ...
@@ -136,3 +172,14 @@ class ExperimentSummary(BaseModel):
             lines += [""]
         lines += [f"_task: {self.task_id}_"]
         return "\n".join(lines)
+
+
+def _reject_non_finite(value: Any, path: str) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{path} must not contain NaN or infinity")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _reject_non_finite(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _reject_non_finite(item, f"{path}[{index}]")

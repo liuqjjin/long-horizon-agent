@@ -7,7 +7,10 @@ the repair lift, transient-error handling, aggregation, and resumability.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 from lha.ablation import (
     CONDITIONS,
@@ -57,11 +60,13 @@ class _FixedLLM(LLMClient):
     def __init__(self, value: int, tamper: bool = False):
         self.value = value
         self.tamper = tamper
+        self.calls = 0
 
     def complete(self, system: str, prompt: str) -> str:
         return ""
 
     def propose_patch(self, step, bundle, workdir) -> Patch:
+        self.calls += 1
         fc = {"m.py": f"def f():\n    return {self.value}\n"}
         if self.tamper:
             fc["tests/test_m.py"] = "def test_f():\n    assert True\n"
@@ -177,17 +182,41 @@ def test_transient_errors_excluded_and_not_cached(tmp_path, monkeypatch):
     assert not (out / "results" / "task__r0.json").exists()
 
 
+def test_error_records_are_never_reused_from_cache(tmp_path):
+    import lha.ablation as abl
+
+    cache = tmp_path / "cell.json"
+    fingerprint = "f" * 64
+    error = RunRecord("task", "trust", 0, "ERROR", False, False, False, 0)
+    cache.write_text(
+        json.dumps(
+            {
+                "schema_version": abl._CACHE_SCHEMA,
+                "fingerprint": fingerprint,
+                "records": [error.__dict__],
+                "llm_calls": [],
+            }
+        )
+    )
+    assert abl._load_cached(cache, fingerprint) is None
+
+
 def test_resumable_caches_real_outcomes(tmp_path):
     out = tmp_path / "out"
     src = _repo(tmp_path / "src")
     task = _task(tmp_path, src)
     base = _base(tmp_path)
-    run_ablation(base, [task], reps=1, out_dir=out, llm_client=_FixedLLM(2))
+    llm = _FixedLLM(2)
+    rep1 = run_ablation(base, [task], reps=1, out_dir=out, llm_client=llm)
     assert (out / "results" / "task__r0.json").exists()
+    assert rep1.llm_calls[0]["cache_hit"] is False
+    calls_after_first_run = llm.calls
 
     # A cached cell must NOT re-invoke the LLM.
-    rep2 = run_ablation(base, [task], reps=1, out_dir=out, llm_client=_FailingLLM())
+    rep2 = run_ablation(base, [task], reps=1, out_dir=out, llm_client=llm)
     assert _by_cond(rep2)["trust"].true_success  # served from cache, no LLM call
+    assert llm.calls == calls_after_first_run
+    assert rep2.llm_calls[0]["cache_hit"] is True
 
 
 # --- aggregation + report ---------------------------------------------------
@@ -218,6 +247,18 @@ def test_errored_runs_excluded_from_rates():
     assert stats["trust"].n == 1 and stats["trust"].false_success_rate == 1.0
     assert isinstance(stats["trust"], ConditionStats)
     assert CONDITIONS[0][0] == "trust"
+
+
+def test_boundary_rate_intervals_use_wilson_instead_of_collapsing():
+    records = [
+        RunRecord(f"t{i}", "verify", 0, "DONE", True, True, False, 0)
+        for i in range(4)
+    ]
+    verify = {s.condition: s for s in _aggregate(records)}["verify"]
+    assert verify.true_ci is not None and verify.true_ci[0] < 1.0
+    assert verify.true_ci[1] == 1.0
+    assert verify.false_ci is not None and verify.false_ci[0] == 0.0
+    assert verify.false_ci[1] > 0.0
 
 
 # --- P0-D: independent truth (prediction vs scorer) ---------------------------
@@ -315,13 +356,72 @@ def test_cache_busts_when_task_changes(tmp_path):
     assert all(r.status == "ERROR" for r in rep2.records)
 
 
+@pytest.mark.parametrize(
+    "source_path",
+    [
+        "ablation.py",
+        "verifiers/code/pytest_verifier.py",
+        "tools/policy.py",
+        "tools/patch.py",
+        "sandbox/local.py",
+        "bench/stats.py",
+    ],
+)
+def test_cache_fingerprint_includes_all_outcome_source(tmp_path, source_path):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    source_files = abl._source_file_digests()
+    assert source_path in source_files
+    original = abl._fingerprint(
+        task, src, "stub", None, source_files=source_files
+    )
+    changed_files = dict(source_files)
+    changed_files[source_path] = "0" * 64
+    changed = abl._fingerprint(
+        task, src, "stub", None, source_files=changed_files
+    )
+    assert changed != original
+
+
+def test_cache_fingerprint_binds_scorer_and_runtime(tmp_path):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    source_files = abl._source_file_digests()
+    local = abl._fingerprint(
+        task,
+        src,
+        "stub",
+        None,
+        "trusted-local",
+        source_files=source_files,
+        runtime={"scorer": {"actual": "trusted-local", "image_id": None}},
+    )
+    docker = abl._fingerprint(
+        task,
+        src,
+        "stub",
+        None,
+        "docker",
+        source_files=source_files,
+        runtime={"scorer": {"actual": "docker", "image_id": "sha256:" + "a" * 64}},
+    )
+    assert docker != local
+
+
 def test_legacy_cache_format_is_recomputed(tmp_path):
+    import lha.ablation as abl
+
     out = tmp_path / "out"
     src = _repo(tmp_path / "src")
     task = _task(tmp_path, src)
     (out / "results").mkdir(parents=True)
     # pre-fingerprint cache format: a bare list
     (out / "results" / "task__r0.json").write_text("[]")
+    assert abl._read_cache(out / "results" / "task__r0.json") == (None, [])
     rep = run_ablation(_base(tmp_path), [task], reps=1, out_dir=out, llm_client=_FixedLLM(2))
     assert _by_cond(rep)["trust"].true_success  # recomputed, not served stale
 
@@ -333,3 +433,131 @@ def test_report_shows_gate_quality_and_scorer(tmp_path):
     assert "precision" in md and "recall" in md and "FP=" in md
     assert report.scorer == "trusted-local"
     assert report.fingerprint
+
+
+def test_new_report_records_complete_secret_free_provenance(tmp_path):
+    import lha.ablation as abl
+
+    report = _run(tmp_path, _FixedLLM(2))
+    raw = json.loads((tmp_path / "out" / "ablation_report.json").read_text())
+    provenance = raw["provenance"]
+
+    assert raw["schema_version"] == 2
+    assert provenance["source_tree_sha256"] == report.provenance.source_tree_sha256
+    assert provenance["source_files"]["ablation.py"]
+    assert provenance["source_files"]["verifiers/code/pytest_verifier.py"]
+    assert provenance["source_files"]["tools/policy.py"]
+    assert provenance["source_files"]["tools/patch.py"]
+    assert provenance["requested_llm_backend"] == "stub"
+    assert provenance["actual_llm_backend"] == "base"
+    assert provenance["model"] is None
+    assert provenance["cli_version"] is None
+    assert provenance["backend_library_version"] is None
+    assert provenance["reasoning_effort"] is None
+    assert provenance["scorer_requested"] == "trusted-local"
+    assert provenance["scorer_backend"] == "trusted-local"
+    assert provenance["task_files_sha256"]["task"]
+    assert provenance["corpus_sha256"]["task"]
+    assert provenance["task_paths"]["task"].endswith("task.yaml")
+    assert provenance["corpus_paths"]["task"].endswith("src")
+    assert provenance["configuration"]["repetitions"] == 1
+    assert provenance["git_commit"] is None or len(provenance["git_commit"]) == 40
+    assert provenance["git_dirty"] in (True, False, None)
+    assert "auth" not in json.dumps(provenance).lower()
+    assert raw["llm_calls"] == [
+        {
+            "task": "task",
+            "rep": 0,
+            "cache_hit": False,
+            "label": "first",
+            "status": "succeeded",
+            "backend": "base",
+        }
+    ]
+
+    loaded = abl.load_ablation_report(tmp_path / "out" / "ablation_report.json")
+    assert loaded.schema_version == 2
+    assert loaded.provenance is not None
+    assert loaded.provenance.source_tree_sha256 == provenance["source_tree_sha256"]
+
+
+def test_old_report_without_provenance_remains_readable(tmp_path):
+    import lha.ablation as abl
+
+    old = tmp_path / "old-report.json"
+    old.write_text(
+        json.dumps(
+            {
+                "llm": "claude_cli",
+                "model": "old-model",
+                "reps": 1,
+                "tasks": ["old-task"],
+                "scorer": "trusted-local",
+                "records": [],
+                "stats": [],
+            }
+        )
+    )
+    loaded = abl.load_ablation_report(old)
+    assert loaded.schema_version == 1
+    assert loaded.provenance is None
+    assert loaded.tasks == ["old-task"]
+
+
+def test_codex_runtime_and_call_audit_are_structured_and_secret_free():
+    import lha.ablation as abl
+    from lha.llm.codex_cli import CodexCLIClient
+
+    client = CodexCLIClient(
+        model="gpt-test-snapshot",
+        reasoning_effort="high",
+        no_tools=True,
+    )
+    client._version = "codex-cli 1.2.3"
+    runtime = abl._client_runtime(
+        "codex_cli",
+        client,
+        model="gpt-test-snapshot",
+        cli_path="codex",
+        backend_details="codex-cli 1.2.3",
+    )
+    assert runtime["actual_backend"] == "codex_cli"
+    assert runtime["model"] == "gpt-test-snapshot"
+    assert runtime["cli_version"] == "codex-cli 1.2.3"
+    assert runtime["reasoning_effort"] == "high"
+
+    client.last_call = {
+        "status": "failed",
+        "cli_version": "codex-cli 1.2.3",
+        "model": "gpt-test-snapshot",
+        "reasoning_effort": "high",
+        "attempt_count": 1,
+        "event_summary": {"total_events": 3, "events": {"turn.failed": 1}},
+        "error_type": "CodexProtocolError",
+        "error": "must-not-be-persisted",
+        "attempts": [
+            {
+                "attempt": 1,
+                "status": "failed",
+                "event_summary": {"total_events": 3},
+                "error": "must-not-be-persisted",
+            }
+        ],
+    }
+    client.last_usage = {
+        "input_tokens": 10,
+        "cached_input_tokens": 2,
+        "output_tokens": 3,
+        "cost_usd": None,
+        "model": "gpt-test-snapshot",
+    }
+    audit = abl._safe_call_audit(
+        client,
+        label="first",
+        status="failed",
+        error=RuntimeError("must-not-be-persisted"),
+    )
+    assert audit["event_summary"]["total_events"] == 3
+    assert audit["status"] == "failed"
+    assert audit["usage"]["output_tokens"] == 3
+    assert "must-not-be-persisted" not in json.dumps(audit)

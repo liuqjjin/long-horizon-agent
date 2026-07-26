@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "task_id": "config_parser",
+  "repo_sha256": "60b17ee1b021f92351543df3ce9b9deac92a2f5dee41ae5328be01614c6bdea1",
+  "task_sha256": "e5ffa45b040cd62e01757408b652aa67597c4e350d07916ab6c3f0a920abe71f",
+  "adapter_sha256": "782adb02b8bb9ca100c9f3a36caa6a327abfc7e3c33c60e191467d905a5cc143",
+  "reference_patch_sha256": "e9117efa522a1bf4190dc9d2bd01586f81fe04553f48c58f075b6a53b0167934",
+  "reference_touched_files": [
+    "src/config_service/loader.py",
+    "src/config_service/model.py"
+  ],
+  "oracle_files": [
+    "tests/test_config.py"
+  ],
+  "expected_baseline_returncode": 1,
+  "expected_patched_test_count": 3
+}

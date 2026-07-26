@@ -1,0 +1,34 @@
+schema_version: 1
+allowed_tools: [python, pytest, ruff]
+setup:
+  - id: setup-python
+    tool: python
+    args: ["--version"]
+baseline:
+  - id: baseline-tests
+    tool: pytest
+    args: ["-q"]
+    expected_returncodes: [1]
+reproduce:
+  - id: reproduce-migration
+    tool: pytest
+    args: ["-q", "tests/test_migration.py::test_v1_database_is_backfilled_and_migration_is_idempotent"]
+    expected_returncodes: [1]
+targeted:
+  - id: targeted-migration
+    tool: pytest
+    args: ["-q", "tests/test_migration.py"]
+full:
+  - id: full-tests
+    tool: pytest
+    args: ["-q"]
+lint:
+  - id: lint
+    tool: ruff
+    args: ["check", "src", "tests"]
+build:
+  - id: build
+    tool: python
+    args: ["-m", "compileall", "-q", "src"]
+cleanup: []
+
