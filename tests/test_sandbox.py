@@ -78,6 +78,8 @@ def test_docker_argv_isolation_flags(tmp_path):
     argv = be.build_argv([sys.executable, "-m", "pytest"], cwd=tmp_path, name="lha-test")
     joined = " ".join(argv)
     assert "--network none" in joined
+    assert "--read-only" in argv
+    assert argv[argv.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=256m,mode=1777"
     assert "--memory 512m" in joined
     assert "--pids-limit 64" in joined
     assert f"{tmp_path.resolve()}:/work" in joined
@@ -90,11 +92,87 @@ def test_docker_argv_isolation_flags(tmp_path):
 
 
 @pytest.mark.skipif(
-    os.environ.get("LHA_DOCKER_TESTS") != "1" or not DockerBackend.available(),
-    reason="docker integration is opt-in (LHA_DOCKER_TESTS=1 + running daemon)",
+    os.environ.get("LHA_DOCKER_TESTS") != "1",
+    reason="docker integration is opt-in (LHA_DOCKER_TESTS=1)",
 )
 def test_docker_backend_runs_python(tmp_path):
+    assert DockerBackend.available(), (
+        "LHA_DOCKER_TESTS=1 requires a working Docker daemon"
+    )
     (tmp_path / "hello.py").write_text("print('from-container')\n")
-    res = DockerBackend().run(["python", "hello.py"], cwd=tmp_path, timeout=120)
+    image = os.environ.get("LHA_DOCKER_TEST_IMAGE", "python:3.12-slim")
+    res = DockerBackend(image=image).run(
+        ["python", "hello.py"], cwd=tmp_path, timeout=120
+    )
     assert res.returncode == 0
     assert "from-container" in res.stdout
+
+
+@pytest.mark.skipif(
+    os.environ.get("LHA_DOCKER_TESTS") != "1",
+    reason="docker integration is opt-in (LHA_DOCKER_TESTS=1)",
+)
+def test_docker_backend_has_read_only_root_and_bounded_tmpfs(tmp_path):
+    assert DockerBackend.available(), (
+        "LHA_DOCKER_TESTS=1 requires a working Docker daemon"
+    )
+    image = os.environ.get("LHA_DOCKER_TEST_IMAGE", "python:3.12-slim")
+    script = """
+from pathlib import Path
+
+mounts = {}
+for line in Path("/proc/mounts").read_text().splitlines():
+    _, target, _, options, *_ = line.split()
+    mounts[target] = set(options.split(","))
+
+assert "ro" in mounts["/"], mounts["/"]
+assert {"rw", "nosuid", "nodev"} <= mounts["/tmp"], mounts["/tmp"]
+assert any(option.startswith("size=") for option in mounts["/tmp"])
+Path("/tmp/lha-tmpfs-probe").write_text("ok")
+print("read-only-root tmpfs-ok")
+"""
+    res = DockerBackend(image=image).run(
+        ["python", "-c", script],
+        cwd=tmp_path,
+        timeout=120,
+    )
+    assert res.returncode == 0, res.stderr or res.stdout
+    assert "read-only-root tmpfs-ok" in res.stdout
+
+
+@pytest.mark.skipif(
+    os.environ.get("LHA_DOCKER_TESTS") != "1",
+    reason="docker integration is opt-in (LHA_DOCKER_TESTS=1)",
+)
+def test_docker_release_image_runs_pytest_and_git_apply(tmp_path):
+    assert DockerBackend.available(), (
+        "LHA_DOCKER_TESTS=1 requires a working Docker daemon"
+    )
+    image = os.environ.get("LHA_DOCKER_TEST_IMAGE")
+    if not image:
+        pytest.fail("LHA_DOCKER_TEST_IMAGE must name the release candidate image")
+    (tmp_path / "value.py").write_text("VALUE = 1\n")
+    (tmp_path / "test_value.py").write_text(
+        "from value import VALUE\n\n"
+        "def test_value():\n"
+        "    assert VALUE == 1\n"
+    )
+    backend = DockerBackend(image=image)
+
+    tests = backend.run(["python", "-m", "pytest", "-q"], cwd=tmp_path, timeout=120)
+    assert tests.returncode == 0, tests.stderr or tests.stdout
+    diff = (
+        "--- a/value.py\n"
+        "+++ b/value.py\n"
+        "@@ -1 +1 @@\n"
+        "-VALUE = 1\n"
+        "+VALUE = 2\n"
+    )
+    applied = backend.run(
+        ["git", "apply", "--whitespace=nowarn", "-p1", "-"],
+        cwd=tmp_path,
+        timeout=120,
+        input=diff,
+    )
+    assert applied.returncode == 0, applied.stderr or applied.stdout
+    assert (tmp_path / "value.py").read_text() == "VALUE = 2\n"

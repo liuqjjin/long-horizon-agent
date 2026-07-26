@@ -41,15 +41,36 @@ def _cfg(tmp_path, **kw) -> Config:
 
 # --- approvals for non-patch steps bind by step id (no livelock) -------------
 def test_binds_step_only_for_actions_without_a_patch():
-    step_only = ApprovalDecision(approved=True, step_id="s1", artifact_sha256=None)
-    assert step_only.binds("s1", None)
-    assert not step_only.binds("s2", None)
-    assert not step_only.binds("s1", "abc")  # a patch step demands a hash
+    request_sha = "a" * 64
+    request_ref = "attempts/s1-r0/approval_request.json"
+    step_only = ApprovalDecision(
+        approved=True,
+        step_id="s1",
+        attempt_id="s1-r0",
+        request_ref=request_ref,
+        request_sha256=request_sha,
+        artifact_sha256=None,
+    )
+    binding = {
+        "step_id": "s1",
+        "attempt_id": "s1-r0",
+        "request_ref": request_ref,
+        "request_sha256": request_sha,
+        "artifact_sha256": None,
+    }
+    assert step_only.binds(**binding)
+    assert not step_only.binds(**(binding | {"step_id": "s2"}))
+    assert not step_only.binds(
+        **(binding | {"artifact_sha256": "b" * 64})
+    )
 
-    with_hash = ApprovalDecision(approved=True, step_id="s1", artifact_sha256="abc")
-    assert with_hash.binds("s1", "abc")
-    assert not with_hash.binds("s1", None)  # a hash for a hashless step never binds
-    assert not with_hash.binds("s1", "other")
+    with_hash = step_only.model_copy(
+        update={"artifact_sha256": "b" * 64}
+    )
+    assert with_hash.binds(
+        **(binding | {"artifact_sha256": "b" * 64})
+    )
+    assert not with_hash.binds(**binding)
 
 
 def test_gated_context_step_approval_takes_effect_on_resume(tmp_path, monkeypatch):

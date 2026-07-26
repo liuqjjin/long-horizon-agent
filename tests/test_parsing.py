@@ -102,14 +102,15 @@ def test_extract_file_blocks_multiple():
     assert blocks == {"pkg/a.py": "print('a')", "b.py": "x = 2"}
 
 
-def test_patch_from_response_builds_file_contents_and_diff(tmp_path):
+def test_patch_from_response_builds_one_executable_representation(tmp_path):
     (tmp_path / "m.py").write_text("def f():\n    return 1\n")
     resp = "### m.py\n```python\ndef f():\n    return 2\n```\n"
     patch = _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
     assert patch.file_contents["m.py"] == "def f():\n    return 2\n"
     assert patch.touched_files == ["m.py"]
-    assert patch.unified_diff  # a display diff is recorded
-    assert "return 2" in patch.unified_diff
+    # A Patch has exactly one executable representation.  The harness derives
+    # the human review diff later from these bytes plus the persisted backup.
+    assert patch.unified_diff == ""
 
 
 def test_patch_from_response_skips_unchanged(tmp_path):

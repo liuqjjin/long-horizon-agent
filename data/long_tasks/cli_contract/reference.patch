@@ -1,0 +1,34 @@
+diff --git a/src/todo_cli/cli.py b/src/todo_cli/cli.py
+index e9c43a0..37abfc3 100644
+--- a/src/todo_cli/cli.py
++++ b/src/todo_cli/cli.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import argparse
++import sys
+ 
+ from .formatters import render_json, render_text
+ from .service import find_item, load_items
+@@ -24,6 +25,6 @@ def run(argv: list[str] | None = None) -> int:
+             items = [find_item(items, args.id)]
+     except (OSError, ValueError) as error:
+-        print(f"error: {error}")
+-        return 0
++        print(f"error: {error}", file=sys.stderr)
++        return 2
+     print(render_json(items) if args.format == "json" else render_text(items))
+     return 0
+diff --git a/src/todo_cli/formatters.py b/src/todo_cli/formatters.py
+index 326ad8f..b27a66c 100644
+--- a/src/todo_cli/formatters.py
++++ b/src/todo_cli/formatters.py
+@@ -7,7 +7,7 @@ from typing import Any
+ 
+ 
+ def render_json(items: list[dict[str, Any]]) -> str:
+-    return "RESULT " + json.dumps({"items": items}, sort_keys=True)
++    return json.dumps({"items": items}, sort_keys=True, separators=(",", ":"))
+ 
+ 
+ def render_text(items: list[dict[str, Any]]) -> str:

@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from conftest import hermetic_task
 
 from lha import eval as lha_eval
@@ -33,6 +34,52 @@ def _cfg(tmp_path: Path, **over) -> Config:
     )
     base.update(over)
     return Config(**base)
+
+
+def test_docker_context_excludes_local_credentials_and_build_outputs():
+    root = Path(__file__).resolve().parents[1]
+    patterns = {
+        line.strip()
+        for line in (root / ".dockerignore").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert {
+        ".env",
+        ".env.*",
+        ".codex/",
+        ".claude/",
+        ".mcp.json",
+        "auth.json",
+        ".ssh/",
+        ".aws/",
+        ".config/gcloud/",
+        ".netrc",
+        ".pypirc",
+        "dist/",
+        "build/",
+        ".coverage",
+    } <= patterns
+    assert "!.env.example" in patterns
+
+
+def test_cli_unexpected_error_has_a_stable_nonzero_exit_without_traceback(
+    monkeypatch, capsys
+):
+    from lha import cli
+
+    monkeypatch.setattr(
+        cli.sys,
+        "argv",
+        ["lha", "run", "/definitely/missing/task.yaml"],
+    )
+    with pytest.raises(SystemExit) as stopped:
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert stopped.value.code == 1
+    assert captured.out == ""
+    assert captured.err.startswith("error: FileNotFoundError:")
+    assert "Traceback" not in captured.err
 
 
 # --- skill memory only records genuine, verified successes ------------------
@@ -156,9 +203,10 @@ def test_dump_keeps_artifacts_inside_the_run_dir(tmp_path):
 
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    _dump(run_dir, "../../escape", "verify.json", "{}")  # malicious step_id
-    assert not (tmp_path / "escape").exists()  # did not escape run_dir/steps
-    assert list((run_dir / "steps").glob("*/verify.json"))  # landed inside, sanitized
+    with pytest.raises(ValueError, match="artifact identity"):
+        _dump(run_dir, "../../escape", "verify.json", "{}")
+    assert not (tmp_path / "escape").exists()
+    assert not (run_dir / "steps").exists()
 
 
 # --- a patch can never write outside the run sandbox ------------------------

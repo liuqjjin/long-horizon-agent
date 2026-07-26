@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "task_id": "cli_contract",
+  "repo_sha256": "048d1ee04a9eacd7b7d7e3b6a599b11b3e7f64330479fb66f8233d0607670479",
+  "task_sha256": "474dc4f0a5dcb987474e67c8c430f4392062c0a5ad303d3ded74f010369185b5",
+  "adapter_sha256": "961d75414ce1093630773fd027ccad9016726226771409f1fc7de5c7e641a612",
+  "reference_patch_sha256": "77f610fc1a1a66dd229ed99267e2a81eaa54fd4aac1f1959f77c5748bbe7e0e0",
+  "reference_touched_files": [
+    "src/todo_cli/cli.py",
+    "src/todo_cli/formatters.py"
+  ],
+  "oracle_files": [
+    "tests/test_cli.py"
+  ],
+  "expected_baseline_returncode": 1,
+  "expected_patched_test_count": 2
+}

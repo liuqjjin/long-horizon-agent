@@ -11,8 +11,10 @@ Covers the invariants:
 
 from __future__ import annotations
 
+import os
 import subprocess
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +22,7 @@ from lha.artifacts import Step
 from lha.clock import now
 from lha.config import Config
 from lha.live_context import (
+    BackendUnavailable,
     ContextBundle,
     ContextItem,
     Provenance,
@@ -30,7 +33,9 @@ from lha.live_context import (
     reject_stale,
 )
 from lha.live_context import freshness as fr
-from lha.live_context.backends.ccc_backend import CccBackend
+from lha.live_context.backends.ccc_backend import CccBackend, _checked_results
+from lha.live_context.backends.coco_flow import CocoFlowBackend
+from lha.live_context.backends.vector_query import IndexRecordError
 from lha.verifiers import VerifyContext
 from lha.verifiers.context.citation_verifier import CitationVerifier
 from lha.verifiers.context.freshness_verifier import FreshnessVerifier
@@ -91,6 +96,15 @@ def test_freshness_fails_on_index_failed(tmp_path):
     bundle = _bundle(status="index_failed", notes=["reindex failed"])
     check = FreshnessVerifier().verify(None, _ctx(tmp_path, bundle))
     assert not check.passed
+
+
+def test_optional_context_does_not_excuse_a_failed_stale_index(tmp_path):
+    bundle = _bundle(status="index_failed", notes=["refresh failed"])
+    bundle.freshness.is_stale_flag = True
+    bundle.freshness.reasons = ["source changed"]
+    check = FreshnessVerifier().verify(None, _ctx(tmp_path, bundle, requirement="optional"))
+    assert not check.passed
+    assert "stale" in check.detail["summary"]
 
 
 def test_freshness_fails_on_empty_when_required(tmp_path):
@@ -163,6 +177,24 @@ def test_get_fresh_context_reports_backend_unavailable(tmp_path):
     assert bundle.items == []
     assert bundle.status == "backend_unavailable"
     assert bundle.status_notes
+    assert bundle.requested_kinds == ["code"]
+    assert bundle.unavailable_reasons == {"code": "no backend available"}
+
+
+def test_get_fresh_context_distinguishes_a_broken_index(monkeypatch):
+    from lha.live_context import facade
+
+    class BrokenBackend:
+        def search(self, query, *, k=8, **filters):
+            raise ValueError("index schema is corrupt")
+
+    monkeypatch.setattr(facade, "_backend_for", lambda kind: BrokenBackend())
+    bundle = get_fresh_context("q", kinds=("code",))
+
+    assert bundle.status == "index_failed"
+    assert bundle.failed_kinds == ["code"]
+    assert "index schema is corrupt" in bundle.failure_reasons["code"]
+    assert bundle.unavailable_kinds == []
 
 
 # --- reject_stale fails closed ----------------------------------------------
@@ -203,12 +235,128 @@ def test_reject_stale_raises_when_reindex_fails(monkeypatch):
     assert bundle.freshness.is_stale()
 
 
+def test_reject_stale_wraps_a_reindex_exception_and_stays_stale(monkeypatch):
+    from lha.live_context import facade
+
+    class RaisingBackend(_StubBackend):
+        def reindex(self, paths=None):
+            raise RuntimeError("damaged index")
+
+    monkeypatch.setattr(
+        facade, "_backend_for", lambda kind: RaisingBackend(reindex_ok=True)
+    )
+    bundle = _stale_bundle()
+    with pytest.raises(StaleContextError, match="damaged index"):
+        reject_stale(bundle)
+    assert bundle.freshness.is_stale()
+
+
 def test_reject_stale_clears_flag_only_after_verified_reindex(monkeypatch):
     from lha.live_context import facade
 
     monkeypatch.setattr(facade, "_backend_for", lambda kind: _StubBackend(reindex_ok=True))
     refreshed = reject_stale(_stale_bundle())
     assert not refreshed.freshness.is_stale()
+
+
+def test_reject_stale_refreshes_every_requested_kind(monkeypatch, tmp_path):
+    from lha.live_context import facade
+    from lha.live_context.models import PaperHit
+
+    source = tmp_path / "paper.md"
+    source.write_text("paper")
+    calls: list[tuple[str, str]] = []
+
+    class Backend:
+        def __init__(self, kind):
+            self.kind = kind
+            self.name = f"stub-{kind}"
+
+        def search(self, query, *, k=8, **filters):
+            calls.append(("search", self.kind))
+            if self.kind == "paper":
+                return [
+                    PaperHit(
+                        text="paper",
+                        provenance=Provenance(
+                            source_kind="paper", locator=str(source), indexed_at=now()
+                        ),
+                    )
+                ]
+            return []
+
+        def index_meta(self):
+            return ("v", now())
+
+        def reindex(self, paths=None):
+            calls.append(("reindex", self.kind))
+            return ReindexResult(kind=self.kind, ok=True)
+
+    backends = {"paper": Backend("paper"), "code": Backend("code")}
+    monkeypatch.setattr(facade, "_backend_for", lambda kind: backends[kind])
+    bundle = ContextBundle(
+        query="q",
+        items=[
+            ContextItem(
+                text="paper",
+                provenance=Provenance(
+                    source_kind="paper", locator=str(source), indexed_at=now()
+                ),
+            )
+        ],
+        freshness=fr.fresh_now("v"),
+        unavailable_kinds=["code"],
+        requested_kinds=["paper", "code"],
+    )
+    bundle.freshness.is_stale_flag = True
+    bundle.freshness.reasons = ["forced"]
+
+    refreshed = reject_stale(bundle)
+    assert ("reindex", "paper") in calls and ("reindex", "code") in calls
+    assert refreshed.requested_kinds == ["paper", "code"]
+    assert refreshed.unavailable_kinds == []
+
+
+def test_reject_stale_does_not_clear_newly_detected_staleness(monkeypatch, tmp_path):
+    from lha.live_context import facade
+    from lha.live_context.models import PaperHit
+
+    missing = tmp_path / "missing.md"
+
+    class BadBackend(_StubBackend):
+        kind = "paper"
+
+        def search(self, query, *, k=8, **filters):
+            return [
+                PaperHit(
+                    text="ghost",
+                    provenance=Provenance(
+                        source_kind="paper", locator=str(missing), indexed_at=now()
+                    ),
+                )
+            ]
+
+        def index_meta(self):
+            return ("v", now())
+
+        def reindex(self, paths=None):
+            return ReindexResult(kind="paper", ok=True)
+
+    monkeypatch.setattr(facade, "_backend_for", lambda kind: BadBackend(reindex_ok=True))
+    bundle = ContextBundle(
+        query="q",
+        items=[
+            ContextItem(
+                text="old",
+                provenance=Provenance(source_kind="paper", locator=str(missing)),
+            )
+        ],
+        freshness=fr.fresh_now("v"),
+        requested_kinds=["paper"],
+    )
+    bundle.freshness.is_stale_flag = True
+    with pytest.raises(StaleContextError, match="still stale"):
+        reject_stale(bundle)
 
 
 # --- ccc reindex checks subprocess results ------------------------------------
@@ -247,6 +395,33 @@ def test_ccc_reindex_ok_on_zero_exit(tmp_path, monkeypatch):
     assert result.ok
 
 
+def test_ccc_mcp_error_is_not_an_empty_result():
+    result = SimpleNamespace(
+        isError=True,
+        structuredContent=None,
+        content=[SimpleNamespace(text='{"error": "boom"}')],
+    )
+    with pytest.raises(BackendUnavailable, match="returned an error"):
+        _checked_results(result)
+
+
+def test_corrupt_vector_index_is_reported_as_index_failed(tmp_path, monkeypatch):
+    from lha.live_context import facade
+
+    index = tmp_path / ".lha_index" / "papers"
+    index.mkdir(parents=True)
+    (index / "bad.json").write_text("{not json")
+    backend = CocoFlowBackend("paper", tmp_path)
+    assert not backend.available()
+    with pytest.raises(IndexRecordError, match="completion manifest"):
+        backend.search("anything")
+    monkeypatch.setattr(facade, "_backend_for", lambda kind: backend)
+    bundle = get_fresh_context("anything", kinds=("paper",))
+    assert bundle.status == "index_failed"
+    assert bundle.failed_kinds == ["paper"]
+    assert bundle.unavailable_kinds == []
+
+
 # --- freshness signals --------------------------------------------------------
 def test_missing_source_file_is_stale(tmp_path):
     item = ContextItem(
@@ -282,3 +457,148 @@ def test_present_code_chunk_stays_fresh(tmp_path):
     )
     verdict = fr.assess([item], index_version="v1", indexed_at=later, base_dir=tmp_path)
     assert not verdict.is_stale_flag
+
+
+def test_changed_indexed_chunk_hash_is_stale(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("value = 1\n")
+    later = now() + timedelta(seconds=5)
+    item = ContextItem(
+        text="value = 1",
+        provenance=Provenance(
+            source_kind="code",
+            locator="a.py",
+            indexed_at=later,
+            content_hash=fr.content_hash("different indexed bytes"),
+        ),
+    )
+    verdict = fr.assess([item], index_version="v1", indexed_at=later, base_dir=tmp_path)
+    assert verdict.is_stale_flag
+    assert "content hash" in verdict.reasons[0]
+
+
+def test_ccc_hit_binds_full_source_digest_and_detects_same_mtime_tamper(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "a.py"
+    source.write_bytes(b"value = 1\n")
+    original_stat = source.stat()
+    backend = CccBackend(tmp_path)
+    backend._ccc = "/fake/ccc"
+
+    async def search(*args, **kwargs):
+        return [{"path": "a.py", "code": "value = 1", "line_start": 1}]
+
+    monkeypatch.setattr(backend, "_search_async", search)
+    hit = backend.search("value", refresh=False)[0]
+    assert hit.provenance.source_sha256 == fr.file_sha256(source)
+    initial = fr.assess(
+        [ContextItem.from_hit(hit)],
+        index_version="ccc@test",
+        indexed_at=hit.provenance.indexed_at,
+    )
+    assert not initial.is_stale()
+
+    source.write_bytes(b"value = 2\n")
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    changed = fr.assess(
+        [ContextItem.from_hit(hit)],
+        index_version="ccc@test",
+        indexed_at=hit.provenance.indexed_at,
+    )
+    assert changed.is_stale()
+    assert any("indexed SHA-256" in reason for reason in changed.reasons)
+
+
+def test_ccc_rejects_symlink_source_provenance(tmp_path, monkeypatch):
+    target = tmp_path / "real.py"
+    target.write_text("value = 1\n")
+    (tmp_path / "alias.py").symlink_to(target)
+    backend = CccBackend(tmp_path)
+    backend._ccc = "/fake/ccc"
+
+    async def search(*args, **kwargs):
+        return [{"path": "alias.py", "code": "value = 1"}]
+
+    monkeypatch.setattr(backend, "_search_async", search)
+    with pytest.raises(BackendUnavailable, match="symlink"):
+        backend.search("value", refresh=False)
+
+
+def test_ccc_rejects_source_outside_indexed_root(tmp_path, monkeypatch):
+    outside = tmp_path / "outside.py"
+    outside.write_text("value = 1\n")
+    root = tmp_path / "repo"
+    root.mkdir()
+    backend = CccBackend(root)
+    backend._ccc = "/fake/ccc"
+
+    async def search(*args, **kwargs):
+        return [{"path": "../outside.py", "code": "value = 1"}]
+
+    monkeypatch.setattr(backend, "_search_async", search)
+    with pytest.raises(BackendUnavailable, match="unsafe source path"):
+        backend.search("value", refresh=False)
+
+
+def test_code_freshness_fails_closed_when_legacy_probe_is_too_large(tmp_path):
+    source = tmp_path / "large.py"
+    source.write_bytes(b"value = 1\n" + b"#" * (2_000_000 + 1))
+    later = now() + timedelta(seconds=5)
+    legacy = ContextItem(
+        text="value = 1",
+        provenance=Provenance(source_kind="code", locator="large.py", indexed_at=later),
+    )
+    verdict = fr.assess([legacy], index_version="legacy", indexed_at=later, base_dir=tmp_path)
+    assert verdict.is_stale()
+    assert any("too large" in reason for reason in verdict.reasons)
+
+    bound = legacy.model_copy(deep=True)
+    bound.provenance.source_sha256 = fr.file_sha256(source)
+    digest_verdict = fr.assess(
+        [bound], index_version="digest", indexed_at=later, base_dir=tmp_path
+    )
+    assert not digest_verdict.is_stale()
+
+
+def test_code_freshness_rejects_symlink_even_when_target_digest_matches(tmp_path):
+    target = tmp_path / "real.py"
+    target.write_text("value = 1\n")
+    alias = tmp_path / "alias.py"
+    alias.symlink_to(target)
+    later = now() + timedelta(seconds=5)
+    item = ContextItem(
+        text="value = 1",
+        provenance=Provenance(
+            source_kind="code",
+            locator="alias.py",
+            indexed_at=later,
+            source_sha256=fr.file_sha256(target),
+        ),
+    )
+    verdict = fr.assess([item], index_version="digest", indexed_at=later, base_dir=tmp_path)
+    assert verdict.is_stale()
+    assert any("read safely" in reason for reason in verdict.reasons)
+
+
+def test_code_freshness_rejects_unreadable_digest_source(tmp_path, monkeypatch):
+    source = tmp_path / "a.py"
+    source.write_text("value = 1\n")
+    later = now() + timedelta(seconds=5)
+    item = ContextItem(
+        text="value = 1",
+        provenance=Provenance(
+            source_kind="code",
+            locator="a.py",
+            indexed_at=later,
+            source_sha256=fr.file_sha256(source),
+        ),
+    )
+
+    def unreadable(*args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(fr, "strict_file_sha256", unreadable)
+    verdict = fr.assess([item], index_version="digest", indexed_at=later, base_dir=tmp_path)
+    assert verdict.is_stale()
+    assert any("read safely" in reason for reason in verdict.reasons)

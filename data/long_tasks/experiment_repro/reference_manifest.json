@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "task_id": "experiment_repro",
+  "repo_sha256": "41a0de56ace0f08cef619582544b855b3949edefbdc78fceddc4e5f71a2e0859",
+  "task_sha256": "4281e7f4c5573df18b79fcf93d8f35ad60b2d773fb2bf98984d2f0d7da617266",
+  "adapter_sha256": "c580a55179da6b8fc4d38cd9758691bb2070d8908a244d61c8471ea32f4e09d3",
+  "reference_patch_sha256": "8edb162e1b11ec4f11b1fd81cc29526111cce052f1f58e4b62ab69579880f70c",
+  "reference_touched_files": [
+    "src/tiny_experiment/artifacts.py",
+    "src/tiny_experiment/run.py"
+  ],
+  "oracle_files": [
+    "tests/test_repro.py"
+  ],
+  "expected_baseline_returncode": 1,
+  "expected_patched_test_count": 2
+}

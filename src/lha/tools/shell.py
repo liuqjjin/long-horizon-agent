@@ -45,6 +45,13 @@ def run(
     except subprocess.TimeoutExpired as e:
         out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
         return ProcResult(124, out, f"timeout after {timeout}s", time.monotonic() - start)
+    except OSError as e:
+        return ProcResult(
+            127,
+            "",
+            f"failed to execute {cmd[0] if cmd else '<empty>'}: {e}",
+            time.monotonic() - start,
+        )
 
 
 def venv_tool(name: str) -> str:

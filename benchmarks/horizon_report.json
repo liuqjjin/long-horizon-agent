@@ -19,150 +19,199 @@
     "bench_window"
   ],
   "n_steps": 17,
-  "reps": 3,
-  "model": "claude-haiku-4-5-20251001",
+  "independent_episode_count": 12,
+  "model": "gpt-5.4-mini",
   "source": "benchmarks/ablation_report.json",
-  "per_task_p": {
-    "bench_basen": 1.0,
-    "bench_brackets": 1.0,
-    "bench_bsearch": 1.0,
-    "bench_caesar": 1.0,
-    "bench_csvlite": 1.0,
-    "bench_flatten": 1.0,
-    "bench_lru": 0.6666666666666666,
-    "bench_median": 0.6666666666666666,
-    "bench_merge_intervals": 1.0,
-    "bench_paginate": 1.0,
-    "bench_roman": 1.0,
-    "bench_rpn": 1.0,
-    "bench_runstats": 1.0,
-    "bench_slugify": 1.0,
-    "bench_spans": 1.0,
-    "bench_urljoin": 1.0,
-    "bench_window": 1.0
-  },
-  "curves": [
-    {
-      "condition": "trust-chain",
-      "rate": [
-        0.9607843137254903,
-        0.9223856209150325,
-        0.8848039215686275,
-        0.8480392156862746,
-        0.812091503267974,
-        0.7769607843137256,
-        0.7426470588235294,
-        0.7091503267973857,
-        0.6764705882352942,
-        0.6446078431372549,
-        0.613562091503268,
-        0.5833333333333333,
-        0.5539215686274509,
-        0.5253267973856208,
-        0.4975490196078431,
-        0.47058823529411764,
-        0.4444444444444444
+  "estimands": {
+    "cell": {
+      "unit": "task \u00d7 repetition cell",
+      "pairs": 204,
+      "trust_successes": 194,
+      "verify_successes": 204,
+      "discordant": [
+        10,
+        0
       ],
-      "ci_lo": [
-        0.9019607843137254,
-        0.8120915032679737,
-        0.7298474945533768,
-        0.6547100321610125,
-        0.5861856613490599,
-        0.5238055336094551,
-        0.46712474163454554,
-        0.41572165428374575,
-        0.3691972515501926,
-        0.32717445952740065,
-        0.28929748537591665,
-        0.2552311522899758,
-        0.22466023446415598,
-        0.19728879206003386,
-        0.17283950617283947,
-        0.1510530137981118,
-        0.1316872427983539
-      ],
-      "ci_hi": [
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0
-      ]
+      "mcnemar_p": 0.001953125
     },
-    {
-      "condition": "verify-chain",
-      "rate": [
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0
+    "episode": {
+      "unit": "complete corpus repetition",
+      "pairs": 12,
+      "trust_successes": 2,
+      "verify_successes": 12,
+      "discordant": [
+        10,
+        0
       ],
-      "ci_lo": [
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0
-      ],
-      "ci_hi": [
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0
+      "mcnemar_p": 0.001953125
+    },
+    "composition": {
+      "unit": "independent-step projection over empirical per-task rates",
+      "independent_samples_added": 0,
+      "per_task_p": {
+        "trust-chain": {
+          "bench_basen": 1.0,
+          "bench_brackets": 1.0,
+          "bench_bsearch": 1.0,
+          "bench_caesar": 0.75,
+          "bench_csvlite": 1.0,
+          "bench_flatten": 1.0,
+          "bench_lru": 1.0,
+          "bench_median": 1.0,
+          "bench_merge_intervals": 1.0,
+          "bench_paginate": 1.0,
+          "bench_roman": 1.0,
+          "bench_rpn": 1.0,
+          "bench_runstats": 1.0,
+          "bench_slugify": 1.0,
+          "bench_spans": 1.0,
+          "bench_urljoin": 0.4166666666666667,
+          "bench_window": 1.0
+        },
+        "verify-chain": {
+          "bench_basen": 1.0,
+          "bench_brackets": 1.0,
+          "bench_bsearch": 1.0,
+          "bench_caesar": 1.0,
+          "bench_csvlite": 1.0,
+          "bench_flatten": 1.0,
+          "bench_lru": 1.0,
+          "bench_median": 1.0,
+          "bench_merge_intervals": 1.0,
+          "bench_paginate": 1.0,
+          "bench_roman": 1.0,
+          "bench_rpn": 1.0,
+          "bench_runstats": 1.0,
+          "bench_slugify": 1.0,
+          "bench_spans": 1.0,
+          "bench_urljoin": 1.0,
+          "bench_window": 1.0
+        }
+      },
+      "curves": [
+        {
+          "condition": "trust-chain",
+          "rate": [
+            0.9509803921568626,
+            0.9030330882352942,
+            0.8561580882352942,
+            0.8103553921568628,
+            0.765625,
+            0.7219669117647058,
+            0.6793811274509804,
+            0.6378676470588235,
+            0.5974264705882353,
+            0.5580575980392157,
+            0.5197610294117647,
+            0.48253676470588236,
+            0.4463848039215687,
+            0.41130514705882354,
+            0.3772977941176471,
+            0.3443627450980392,
+            0.3125
+          ],
+          "task_bootstrap_lo": [
+            0.8725490196078431,
+            0.7589358660130718,
+            0.6579248366013072,
+            0.568366122490663,
+            0.489191635187729,
+            0.4194109406457896,
+            0.35810730072527813,
+            0.30443382205646685,
+            0.25760971230439295,
+            0.21691664383602,
+            0.1816952247896354,
+            0.15134157754648334,
+            0.12530402460463352,
+            0.10307988185508579,
+            0.0842123592601103,
+            0.06828756893382353,
+            0.05425347222222223
+          ],
+          "task_bootstrap_hi": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ]
+        },
+        {
+          "condition": "verify-chain",
+          "rate": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "task_bootstrap_lo": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "task_bootstrap_hi": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
       ]
     }
-  ],
+  },
   "episodes": [
     {
       "condition": "trust-chain",
@@ -171,26 +220,114 @@
       "steps_correct": 16,
       "end_to_end": false,
       "failing_tasks": [
-        "bench_median"
+        "bench_caesar"
       ]
     },
     {
       "condition": "trust-chain",
       "rep": 1,
       "n_steps": 17,
-      "steps_correct": 16,
-      "end_to_end": false,
-      "failing_tasks": [
-        "bench_lru"
-      ]
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     },
     {
       "condition": "trust-chain",
       "rep": 2,
       "n_steps": 17,
+      "steps_correct": 16,
+      "end_to_end": false,
+      "failing_tasks": [
+        "bench_urljoin"
+      ]
+    },
+    {
+      "condition": "trust-chain",
+      "rep": 3,
+      "n_steps": 17,
+      "steps_correct": 16,
+      "end_to_end": false,
+      "failing_tasks": [
+        "bench_urljoin"
+      ]
+    },
+    {
+      "condition": "trust-chain",
+      "rep": 4,
+      "n_steps": 17,
+      "steps_correct": 16,
+      "end_to_end": false,
+      "failing_tasks": [
+        "bench_urljoin"
+      ]
+    },
+    {
+      "condition": "trust-chain",
+      "rep": 5,
+      "n_steps": 17,
+      "steps_correct": 16,
+      "end_to_end": false,
+      "failing_tasks": [
+        "bench_caesar"
+      ]
+    },
+    {
+      "condition": "trust-chain",
+      "rep": 6,
+      "n_steps": 17,
+      "steps_correct": 16,
+      "end_to_end": false,
+      "failing_tasks": [
+        "bench_caesar"
+      ]
+    },
+    {
+      "condition": "trust-chain",
+      "rep": 7,
+      "n_steps": 17,
+      "steps_correct": 16,
+      "end_to_end": false,
+      "failing_tasks": [
+        "bench_urljoin"
+      ]
+    },
+    {
+      "condition": "trust-chain",
+      "rep": 8,
+      "n_steps": 17,
       "steps_correct": 17,
       "end_to_end": true,
       "failing_tasks": []
+    },
+    {
+      "condition": "trust-chain",
+      "rep": 9,
+      "n_steps": 17,
+      "steps_correct": 16,
+      "end_to_end": false,
+      "failing_tasks": [
+        "bench_urljoin"
+      ]
+    },
+    {
+      "condition": "trust-chain",
+      "rep": 10,
+      "n_steps": 17,
+      "steps_correct": 16,
+      "end_to_end": false,
+      "failing_tasks": [
+        "bench_urljoin"
+      ]
+    },
+    {
+      "condition": "trust-chain",
+      "rep": 11,
+      "n_steps": 17,
+      "steps_correct": 16,
+      "end_to_end": false,
+      "failing_tasks": [
+        "bench_urljoin"
+      ]
     },
     {
       "condition": "verify-chain",
@@ -215,13 +352,79 @@
       "steps_correct": 17,
       "end_to_end": true,
       "failing_tasks": []
+    },
+    {
+      "condition": "verify-chain",
+      "rep": 3,
+      "n_steps": 17,
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
+    },
+    {
+      "condition": "verify-chain",
+      "rep": 4,
+      "n_steps": 17,
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
+    },
+    {
+      "condition": "verify-chain",
+      "rep": 5,
+      "n_steps": 17,
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
+    },
+    {
+      "condition": "verify-chain",
+      "rep": 6,
+      "n_steps": 17,
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
+    },
+    {
+      "condition": "verify-chain",
+      "rep": 7,
+      "n_steps": 17,
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
+    },
+    {
+      "condition": "verify-chain",
+      "rep": 8,
+      "n_steps": 17,
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
+    },
+    {
+      "condition": "verify-chain",
+      "rep": 9,
+      "n_steps": 17,
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
+    },
+    {
+      "condition": "verify-chain",
+      "rep": 10,
+      "n_steps": 17,
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
+    },
+    {
+      "condition": "verify-chain",
+      "rep": 11,
+      "n_steps": 17,
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     }
   ],
-  "discordant": [
-    2,
-    0
-  ],
-  "mcnemar_p": 0.5,
-  "reps_for_alpha": 9,
   "alpha": 0.05
 }

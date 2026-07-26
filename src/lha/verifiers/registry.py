@@ -5,7 +5,13 @@ from __future__ import annotations
 
 from ..artifacts import Step
 from .base import Verifier
-from .code import PytestVerifier, RuffVerifier
+from .code import (
+    PytestVerifier,
+    RepoIntegrityVerifier,
+    RepoStageVerifier,
+    RepoTargetedVerifier,
+    RuffVerifier,
+)
 from .context import CitationVerifier, FreshnessVerifier
 from .experiment import PSNRVerifier, ReproVerifier, SSIMVerifier
 
@@ -31,6 +37,9 @@ def all_verifiers() -> list[Verifier]:
 # --- built-ins -------------------------------------------------------------
 register(PytestVerifier())
 register(RuffVerifier())
+register(RepoIntegrityVerifier())
+register(RepoStageVerifier())
+register(RepoTargetedVerifier())
 register(FreshnessVerifier())
 register(CitationVerifier())
 register(PSNRVerifier())

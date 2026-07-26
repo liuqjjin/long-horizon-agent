@@ -18,6 +18,7 @@ from lha.artifacts import Patch, Step
 from lha.config import Config
 from lha.harness import Harness
 from lha.harness.approval import ApprovalDecision, HumanApprovalGate
+from lha.harness.errors import CheckpointCorrupt
 from lha.llm.anthropic_client import AnthropicClient, AnthropicResponseError
 from lha.tools.shell import ProcResult
 from lha.verifiers import VerifyContext, registry
@@ -47,8 +48,10 @@ class _CannedExec:
 
     def __init__(self, result: ProcResult):
         self._result = result
+        self.commands: list[list[str]] = []
 
     def run(self, cmd, *, cwd, timeout=300.0, input=None, limits=None):
+        self.commands.append(list(cmd))
         return self._result
 
     def python(self):
@@ -66,6 +69,16 @@ def test_ruff_fails_when_it_cannot_run(tmp_path):
     )
     assert not check.passed  # "couldn't verify" must not read as "verified"
     assert "failed to run" in check.detail["summary"]
+
+
+def test_ruff_does_not_require_a_writable_project_cache(tmp_path):
+    exec_stub = _CannedExec(ProcResult(0, "[]", "", 0.0))
+    check = RuffVerifier().verify(
+        Patch(step_id="s"),
+        VerifyContext(workdir=tmp_path, step=_step("ruff"), exec=exec_stub),
+    )
+    assert check.passed
+    assert "--no-cache" in exec_stub.commands[0]
 
 
 def test_ruff_fails_on_inconsistent_exit_codes(tmp_path):
@@ -88,6 +101,20 @@ def test_ruff_fails_on_inconsistent_exit_codes(tmp_path):
         ),
     )
     assert not c2.passed
+
+
+def test_pytest_fails_when_every_collected_test_is_skipped(tmp_path):
+    (tmp_path / "test_only.py").write_text(
+        "import pytest\n\n@pytest.mark.skip(reason='not evidence')\ndef test_only():\n    pass\n"
+    )
+    from lha.verifiers.code import PytestVerifier
+
+    check = PytestVerifier().verify(
+        Patch(step_id="s"),
+        VerifyContext(workdir=tmp_path, step=_step("pytest")),
+    )
+    assert not check.passed
+    assert "all tests skipped" in check.detail["summary"]
 
 
 # --- a step that verified nothing must not pass vacuously --------------------
@@ -123,15 +150,17 @@ def test_budget_is_per_run_across_resume(tmp_path):
     assert again.status == "PAUSED"
     assert again.state.cursor == 1
 
-    # a larger budget lets the same run finish.
-    done = Harness(_cfg(tmp_path, max_steps=20)).resume(paused.state.run_id)
-    assert done.status == "DONE"
+    # A new process cannot buy more work by changing the original run contract.
+    with pytest.raises(CheckpointCorrupt, match=r"max_steps.*recorded=1.*current=20"):
+        Harness(_cfg(tmp_path, max_steps=20)).resume(paused.state.run_id)
 
 
 # --- deadline_s reaches the loop through the documented env path ------------
 def test_deadline_s_is_read_from_env(monkeypatch):
     monkeypatch.setenv("LHA_DEADLINE_S", "1.5")
     assert Config.from_env().deadline_s == 1.5
+    monkeypatch.setenv("LHA_DEADLINE_S", "0")
+    assert Config.from_env().deadline_s is None
     monkeypatch.delenv("LHA_DEADLINE_S", raising=False)
     assert Config.from_env().deadline_s is None
 
@@ -277,6 +306,37 @@ def test_langgraph_budget_caps_steps(tmp_path):
     assert paused.state.cursor == 1  # ran step 1, paused before step 2
 
 
+def test_langgraph_crash_replay_does_not_reset_step_budget(tmp_path, monkeypatch):
+    pytest.importorskip("langgraph")
+    from lha.agents.context_engineer import ContextEngineer
+    from lha.harness.checkpoint import load_state
+    from lha.runtime.langgraph_runner import LangGraphHarness
+
+    original = ContextEngineer.gather
+    crashed = False
+
+    def interrupt_once(self, step, workdir=None):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise KeyboardInterrupt
+        return original(self, step, workdir)
+
+    monkeypatch.setattr(ContextEngineer, "gather", interrupt_once)
+    config = _cfg(tmp_path)
+    task = hermetic_task("data/tasks/fix_average.yaml")
+    with pytest.raises(KeyboardInterrupt):
+        LangGraphHarness(config).run(task, run_id="graph-budget-crash")
+
+    checkpoint = load_state(tmp_path / "runs" / "graph-budget-crash")
+    assert checkpoint.steps_used == 1
+    assert checkpoint.budgeted_attempts == ["s1-context-r0"]
+
+    resumed = LangGraphHarness(config).resume("graph-budget-crash")
+    assert resumed.status == "DONE"
+    assert resumed.state.steps_used == 2
+
+
 def test_langgraph_deadline_pauses(tmp_path):
     pytest.importorskip("langgraph")
     from lha.runtime.langgraph_runner import LangGraphHarness
@@ -320,7 +380,7 @@ def test_approval_reuses_the_reviewed_patch_on_resume(tmp_path, monkeypatch):
     assert "len(values) - 1" not in fixed  # the reviewed fix was applied
 
 
-def test_stale_approval_decision_is_ignored(tmp_path):
+def test_stale_approval_decision_fails_closed(tmp_path):
     cfg = _cfg(tmp_path)
     paused = Harness(cfg).run(hermetic_task("data/tasks/fix_average_approval.yaml"))
     assert paused.status == "AWAITING_APPROVAL"
@@ -329,4 +389,4 @@ def test_stale_approval_decision_is_ignored(tmp_path):
         ApprovalDecision(approved=True, step_id="some-other-step").model_dump_json()
     )
     resumed = Harness(cfg).resume(paused.state.run_id)
-    assert resumed.status == "AWAITING_APPROVAL"  # stale decision discarded, not applied
+    assert resumed.status == "FAILED"

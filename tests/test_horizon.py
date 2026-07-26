@@ -1,9 +1,8 @@
-"""The horizon analysis: exact compounding, honest episodes, no invented power.
+"""The horizon analysis keeps cells, episodes, and composition distinct.
 
-The point of these tests is the last one. Composing measured cells into a
-longer horizon must re-express the evidence without inflating it: the paired
-test at the terminal step has to return exactly what the same cells return at
-the step level, no matter how many orderings the curve averages over.
+The regression that matters is that cell- and episode-level paired tests may
+legitimately differ: several cell disagreements can occur in the same episode.
+Composition remains descriptive and contributes zero independent samples.
 """
 
 from __future__ import annotations
@@ -31,12 +30,22 @@ def _report(tmp_path, outcomes: dict[str, list[tuple[bool, bool]]], model="m"):
     for task, reps in outcomes.items():
         for rep, (trust, verify) in enumerate(reps):
             records.append(
-                {"task": task, "condition": "trust", "rep": rep, "status": "DONE",
-                 "true_success": trust}
+                {
+                    "task": task,
+                    "condition": "trust",
+                    "rep": rep,
+                    "status": "DONE",
+                    "true_success": trust,
+                }
             )
             records.append(
-                {"task": task, "condition": "verify", "rep": rep, "status": "DONE",
-                 "true_success": verify}
+                {
+                    "task": task,
+                    "condition": "verify",
+                    "rep": rep,
+                    "status": "DONE",
+                    "true_success": verify,
+                }
             )
     path = tmp_path / "ablation_report.json"
     path.write_text(json.dumps({"tasks": list(outcomes), "model": model, "records": records}))
@@ -102,6 +111,10 @@ def test_incomplete_rep_is_not_a_shorter_episode(tmp_path):
     cells = load_cells(path)
     assert cells.complete_reps("trust") == [0]
     assert [e.rep for e in episodes_for(cells, "trust-chain", "trust")] == [0]
+    report = build_report(cells)
+    assert report.independent_episode_count == 1
+    assert report.episode_estimand.pairs == 1
+    assert {episode.rep for episode in report.episodes} == {0}
 
 
 # --- episodes -----------------------------------------------------------------
@@ -121,50 +134,55 @@ def test_episode_is_one_repetition_of_the_whole_corpus(tmp_path):
     assert eps[1].end_to_end is True and eps[1].failing_tasks == []
 
 
-# --- the property that matters: composition must not invent power -------------
-def test_composition_does_not_manufacture_significance(tmp_path):
-    """A longer horizon re-expresses the same events; it must not add evidence.
-
-    Three repetitions of a 17-task corpus with two wrong first attempts give
-    b=2, c=0 at the terminal step — the same discordance, and so the same exact
-    p-value, that the underlying per-cell comparison gives.
-    """
+# --- the three estimands ------------------------------------------------------
+def test_report_separates_cells_episodes_and_composition(tmp_path):
     outcomes = {f"t{i:02d}": [(True, True)] * 3 for i in range(17)}
     outcomes["t05"][0] = (False, True)  # wrong in rep 0, repaired by verify
     outcomes["t11"][1] = (False, True)  # wrong in rep 1, repaired by verify
     report = build_report(load_cells(_report(tmp_path, outcomes)))
 
-    assert report.n_steps == 17 and report.reps == 3
-    assert report.discordant == (2, 0)
-    assert report.mcnemar_p == pytest.approx(mcnemar_exact(2, 0))
-    assert report.mcnemar_p == pytest.approx(0.5)  # unchanged by the horizon framing
-    # ...while the effect SIZE is legitimately much larger at the terminal step.
-    trust = next(c for c in report.curves if c.condition == "trust-chain")
-    verify = next(c for c in report.curves if c.condition == "verify-chain")
+    assert report.n_steps == 17
+    assert report.independent_episode_count == 3  # R repetitions -> exactly R episodes
+
+    assert report.cell_estimand.pairs == 51
+    assert report.cell_estimand.discordant == (2, 0)
+    assert report.cell_estimand.mcnemar_p == pytest.approx(mcnemar_exact(2, 0))
+
+    assert report.episode_estimand.pairs == 3
+    assert report.episode_estimand.discordant == (2, 0)
+    assert report.episode_estimand.mcnemar_p == pytest.approx(mcnemar_exact(2, 0))
+
+    composition = report.composition_estimand
+    assert composition.independent_samples_added == 0
+    trust = next(c for c in composition.curves if c.condition == "trust-chain")
+    verify = next(c for c in composition.curves if c.condition == "verify-chain")
     assert trust.rate[0] == pytest.approx(49 / 51)  # per-step, as measured
     assert trust.rate[-1] == pytest.approx((2 / 3) ** 2)  # 17 steps: 44.4%
     assert verify.rate[-1] == pytest.approx(1.0)
 
-
-def test_report_states_how_many_reps_reach_significance(tmp_path):
-    outcomes = {f"t{i:02d}": [(True, True)] * 3 for i in range(17)}
-    outcomes["t05"][0] = (False, True)
-    outcomes["t11"][1] = (False, True)
-    report = build_report(load_cells(_report(tmp_path, outcomes)))
-    assert report.reps_for_alpha is not None and report.reps_for_alpha > report.reps
     md = report.to_markdown()
+    assert "Estimand 1" in md and "Estimand 2" in md and "Estimand 3" in md
     assert "not significant" in md
-    assert "repetitions" in md
-    assert "cannot create information" in md  # the honesty note is not optional
+    assert "adds no observations" in md
+    assert "Independent samples added by composition: **0**" in md
 
 
-def test_no_extrapolation_needed_when_already_significant(tmp_path):
-    outcomes = {f"t{i:02d}": [(True, True)] * 8 for i in range(4)}
-    for rep in range(7):  # 7 of 8 episodes discordant, all one direction
-        outcomes["t00"][rep] = (False, True)
+def test_cell_and_episode_mcnemar_p_can_differ(tmp_path):
+    """Eight cell disagreements in one rep collapse into one episode disagreement."""
+    outcomes = {f"t{i:02d}": [(False, True), (True, True)] for i in range(8)}
     report = build_report(load_cells(_report(tmp_path, outcomes)))
-    assert report.mcnemar_p < 0.05
-    assert report.reps_for_alpha is None
+
+    assert report.cell_estimand.pairs == 16
+    assert report.cell_estimand.discordant == (8, 0)
+    assert report.cell_estimand.mcnemar_p == pytest.approx(mcnemar_exact(8, 0))
+    assert report.cell_estimand.mcnemar_p == pytest.approx(0.0078125)
+
+    assert report.independent_episode_count == 2
+    assert report.episode_estimand.pairs == 2
+    assert report.episode_estimand.discordant == (1, 0)
+    assert report.episode_estimand.mcnemar_p == pytest.approx(mcnemar_exact(1, 0))
+    assert report.episode_estimand.mcnemar_p == pytest.approx(1.0)
+    assert report.cell_estimand.mcnemar_p != report.episode_estimand.mcnemar_p
 
 
 def test_per_task_p_averages_over_reps(tmp_path):
@@ -173,28 +191,35 @@ def test_per_task_p_averages_over_reps(tmp_path):
     assert per_task_p(cells, "verify")["a"] == pytest.approx(1.0)
 
 
-def test_bootstrap_ci_brackets_the_estimate_and_is_seeded(tmp_path):
+def test_task_bootstrap_interval_brackets_the_projection_and_is_seeded(tmp_path):
     outcomes = {f"t{i:02d}": [(True, True)] * 3 for i in range(17)}
     outcomes["t05"][0] = (False, True)
     path = _report(tmp_path, outcomes)
     a = build_report(load_cells(path), seed=7)
     b = build_report(load_cells(path), seed=7)
-    trust_a = next(c for c in a.curves if c.condition == "trust-chain")
-    trust_b = next(c for c in b.curves if c.condition == "trust-chain")
-    assert trust_a.ci_lo == trust_b.ci_lo and trust_a.ci_hi == trust_b.ci_hi  # deterministic
+    trust_a = next(c for c in a.composition_estimand.curves if c.condition == "trust-chain")
+    trust_b = next(c for c in b.composition_estimand.curves if c.condition == "trust-chain")
+    assert trust_a.task_bootstrap_lo == trust_b.task_bootstrap_lo
+    assert trust_a.task_bootstrap_hi == trust_b.task_bootstrap_hi
     for k in range(a.n_steps):
-        assert trust_a.ci_lo[k] <= trust_a.rate[k] <= trust_a.ci_hi[k]
+        assert trust_a.task_bootstrap_lo[k] <= trust_a.rate[k]
+        assert trust_a.rate[k] <= trust_a.task_bootstrap_hi[k]
 
 
-def test_run_horizon_writes_both_artifacts(tmp_path):
+def test_run_horizon_writes_all_artifacts_and_explicit_estimands(tmp_path):
     path = _report(tmp_path, {"a": [(True, True)], "b": [(False, True)]})
     report = run_horizon(path, tmp_path / "out")
     assert (tmp_path / "out" / "horizon_report.md").exists()
     assert (tmp_path / "out" / "horizon_report.json").exists()
+    assert (tmp_path / "out" / "horizon_curve.svg").exists()
     reloaded = json.loads((tmp_path / "out" / "horizon_report.json").read_text())
     assert reloaded["n_steps"] == 2
-    assert reloaded["discordant"] == [1, 0]
-    assert report.mcnemar_p == pytest.approx(1.0)  # a single discordant pair proves nothing
+    assert reloaded["independent_episode_count"] == 1
+    assert reloaded["estimands"]["cell"]["discordant"] == [1, 0]
+    assert reloaded["estimands"]["episode"]["discordant"] == [1, 0]
+    assert reloaded["estimands"]["composition"]["independent_samples_added"] == 0
+    assert "mcnemar_p" not in reloaded["estimands"]["composition"]
+    assert report.episode_estimand.mcnemar_p == pytest.approx(1.0)
 
 
 # --- Wilson intervals ---------------------------------------------------------

@@ -1,0 +1,17 @@
+kind: issue_to_pr
+title: "Experiment reruns ignore the seed and artifacts do not bind their evidence"
+description: >
+  Make seeded runs byte-for-byte reproducible and extend the artifact manifest with
+  canonical input and raw-output SHA-256 digests. Metrics must still be derived from
+  the saved values rather than trusted as independent evidence.
+target_repo: data/long_tasks/experiment_repro/repo
+context_requirement: optional
+inputs:
+  context_query: "experiment seed reproducibility artifact input output digest"
+  repo_adapter: data/long_tasks/experiment_repro/adapter.yaml
+  reference_manifest: data/long_tasks/experiment_repro/reference_manifest.json
+success:
+  - "same seed produces identical raw values and manifest"
+  - "manifest binds canonical parameters and raw output bytes"
+  - "full tests, lint, and compileall pass"
+

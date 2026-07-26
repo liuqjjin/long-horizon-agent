@@ -54,6 +54,7 @@ class PytestVerifier(Verifier):
         passed_n = int(summary.get("passed", 0))
         failed_n = int(summary.get("failed", 0))
         error_n = int(summary.get("error", 0))
+        skipped_n = int(summary.get("skipped", 0))
         collected = int(summary.get("total", passed_n + failed_n + error_n))
         bad = [
             t
@@ -70,10 +71,18 @@ class PytestVerifier(Verifier):
         detail_summary = count_line
         if collected == 0:
             detail_summary += " (no tests collected)"
+        elif passed_n == 0 and skipped_n == collected:
+            detail_summary += " (all tests skipped)"
         elif messages:
             detail_summary += " — " + "; ".join(messages[:3])
 
-        ok = res.returncode == 0 and failed_n == 0 and error_n == 0 and collected > 0
+        ok = (
+            res.returncode == 0
+            and failed_n == 0
+            and error_n == 0
+            and collected > 0
+            and passed_n > 0
+        )
         return Check(
             name=self.name,
             family=self.family,

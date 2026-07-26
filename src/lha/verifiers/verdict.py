@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, FiniteFloat, model_validator
 
 from ..clock import now
 
@@ -18,10 +18,10 @@ class Check(BaseModel):
     name: str  # "pytest", "ruff", "psnr", "freshness", ...
     family: VerifierFamily
     passed: bool
-    score: float | None = None
-    threshold: float | None = None
+    score: FiniteFloat | None = None
+    threshold: FiniteFloat | None = None
     detail: dict[str, Any] = Field(default_factory=dict)
-    duration_s: float = 0.0
+    duration_s: FiniteFloat = Field(default=0.0, ge=0)
 
 
 class Verdict(BaseModel):
@@ -32,8 +32,22 @@ class Verdict(BaseModel):
     checks: list[Check] = Field(default_factory=list)
     failures: list[str] = Field(default_factory=list)  # fed back into the repair loop
     artifact_ref: str | None = None
+    artifact_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    attempt_id: str | None = None
     timestamp: datetime = Field(default_factory=now)
     env: dict[str, Any] = Field(default_factory=dict)  # reproducibility record
+
+    @model_validator(mode="after")
+    def _aggregate_is_not_forgeable(self) -> "Verdict":
+        expected = bool(self.checks) and all(check.passed for check in self.checks)
+        if self.passed != expected:
+            raise ValueError(
+                "passed must equal the non-empty conjunction of checks; "
+                f"expected {expected}, got {self.passed}"
+            )
+        return self
 
     @classmethod
     def from_checks(
@@ -42,6 +56,8 @@ class Verdict(BaseModel):
         checks: list[Check],
         *,
         artifact_ref: str | None = None,
+        artifact_sha256: str | None = None,
+        attempt_id: str | None = None,
         env: dict[str, Any] | None = None,
     ) -> "Verdict":
         # An empty check list verified nothing, so it must not pass. The rule
@@ -59,5 +75,7 @@ class Verdict(BaseModel):
             checks=checks,
             failures=failures,
             artifact_ref=artifact_ref,
+            artifact_sha256=artifact_sha256,
+            attempt_id=attempt_id,
             env=env or {},
         )

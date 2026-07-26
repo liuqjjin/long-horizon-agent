@@ -36,6 +36,13 @@ class PSNRVerifier(Verifier):
         from skimage.metrics import peak_signal_noise_ratio
 
         data_range_v, dr_conflict = metric_param(artifact, ctx.step, "data_range", 1.0)
+        if not is_finite(data_range_v) or float(data_range_v) <= 0:
+            return Check(
+                name=self.name,
+                family=self.family,
+                passed=False,
+                detail={"summary": f"invalid data_range: {data_range_v!r}"},
+            )
         data_range = float(data_range_v)
         value = float(peak_signal_noise_ratio(ref, pred, data_range=data_range))
         threshold = ctx.step.params.get("psnr_min")
@@ -50,8 +57,11 @@ class PSNRVerifier(Verifier):
         if not is_finite(value):
             reasons.append(f"non-finite PSNR ({value}) — degenerate result")
         else:
-            if threshold is not None and value < float(threshold):
-                reasons.append(f"PSNR {value:.3f} < threshold {threshold}")
+            if threshold is not None:
+                if not is_finite(threshold):
+                    reasons.append(f"PSNR threshold is non-finite ({threshold})")
+                elif value < float(threshold):
+                    reasons.append(f"PSNR {value:.3f} < threshold {threshold}")
             if reported is not None:
                 if not is_finite(reported):
                     reasons.append(f"self-reported PSNR is non-finite ({reported})")
@@ -67,7 +77,7 @@ class PSNRVerifier(Verifier):
             family=self.family,
             passed=not reasons,
             score=score,
-            threshold=float(threshold) if threshold is not None else None,
+            threshold=float(threshold) if threshold is not None and is_finite(threshold) else None,
             detail={
                 "summary": f"PSNR={shown} (reported={reported}, threshold={threshold})",
                 "reasons": reasons,

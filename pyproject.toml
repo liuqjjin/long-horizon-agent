@@ -1,7 +1,7 @@
 [project]
 name = "lha"
-version = "0.4.1"
-description = "A verification-first long-horizon agent harness for code, papers, and experiments"
+version = "0.4.2.dev0"
+description = "A resumable task runner with executable checks for code and experiments"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -45,7 +45,11 @@ dependencies = [
 [project.optional-dependencies]
 # The doc/experiment/skill vector index is optional: without it, those context
 # backends report "unavailable" and required-context steps fail closed.
-context = ["cocoindex>=1.0.11", "sentence-transformers>=5.6.0"]
+context = [
+    "cocoindex>=1.0.11",
+    "sentence-transformers>=5.6.0",
+    "torch>=2.11.0",
+]
 # Public-benchmark harnesses. harbor needs Python >= 3.12 (lha itself runs on 3.11).
 bench = ["swebench>=4.1.0", "harbor>=0.20; python_version >= '3.12'"]
 llm = ["anthropic>=0.69"]  # needs the Opus-4.8 surface (adaptive thinking, output_config.effort)
@@ -62,7 +66,7 @@ lha = "lha.cli:main"
 
 [tool.ruff]
 line-length = 100
-exclude = ["runs", "data", ".cocoindex_code", "flows/_scratch"]
+exclude = ["runs", "data", ".cocoindex_code", "src/lha/live_context/flows/_scratch"]
 
 [tool.ruff.lint]
 extend-select = ["I"]
@@ -73,9 +77,20 @@ addopts = "-q"
 
 [tool.pyright]
 include = ["src/lha"]
+exclude = ["src/lha/resources/eval/sample_repo"]
 pythonVersion = "3.11"
 venvPath = "."
 venv = ".venv"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.11.16,<0.12.0"]

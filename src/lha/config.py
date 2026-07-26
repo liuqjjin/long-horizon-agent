@@ -10,8 +10,9 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, FiniteFloat
 
 try:  # optional: load .env if python-dotenv is installed
     from dotenv import load_dotenv
@@ -40,7 +41,7 @@ def _env_float_opt(key: str) -> float | None:
         raise ValueError(f"{key} must be a number, got {raw!r}") from e
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{key} must be a finite, non-negative number, got {raw!r}")
-    return value
+    return value or None
 
 
 def _env_int_opt(key: str) -> int | None:
@@ -61,16 +62,26 @@ def _env_int_opt(key: str) -> int | None:
     return value or None
 
 
+def _env_codex_sandbox() -> Literal["read-only", "workspace-write", "danger-full-access"]:
+    value = _env("LHA_CODEX_SANDBOX", "read-only")
+    if value == "read-only":
+        return "read-only"
+    if value == "workspace-write":
+        return "workspace-write"
+    if value == "danger-full-access":
+        return "danger-full-access"
+    raise ValueError(f"LHA_CODEX_SANDBOX has unsupported value {value!r}")
+
+
 class Config(BaseModel):
     """Harness configuration. Construct with ``Config.from_env()``."""
 
     # Loop budget
-    max_steps: int = 20
-    max_repairs: int = 3
-    deadline_s: float | None = None
-    # Model-call budget for a single process (None = unbounded). A run that
-    # would loop on a broken backend pauses instead of burning tokens.
-    max_llm_calls: int | None = None
+    max_steps: int = Field(default=20, ge=1)
+    max_repairs: int = Field(default=3, ge=0)
+    deadline_s: FiniteFloat | None = Field(default=None, ge=0)
+    # Model-call budget for the whole durable run (None = unbounded).
+    max_llm_calls: int | None = Field(default=None, ge=1)
 
     # Run the selected verifiers concurrently
     parallel_verify: bool = True
@@ -83,13 +94,24 @@ class Config(BaseModel):
     dynamic_planning: bool = False
 
     # Freshness
-    freshness_max_age_s: float = 3600.0
+    freshness_max_age_s: FiniteFloat = Field(default=3600.0, ge=0)
 
-    # LLM backend: "stub" | "claude_cli" | "anthropic"
+    # LLM backend: "stub" | "claude_cli" | "codex_cli" | "anthropic"
     llm_backend: str = "stub"
     claude_cli_path: str = "claude"
     # Pin a full model snapshot for reproducible runs; "" lets the CLI decide.
     claude_cli_model: str = ""
+    codex_cli_path: str = "codex"
+    codex_model: str = ""
+    codex_reasoning_effort: str = "medium"
+    codex_sandbox: Literal["read-only", "workspace-write", "danger-full-access"] = "read-only"
+    # danger-full-access is only valid when the whole process already runs in a
+    # disposable external sandbox (for example a Harbor task container).
+    codex_external_sandbox: bool = False
+    # Only failures classified as transport/service-transient are retried.
+    # Protocol violations and unsafe event streams fail on the first attempt.
+    codex_max_retries: int = Field(default=2, ge=0, le=10)
+    codex_retry_backoff_s: FiniteFloat = Field(default=1.0, ge=0)
     anthropic_model_impl: str = "claude-opus-4-8"
     anthropic_model_orchestration: str = "claude-sonnet-4-6"
 
@@ -120,6 +142,14 @@ class Config(BaseModel):
             llm_backend=_env("LHA_LLM_BACKEND", "stub"),
             claude_cli_path=_env("LHA_CLAUDE_CLI", "claude"),
             claude_cli_model=_env("LHA_CLAUDE_MODEL", ""),
+            codex_cli_path=_env("LHA_CODEX_CLI", "codex"),
+            codex_model=_env("LHA_CODEX_MODEL", ""),
+            codex_reasoning_effort=_env("LHA_CODEX_EFFORT", "medium"),
+            codex_sandbox=_env_codex_sandbox(),
+            codex_external_sandbox=_env("LHA_CODEX_EXTERNAL_SANDBOX", "0")
+            not in ("0", "false", "False"),
+            codex_max_retries=int(_env("LHA_CODEX_MAX_RETRIES", "2")),
+            codex_retry_backoff_s=float(_env("LHA_CODEX_RETRY_BACKOFF_S", "1")),
             anthropic_model_impl=_env("LHA_ANTHROPIC_MODEL_IMPL", "claude-opus-4-8"),
             anthropic_model_orchestration=_env("LHA_ANTHROPIC_MODEL_ORCH", "claude-sonnet-4-6"),
             code_backend=_env("LHA_CODE_BACKEND", "auto"),

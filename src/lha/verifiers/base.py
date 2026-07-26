@@ -27,6 +27,8 @@ class VerifyContext:
     bundle: ContextBundle | None = None
     # Where target code (pytest, experiments, re-runs) actually executes.
     exec: ExecutionBackend = field(default_factory=TrustedLocalBackend)
+    # Stable across process crashes, different for each repair attempt.
+    attempt_id: str | None = None
 
 
 class Verifier(ABC):

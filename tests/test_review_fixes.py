@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import stat
 from datetime import timedelta
 from pathlib import Path
+
+import pytest
 
 from lha.agents.verifier_agent import VerifierAgent
 from lha.artifacts import Patch, Step
@@ -25,7 +28,7 @@ def test_missing_verifier_fails_not_silently_passes(tmp_path):
     assert any(c.name == "does_not_exist" and not c.passed for c in verdict.checks)
 
 
-def test_diff_apply_is_idempotent(tmp_path):
+def test_diff_apply_rejects_an_unjournaled_duplicate(tmp_path):
     target = tmp_path / "f.py"
     original = "a = 1\nb = 2\n"
     target.write_text(original)
@@ -37,8 +40,10 @@ def test_diff_apply_is_idempotent(tmp_path):
     )
     apply_patch(patch, tmp_path)
     assert target.read_text() == updated
-    # second application (e.g. on resume) must not raise "already applied"
-    apply_patch(patch, tmp_path)
+    # Resume idempotency belongs to PatchTransaction. Silently accepting a raw
+    # duplicate would hide state drift (especially for mode-only diffs).
+    with pytest.raises(RuntimeError, match="git apply failed"):
+        apply_patch(patch, tmp_path)
     assert target.read_text() == updated
 
 
@@ -47,7 +52,10 @@ def test_backup_persists_to_disk_and_reverts(tmp_path):
 
     target = tmp_path / "m.py"
     target.write_text("orig\n")
-    backup = Backup(originals={"m.py": "orig\n"})
+    backup = Backup(
+        originals={"m.py": b"orig\n"},
+        modes={"m.py": stat.S_IMODE(target.stat().st_mode)},
+    )
     target.write_text("changed\n")  # simulate an applied patch
 
     save_backup(backup, tmp_path / "backups" / "s.json")

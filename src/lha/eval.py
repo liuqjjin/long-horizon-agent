@@ -15,14 +15,21 @@ installed. The score means the same thing on a laptop and on a CI runner.
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
+from importlib import resources
 from pathlib import Path
 
 from . import live_context
+from .clock import now
 from .config import Config
 from .harness import Harness
+from .harness.approval import HumanApprovalGate
+from .live_context import freshness as context_freshness
+from .live_context.models import ContextItem, Provenance
 from .tasks.spec import TaskSpec
 from .verifiers.verdict import Verdict
 
@@ -68,7 +75,19 @@ def _verified(result) -> bool:
     return Verdict.model_validate_json(vj.read_text()).passed
 
 
-def _loop_task(path: str) -> TaskSpec:
+def _task(base: Config, name: str) -> TaskSpec:
+    """Load one fixed eval task and bind its repository to the active fixture root."""
+    task = TaskSpec.from_file(Path(base.data_dir) / "tasks" / name)
+    if task.target_repo is None:
+        return task
+    target = Path(task.target_repo)
+    if not target.is_absolute():
+        parts = target.parts[1:] if target.parts[:1] == ("data",) else target.parts
+        target = Path(base.data_dir).joinpath(*parts)
+    return task.model_copy(update={"target_repo": str(target.resolve())})
+
+
+def _loop_task(base: Config, name: str) -> TaskSpec:
     """A bundled task loaded for the loop-focused cases.
 
     Their oracle is the real ``pytest`` run on the patched sandbox, and that
@@ -80,11 +99,11 @@ def _loop_task(path: str) -> TaskSpec:
     (``_case_context_fail_closed``), which forces the backend dark in every
     environment instead of relying on one.
     """
-    return TaskSpec.from_file(path).model_copy(update={"context_requirement": "optional"})
+    return _task(base, name).model_copy(update={"context_requirement": "optional"})
 
 
 def _case_issue_to_pr(base: Config) -> EvalResult:
-    r = Harness(_cfg(base, "issue_to_pr")).run(_loop_task("data/tasks/fix_average.yaml"))
+    r = Harness(_cfg(base, "issue_to_pr")).run(_loop_task(base, "fix_average.yaml"))
     ok = r.status == "DONE" and _verified(r)
     return EvalResult(
         "fix_average", "issue-to-PR", ok, f"status={r.status} verified={_verified(r)}"
@@ -92,11 +111,27 @@ def _case_issue_to_pr(base: Config) -> EvalResult:
 
 
 def _case_resume(base: Config) -> EvalResult:
-    paused = Harness(_cfg(base, "resume", max_steps=1)).run(
-        _loop_task("data/tasks/fix_average.yaml")
+    config = _cfg(base, "resume")
+    task = _loop_task(base, "fix_average.yaml")
+    task = task.model_copy(
+        update={
+            "inputs": {
+                **task.inputs,
+                "require_approval": True,
+            }
+        }
     )
-    resumed = Harness(_cfg(base, "resume")).resume(paused.state.run_id)
-    ok = paused.status == "PAUSED" and resumed.status == "DONE" and _verified(resumed)
+    paused = Harness(config, interactive_approval=False).run(task)
+    HumanApprovalGate(paused.state.run_dir).resolve(
+        approved=True,
+        note="self-eval approval",
+    )
+    resumed = Harness(config, interactive_approval=False).resume(paused.state.run_id)
+    ok = (
+        paused.status == "AWAITING_APPROVAL"
+        and resumed.status == "DONE"
+        and _verified(resumed)
+    )
     return EvalResult(
         "pause_resume", "resume", ok, f"first={paused.status} resumed={resumed.status}"
     )
@@ -112,7 +147,7 @@ def _case_context_fail_closed(base: Config) -> EvalResult:
     be a failure of some other kind.
     """
     cfg = _cfg(base, "context_fail_closed", code_backend="null", max_repairs=0)
-    task = TaskSpec.from_file("data/tasks/fix_average.yaml")  # context_requirement: required
+    task = _task(base, "fix_average.yaml")  # context_requirement: required
     r = Harness(cfg).run(task)
 
     named_the_reason = False
@@ -138,31 +173,82 @@ def _case_context_fail_closed(base: Config) -> EvalResult:
 
 
 def _case_freshness(base: Config) -> EvalResult:
-    # Use the paper corpus (CocoFlowBackend — no background daemon) for a
-    # deterministic freshness test, isolated in a temp data dir so the committed
-    # sample notes are never mutated.
+    checkout_data = (Path.cwd() / "data").resolve()
+    if Path(base.data_dir).resolve() == checkout_data:
+        return _case_index_freshness(base)
+    return _case_packaged_freshness(base)
+
+
+def _case_index_freshness(base: Config) -> EvalResult:
+    """Exercise the optional CocoIndex refresh path in a source checkout."""
     data = Path(base.runs_dir) / "eval" / "fresh_data"
     if data.exists():
         shutil.rmtree(data)
-    shutil.copytree("data/papers", data / "papers")
-    fcfg = base.model_copy(update={"data_dir": data})
-    live_context.configure(config=fcfg)
+    shutil.copytree(Path(base.data_dir) / "papers", data / "papers")
+    config = base.model_copy(update={"data_dir": data})
+    live_context.configure(config=config)
     live_context.index_docs(("paper",))
 
-    q = "super resolution PSNR data_range"
-    cap = live_context.get_fresh_context(q, kinds=("paper",), k=2)
-    initial_fresh = (not cap.freshness.is_stale()) and len(cap.items) > 0
+    query = "super resolution PSNR data_range"
+    first = live_context.get_fresh_context(query, kinds=("paper",), k=2)
+    initial_fresh = (not first.freshness.is_stale()) and len(first.items) > 0
 
     note = sorted((data / "papers").glob("*.md"))[0]
     note.write_text(note.read_text() + "\n\nEVAL_FRESHNESS_PROBE: acceptance SSIM 0.90\n")
     time.sleep(1.1)
 
-    # Re-search without reindex: the JSON index now lags the edited note, so the
-    # bundle is detected stale; reject_stale incrementally rebuilds it.
-    b2 = live_context.get_fresh_context(q, kinds=("paper",), k=2)
-    stale_after_edit = b2.freshness.is_stale()
-    b3 = live_context.reject_stale(b2) if stale_after_edit else b2
-    fresh_after_reject = not b3.freshness.is_stale()
+    changed = live_context.get_fresh_context(query, kinds=("paper",), k=2)
+    stale_after_edit = changed.freshness.is_stale()
+    refreshed = live_context.reject_stale(changed) if stale_after_edit else changed
+    fresh_after_reject = not refreshed.freshness.is_stale()
+    return EvalResult(
+        "edit_reindex",
+        "freshness",
+        initial_fresh and stale_after_edit and fresh_after_reject,
+        f"initial_fresh={initial_fresh} stale_after_edit={stale_after_edit} "
+        f"fresh_after_reject={fresh_after_reject}",
+    )
+
+
+def _case_packaged_freshness(base: Config) -> EvalResult:
+    """Exercise source-digest freshness without the optional context extra."""
+    data = Path(base.runs_dir) / "eval" / "fresh_data"
+    if data.exists():
+        shutil.rmtree(data)
+    shutil.copytree(Path(base.data_dir) / "papers", data / "papers")
+    note = sorted((data / "papers").glob("*.md"))[0].resolve()
+    indexed_at = now() + timedelta(seconds=5)
+    original_sha256 = context_freshness.file_sha256(note)
+    item = ContextItem(
+        text=note.read_text(),
+        provenance=Provenance(
+            source_kind="paper",
+            locator=str(note),
+            indexed_at=indexed_at,
+            content_hash=context_freshness.content_hash(note.read_text()),
+            source_sha256=original_sha256,
+        ),
+    )
+    initial = context_freshness.assess(
+        [item], index_version="eval-source-v1", indexed_at=indexed_at
+    )
+    initial_fresh = not initial.is_stale()
+
+    stat_before = note.stat()
+    note.write_bytes(note.read_bytes() + b"\nEVAL_FRESHNESS_PROBE: acceptance SSIM 0.90\n")
+    os.utime(note, ns=(stat_before.st_atime_ns, stat_before.st_mtime_ns))
+    changed = context_freshness.assess(
+        [item], index_version="eval-source-v1", indexed_at=indexed_at
+    )
+    stale_after_edit = changed.is_stale()
+
+    item.provenance.source_sha256 = context_freshness.file_sha256(note)
+    item.text = note.read_text()
+    item.provenance.content_hash = context_freshness.content_hash(item.text)
+    refreshed = context_freshness.assess(
+        [item], index_version="eval-source-v2", indexed_at=now() + timedelta(seconds=5)
+    )
+    fresh_after_reject = not refreshed.is_stale()
 
     ok = initial_fresh and stale_after_edit and fresh_after_reject
     return EvalResult(
@@ -176,7 +262,7 @@ def _case_freshness(base: Config) -> EvalResult:
 
 def _case_paper_to_experiment(base: Config) -> EvalResult:
     r = Harness(_cfg(base, "paper_to_experiment")).run(
-        TaskSpec.from_file("data/tasks/run_sr_experiment.yaml")
+        _task(base, "run_sr_experiment.yaml")
     )
     ok = r.status == "DONE" and _verified(r)
     return EvalResult(
@@ -187,7 +273,7 @@ def _case_paper_to_experiment(base: Config) -> EvalResult:
 def _case_verification_ablation(base: Config) -> EvalResult:
     # An unreachable PSNR bar: a correct harness must FAIL (verifier catches it).
     r = Harness(_cfg(base, "ablation", max_repairs=0)).run(
-        TaskSpec.from_file("data/tasks/run_sr_experiment_strict.yaml")
+        _task(base, "run_sr_experiment_strict.yaml")
     )
     psnr_failed = False
     reached_psnr = False
@@ -209,7 +295,63 @@ _FAST = [_case_issue_to_pr, _case_resume, _case_freshness, _case_context_fail_cl
 _SLOW = [_case_paper_to_experiment, _case_verification_ablation]
 
 
+def _copy_resource_tree(source, destination: Path) -> None:
+    if destination.is_symlink():
+        raise RuntimeError(f"refusing symlinked eval resource path: {destination}")
+    destination.mkdir(parents=True, exist_ok=True)
+    for child in source.iterdir():
+        if child.name == "__pycache__" or child.name.endswith(".pyc"):
+            continue
+        target = destination / child.name
+        if target.is_symlink():
+            raise RuntimeError(f"refusing symlinked eval resource target: {target}")
+        if child.is_dir():
+            _copy_resource_tree(child, target)
+        else:
+            target.write_bytes(child.read_bytes())
+
+
+def _eval_data_root(base: Config, *, quick: bool) -> Path:
+    """Use checkout fixtures when present, otherwise materialize packaged ones."""
+    checkout = Path.cwd() / "data"
+    required = [
+        checkout / "tasks" / "fix_average.yaml",
+        checkout / "sample_repo" / "mathutils.py",
+        checkout / "papers" / "note_srgan.md",
+    ]
+    if not quick:
+        required.extend(
+            [
+                checkout / "tasks" / "run_sr_experiment.yaml",
+                checkout / "tasks" / "run_sr_experiment_strict.yaml",
+                checkout / "sample_experiment" / "experiment.py",
+            ]
+        )
+    if all(path.is_file() for path in required):
+        return checkout.resolve()
+    if not quick:
+        raise FileNotFoundError(
+            "the full self-eval requires a source checkout; installed packages support --quick"
+        )
+
+    destination = Path(base.runs_dir).absolute() / "eval" / "_fixtures"
+    if destination.is_symlink():
+        raise RuntimeError(f"refusing symlinked eval fixture directory: {destination}")
+    if destination.exists() and not destination.is_dir():
+        raise RuntimeError(f"eval fixture path is not a directory: {destination}")
+    source = resources.files("lha.resources").joinpath("eval")
+    _copy_resource_tree(source, destination)
+    return destination.resolve()
+
+
 def run_eval(base: Config, *, quick: bool = False) -> EvalReport:
+    try:
+        data_root = _eval_data_root(base, quick=quick)
+    except Exception as error:
+        return EvalReport(
+            [EvalResult("fixtures", "packaging", False, f"errored: {error!r}")]
+        )
+    base = base.model_copy(update={"data_dir": data_root})
     cases = _FAST + ([] if quick else _SLOW)
     results: list[EvalResult] = []
     for case in cases:

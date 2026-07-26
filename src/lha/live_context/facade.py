@@ -7,6 +7,7 @@ The rest of the system imports exactly these five functions (plus the models and
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 from ..clock import now
 from ..config import Config
@@ -92,7 +93,13 @@ def index_docs(kinds: tuple[SourceKind, ...] = ("paper", "experiment", "skill"))
         sourcedir = _state.config.data_dir / f"{kind}s"
         if not sourcedir.exists():
             continue  # nothing to index for this kind yet
-        results.append(CocoFlowBackend(kind, _state.config.data_dir).reindex())
+        results.append(
+            CocoFlowBackend(
+                kind,
+                _state.config.data_dir,
+                embedder_model=_state.config.embedder_model,
+            ).reindex()
+        )
     _state.reset_cache()
     return results
 
@@ -102,8 +109,15 @@ def _backend_for(kind: SourceKind) -> SearchBackend:
         return _code_backend()
     key = f"{kind}"
     if key not in _state._cache:
-        be = CocoFlowBackend(kind, _state.config.data_dir)
-        _state._cache[key] = be if be.available() else NullBackend(kind)
+        be = CocoFlowBackend(
+            kind,
+            _state.config.data_dir,
+            embedder_model=_state.config.embedder_model,
+        )
+        # Persisted-but-incomplete/corrupt generations must reach ``search`` so
+        # they are classified as ``index_failed``.  Only a genuinely
+        # uninitialized optional index maps to an unavailable null backend.
+        _state._cache[key] = be if be.has_index_state() else NullBackend(kind)
     return _state._cache[key]
 
 
@@ -148,22 +162,33 @@ def get_fresh_context(
     from "could not search" (``backend_unavailable``) — the two must never be
     conflated, or missing infrastructure reads as verified-empty context.
     """
+    requested_kinds = tuple(dict.fromkeys(kinds))
     items: list[ContextItem] = []
     versions: list[str] = []
     indexed_ats = []
     notes: list[str] = []
-    unavailable_kinds: list[str] = []
-    for kind in kinds:
+    unavailable_kinds: list[SourceKind] = []
+    unavailable_reasons: dict[SourceKind, str] = {}
+    failed_kinds: list[SourceKind] = []
+    failure_reasons: dict[SourceKind, str] = {}
+    for kind in requested_kinds:
         be = _backend_for(kind)
         if isinstance(be, NullBackend):
             unavailable_kinds.append(kind)
-            notes.append(f"{kind}: no backend available")
+            unavailable_reasons[kind] = "no backend available"
+            notes.append(f"{kind}: {unavailable_reasons[kind]}")
             continue
         try:
             hits = be.search(query, k=k)
         except BackendUnavailable as e:
             unavailable_kinds.append(kind)
-            notes.append(f"{kind}: {e}")
+            unavailable_reasons[kind] = str(e)
+            notes.append(f"{kind}: {unavailable_reasons[kind]}")
+            continue
+        except Exception as e:
+            failed_kinds.append(kind)
+            failure_reasons[kind] = f"{type(e).__name__}: {e}"
+            notes.append(f"{kind} index query failed: {failure_reasons[kind]}")
             continue
         # Only backends that actually contributed context affect freshness, so an
         # empty/uninitialized backend can't skew the bundle's indexed_at.
@@ -180,11 +205,19 @@ def get_fresh_context(
         indexed_at=indexed_at,
         base_dir=Path.cwd(),
     )
+    if failed_kinds:
+        freshness.is_stale_flag = True
+        freshness.reasons.extend(
+            f"{kind} index cannot be matched to its current sources"
+            for kind in failed_kinds
+        )
     if max_age_s is not None and freshness.is_stale(max_age_s) and not freshness.is_stale_flag:
         freshness.is_stale_flag = True
         freshness.reasons.append(f"older than max_age_s={max_age_s}")
     status: ContextStatus = "ok"
-    if not items:
+    if failed_kinds:
+        status = "index_failed"
+    elif not items:
         status = "backend_unavailable" if unavailable_kinds else "empty"
     return ContextBundle(
         query=query,
@@ -193,6 +226,10 @@ def get_fresh_context(
         status=status,
         status_notes=notes,
         unavailable_kinds=unavailable_kinds,
+        unavailable_reasons=unavailable_reasons,
+        failed_kinds=failed_kinds,
+        failure_reasons=failure_reasons,
+        requested_kinds=list(requested_kinds),
     )
 
 
@@ -209,11 +246,31 @@ def reject_stale(bundle: ContextBundle, *, reindex: bool = True) -> ContextBundl
         raise StaleContextError(
             f"context for {bundle.query!r} is stale: {bundle.freshness.reasons}"
         )
+    inferred: list[SourceKind] = [i.provenance.source_kind for i in bundle.items]
+    inferred.extend(
+        cast(SourceKind, k)
+        for k in bundle.unavailable_kinds
+        if k in ("code", "paper", "experiment", "skill")
+    )
     kinds: tuple[SourceKind, ...] = tuple(
-        dict.fromkeys(i.provenance.source_kind for i in bundle.items)
+        dict.fromkeys(bundle.requested_kinds or inferred)
     ) or ("code",)
-    results = [_backend_for(kind).reindex() for kind in kinds]
-    failed = [r for r in results if not r.ok]
+    results: list[ReindexResult] = []
+    for kind in kinds:
+        try:
+            results.append(_backend_for(kind).reindex())
+        except Exception as error:
+            results.append(
+                ReindexResult(
+                    kind=kind,
+                    ok=False,
+                    detail=f"{type(error).__name__}: {error}",
+                )
+            )
+    # Skill memory is an optional augmentation (matching FreshnessVerifier).
+    # Still attempt its refresh, but a dark memory index must not block otherwise
+    # valid task context.
+    failed = [r for r in results if not r.ok and r.kind != "skill"]
     if failed:
         raise StaleContextError(
             "stale context could not be refreshed: "
@@ -222,10 +279,12 @@ def reject_stale(bundle: ContextBundle, *, reindex: bool = True) -> ContextBundl
     _state.reset_cache()
     k = max(len(bundle.items), 1)
     refreshed = get_fresh_context(bundle.query, kinds=kinds, k=k)
-    # The reindex verifiably succeeded, so the bundle is fresh by construction;
-    # mtime lag (e.g. a touched-but-unchanged source that memoization skipped)
-    # must not re-flag it.
-    refreshed.freshness.is_stale_flag = False
-    refreshed.freshness.reasons = []
-    refreshed.freshness.indexed_at = now()
+    blocking_unavailable = [k for k in refreshed.unavailable_kinds if k != "skill"]
+    if blocking_unavailable or refreshed.status == "index_failed":
+        detail = "; ".join(refreshed.status_notes) or ", ".join(blocking_unavailable)
+        raise StaleContextError(f"refreshed context is still unavailable: {detail}")
+    if refreshed.freshness.is_stale():
+        raise StaleContextError(
+            f"refreshed context is still stale: {refreshed.freshness.reasons}"
+        )
     return refreshed

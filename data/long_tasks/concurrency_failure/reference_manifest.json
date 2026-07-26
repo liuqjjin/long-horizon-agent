@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "task_id": "concurrency_failure",
+  "repo_sha256": "b8fe5862d08ca334489ae41258d1cd98059ded6b798be555c6d1952adf458f56",
+  "task_sha256": "77c1c68a18c340d807a64da608efe3a88bcd5ea0e374497a46b801a6d32ad843",
+  "adapter_sha256": "e8cb839fb79bade45ad173cb10f48bd956500461ea1cffe323639e8189982cee",
+  "reference_patch_sha256": "c1dde7e216403cf53f5292f1ef9d2bf7e7c6416b4ab9a86ac3500e567fc8e53b",
+  "reference_touched_files": [
+    "src/concurrent_counter/store.py",
+    "src/concurrent_counter/worker.py"
+  ],
+  "oracle_files": [
+    "tests/test_concurrency.py"
+  ],
+  "expected_baseline_returncode": 1,
+  "expected_patched_test_count": 2
+}

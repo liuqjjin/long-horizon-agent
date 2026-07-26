@@ -1,0 +1,17 @@
+kind: issue_to_pr
+title: "CLI violates its JSON and error-channel contract"
+description: >
+  Restore the command-line contract: JSON mode must emit exactly one parseable JSON
+  document, user/data errors must go to stderr, and those errors must return exit code
+  2 without changing successful text output.
+target_repo: data/long_tasks/cli_contract/repo
+context_requirement: optional
+inputs:
+  context_query: "CLI JSON stdout stderr exit code contract"
+  repo_adapter: data/long_tasks/cli_contract/adapter.yaml
+  reference_manifest: data/long_tasks/cli_contract/reference_manifest.json
+success:
+  - "JSON stdout parses without stripping prefixes"
+  - "missing items return code 2 with stderr only"
+  - "full tests, lint, and compileall pass"
+

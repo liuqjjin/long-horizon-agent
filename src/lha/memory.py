@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from . import __version__
 from .artifacts import ExperimentResult, Patch
 from .clock import now
@@ -33,11 +35,24 @@ class SkillMemory:
             return None
         run_dir = Path(state.run_dir)
 
-        verify_json = run_dir / "verify.json"
+        plan = getattr(state, "plan", None)
+        completed = set(getattr(state, "completed_steps", []))
+        if plan is not None:
+            if not plan.steps or any(step.step_id not in completed for step in plan.steps):
+                return None
+            final_step_id = plan.steps[-1].step_id
+            verify_json = run_dir / "steps" / _slug(final_step_id) / "verify.json"
+            if not verify_json.exists():
+                # Step ids use a slightly broader safe alphabet than title slugs.
+                from .harness.loop import _safe_seg
+
+                verify_json = run_dir / "steps" / _safe_seg(final_step_id) / "verify.json"
+        else:
+            verify_json = run_dir / "verify.json"
         if not verify_json.exists():
             return None
         verdict = Verdict.model_validate_json(verify_json.read_text())
-        if not verdict.passed:
+        if not verdict.passed or not verdict.checks or not all(c.passed for c in verdict.checks):
             return None  # only record genuine successes
         checks = [f"{c.name}: {c.detail.get('summary', 'passed')}" for c in verdict.checks]
 
@@ -60,21 +75,25 @@ class SkillMemory:
         verdict_sha = hashlib.sha256(verify_json.read_bytes()).hexdigest()
         body = self._render(task, approach, files, checks, state.run_id, verdict_sha)
         self.skills_dir.mkdir(parents=True, exist_ok=True)
-        path = self.skills_dir / f"{_slug(task.title)}.md"  # stable per task -> updated in place
+        identity = hashlib.sha256(f"{task.kind}\0{task.title}".encode()).hexdigest()[:10]
+        path = self.skills_dir / f"{_slug(task.title)}-{identity}.md"
         path.write_text(body)
         return path
 
     @staticmethod
     def _render(task, approach, files, checks, skill_id, verdict_sha: str) -> str:
+        metadata = {
+            "title": task.title,
+            "task_kind": task.kind,
+            "skill_id": skill_id,
+            "verified": True,
+            "verdict_sha256": verdict_sha,
+            "harness_version": __version__,
+            "created": now().isoformat(),
+        }
         lines = [
             "---",
-            f'title: "{task.title}"',
-            f"task_kind: {task.kind}",
-            f"skill_id: {skill_id}",
-            "verified: true",
-            f"verdict_sha256: {verdict_sha}",
-            f"harness_version: {__version__}",
-            f'created: "{now():%Y-%m-%dT%H:%M:%SZ}"',
+            yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False).rstrip(),
             "---",
             "",
             f"# Skill: {task.title}",

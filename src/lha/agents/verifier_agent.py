@@ -96,5 +96,6 @@ class VerifierAgent:
             step.step_id,
             checks,
             artifact_ref=step.step_id,
+            attempt_id=ctx.attempt_id,
             env=_env_record(ctx.workdir),
         )

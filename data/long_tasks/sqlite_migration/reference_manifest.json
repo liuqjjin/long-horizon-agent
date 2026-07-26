@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "task_id": "sqlite_migration",
+  "repo_sha256": "5d8effe8b0250ce8a43324970a33b5955b5a66a387db4d76f4f87e6534339ee2",
+  "task_sha256": "7c367fe44e46fc8cd124d0bfbc167aaddb1c327d83f9094ea234977983ad1bba",
+  "adapter_sha256": "32bdb32a19b172f3f67630a2f2eff61af45215ef4810161c5b8eae179a099218",
+  "reference_patch_sha256": "8d5684965d6add4cdeddc378d20f7931832a69079c89a08f38218669c24d038d",
+  "reference_touched_files": [
+    "src/note_store/migrations.py",
+    "src/note_store/repository.py"
+  ],
+  "oracle_files": [
+    "tests/test_migration.py"
+  ],
+  "expected_baseline_returncode": 1,
+  "expected_patched_test_count": 2
+}

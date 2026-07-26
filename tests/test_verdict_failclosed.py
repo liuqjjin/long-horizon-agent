@@ -8,6 +8,9 @@ not enforced by the type. These tests pin it at the primitive.
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from lha.artifacts import Patch, Step
 from lha.verifiers import VerifyContext
 from lha.verifiers.verdict import Check, Verdict
@@ -45,3 +48,24 @@ def test_verifier_agent_still_names_the_reason(tmp_path):
     assert verdict.passed is False
     assert any(c.name == "no-verifier" for c in verdict.checks)
     assert verdict.failures  # the reason reaches the repair loop, not just a bare False
+
+
+def test_passed_boolean_cannot_disagree_with_checks():
+    with pytest.raises(ValidationError, match="passed must equal"):
+        Verdict(
+            step_id="s",
+            passed=True,
+            checks=[Check(name="pytest", family="code", passed=False)],
+        )
+
+    with pytest.raises(ValidationError, match="passed must equal"):
+        Verdict(
+            step_id="s",
+            passed=False,
+            checks=[Check(name="pytest", family="code", passed=True)],
+        )
+
+
+def test_nonfinite_check_values_are_rejected():
+    with pytest.raises(ValidationError):
+        Check(name="psnr", family="experiment", passed=False, threshold=float("nan"))

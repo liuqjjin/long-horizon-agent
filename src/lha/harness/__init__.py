@@ -1,5 +1,5 @@
 from .approval import HumanApprovalGate
-from .budget import StepBudget
+from .budget import RunBudgetLimits, StepBudget
 from .checkpoint import load_state, load_state_by_id, save_state
 from .errors import ApprovalPending, ApprovalRejected, BudgetExceeded, HarnessError
 from .loop import Harness, RunResult
@@ -11,6 +11,7 @@ __all__ = [
     "RunState",
     "StepRecord",
     "StepBudget",
+    "RunBudgetLimits",
     "HumanApprovalGate",
     "save_state",
     "load_state",

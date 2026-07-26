@@ -13,6 +13,7 @@ a purpose-built image (see SECURITY.md, "Execution backends").
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from ..tools.shell import ProcResult
 from .base import ExecutionBackend, ResourceLimits
 
 _WORK = "/work"
+_TMPFS = "/tmp:rw,nosuid,nodev,size=256m,mode=1777"
 
 
 class DockerBackend(ExecutionBackend):
@@ -79,6 +81,9 @@ class DockerBackend(ExecutionBackend):
             name,
             "--network",
             "none",
+            "--read-only",
+            "--tmpfs",
+            _TMPFS,
             "--env",
             "HOME=/tmp",
             "-v",
@@ -86,6 +91,8 @@ class DockerBackend(ExecutionBackend):
             "-w",
             _WORK,
         ]
+        if hasattr(os, "getuid") and hasattr(os, "getgid"):
+            argv += ["--user", f"{os.getuid()}:{os.getgid()}"]
         if limits.memory_mb:
             argv += ["--memory", f"{limits.memory_mb}m"]
         if limits.pids:

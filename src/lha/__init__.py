@@ -1,9 +1,8 @@
-"""lha — a verification-first long-horizon agent harness.
+"""LHA runs model-generated task steps behind executable checks.
 
-The core is the verification loop (context -> tool -> execute -> verify ->
-repair -> checkpoint -> repeat). The live-context layer (code/paper/experiment
-search) is infrastructure underneath it, reachable only through
-``lha.live_context``.
+The main loop reads context, executes a step, runs its checks, then either
+repairs the result or saves a checkpoint and advances. Code and document search
+are available only through ``lha.live_context``.
 """
 
 from importlib.metadata import PackageNotFoundError, version

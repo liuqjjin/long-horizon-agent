@@ -10,6 +10,7 @@ COPY --from=uv-provider /uv /uvx /usr/local/bin/
 
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
+    UV_HTTP_TIMEOUT=120 \
     UV_PROJECT_ENVIRONMENT=/opt/venv
 
 WORKDIR /app
@@ -22,9 +23,10 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable --extra context
 
-# The [context] extra ships the vector-index stack so `lha eval` reaches 5/5
-# in-container (docs/DEPLOY.md); its torch dependency is what makes the image
-# roughly 1-2 GB. python:3.11-slim matches .python-version.
+# The [context] extra ships the vector-index stack so `lha eval` reaches 6/6
+# in-container (docs/DEPLOY.md). The uv source map selects CPU-only PyTorch on
+# Linux; a CUDA runtime is unnecessary for this image. Python matches the
+# repository's pinned version.
 FROM python:3.11-slim AS runtime
 
 COPY --from=uv-provider /uv /uvx /usr/local/bin/
@@ -35,7 +37,10 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/home/lha/.cache/huggingface
 
-RUN useradd --create-home --home-dir /home/lha --shell /usr/sbin/nologin lha
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --create-home --home-dir /home/lha --shell /usr/sbin/nologin lha
 
 WORKDIR /app
 

@@ -31,6 +31,14 @@ class Provenance(BaseModel):
     score: float = 0.0  # similarity score from the search backend
     indexed_at: datetime = Field(default_factory=now)
     content_hash: str | None = None  # sha256 of the chunk at index time
+    # Document flows persist the digest of the complete source bytes.  Unlike a
+    # chunk hash, this detects edits elsewhere in the same Markdown file even
+    # when its mtime is restored.
+    source_sha256: str | None = None
+    # Locators are portable relative paths when a backend can provide a stable
+    # source root. Freshness checks resolve against this root; code-repair
+    # overlays replace it with the current run workdir.
+    source_root: str | None = None
 
 
 class Hit(BaseModel):
@@ -118,7 +126,17 @@ class ContextBundle(BaseModel):
     # Kinds whose backend could not be searched at all. Even when OTHER kinds
     # returned items (status "ok"), a required step must not proceed as
     # "verified" while a kind it asked for was dark.
-    unavailable_kinds: list[str] = Field(default_factory=list)
+    unavailable_kinds: list[SourceKind] = Field(default_factory=list)
+    unavailable_reasons: dict[SourceKind, str] = Field(default_factory=dict)
+    # A backend was reachable but could not query its index (for example,
+    # corrupt on-disk state or an incompatible schema). This is different from
+    # an unavailable service and must fail the bundle even if another kind
+    # returned useful hits.
+    failed_kinds: list[SourceKind] = Field(default_factory=list)
+    failure_reasons: dict[SourceKind, str] = Field(default_factory=dict)
+    # Persist the full query contract. Inferring kinds from returned items loses
+    # a requested backend that was unavailable and lets a refresh erase the outage.
+    requested_kinds: list[SourceKind] = Field(default_factory=list)
 
     def locators(self) -> list[str]:
         return [i.provenance.locator for i in self.items]

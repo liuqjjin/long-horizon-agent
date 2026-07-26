@@ -1,39 +1,20 @@
-"""Error compounding over a horizon: what the per-step gate buys across n steps.
+"""Describe error compounding without conflating three statistical questions.
 
-``docs/VERIFICATION_FIRST.md`` models a task as ``n`` sequential steps, each
-succeeding independently with probability ``p`` and with no recovery, so
-end-to-end success is ``p**n``. ``lha ablate`` measures ``p`` at ``n = 1``. This
-module measures the other half of that claim — what the same per-step effect
-compounds to over a horizon — and checks it against the model's own prediction.
+``lha ablate`` produces paired truth labels for each ``(task, repetition)`` cell.
+This module reports three estimands from those measurements:
 
-An **episode** is an ordered sequence of ``k`` independent subtasks: each is its
-own repository, its own model call, sharing no state with the others. The
-episode is still correct through step ``k`` only if every one of steps ``1..k``
-truly succeeded, as judged by the ablation's independent scorer. Because the
-subtasks share no state, the attempt drawn at step ``k`` cannot depend on what
-happened at steps ``1..k-1`` — so one measured attempt scores under both
-conditions and the pairing is exact at every ``k``, not only at ``k = 1``.
+1. **Cell level** — how often the same task attempt succeeds under ``trust`` and
+   ``verify``. Its paired unit is one ``(task, repetition)`` cell.
+2. **Episode level** — how often an entire corpus repetition succeeds end to
+   end. Its paired unit is one complete repetition, so ``R`` repetitions are
+   exactly ``R`` independent observed episodes.
+3. **Composition** — the survival curve obtained by inserting empirical
+   per-task rates into an independent-step model. It is a descriptive
+   projection, not another experiment, and adds zero independent samples.
 
-Two conditions, both read off the same measurements:
-
-- ``trust-chain``  — no gate. A wrong step is accepted silently; the episode is
-  already lost and nothing reports it.
-- ``verify-chain`` — gate plus repair at every step.
-
-What this is, stated precisely because the distinction is easy to blur:
-
-- The **curve** is the compounding model evaluated at the measured per-task
-  ``p``. It is exact given independence, which holds by construction. It
-  re-expresses the measured per-step effect on the axis the thesis argues
-  about; it is not a second experiment.
-- The **episodes** are the direct observations. One repetition of the whole
-  corpus is one independent episode, so ``R`` repetitions give exactly ``R``
-  episodes. Composing cells into more orderings does not create information:
-  with ``R = 3`` the paired test at the terminal step returns the same p-value
-  as the single-step test on the same cells. Raising ``--reps`` on ``lha
-  ablate`` is the only thing that changes it.
-
-See ``docs/HORIZON.md`` for the registered prediction and the stopping rule.
+Cell and episode McNemar tests answer different questions and need not have the
+same p-value: several discordant cells can collapse into one discordant episode.
+The composition has no McNemar test at all.
 """
 
 from __future__ import annotations
@@ -100,64 +81,86 @@ class Episode:
 
 @dataclass
 class Curve:
-    """P(episode still correct through step k), k = 1..n."""
+    """Descriptive P(chain still correct through step k), k = 1..n."""
 
     condition: str
     rate: list[float]
-    ci_lo: list[float]
-    ci_hi: list[float]
+    task_bootstrap_lo: list[float]
+    task_bootstrap_hi: list[float]
+
+
+@dataclass(frozen=True)
+class PairedEstimand:
+    """A paired binary comparison at one explicitly named unit of analysis."""
+
+    unit: str
+    pairs: int
+    trust_successes: int
+    verify_successes: int
+    # (verify succeeds / trust fails, trust succeeds / verify fails)
+    discordant: tuple[int, int]
+    mcnemar_p: float
+
+
+@dataclass
+class CompositionEstimand:
+    """A model-derived curve; it contributes no additional observations."""
+
+    unit: str
+    independent_samples_added: int
+    per_task_p: dict[str, dict[str, float]]
+    curves: list[Curve]
 
 
 @dataclass
 class HorizonReport:
     tasks: list[str]
     n_steps: int
-    reps: int
+    independent_episode_count: int
     model: str
     source: str
-    per_task_p: dict[str, float]
-    curves: list[Curve]
+    cell_estimand: PairedEstimand
+    episode_estimand: PairedEstimand
+    composition_estimand: CompositionEstimand
     episodes: list[Episode]
-    discordant: tuple[int, int]
-    mcnemar_p: float
-    reps_for_alpha: int | None
     alpha: float = _TARGET_ALPHA
 
     # --- rendering ---------------------------------------------------------
     def to_markdown(self) -> str:
-        by_cond = {c.condition: c for c in self.curves}
+        by_cond = {c.condition: c for c in self.composition_estimand.curves}
         trust, verify = by_cond["trust-chain"], by_cond["verify-chain"]
         n = self.n_steps
+        cell = self.cell_estimand
+        episode = self.episode_estimand
+        cell_b, cell_c = cell.discordant
+        episode_b, episode_c = episode.discordant
         lines = [
             "# Error compounding over a horizon",
             "",
             f"corpus: {n} independent subtasks · model: `{self.model or '(backend default)'}` · "
-            f"repetitions: {self.reps} → **{self.reps} independent episodes** · "
+            f"complete paired repetitions: {self.independent_episode_count} → "
+            f"**{self.independent_episode_count} independent observed episodes** · "
             f"per-step truth from `{self.source}`",
             "",
-            "An episode is correct through step k only if every one of steps 1..k truly "
-            "succeeded, as graded by the ablation's independent scorer.",
+            "This report keeps three estimands separate. The cell and episode tests use "
+            "different paired units; the composition is a descriptive model projection "
+            "and adds no observations.",
             "",
-            "| k | `trust-chain` (95% CI) | `verify-chain` (95% CI) | gap |",
-            "|---:|---|---|---:|",
-        ]
-        for k in _milestones(n):
-            i = k - 1
-            gap = 100 * (verify.rate[i] - trust.rate[i])
-            lines.append(
-                f"| {k} | {_pct(trust.rate[i])} ({_pct(trust.ci_lo[i])}–{_pct(trust.ci_hi[i])}) "
-                f"| {_pct(verify.rate[i])} ({_pct(verify.ci_lo[i])}–{_pct(verify.ci_hi[i])}) "
-                f"| {gap:+.1f} pp |"
-            )
-        lines += [
+            "## Estimand 1 — paired cells",
             "",
-            "Conditions:",
-        ]
-        for name, _src, blurb in CONDITIONS:
-            lines.append(f"- `{name}` — {blurb}.")
-        lines += [
+            f"Unit: `{cell.unit}` · pairs: **{cell.pairs}** · "
+            f"`trust` true success: {cell.trust_successes}/{cell.pairs} · "
+            f"`verify` true success: {cell.verify_successes}/{cell.pairs}.",
             "",
-            "## Observed episodes",
+            f"Discordant cells (verify-only / trust-only): {cell_b}/{cell_c} · "
+            f"exact McNemar p = {cell.mcnemar_p:.4f}"
+            + ("" if cell.mcnemar_p < self.alpha else " — **not significant**"),
+            "",
+            "## Estimand 2 — observed episodes",
+            "",
+            "An episode is one complete corpus repetition and is correct only if every "
+            "subtask in that repetition truly succeeded. Multiple failed cells in the "
+            "same repetition still make one failed episode.",
             "",
             "| condition | end-to-end correct | first failing subtask(s) |",
             "|---|---|---|",
@@ -171,29 +174,54 @@ class HorizonReport:
                 f"| `{name}` | {ok}/{len(eps)} ({_pct(lo)}–{_pct(hi)}, Wilson) "
                 f"| {', '.join(f'`{t}`' for t in failing) or '—'} |"
             )
-        b, c = self.discordant
         lines += [
             "",
-            f"Paired at the terminal step: discordant {b}/{c} of {self.reps} episodes · "
-            f"exact McNemar p = {self.mcnemar_p:.4f}"
-            + ("" if self.mcnemar_p < self.alpha else " — **not significant**"),
+            f"Discordant episodes (verify-only / trust-only): {episode_b}/{episode_c} of "
+            f"{episode.pairs} paired episodes · exact McNemar p = "
+            f"{episode.mcnemar_p:.4f}"
+            + ("" if episode.mcnemar_p < self.alpha else " — **not significant**"),
             "",
-            "## What this does and does not show",
+            "The cell- and episode-level p-values may coincide for a particular dataset, "
+            "but equality is not a statistical contract: aggregation changes the paired "
+            "unit and can collapse many cell disagreements into one episode disagreement.",
             "",
-            "The curve is the compounding model evaluated at the measured per-task p. "
-            "Independence holds by construction (each subtask is its own repository and "
-            "its own model call), so the composition is exact — but it is a "
-            "re-expression of the per-step measurement, not a second experiment. "
-            "Composing cells into more orderings cannot create information.",
+            "## Estimand 3 — descriptive composition",
             "",
-            f"The evidence is the {self.reps} observed episodes. "
-            + (
-                f"To reach p < {self.alpha} at the observed discordance rate, "
-                f"re-run `lha ablate` with about **{self.reps_for_alpha} repetitions** "
-                "and regenerate this report."
-                if self.reps_for_alpha is not None
-                else "The observed discordance already clears the target alpha."
-            ),
+            "The curve inserts empirical per-task success rates into an independent-step, "
+            "uniform-random-order model. Its task-bootstrap interval describes sensitivity "
+            "to the observed task mix; it is not an episode confidence interval and has no "
+            "McNemar p-value.",
+            "",
+            f"Independent samples added by composition: "
+            f"**{self.composition_estimand.independent_samples_added}**.",
+            "",
+            "| k | `trust-chain` (95% task-bootstrap interval) "
+            "| `verify-chain` (95% task-bootstrap interval) | gap |",
+            "|---:|---|---|---:|",
+        ]
+        for k in _milestones(n):
+            i = k - 1
+            gap = 100 * (verify.rate[i] - trust.rate[i])
+            lines.append(
+                f"| {k} | {_pct(trust.rate[i])} "
+                f"({_pct(trust.task_bootstrap_lo[i])}–"
+                f"{_pct(trust.task_bootstrap_hi[i])}) "
+                f"| {_pct(verify.rate[i])} "
+                f"({_pct(verify.task_bootstrap_lo[i])}–"
+                f"{_pct(verify.task_bootstrap_hi[i])}) "
+                f"| {gap:+.1f} pp |"
+            )
+        lines += [
+            "",
+            "Conditions:",
+        ]
+        for name, _src, blurb in CONDITIONS:
+            lines.append(f"- `{name}` — {blurb}.")
+        lines += [
+            "",
+            "Only new complete repetitions increase the episode sample count. Reordering "
+            "or composing the existing cells changes the projected effect size, not the "
+            "number of independent observed episodes.",
             "",
         ]
         return "\n".join(lines)
@@ -203,15 +231,15 @@ class HorizonReport:
             {
                 "tasks": self.tasks,
                 "n_steps": self.n_steps,
-                "reps": self.reps,
+                "independent_episode_count": self.independent_episode_count,
                 "model": self.model,
                 "source": self.source,
-                "per_task_p": self.per_task_p,
-                "curves": [asdict(c) for c in self.curves],
+                "estimands": {
+                    "cell": asdict(self.cell_estimand),
+                    "episode": asdict(self.episode_estimand),
+                    "composition": asdict(self.composition_estimand),
+                },
                 "episodes": [asdict(e) for e in self.episodes],
-                "discordant": list(self.discordant),
-                "mcnemar_p": self.mcnemar_p,
-                "reps_for_alpha": self.reps_for_alpha,
                 "alpha": self.alpha,
             },
             indent=2,
@@ -298,14 +326,15 @@ def compounding_curve(probabilities: list[float]) -> list[float]:
     return [e[k] / comb(n, k) for k in range(1, n + 1)]
 
 
-def _bootstrap_ci(
+def _task_bootstrap_interval(
     probabilities_by_task: dict[str, float], *, n: int = _BOOTSTRAP_N, seed: int = 0
 ) -> tuple[list[float], list[float]]:
-    """Per-k 95% CI by resampling TASKS with replacement.
+    """Per-k sensitivity interval from resampling tasks with replacement.
 
     Tasks are the exchangeable unit: repetitions of one task are correlated, and
     here the whole effect is carried by however many tasks the model gets wrong,
-    so between-task variation is the uncertainty that matters.
+    so this describes how the projection changes with the observed task mix. It
+    does not add episodes or supply an episode-level confidence interval.
     """
     tasks = list(probabilities_by_task)
     steps = len(tasks)
@@ -344,60 +373,175 @@ def episodes_for(cells: Cells, condition: str, ablation_condition: str) -> list[
     return out
 
 
-def _reps_for_alpha(b: int, c: int, reps: int, alpha: float) -> int | None:
-    """Repetitions needed to reach ``alpha``, extrapolating the observed rate.
-
-    Returns ``None`` when the current data already clears it. Assumes the
-    discordance rate holds and stays one-directional — an optimistic estimate,
-    so treat it as a floor on the sample size rather than a promise.
-    """
-    if mcnemar_exact(b, c) < alpha:
-        return None
-    total = b + c
-    if reps <= 0 or total == 0:
-        return None
-    rate = total / reps
-    for candidate in range(reps + 1, 200):
-        projected = round(candidate * rate)
-        if projected and mcnemar_exact(projected, 0) < alpha:
-            return candidate
-    return None
+def _paired_estimand(unit: str, pairs: list[tuple[bool, bool]]) -> PairedEstimand:
+    """Summarize paired ``(trust, verify)`` outcomes at one unit of analysis."""
+    trust_successes = sum(trust for trust, _verify in pairs)
+    verify_successes = sum(verify for _trust, verify in pairs)
+    verify_only = sum(verify and not trust for trust, verify in pairs)
+    trust_only = sum(trust and not verify for trust, verify in pairs)
+    return PairedEstimand(
+        unit=unit,
+        pairs=len(pairs),
+        trust_successes=trust_successes,
+        verify_successes=verify_successes,
+        discordant=(verify_only, trust_only),
+        mcnemar_p=mcnemar_exact(verify_only, trust_only),
+    )
 
 
 def build_report(cells: Cells, *, seed: int = 0, alpha: float = _TARGET_ALPHA) -> HorizonReport:
     curves: list[Curve] = []
     episodes: list[Episode] = []
-    p_trust: dict[str, float] = {}
+    probabilities: dict[str, dict[str, float]] = {}
     for name, source, _blurb in CONDITIONS:
         probs = per_task_p(cells, source)
-        if name == "trust-chain":
-            p_trust = probs
+        probabilities[name] = probs
         rate = compounding_curve(list(probs.values()))
-        lo, hi = _bootstrap_ci(probs, seed=seed)
-        curves.append(Curve(condition=name, rate=rate, ci_lo=lo, ci_hi=hi))
+        lo, hi = _task_bootstrap_interval(probs, seed=seed)
+        curves.append(
+            Curve(
+                condition=name,
+                rate=rate,
+                task_bootstrap_lo=lo,
+                task_bootstrap_hi=hi,
+            )
+        )
         episodes.extend(episodes_for(cells, name, source))
+
+    cell_pairs = [
+        (cells.truth("trust", task, rep), cells.truth("verify", task, rep))
+        for task in cells.tasks
+        for rep in cells.reps
+        if ("trust", task, rep) in cells.outcome and ("verify", task, rep) in cells.outcome
+    ]
+    if not cell_pairs:
+        raise HorizonDataError("no paired trust/verify cells")
 
     trust_eps = {e.rep: e.end_to_end for e in episodes if e.condition == "trust-chain"}
     verify_eps = {e.rep: e.end_to_end for e in episodes if e.condition == "verify-chain"}
     paired = sorted(set(trust_eps) & set(verify_eps))
-    b = sum(1 for r in paired if verify_eps[r] and not trust_eps[r])
-    c = sum(1 for r in paired if trust_eps[r] and not verify_eps[r])
-    p_value = mcnemar_exact(b, c)
+    if not paired:
+        raise HorizonDataError("no complete repetition is paired under trust and verify")
+    episode_pairs = [(trust_eps[rep], verify_eps[rep]) for rep in paired]
+    paired_episodes = [episode for episode in episodes if episode.rep in paired]
 
     return HorizonReport(
         tasks=cells.tasks,
         n_steps=len(cells.tasks),
-        reps=len(paired),
+        independent_episode_count=len(paired),
         model=cells.model,
         source=cells.source,
-        per_task_p=p_trust,
-        curves=curves,
-        episodes=episodes,
-        discordant=(b, c),
-        mcnemar_p=p_value,
-        reps_for_alpha=_reps_for_alpha(b, c, len(paired), alpha),
+        cell_estimand=_paired_estimand("task × repetition cell", cell_pairs),
+        episode_estimand=_paired_estimand("complete corpus repetition", episode_pairs),
+        composition_estimand=CompositionEstimand(
+            unit="independent-step projection over empirical per-task rates",
+            independent_samples_added=0,
+            per_task_p=probabilities,
+            curves=curves,
+        ),
+        episodes=paired_episodes,
         alpha=alpha,
     )
+
+
+# --- figure ------------------------------------------------------------------
+_W, _H = 720, 380
+_PAD_L, _PAD_R, _PAD_T, _PAD_B = 62, 130, 26, 46
+_INK = "#3d444d"
+_TRUST = "#c9432f"
+_VERIFY = "#1f7a4d"
+
+
+def _svg(report: HorizonReport) -> str:
+    """A dependency-free line chart of the two curves.
+
+    Written by hand rather than through a plotting library so the figure is
+    regenerable from the committed report by anyone who clones the repo, with no
+    extra install. Explicit light panel so it reads on both GitHub themes.
+    """
+    by = {c.condition: c for c in report.composition_estimand.curves}
+    trust, verify = by["trust-chain"], by["verify-chain"]
+    n = report.n_steps
+    plot_w = _W - _PAD_L - _PAD_R
+    plot_h = _H - _PAD_T - _PAD_B
+
+    def x(k: int) -> float:
+        return _PAD_L + (plot_w * (k - 1) / max(n - 1, 1))
+
+    def y(v: float) -> float:
+        return _PAD_T + plot_h * (1.0 - v)
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{_W}" height="{_H}" '
+        f'viewBox="0 0 {_W} {_H}" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">',
+        f'<rect width="{_W}" height="{_H}" fill="#ffffff" rx="6"/>',
+    ]
+    # gridlines + y axis labels
+    for pct in range(0, 101, 20):
+        gy = y(pct / 100)
+        parts.append(
+            f'<line x1="{_PAD_L}" y1="{gy:.1f}" x2="{_PAD_L + plot_w}" y2="{gy:.1f}" '
+            f'stroke="#e6e8eb" stroke-width="1"/>'
+        )
+        parts.append(
+            f'<text x="{_PAD_L - 10}" y="{gy + 4:.1f}" text-anchor="end" font-size="11" '
+            f'fill="{_INK}">{pct}%</text>'
+        )
+    # x axis labels
+    for k in _milestones(n):
+        parts.append(
+            f'<text x="{x(k):.1f}" y="{_PAD_T + plot_h + 18:.1f}" text-anchor="middle" '
+            f'font-size="11" fill="{_INK}">{k}</text>'
+        )
+    # trust-chain confidence band
+    band = " ".join(f"{x(k):.1f},{y(trust.task_bootstrap_hi[k - 1]):.1f}" for k in range(1, n + 1))
+    band += " " + " ".join(
+        f"{x(k):.1f},{y(trust.task_bootstrap_lo[k - 1]):.1f}" for k in range(n, 0, -1)
+    )
+    parts.append(f'<polygon points="{band}" fill="{_TRUST}" fill-opacity="0.10"/>')
+    # the two curves
+    for curve, colour, dash in ((verify, _VERIFY, ""), (trust, _TRUST, "")):
+        pts = " ".join(f"{x(k):.1f},{y(curve.rate[k - 1]):.1f}" for k in range(1, n + 1))
+        extra = f' stroke-dasharray="{dash}"' if dash else ""
+        parts.append(
+            f'<polyline points="{pts}" fill="none" stroke="{colour}" stroke-width="2.4"'
+            f'{extra} stroke-linejoin="round"/>'
+        )
+    # terminal markers + labels
+    for curve, colour, label in (
+        (verify, _VERIFY, "verify-chain"),
+        (trust, _TRUST, "trust-chain"),
+    ):
+        vy, terminal = y(curve.rate[-1]), curve.rate[-1]
+        parts.append(f'<circle cx="{x(n):.1f}" cy="{vy:.1f}" r="3.6" fill="{colour}"/>')
+        parts.append(
+            f'<text x="{x(n) + 10:.1f}" y="{vy + 4:.1f}" font-size="12" fill="{colour}" '
+            f'font-weight="600">{label} {100 * terminal:.0f}%</text>'
+        )
+    # axes + titles
+    parts.append(
+        f'<line x1="{_PAD_L}" y1="{_PAD_T + plot_h}" x2="{_PAD_L + plot_w}" '
+        f'y2="{_PAD_T + plot_h}" stroke="{_INK}" stroke-width="1.2"/>'
+    )
+    parts.append(
+        f'<line x1="{_PAD_L}" y1="{_PAD_T}" x2="{_PAD_L}" y2="{_PAD_T + plot_h}" '
+        f'stroke="{_INK}" stroke-width="1.2"/>'
+    )
+    parts.append(
+        f'<text x="{_PAD_L + plot_w / 2:.1f}" y="{_H - 10}" text-anchor="middle" '
+        f'font-size="12" fill="{_INK}">steps completed (k)</text>'
+    )
+    parts.append(
+        f'<text x="14" y="{_PAD_T + plot_h / 2:.1f}" font-size="12" fill="{_INK}" '
+        f'transform="rotate(-90 14 {_PAD_T + plot_h / 2:.1f})" text-anchor="middle">'
+        "end-to-end still correct</text>"
+    )
+    parts.append(
+        f'<text x="{_PAD_L}" y="{_PAD_T - 10}" font-size="11" fill="#8b949e">'
+        f"{n} subtasks · descriptive composition · 0 added episodes</text>"
+    )
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
 
 
 def run_horizon(report_path: str | Path, out_dir: str | Path, *, seed: int = 0) -> HorizonReport:
@@ -407,4 +551,5 @@ def run_horizon(report_path: str | Path, out_dir: str | Path, *, seed: int = 0) 
     out.mkdir(parents=True, exist_ok=True)
     (out / "horizon_report.json").write_text(report.to_json())
     (out / "horizon_report.md").write_text(report.to_markdown())
+    (out / "horizon_curve.svg").write_text(_svg(report))
     return report

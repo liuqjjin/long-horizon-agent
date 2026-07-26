@@ -1,0 +1,17 @@
+kind: issue_to_pr
+title: "SQLite v1 databases cannot migrate or persist v2 notes safely"
+description: >
+  Make the schema migration transactional and idempotent, backfill legacy rows with
+  timezone-aware timestamps, advance user_version, and ensure newly inserted notes
+  retain the same timestamp after the database is reopened.
+target_repo: data/long_tasks/sqlite_migration/repo
+context_requirement: optional
+inputs:
+  context_query: "sqlite user_version migration backfill idempotent persistence"
+  repo_adapter: data/long_tasks/sqlite_migration/adapter.yaml
+  reference_manifest: data/long_tasks/sqlite_migration/reference_manifest.json
+success:
+  - "legacy v1 data migrates without loss"
+  - "opening an already migrated database is idempotent"
+  - "new notes survive reopen with stable timestamps"
+

@@ -6,6 +6,75 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Durable patch transactions.** `ResolvedPatch` derives one write set from the
+  actual patch, and `PatchTransaction` records
+  `PREPARED`/`APPLIED`/`VERIFIED`/`REVERTED` with a checksummed journal,
+  per-attempt artifacts, and redundant backups. Backups preserve original bytes,
+  file modes, and directories created by a patch.
+- **Run-state schema v2.** Checkpoints now persist stable attempt IDs, cumulative
+  model usage, and the original step, repair, deadline, and model-call limits.
+  Resume rejects any configuration drift in those limits. A per-run lock rejects
+  concurrent resume, while ledger idempotency keys prevent duplicate approval
+  and completion events. Schema-v1 runs remain inspectable but are not resumed
+  unsafely.
+- **Five fixed 10-step repository tasks** under `data/long_tasks/`, covering
+  configuration parsing, SQLite migration, concurrency, CLI contracts, and
+  experiment reproducibility. Their integration protocol includes a rejected
+  first patch, repair, two approvals, a process interruption, and comparison
+  with an uninterrupted terminal state.
+- **Typed `RepoAdapter` stages** for integrity, setup, baseline, reproduction,
+  targeted tests, full tests, lint, build, and cleanup. Stage intent is written
+  before execution; ambiguous completion fails closed rather than replaying a
+  possible side effect.
+- **Validated run reporting.** `lha trace --html` writes a self-contained static
+  report; `lha runs list|show|prune` inspects evidence and performs dry-run-first
+  retention. Locked, active, or corrupt runs cannot be pruned.
+
+### Changed
+- **Codex CLI isolation and protocol validation** now use an attempt-local home,
+  credential copy, workspace, temporary directory, minimal environment, and a
+  dedicated process group. Malformed or incomplete JSONL, unknown events, error
+  events, and unfinished/disallowed tool use fail closed. Secret-free
+  provenance records CLI version, model, reasoning effort, event summary, usage,
+  and outcome.
+- **Experiment evidence** binds input/output arrays with hashes, shapes, dtypes,
+  and finite-value checks. Reproducibility uses a fresh rerun directory and
+  refuses stale, missing, or mismatched artifacts.
+- **Context evidence** records requested kinds, source digests, partial
+  availability, and failure reasons instead of conflating empty results with an
+  unavailable or damaged index.
+- **Horizon statistics** now report paired cells, observed complete-corpus
+  episodes, and descriptive composition as three separate estimands. Cell- and
+  episode-level McNemar tests may differ; composition adds no samples and has no
+  McNemar p-value.
+- **Boundary-rate intervals use Wilson scores.** Interior rates retain the
+  task-cluster bootstrap; an all-zero or all-one sample no longer receives a
+  misleading zero-width percentile interval.
+- Packaged CocoIndex flows moved under `src/lha/live_context/flows/`, and release
+  checks now build and install both wheel and source distribution from empty
+  directories.
+- Public documentation was updated for the transaction, long-task, reporting,
+  packaging, and statistical contracts. The root README remains Chinese; the
+  compact English overview is `docs/README.en.md`.
+
+### Measurement
+- The frozen schema-v2 ablation contains 17 tasks × 12 repetitions = 204 paired
+  cells, scored independently in Docker with 0 `ERROR` cells. With Codex CLI
+  0.141.0, `gpt-5.4-mini`, low reasoning effort, and read-only mode, `trust`
+  produced 194 correct and 10 incorrect deliveries. `gate` accepted the 194
+  correct attempts and rejected all 10 incorrect attempts; bounded repair then
+  brought `verify` to 204/204 correct. The exact two-sided McNemar result for
+  `trust` versus `verify` is `p = 0.00195`.
+- Across the 12 observed whole-corpus episodes, `trust` completed 2/12 and
+  `verify` completed 12/12. The separate horizon composition adds zero
+  independent samples and is reported only as a model-based projection.
+- The release gate produced `523 passed, 3 skipped`, 83% statement coverage,
+  and `lha eval` at 6/6. Generated files under `benchmarks/` remain the
+  authoritative source for experiment numbers.
+- Terminal-Bench and SWE-bench adapters do not imply a score. No public
+  benchmark result is claimed in this release section.
+
 ## [0.4.1] — 2026-07-25
 
 ### Fixed
@@ -39,13 +108,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   truly succeeded, as graded by the ablation's independent scorer. The curve is
   the compounding model evaluated at the measured per-task `p`, computed exactly
   (elementary symmetric polynomial over random orderings, no sampling noise) with
-  a task-cluster bootstrap CI. Composed from the committed run: `trust-chain`
-  falls to 44% (13–100%) at 17 steps while `verify-chain` stays at 100%.
-  The report states in its own body that composition changes the effect size and
-  not the confidence — one repetition of the corpus is one episode, so the paired
-  test at the terminal step returns the same `p = 0.50` as the single-step test on
-  the same cells, and it names how many repetitions would clear `p < 0.05`.
-  Registered prediction and stopping rule in [docs/HORIZON.md](docs/HORIZON.md).
+  a task-cluster bootstrap interval. The v0.4.0 generated output is historical;
+  its assumption that cell- and episode-level paired tests must agree was
+  corrected under Unreleased. Current results come only from regenerated
+  `benchmarks/horizon_report.*`.
 - `bench.stats.wilson_interval`: a score interval for boundary proportions, where a
   percentile bootstrap degenerates to a zero-width `0%–0%` artifact.
 - **Execution backends** (`lha.sandbox`): a single seam for everywhere
@@ -113,12 +179,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **cocoindex/sentence-transformers moved to the `[context]` extra.** Without
   it the vector backends report "unavailable" (fail-closed for required
   context) with an install hint; the dev group still installs both.
-- The ablation headline was re-measured under the new method (pinned
-  `claude-haiku-4-5-20251001`, independent scorer, 17 tasks × 3 reps): trust
-  ships 2/51 wrong fixes (4%, CI 0–10%); the gate refuses exactly those two
-  with zero false negatives; repair fixes both (100% true success). The
-  previously published 39%→0%→85% numbers came from the old gate-graded design
-  and a floating model alias and are superseded.
+- The ablation headline was re-measured under the new independent-scorer method.
+  Those v0.4.0 measurements and the earlier gate-graded headline are historical
+  and superseded; current numbers come only from the regenerated report named in
+  the Unreleased section.
 - Reworded documentation and code comments for a plainer, more consistent voice, and
   renamed the self-eval suite (previously "ResearchAgentBench-Lite") to "self-eval".
   No behavior change.
@@ -133,11 +197,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   held for the parts but not for the aggregate. Every call site already guarded
   it, so no run ever passed vacuously, but the guard was a convention rather than
   a property of the type. Pinned by `tests/test_verdict_failclosed.py`.
-- Documentation drift caught by re-running the gate: `docs/ABLATION.md` said "3
-  wrong first attempts" where the committed run measured two, `CONTRIBUTING.md`
-  quoted 73% coverage over 65 tests against an actual 80% over 192,
-  `docs/demo.md` embedded a `demo.gif` that does not exist, and `.env.example`
-  listed 9 of the 18 environment variables the harness reads.
+- Documentation drift caught by re-running the gate: ablation and coverage
+  numbers no longer matched their generated output, `docs/demo.md` embedded a
+  file that did not exist, and `.env.example` omitted supported variables.
 - Untracked `.coverage`, a local artifact that had been committed.
 
 ## [0.3.0] — 2026-06-28

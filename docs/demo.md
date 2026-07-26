@@ -1,73 +1,127 @@
-# Recording the demo GIF
+# 60–90 second terminal demo
 
-A short terminal GIF for the README. This file is the script to record it.
+This is a recording script, not a claim that a video has already been produced.
+Run it on a workstation with a warm `uv` environment, review the output, and
+publish media only after every command succeeds.
 
-> **NOTE (for a human):** recording needs an interactive TTY and screen-recording
-> tools, so it must be run on a workstation — not by the headless autonomous
-> maintainer. Follow the steps below, then drop the result at
-> `docs/demo.gif` and it will appear in the README via the embed at the bottom.
+The recording has two parts:
 
-## What the demo shows
+1. a real approval-gated CLI run that pauses in one process and resumes in
+   another;
+2. one fixed 10-step long-task integration test whose persisted trace contains
+   an objectively rejected first patch, one repair, two approvals, a simulated
+   process exit at a safe boundary, and successful recovery.
 
-1. The **durable human-approval gate** on the LangGraph runtime:
-   `run → AWAITING_APPROVAL → approve → resume → DONE` (the run is checkpointed to
-   `graph.sqlite` between the two processes).
-2. The harness **self-evaluating** with `lha eval` → `6/6`.
-
-Both are objective: the fix is accepted only after a real `pytest` passes.
+The reference patch used by the integration test is test-only oracle data; the
+production harness does not read it.
 
 ## Prerequisites
 
 ```bash
-# the harness
 uv sync
 
-# recording tools (macOS shown; Linux: use your package manager)
-brew install asciinema agg          # agg converts .cast -> .gif
+# macOS; use equivalent packages on Linux
+brew install asciinema agg
 ```
 
-## Record
+Open a 100×32 terminal. Keep the environment and model cache warm before
+recording so installation and downloads are not part of the clip.
+
+## Start recording
 
 ```bash
-# clean slate so run_ids are fresh
-rm -rf runs
-
-asciinema rec docs/demo.cast --overwrite --cols 100 --rows 30 -c bash
-# --- inside the recording session, run: ---
-
-# 1) start a run whose edit step needs approval -> pauses, durably checkpointed
-uv run lha run --runtime langgraph data/tasks/fix_average_approval.yaml
-#    note the printed run_id, e.g. 20260101-120000-fix-average-...-abcd
-RID=$(ls -t runs | head -1)
-
-# 2) a human approves the pending edit
-uv run lha approve "$RID"
-
-# 3) resume: LangGraph replays from the SqliteSaver checkpoint, verifies, finishes
-uv run lha resume --runtime langgraph "$RID"
-
-# 4) the harness grades itself across all six workflows
-uv run lha eval
-
-exit   # ends the asciinema recording
+asciinema rec docs/demo.cast \
+  --overwrite \
+  --cols 100 \
+  --rows 32 \
+  -c 'env PS1="$ " zsh -f'
 ```
 
-## Convert to GIF and embed
+Run the following commands inside that shell.
+
+## Part 1 — approval survives a process boundary
+
+Use a unique output directory so the demo does not delete or mix with existing
+runs:
 
 ```bash
-agg docs/demo.cast docs/demo.gif --cols 100 --rows 30
-rm docs/demo.cast              # keep the repo light; the GIF is the artifact
+DEMO_ROOT="${TMPDIR:-/tmp}/lha-demo-$(date +%Y%m%d-%H%M%S)-$$"
+DEMO_START_LOG="$DEMO_ROOT/start.log"
+mkdir -p "$DEMO_ROOT"
+export LHA_RUNS_DIR="$DEMO_ROOT/manual"
+
+uv run lha run \
+  --runtime langgraph \
+  data/tasks/fix_average_approval.yaml | tee "$DEMO_START_LOG"
+
+DEMO_RUN_ID="$(awk '$1 == "run_id" {print $3}' "$DEMO_START_LOG")"
+uv run lha runs show "$DEMO_RUN_ID"
+uv run lha approve "$DEMO_RUN_ID" --note "reviewed the persisted patch"
+uv run lha resume --runtime langgraph "$DEMO_RUN_ID"
+uv run lha trace "$DEMO_RUN_ID"
 ```
 
-It renders in this doc once `docs/demo.gif` exists (below); add the same line to
-the README with the path `docs/demo.gif`:
+The first command must show `AWAITING_APPROVAL`; the resume must show `DONE` only
+after executable checks pass. Stop the recording if either expectation is not
+met.
 
-Once `docs/demo.gif` exists, uncomment the line below (and add the same one to the
-README) so it renders here:
+## Part 2 — rejected patch, repair, interruption, and 10-step resume
 
-<!-- ![demo: approval-gated run, resume, and lha eval 6/6](demo.gif) -->
+Run one parameterized integration case in a retained, unique pytest directory:
 
+```bash
+DEMO_PYTEST_ROOT="$DEMO_ROOT/long-task"
 
-Tips for a clean recording: keep the window ~100×30, run each command and let its
-output settle before the next, and trim dead time afterward with
-`asciinema`'s editing or by re-recording. Aim for under ~30 seconds.
+uv run pytest \
+  'tests/test_long_task_harness.py::test_all_long_tasks_approval_and_safe_crash_match_an_uninterrupted_run[config_parser]' \
+  --basetemp "$DEMO_PYTEST_ROOT" \
+  -q \
+  -rA
+
+DEMO_LONG_RUN="$(find "$DEMO_PYTEST_ROOT" \
+  -type d \
+  -name 'config_parser-interrupted' \
+  -print \
+  -quit)"
+DEMO_LONG_RUNS="$(dirname "$DEMO_LONG_RUN")"
+
+LHA_RUNS_DIR="$DEMO_LONG_RUNS" \
+  uv run lha runs show config_parser-interrupted
+LHA_RUNS_DIR="$DEMO_LONG_RUNS" \
+  uv run lha trace config_parser-interrupted
+LHA_RUNS_DIR="$DEMO_LONG_RUNS" \
+  uv run lha trace config_parser-interrupted --html
+```
+
+The test itself is the check. It asserts:
+
+- the initial empty patch reaches approval and is rejected by the targeted
+  repository check;
+- the reference repair reaches a second approval and passes;
+- the process exits after step 6 is durably verified and before step 7 begins;
+- a fresh `Harness` resumes and completes all 10 steps;
+- repaired and uninterrupted worktrees have the same terminal digest;
+- approval, repair, and completion idempotency keys are not duplicated.
+
+The final `trace` makes the persisted step and repair history visible. The HTML
+path printed by the last command can be opened after recording; do not spend
+screen time launching a browser in the terminal clip.
+
+## Finish and render
+
+```bash
+exit
+agg docs/demo.cast docs/demo.gif --cols 100 --rows 32
+```
+
+Review the GIF before adding an embed. Check that:
+
+- no username, credential path, token, unrelated terminal history, or private
+  repository path is visible;
+- the clip is between 60 and 90 seconds after trimming idle time;
+- the `AWAITING_APPROVAL`, `DONE`, pytest pass, repair event, and 10 completed
+  steps remain readable;
+- no result is described before its command appears.
+
+Do not commit `demo.gif` merely because the script exists. The media is a release
+artifact only after the recording has been made and reviewed.
