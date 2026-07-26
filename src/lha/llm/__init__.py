@@ -17,6 +17,18 @@ def get_llm(config: Config) -> LLMClient:
         return ClaudeCLIClient(
             cli_path=config.claude_cli_path, model=config.claude_cli_model or None
         )
+    if backend == "codex_cli":
+        from .codex_cli import CodexCLIClient
+
+        return CodexCLIClient(
+            cli_path=config.codex_cli_path,
+            model=config.codex_model or None,
+            reasoning_effort=config.codex_reasoning_effort,
+            sandbox_mode=config.codex_sandbox,
+            externally_sandboxed=config.codex_external_sandbox,
+            max_retries=config.codex_max_retries,
+            retry_backoff_s=config.codex_retry_backoff_s,
+        )
     if backend == "anthropic":
         from .anthropic_client import AnthropicClient
 

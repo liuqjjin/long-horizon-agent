@@ -14,7 +14,6 @@ from pathlib import Path
 
 from ..artifacts import Patch, Plan, Step
 from ..live_context.models import ContextBundle
-from ..tools.patch import make_unified_diff
 
 _DIFF_FENCE = re.compile(r"```(?:diff|patch)?\s*\n(.*?)```", re.DOTALL)
 _JSON_FENCE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
@@ -98,8 +97,9 @@ class LLMClient(ABC):
             f"## Example plan for this task kind\n{template.model_dump_json(indent=2)}\n\n"
             "Return a JSON plan decomposing this task into verifiable steps."
         )
+        response = self.complete(_PLAN_SYSTEM, prompt)
         try:
-            data = json.loads(extract_json(self.complete(_PLAN_SYSTEM, prompt)) or "{}")
+            data = json.loads(extract_json(response) or "{}")
             steps = [Step.model_validate(s) for s in data.get("steps", [])]
             if not steps:
                 return None
@@ -109,7 +109,7 @@ class LLMClient(ABC):
                 steps=steps,
                 overall_success=task.success or template.overall_success,
             )
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             return None
 
     def propose_patch(self, step, bundle: ContextBundle, workdir: str | Path) -> Patch:
@@ -139,7 +139,6 @@ class LLMClient(ABC):
     ) -> Patch:
         blocks = extract_file_blocks(response) or self._single_block_fallback(workdir, response)
         file_contents: dict[str, str] = {}
-        diffs: list[str] = []
         for rel, content in blocks.items():
             if Path(rel).is_absolute() or ".." in Path(rel).parts:
                 continue  # apply_patch guards too, but never even propose an escape
@@ -151,10 +150,8 @@ class LLMClient(ABC):
             norm = content if content.endswith("\n") else content + "\n"
             if norm.strip() and norm != original:
                 file_contents[rel] = norm
-                diffs.append(make_unified_diff(original, norm, rel))
         return Patch(
             step_id=step.step_id,
-            unified_diff="".join(diffs),
             file_contents=file_contents,
             touched_files=list(file_contents),
             rationale=f"Whole-file fix by {self.name}.",

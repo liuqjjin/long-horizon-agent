@@ -11,7 +11,6 @@ from pathlib import Path
 
 from ..artifacts import Patch
 from ..live_context.models import ContextBundle
-from ..tools.patch import make_unified_diff
 from .base import LLMClient
 
 # The scripted fix: drop the stray "- 1" in average().
@@ -46,7 +45,6 @@ class DeterministicStub(LLMClient):
 
         return Patch(
             step_id=step.step_id,
-            unified_diff=make_unified_diff(original, fixed, target_rel),
             touched_files=[target_rel],
             file_contents={target_rel: fixed},
             rationale="Remove the stray '- 1' that made average() off-by-one.",
