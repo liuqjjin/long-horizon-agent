@@ -1,7 +1,8 @@
 """Describe error compounding without conflating three statistical questions.
 
-``lha ablate`` produces paired truth labels for each ``(task, repetition)`` cell.
-This module reports three estimands from those measurements:
+``lha ablate`` produces paired delivered-correctness labels for each
+``(task, repetition)`` cell. This module reports three estimands from those
+measurements:
 
 1. **Cell level** — how often the same task attempt succeeds under ``trust`` and
    ``verify``. Its paired unit is one ``(task, repetition)`` cell.
@@ -35,6 +36,8 @@ CONDITIONS: list[tuple[str, str, str]] = [
 
 _BOOTSTRAP_N = 2_000
 _TARGET_ALPHA = 0.05
+_ABLATION_CONDITIONS = frozenset({"trust", "gate", "verify"})
+_RECORD_STATUSES = frozenset({"DONE", "FAILED", "ERROR"})
 
 
 class HorizonDataError(ValueError):
@@ -43,7 +46,7 @@ class HorizonDataError(ValueError):
 
 @dataclass(frozen=True)
 class Cells:
-    """Per-``(condition, task, rep)`` truth, as measured by the ablation scorer."""
+    """Per-cell delivered correctness, after combining decision and scorer truth."""
 
     tasks: list[str]
     reps: list[int]
@@ -271,21 +274,90 @@ def load_cells(report_path: str | Path) -> Cells:
     except (OSError, json.JSONDecodeError) as e:
         raise HorizonDataError(f"unreadable ablation report {path}: {e}") from e
 
+    if not isinstance(raw, dict):
+        raise HorizonDataError(f"{path} must contain a JSON object")
+    schema_raw = raw.get("schema_version", 1)
+    if not isinstance(schema_raw, int) or isinstance(schema_raw, bool) or schema_raw < 1:
+        raise HorizonDataError(f"{path} has an invalid schema_version")
+    schema_version = schema_raw
+    tasks_raw = raw.get("tasks")
+    if (
+        not isinstance(tasks_raw, list)
+        or not tasks_raw
+        or not all(isinstance(task, str) and task for task in tasks_raw)
+        or len(tasks_raw) != len(set(tasks_raw))
+    ):
+        raise HorizonDataError(f"{path} has an invalid task list")
+    records = raw.get("records")
+    if not isinstance(records, list):
+        raise HorizonDataError(f"{path} has an invalid records list")
+
+    tasks = sorted(tasks_raw)
+    declared_tasks = set(tasks)
     outcome: dict[tuple[str, str, int], bool] = {}
     reps: set[int] = set()
-    for rec in raw.get("records", []):
-        if rec.get("status") == "ERROR":
+    seen: set[tuple[str, str, int]] = set()
+    for index, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            raise HorizonDataError(f"{path} record {index} must be a JSON object")
+        condition = rec.get("condition")
+        task = rec.get("task")
+        rep = rec.get("rep")
+        status = rec.get("status")
+        true_success = rec.get("true_success")
+        if not isinstance(condition, str) or condition not in _ABLATION_CONDITIONS:
+            raise HorizonDataError(f"{path} record {index} has invalid condition {condition!r}")
+        if not isinstance(task, str) or task not in declared_tasks:
+            raise HorizonDataError(f"{path} record {index} has invalid task {task!r}")
+        if not isinstance(rep, int) or isinstance(rep, bool) or rep < 0:
+            raise HorizonDataError(f"{path} record {index} has invalid repetition {rep!r}")
+        if not isinstance(status, str) or status not in _RECORD_STATUSES:
+            raise HorizonDataError(f"{path} record {index} has invalid status {status!r}")
+        if not isinstance(true_success, bool):
+            raise HorizonDataError(
+                f"{path} record {index} field 'true_success' must be boolean"
+            )
+        if schema_version >= 4:
+            claimed_success = rec.get("claimed_success")
+            artifact_correct = rec.get("artifact_correct")
+            if not isinstance(claimed_success, bool):
+                raise HorizonDataError(
+                    f"{path} record {index} field 'claimed_success' must be boolean"
+                )
+            if not isinstance(artifact_correct, bool):
+                raise HorizonDataError(
+                    f"{path} record {index} field 'artifact_correct' must be boolean"
+                )
+            if true_success != (claimed_success and artifact_correct):
+                raise HorizonDataError(
+                    f"{path} record {index} has inconsistent delivered correctness"
+                )
+        else:
+            # Historical schemas used true_success for artifact correctness.
+            # If the delivery decision is present, recover the chain outcome;
+            # otherwise keep the historical value for read-only compatibility.
+            claimed_success = rec.get("claimed_success")
+            if isinstance(claimed_success, bool):
+                true_success = claimed_success and true_success
+
+        key = (condition, task, rep)
+        if key in seen:
+            raise HorizonDataError(f"{path} contains duplicate measured cell {key!r}")
+        seen.add(key)
+        if status == "ERROR":
             continue
-        outcome[(rec["condition"], rec["task"], int(rec["rep"]))] = bool(rec["true_success"])
-        reps.add(int(rec["rep"]))
-    tasks = sorted(raw.get("tasks", []))
+        outcome[key] = true_success
+        reps.add(rep)
     if not tasks or not outcome:
         raise HorizonDataError(f"{path} contains no usable measured cells")
+    model = raw.get("model", "")
+    if not isinstance(model, str):
+        raise HorizonDataError(f"{path} field 'model' must be a string")
     return Cells(
         tasks=tasks,
         reps=sorted(reps),
         outcome=outcome,
-        model=raw.get("model", ""),
+        model=model,
         source=str(path),
     )
 

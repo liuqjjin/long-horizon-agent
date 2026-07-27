@@ -35,6 +35,8 @@ def _report(tmp_path, outcomes: dict[str, list[tuple[bool, bool]]], model="m"):
                     "condition": "trust",
                     "rep": rep,
                     "status": "DONE",
+                    "claimed_success": True,
+                    "artifact_correct": trust,
                     "true_success": trust,
                 }
             )
@@ -44,11 +46,22 @@ def _report(tmp_path, outcomes: dict[str, list[tuple[bool, bool]]], model="m"):
                     "condition": "verify",
                     "rep": rep,
                     "status": "DONE",
+                    "claimed_success": verify,
+                    "artifact_correct": verify,
                     "true_success": verify,
                 }
             )
     path = tmp_path / "ablation_report.json"
-    path.write_text(json.dumps({"tasks": list(outcomes), "model": model, "records": records}))
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "tasks": list(outcomes),
+                "model": model,
+                "records": records,
+            }
+        )
+    )
     return path
 
 
@@ -90,12 +103,100 @@ def test_load_cells_drops_error_records(tmp_path):
     path = _report(tmp_path, {"a": [(True, True)]})
     raw = json.loads(path.read_text())
     raw["records"].append(
-        {"task": "a", "condition": "trust", "rep": 1, "status": "ERROR", "true_success": False}
+        {
+            "task": "a",
+            "condition": "trust",
+            "rep": 1,
+            "status": "ERROR",
+            "claimed_success": False,
+            "artifact_correct": False,
+            "true_success": False,
+        }
     )
     path.write_text(json.dumps(raw))
     cells = load_cells(path)
     assert ("trust", "a", 1) not in cells.outcome  # an ERROR is not a measurement
     assert cells.complete_reps("trust") == [0]
+
+
+@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
+def test_load_cells_rejects_non_boolean_truth_values(tmp_path, value):
+    path = _report(tmp_path, {"a": [(True, True)]})
+    raw = json.loads(path.read_text())
+    raw["records"][0]["true_success"] = value
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(HorizonDataError, match="'true_success' must be boolean"):
+        load_cells(path)
+
+
+def test_load_cells_validates_error_records_before_dropping_them(tmp_path):
+    path = _report(tmp_path, {"a": [(True, True)]})
+    raw = json.loads(path.read_text())
+    raw["records"].append(
+        {
+            "task": "a",
+            "condition": "trust",
+            "rep": 1,
+            "status": "ERROR",
+            "claimed_success": False,
+            "artifact_correct": False,
+            "true_success": "false",
+        }
+    )
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(HorizonDataError, match="'true_success' must be boolean"):
+        load_cells(path)
+
+
+def test_load_cells_rejects_duplicate_condition_task_rep_cells(tmp_path):
+    path = _report(tmp_path, {"a": [(True, True)]})
+    raw = json.loads(path.read_text())
+    duplicate = dict(raw["records"][0])
+    duplicate["claimed_success"] = False
+    duplicate["artifact_correct"] = False
+    duplicate["true_success"] = False
+    raw["records"].append(duplicate)
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(HorizonDataError, match="duplicate measured cell"):
+        load_cells(path)
+
+
+def test_load_cells_rejects_boolean_repetition_values(tmp_path):
+    path = _report(tmp_path, {"a": [(True, True)]})
+    raw = json.loads(path.read_text())
+    raw["records"][0]["rep"] = True
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(HorizonDataError, match="invalid repetition"):
+        load_cells(path)
+
+
+def test_schema_four_chain_uses_delivery_not_artifact_correctness(tmp_path):
+    path = _report(tmp_path, {"a": [(True, True)]})
+    raw = json.loads(path.read_text())
+    verify = next(record for record in raw["records"] if record["condition"] == "verify")
+    verify["claimed_success"] = False
+    verify["artifact_correct"] = True
+    verify["true_success"] = False
+    verify["status"] = "FAILED"
+    path.write_text(json.dumps(raw))
+
+    cells = load_cells(path)
+
+    assert cells.truth("verify", "a", 0) is False
+
+
+def test_schema_four_rejects_inconsistent_delivery_truth(tmp_path):
+    path = _report(tmp_path, {"a": [(True, True)]})
+    raw = json.loads(path.read_text())
+    raw["records"][0]["claimed_success"] = False
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(HorizonDataError, match="inconsistent delivered correctness"):
+        load_cells(path)
 
 
 def test_load_cells_rejects_an_empty_report(tmp_path):

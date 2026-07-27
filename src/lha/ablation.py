@@ -16,17 +16,16 @@ Prediction and truth are produced by different mechanisms:
     what happened in the working copy — and runs pytest there through a separate
     execution backend. Its outcome is *truth*.
 
-Every condition is scored by the final scorer, including attempts the gate refused,
-so the gate's precision/recall/FPR/FNR and a full confusion matrix are measured
-rather than assumed. (With a shared oracle, prediction==truth would hold by
-construction; here divergence — stale caches, dirty workdirs, flaky tests — is
-observable.)
+Every condition is scored by the final scorer, including attempts the gate refused.
+``artifact_correct`` records that verdict; ``true_success`` additionally requires
+the condition to deliver the artifact. Gate precision/recall/FPR/FNR use artifact
+correctness, while end-to-end success uses delivered correctness.
 
 Integrity properties:
   - Leak-free: the implementer is a single-shot completion with file tools denied
     (``no_tools``) and sees only non-test source, so it cannot read the oracle.
-  - Tamper-proof: a patch may only edit source (tools.policy); the test oracle and
-    config stay canonical, and the frozen diff excludes protected paths.
+  - Protected paths are excluded from the frozen patch; this is an input-policy
+    guarantee, not containment against arbitrary same-UID code at runtime.
   - Transient backend errors are retried and, if they persist, recorded as ``ERROR``
     (never cached; excluded from rates but counted and reported, never silently
     dropped).
@@ -49,11 +48,15 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
+import stat
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from enum import Enum
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import __version__
@@ -63,6 +66,16 @@ from .clock import now
 from .config import Config
 from .live_context.models import ContextBundle, Freshness
 from .llm.base import LLMClient
+from .pytest_evidence import (
+    EVIDENCE_SCHEMA as PYTEST_EVIDENCE_SCHEMA,
+)
+from .pytest_evidence import (
+    canonical_json_bytes,
+    classify_receipt,
+    collect_inventory,
+    run_with_evidence,
+    validate_evidence,
+)
 from .sandbox import ExecutionBackend, TrustedLocalBackend, make_backend
 from .tasks.spec import TaskSpec
 from .tools import policy
@@ -81,13 +94,58 @@ CONDITIONS = [
 
 _MAX_REPAIRS = 3
 _LLM_RETRIES = 3
-_CACHE_SCHEMA = 4
-_REPORT_SCHEMA = 2
+_CACHE_SCHEMA = 7
+_REPORT_SCHEMA = 4
+_FROZEN_ARTIFACT_SCHEMA = 1
+_INPUT_SNAPSHOT_SCHEMA = 1
+_SCORER_EVIDENCE_SCHEMA = 2
 _BOOTSTRAP_N = 10_000
+_READ_CHUNK_BYTES = 64 * 1024
+_MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+_MAX_SCORER_EVIDENCE_BYTES = 12 * 1024 * 1024
+_MAX_CACHE_BYTES = 8 * 1024 * 1024
+_MAX_REPORT_BYTES = 32 * 1024 * 1024
+_MAX_TASK_BYTES = 2 * 1024 * 1024
+_MAX_SOURCE_TEXT_BYTES = 8 * 1024 * 1024
 
 
 class _Transient(Exception):
     """A backend error that should be retried / excluded, not counted as a result."""
+
+
+class ScoreOutcome(str, Enum):
+    """A Pytest measurement, keeping test failures separate from missing evidence."""
+
+    PASS = "PASS"
+    TEST_FAIL = "TEST_FAIL"
+    INFRA_ERROR = "INFRA_ERROR"
+
+
+@dataclass(frozen=True)
+class PytestResult:
+    outcome: ScoreOutcome
+    returncode: int | None
+    detail: str
+    messages: tuple[str, ...] = ()
+    evidence_sha256: str = ""
+    expected_tests: int = 0
+    passed_tests: int = 0
+
+    @property
+    def passed(self) -> bool:
+        return self.outcome is ScoreOutcome.PASS
+
+
+@dataclass(frozen=True)
+class ScorerEvidenceBinding:
+    """Identity that prevents a valid receipt from grading a different cell."""
+
+    task: str
+    rep: int
+    artifact_sha256: str
+    input_snapshot_sha256: str
+    scorer_backend: str
+    scorer_image_id: str | None
 
 
 @dataclass
@@ -97,13 +155,19 @@ class RunRecord:
     rep: int
     status: str  # DONE | FAILED | ERROR
     claimed_success: bool  # the condition's own decision (internal gate for gate/verify)
-    true_success: bool  # the independent final scorer's verdict on the frozen artifact
-    false_success: bool  # claimed and not true
+    artifact_correct: bool  # independent scorer verdict for the frozen patch bytes
+    true_success: bool  # the condition delivered an independently correct artifact
+    false_success: bool  # delivered, but the artifact is independently incorrect
     repairs: int
     detail: str = ""
     # internal-gate prediction (None for trust, which runs no gate)
     gate_prediction: bool | None = None
     artifact_sha256: str = ""
+    # Final Pytest scorer classification. Older reports legitimately omit it.
+    scorer_outcome: str | None = None
+    scorer_evidence_sha256: str = ""
+    scorer_expected_tests: int = 0
+    scorer_passed_tests: int = 0
 
 
 @dataclass
@@ -112,6 +176,7 @@ class ConditionStats:
     blurb: str
     n: int
     claimed_success_rate: float
+    artifact_correct_rate: float
     true_success_rate: float
     false_success_rate: float
     mean_repairs: float
@@ -126,6 +191,7 @@ class ConditionStats:
     fpr: float | None = None
     fnr: float | None = None
     # task-cluster bootstrap 95% CIs
+    artifact_ci: tuple[float, float] | None = None
     true_ci: tuple[float, float] | None = None
     false_ci: tuple[float, float] | None = None
 
@@ -162,6 +228,7 @@ class AblationProvenance:
     corpus_paths: dict[str, str] = field(default_factory=dict)
     task_files_sha256: dict[str, str] = field(default_factory=dict)
     corpus_sha256: dict[str, str] = field(default_factory=dict)
+    input_snapshot_sha256: dict[str, str] = field(default_factory=dict)
     configuration: dict[str, Any] = field(default_factory=dict)
 
 
@@ -192,23 +259,32 @@ class AblationReport:
             f"final scorer: `{self.scorer}` (fresh copy, canonical tests, independent of "
             "the internal gate)",
             "",
-            "| condition | n | claimed | true success (95% CI) | false success (95% CI) "
+            "| condition | n | delivered | artifact correct (95% CI) "
+            "| delivered correct (95% CI) | delivered wrong (95% CI) "
             "| mean repairs | errors |",
-            "|---|---|---|---|---|---|---|",
+            "|---|---|---|---|---|---|---|---|",
         ]
         for s in self.stats:
             lines.append(
                 f"| `{s.condition}` | {s.n} | {_pct(s.claimed_success_rate)} | "
+                f"{_pct(s.artifact_correct_rate)}{_ci(s.artifact_ci)} | "
                 f"{_pct(s.true_success_rate)}{_ci(s.true_ci)} | "
                 f"{_pct(s.false_success_rate)}{_ci(s.false_ci)} | "
                 f"{s.mean_repairs:.2f} | {s.errors} |"
             )
-        lines += ["", "Conditions:"]
+        lines.append("")
+        if self.schema_version >= 3:
+            lines += [
+                "`n` counts usable measurements. `errors` stay in the scheduled denominator "
+                "(`n + errors`) and are never relabelled as incorrect patches.",
+                "",
+            ]
+        lines.append("Conditions:")
         for name, blurb in CONDITIONS:
             lines.append(f"- `{name}` — {blurb}.")
         gate_lines = _gate_quality_lines(self.stats)
         if gate_lines:
-            lines += ["", "Internal gate vs final scorer (per attempt):", *gate_lines]
+            lines += ["", "Internal gate vs artifact correctness (per attempt):", *gate_lines]
         mcnemar_lines = _paired_mcnemar_lines(self.records)
         if mcnemar_lines:
             lines += ["", "Paired contrasts:", *mcnemar_lines]
@@ -222,8 +298,9 @@ class AblationReport:
             lines.append(f"| `{task}` | {cells[0]} | {cells[1]} | {cells[2]} |")
         lines += [
             "",
-            "Legend: pass = true success · fail = refused · false-pass = claimed but wrong. "
-            "Exact counts across repetitions; outcomes are the final scorer's.",
+            "Legend: pass = delivered and independently correct · fail = not delivered · "
+            "false-pass = delivered but independently wrong. Artifact correctness is "
+            "reported separately from delivery.",
             "",
         ]
         if self.provenance is not None:
@@ -305,7 +382,8 @@ def _summary(stats: list[ConditionStats]) -> str:
         f"(scorer-graded); the gate (same attempts) reduces that to "
         f"{_pct(gate.false_success_rate)}, and the repair loop raises true success from "
         f"{_pct(gate.true_success_rate)} to {_pct(verify.true_success_rate)}. "
-        f"The gate discarded {gate.fn or 0} correct fix(es) (false negatives)."
+        f"The gate discarded {gate.fn or 0} independently correct artifact(s) "
+        "(false negatives)."
     )
 
 
@@ -314,6 +392,105 @@ _IGNORE = shutil.ignore_patterns(
     "__pycache__", "*.pyc", ".pytest_cache", ".lha_pytest.json", ".cocoindex_code", ".git"
 )
 _DIFF_IGNORE = {"__pycache__", ".pytest_cache", ".lha_pytest.json", ".cocoindex_code", ".git"}
+
+
+def _stable_file_signature(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _consume_stable_regular_file(
+    path: Path,
+    consume: Callable[[bytes], object],
+    *,
+    max_bytes: int | None = None,
+    reject_hardlinks: bool = True,
+) -> None:
+    """Read one stable regular file without following links or growing unbounded."""
+    path_before = path.lstat()
+    if not stat.S_ISREG(path_before.st_mode):
+        raise ValueError(f"{path} is not a regular file")
+    if reject_hardlinks and path_before.st_nlink != 1:
+        raise ValueError(f"{path} has multiple hard links")
+    if max_bytes is not None and path_before.st_size > max_bytes:
+        raise ValueError(f"{path} exceeds the {max_bytes}-byte limit")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _stable_file_signature(opened) != _stable_file_signature(path_before)
+        ):
+            raise ValueError(f"{path} changed before it could be read")
+        total = 0
+        while True:
+            chunk = os.read(descriptor, _READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise ValueError(f"{path} exceeds the {max_bytes}-byte limit")
+            consume(chunk)
+        descriptor_after = os.fstat(descriptor)
+        path_after = path.lstat()
+        expected = _stable_file_signature(opened)
+        if (
+            _stable_file_signature(descriptor_after) != expected
+            or _stable_file_signature(path_after) != expected
+            or total != opened.st_size
+        ):
+            raise ValueError(f"{path} changed while it was being read")
+    finally:
+        os.close(descriptor)
+
+
+def _read_bounded_bytes(
+    path: Path,
+    *,
+    max_bytes: int,
+    reject_hardlinks: bool = True,
+) -> bytes:
+    buffer = bytearray()
+    _consume_stable_regular_file(
+        path,
+        buffer.extend,
+        max_bytes=max_bytes,
+        reject_hardlinks=reject_hardlinks,
+    )
+    return bytes(buffer)
+
+
+def _read_bounded_text(
+    path: Path,
+    *,
+    max_bytes: int,
+    errors: str = "strict",
+    reject_hardlinks: bool = True,
+) -> str:
+    return _read_bounded_bytes(
+        path,
+        max_bytes=max_bytes,
+        reject_hardlinks=reject_hardlinks,
+    ).decode("utf-8", errors=errors)
+
+
+def _sha256_regular_file(path: Path, *, reject_hardlinks: bool = False) -> str:
+    digest = hashlib.sha256()
+    _consume_stable_regular_file(
+        path,
+        digest.update,
+        reject_hardlinks=reject_hardlinks,
+    )
+    return digest.hexdigest()
 
 
 def _sanitize(patch: Patch) -> Patch:
@@ -344,6 +521,11 @@ def _copy_repo(source: Path, dst: Path, *, include_tests: bool) -> None:
     if dst.exists():
         shutil.rmtree(dst)
     shutil.copytree(source, dst, ignore=_IGNORE)
+    # Content-addressed input snapshots are read-only. Working copies must still
+    # be writable so patches never target the snapshot itself.
+    for path in dst.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            path.chmod(path.stat().st_mode | 0o200)
     if not include_tests:
         shutil.rmtree(dst / "tests", ignore_errors=True)
 
@@ -446,13 +628,33 @@ def _retry(
     raise _Transient(f"{label}: {last}")
 
 
-def _pytest(workdir: Path, exec_backend: ExecutionBackend) -> tuple[bool, list[str]]:
-    """Run pytest via the given backend; return (passed, failing-assertion messages)."""
+def _pytest(
+    workdir: Path,
+    exec_backend: ExecutionBackend,
+    *,
+    isolated_interpreter: bool = False,
+) -> PytestResult:
+    """Run the prediction-side gate and retain an explicit infrastructure state."""
     step = Step(step_id="grade", kind="code", action="edit_code", goal="grade", verifiers=["pytest"])
-    check = PytestVerifier().verify(
+    check = PytestVerifier(isolated_interpreter=isolated_interpreter).verify(
         None, VerifyContext(workdir=workdir, step=step, exec=exec_backend)
     )
-    return check.passed, list(check.detail.get("messages", []))
+    raw_outcome = check.detail.get("outcome")
+    try:
+        outcome = ScoreOutcome(raw_outcome)
+    except ValueError:
+        outcome = ScoreOutcome.INFRA_ERROR
+    messages = check.detail.get("messages", [])
+    return PytestResult(
+        outcome=outcome,
+        returncode=(
+            check.detail.get("returncode")
+            if type(check.detail.get("returncode")) is int
+            else None
+        ),
+        detail=str(check.detail.get("summary") or "pytest produced no summary"),
+        messages=tuple(str(message) for message in messages if isinstance(message, str)),
+    )
 
 
 def _first_attempt(
@@ -502,21 +704,129 @@ def _frozen_diff(source: Path, wd: Path) -> dict[str, str | None]:
         if w is None:
             frozen[rel] = None
         else:
-            text = w.read_text(errors="replace")
-            if s is None or s.read_text(errors="replace") != text:
+            text = _read_bounded_text(
+                w,
+                max_bytes=_MAX_SOURCE_TEXT_BYTES,
+                errors="replace",
+                reject_hardlinks=False,
+            )
+            if s is None or _read_bounded_text(
+                s,
+                max_bytes=_MAX_SOURCE_TEXT_BYTES,
+                errors="replace",
+                reject_hardlinks=False,
+            ) != text:
                 frozen[rel] = text
     return frozen
 
 
+def _frozen_artifact_bytes(frozen: dict[str, str | None]) -> bytes:
+    """Canonical, content-addressable representation of an effective patch."""
+    for rel, content in frozen.items():
+        path = PurePosixPath(rel)
+        if (
+            not rel
+            or rel == "."
+            or "\x00" in rel
+            or path.is_absolute()
+            or "\\" in rel
+            or path.as_posix() != rel
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or not (content is None or isinstance(content, str))
+        ):
+            raise ValueError(f"invalid frozen artifact entry: {rel!r}")
+        if policy.is_protected(rel):
+            raise ValueError(f"frozen artifact contains protected path: {rel!r}")
+    payload = json.dumps(
+        {"schema_version": _FROZEN_ARTIFACT_SCHEMA, "files": frozen},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    if len(payload) > _MAX_ARTIFACT_BYTES:
+        raise ValueError(
+            f"frozen artifact exceeds the {_MAX_ARTIFACT_BYTES}-byte limit"
+        )
+    return payload
+
+
 def _artifact_digest(frozen: dict[str, str | None]) -> str:
-    h = hashlib.sha256()
-    for rel in sorted(frozen):
-        h.update(rel.encode())
-        h.update(b"\0")
-        content = frozen[rel]
-        h.update(("\0<deleted>" if content is None else content).encode())
-        h.update(b"\0")
-    return h.hexdigest()
+    return _sha256_bytes(_frozen_artifact_bytes(frozen))
+
+
+def _store_frozen_artifact(frozen: dict[str, str | None], artifact_dir: Path) -> str:
+    """Persist frozen bytes under their SHA-256 and reject conflicting content."""
+    payload = _frozen_artifact_bytes(frozen)
+    digest = _sha256_bytes(payload)
+    path = artifact_dir / f"{digest}.json"
+    if path.exists():
+        if (
+            _read_bounded_bytes(path, max_bytes=_MAX_ARTIFACT_BYTES)
+            != payload
+        ):
+            raise RuntimeError(f"frozen artifact store is corrupt for {digest}")
+        return digest
+    _atomic_write_bytes(path, payload)
+    return digest
+
+
+def _artifact_file_is_valid(path: Path, expected_digest: str) -> bool:
+    """Validate a cached artifact before trusting the records that reference it."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        return False
+    try:
+        payload = _read_bounded_bytes(path, max_bytes=_MAX_ARTIFACT_BYTES)
+        if _sha256_bytes(payload) != expected_digest:
+            return False
+        raw = json.loads(payload)
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"schema_version", "files"}
+            or raw.get("schema_version") != _FROZEN_ARTIFACT_SCHEMA
+            or not isinstance(raw.get("files"), dict)
+        ):
+            return False
+        files = raw["files"]
+        if not all(
+            isinstance(rel, str) and (content is None or isinstance(content, str))
+            for rel, content in files.items()
+        ):
+            return False
+        return payload == _frozen_artifact_bytes(files)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+
+
+def _scorer_evidence_file_is_valid(
+    path: Path,
+    expected_digest: str,
+    record: RunRecord,
+    expected_binding: ScorerEvidenceBinding,
+) -> bool:
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        return False
+    try:
+        payload = _read_bounded_bytes(
+            path,
+            max_bytes=_MAX_SCORER_EVIDENCE_BYTES,
+        )
+        if _sha256_bytes(payload) != expected_digest:
+            return False
+        evidence = json.loads(payload)
+        if payload != _scorer_evidence_bytes(evidence):
+            return False
+        outcome, expected, passed = _validate_scorer_evidence(
+            evidence,
+            expected_binding=expected_binding,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return (
+        record.scorer_outcome == outcome.value
+        and record.scorer_expected_tests == expected
+        and record.scorer_passed_tests == passed
+        and record.artifact_correct == (outcome is ScoreOutcome.PASS)
+    )
 
 
 def _score(
@@ -525,23 +835,236 @@ def _score(
     scratch: Path,
     label: str,
     scorer: ExecutionBackend,
-) -> bool:
+    evidence_dir: Path | None = None,
+    evidence_binding: ScorerEvidenceBinding | None = None,
+) -> PytestResult:
     """Final truth: canonical repo + frozen diff, graded in a fresh copy.
 
     Shares no state with the internal gate: fresh directory, canonical tests,
-    its own execution backend.
+    its own execution backend. The final decision comes from the backend's
+    process result, not a JSON file in the candidate-writable repository.
     """
-    wd = scratch / f"score_{label}"
-    _copy_repo(source, wd, include_tests=True)
-    for rel, content in frozen.items():
-        target = wd / rel
-        if content is None:
-            target.unlink(missing_ok=True)
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
-    ok, _ = _pytest(wd, scorer)
-    return ok
+    try:
+        # Validate direct callers as well as artifacts produced by _frozen_diff.
+        # This prevents a corrupt cache from turning the scorer setup into a
+        # path traversal or an oracle rewrite.
+        _frozen_artifact_bytes(frozen)
+        wd = scratch / f"score_{label}"
+        _copy_repo(source, wd, include_tests=True)
+        expected, inventory_error = _collect_expected_nodeids(wd, scorer)
+        if inventory_error is not None:
+            return PytestResult(
+                ScoreOutcome.INFRA_ERROR,
+                inventory_error.returncode,
+                f"scorer inventory failed: {inventory_error.detail}",
+            )
+        for rel, content in frozen.items():
+            target = wd / rel
+            if content is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+        return _control_plane_pytest(
+            wd,
+            scorer,
+            expected_nodeids=expected,
+            evidence_dir=evidence_dir,
+            evidence_binding=evidence_binding,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        return PytestResult(
+            ScoreOutcome.INFRA_ERROR,
+            None,
+            f"scorer setup failed: {type(error).__name__}",
+        )
+
+
+def _collect_expected_nodeids(
+    workdir: Path,
+    scorer: ExecutionBackend,
+) -> tuple[tuple[str, ...], PytestResult | None]:
+    """Collect node IDs from the pristine corpus before candidate bytes are applied."""
+    inventory = collect_inventory(workdir, scorer)
+    if not inventory.ready:
+        return (), PytestResult(
+            ScoreOutcome.INFRA_ERROR,
+            inventory.driver.returncode,
+            inventory.driver.detail,
+        )
+    return inventory.expected_nodeids, None
+
+
+def _classify_scorer_receipt(
+    *,
+    process_returncode: int,
+    receipt: dict[str, Any],
+    expected_nodeids: tuple[str, ...],
+) -> tuple[ScoreOutcome, int]:
+    """Cross-check the runner return code, hook receipt, and pristine inventory."""
+    outcome, passed = classify_receipt(
+        process_returncode=process_returncode,
+        receipt=receipt,
+        expected_nodeids=expected_nodeids,
+    )
+    return ScoreOutcome(outcome.value), passed
+
+
+def _scorer_evidence_bytes(evidence: dict[str, Any]) -> bytes:
+    payload = canonical_json_bytes(evidence)
+    if len(payload) > _MAX_SCORER_EVIDENCE_BYTES:
+        raise ValueError(
+            "scorer evidence exceeds "
+            f"the {_MAX_SCORER_EVIDENCE_BYTES}-byte limit"
+        )
+    return payload
+
+
+def _store_scorer_evidence(evidence: dict[str, Any], evidence_dir: Path) -> str:
+    payload = _scorer_evidence_bytes(evidence)
+    digest = _sha256_bytes(payload)
+    path = evidence_dir / f"{digest}.json"
+    if path.exists():
+        if (
+            _read_bounded_bytes(
+                path,
+                max_bytes=_MAX_SCORER_EVIDENCE_BYTES,
+            )
+            != payload
+        ):
+            raise RuntimeError(f"scorer evidence store is corrupt for {digest}")
+        return digest
+    _atomic_write_bytes(path, payload)
+    return digest
+
+
+def _validate_scorer_evidence(
+    evidence: Any,
+    *,
+    expected_binding: ScorerEvidenceBinding | None = None,
+) -> tuple[ScoreOutcome, int, int]:
+    """Validate schema-v2 scorer evidence and recompute its classification."""
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != {"schema_version", "binding", "pytest_evidence"}
+        or evidence.get("schema_version") != _SCORER_EVIDENCE_SCHEMA
+        or not isinstance(evidence.get("binding"), dict)
+        or not isinstance(evidence.get("pytest_evidence"), dict)
+    ):
+        raise ValueError("invalid scorer evidence envelope")
+    binding_raw = evidence["binding"]
+    if (
+        set(binding_raw)
+        != {
+            "task",
+            "rep",
+            "artifact_sha256",
+            "input_snapshot_sha256",
+            "scorer_backend",
+            "scorer_image_id",
+        }
+        or not isinstance(binding_raw.get("task"), str)
+        or not binding_raw["task"]
+        or len(binding_raw["task"]) > 512
+        or type(binding_raw.get("rep")) is not int
+        or binding_raw["rep"] < 0
+        or not isinstance(binding_raw.get("artifact_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding_raw["artifact_sha256"]) is None
+        or not isinstance(binding_raw.get("input_snapshot_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding_raw["input_snapshot_sha256"]) is None
+        or not isinstance(binding_raw.get("scorer_backend"), str)
+        or not binding_raw["scorer_backend"]
+        or len(binding_raw["scorer_backend"]) > 128
+    ):
+        raise ValueError("invalid scorer evidence binding")
+    image_id = binding_raw.get("scorer_image_id")
+    if image_id is not None and (
+        not isinstance(image_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+    ):
+        raise ValueError("invalid scorer evidence image ID")
+    if binding_raw["scorer_backend"] == "docker" and image_id is None:
+        raise ValueError("Docker scorer evidence is missing an immutable image ID")
+    binding = ScorerEvidenceBinding(**binding_raw)
+    if expected_binding is not None and binding != expected_binding:
+        raise ValueError("scorer evidence binding does not match the record")
+    pytest_evidence = evidence["pytest_evidence"]
+    if pytest_evidence.get("schema_version") != PYTEST_EVIDENCE_SCHEMA:
+        raise ValueError("invalid nested Pytest evidence schema")
+    outcome, expected, passed = validate_evidence(pytest_evidence)
+    return ScoreOutcome(outcome.value), expected, passed
+
+
+def _control_plane_pytest(
+    workdir: Path,
+    scorer: ExecutionBackend,
+    *,
+    expected_nodeids: tuple[str, ...] | None = None,
+    evidence_dir: Path | None = None,
+    evidence_binding: ScorerEvidenceBinding | None = None,
+) -> PytestResult:
+    """Require a normal Pytest return plus a nonce-bound post-session receipt.
+
+    The receipt is created only after ``pytest.main`` returns. A candidate import
+    that prints a forged summary and calls ``os._exit(0)`` therefore has no
+    receipt and fails closed. The random path and nonce are defense in depth,
+    not a privilege boundary: trusted-local scoring cannot contain arbitrary
+    same-user code; Docker remains required for untrusted repositories.
+    """
+    if expected_nodeids is None:
+        expected_nodeids, inventory_error = _collect_expected_nodeids(workdir, scorer)
+        if inventory_error is not None:
+            return inventory_error
+    result = run_with_evidence(
+        workdir,
+        scorer,
+        expected_nodeids=expected_nodeids,
+    )
+    if result.receipt is None:
+        return PytestResult(
+            ScoreOutcome.INFRA_ERROR,
+            result.returncode,
+            f"scorer: {result.detail}",
+        )
+    outcome = ScoreOutcome(result.outcome.value)
+    pytest_evidence = {
+        "schema_version": PYTEST_EVIDENCE_SCHEMA,
+        "expected_nodeids": list(expected_nodeids),
+        "process_returncode": result.returncode,
+        "receipt": result.receipt,
+        "receipt_sha256": result.receipt_sha256,
+        "classification": outcome.value,
+    }
+    if evidence_dir is not None and evidence_binding is None:
+        return PytestResult(
+            ScoreOutcome.INFRA_ERROR,
+            result.returncode,
+            "scorer: missing evidence binding",
+        )
+    evidence = {
+        "schema_version": _SCORER_EVIDENCE_SCHEMA,
+        "binding": asdict(evidence_binding) if evidence_binding is not None else {},
+        "pytest_evidence": pytest_evidence,
+    }
+    evidence_sha256 = (
+        _store_scorer_evidence(evidence, evidence_dir)
+        if evidence_dir is not None and outcome is not ScoreOutcome.INFRA_ERROR
+        else ""
+    )
+    if outcome is ScoreOutcome.PASS:
+        detail = "scorer: tests pass with complete control-plane evidence"
+    elif outcome is ScoreOutcome.TEST_FAIL:
+        detail = "scorer: tests fail with complete control-plane evidence"
+    else:
+        detail = "scorer: inconsistent Pytest control-plane evidence"
+    return PytestResult(
+        outcome,
+        result.returncode,
+        detail,
+        evidence_sha256=evidence_sha256,
+        expected_tests=len(expected_nodeids),
+        passed_tests=result.passed_tests,
+    )
 
 
 def _evaluate(
@@ -553,6 +1076,10 @@ def _evaluate(
     rep: int,
     agent_exec: ExecutionBackend,
     scorer: ExecutionBackend,
+    artifact_dir: Path,
+    input_snapshot_sha256: str,
+    scorer_backend: str,
+    scorer_image_id: str | None,
     audit_log: list[dict[str, Any]] | None = None,
 ) -> list[RunRecord]:
     name = task.inputs.get("_name", task.title)
@@ -564,24 +1091,81 @@ def _evaluate(
     _copy_repo(source, wd, include_tests=True)
     if patch.file_contents:
         apply_patch(patch, wd)
-    gate_pred, _ = _pytest(wd, agent_exec)
+    first_gate = _pytest(wd, agent_exec)
     frozen = _frozen_diff(source, wd)
-    sha = _artifact_digest(frozen)
-    truth = _score(source, frozen, scratch, "first", scorer)
+    sha = _store_frozen_artifact(frozen, artifact_dir)
+    scorer_evidence_dir = artifact_dir.parent / "scorer_evidence"
+    first_binding = ScorerEvidenceBinding(
+        task=name,
+        rep=rep,
+        artifact_sha256=sha,
+        input_snapshot_sha256=input_snapshot_sha256,
+        scorer_backend=scorer_backend,
+        scorer_image_id=scorer_image_id,
+    )
+    first_score = _score(
+        source,
+        frozen,
+        scratch,
+        "first",
+        scorer,
+        scorer_evidence_dir,
+        first_binding,
+    )
+    first_truth_available = first_score.outcome is not ScoreOutcome.INFRA_ERROR
+    first_artifact_correct = first_score.outcome is ScoreOutcome.PASS
 
     out.append(
         RunRecord(
-            name, "trust", rep, "DONE", True, truth, not truth, 0,
-            _truth_detail(truth), None, sha,
+            task=name,
+            condition="trust",
+            rep=rep,
+            status="DONE" if first_truth_available else "ERROR",
+            claimed_success=first_truth_available,
+            artifact_correct=first_artifact_correct if first_truth_available else False,
+            true_success=first_artifact_correct if first_truth_available else False,
+            false_success=first_truth_available and not first_artifact_correct,
+            repairs=0,
+            detail=first_score.detail,
+            gate_prediction=None,
+            artifact_sha256=sha,
+            scorer_outcome=first_score.outcome.value,
+            scorer_evidence_sha256=first_score.evidence_sha256,
+            scorer_expected_tests=first_score.expected_tests,
+            scorer_passed_tests=first_score.passed_tests,
         )
     )
     # The scorer grades the SAME artifact even when the gate refused it, so a
     # refusal of a correct fix is counted (false negative), not invisible.
+    gate_error = (
+        first_gate.outcome is ScoreOutcome.INFRA_ERROR
+        or first_score.outcome is ScoreOutcome.INFRA_ERROR
+    )
+    gate_pred = first_gate.outcome is ScoreOutcome.PASS
     out.append(
         RunRecord(
-            name, "gate", rep, "DONE" if gate_pred else "FAILED",
-            gate_pred, truth, gate_pred and not truth, 0,
-            _truth_detail(truth), gate_pred, sha,
+            task=name,
+            condition="gate",
+            rep=rep,
+            status="ERROR" if gate_error else ("DONE" if gate_pred else "FAILED"),
+            claimed_success=False if gate_error else gate_pred,
+            artifact_correct=False if gate_error else first_artifact_correct,
+            true_success=False if gate_error else gate_pred and first_artifact_correct,
+            false_success=False if gate_error else gate_pred and not first_artifact_correct,
+            repairs=0,
+            detail=(
+                f"gate: {first_gate.detail}; {first_score.detail}"
+                if gate_error
+                else first_score.detail
+            ),
+            gate_prediction=(
+                None if first_gate.outcome is ScoreOutcome.INFRA_ERROR else gate_pred
+            ),
+            artifact_sha256=sha,
+            scorer_outcome=first_score.outcome.value,
+            scorer_evidence_sha256=first_score.evidence_sha256,
+            scorer_expected_tests=first_score.expected_tests,
+            scorer_passed_tests=first_score.passed_tests,
         )
     )
 
@@ -590,9 +1174,10 @@ def _evaluate(
     _copy_repo(source, wd2, include_tests=True)
     if patch.file_contents:
         apply_patch(patch, wd2)
-    ok, failures = _pytest(wd2, agent_exec)
+    verify_gate = _pytest(wd2, agent_exec)
+    failures = list(verify_gate.messages)
     repairs = 0
-    while not ok and repairs < _MAX_REPAIRS:
+    while verify_gate.outcome is ScoreOutcome.TEST_FAIL and repairs < _MAX_REPAIRS:
         repairs += 1
         step = _fix_step(task).as_repair(failures)
         repair = _retry(
@@ -604,22 +1189,60 @@ def _evaluate(
         if not repair.file_contents:
             break  # nothing new to try
         apply_patch(repair, wd2)
-        ok, failures = _pytest(wd2, agent_exec)
+        verify_gate = _pytest(wd2, agent_exec)
+        failures = list(verify_gate.messages)
     frozen2 = _frozen_diff(source, wd2)
-    sha2 = _artifact_digest(frozen2)
-    truth2 = _score(source, frozen2, scratch, "verify", scorer)
+    sha2 = _store_frozen_artifact(frozen2, artifact_dir)
+    verify_binding = ScorerEvidenceBinding(
+        task=name,
+        rep=rep,
+        artifact_sha256=sha2,
+        input_snapshot_sha256=input_snapshot_sha256,
+        scorer_backend=scorer_backend,
+        scorer_image_id=scorer_image_id,
+    )
+    score2 = _score(
+        source,
+        frozen2,
+        scratch,
+        "verify",
+        scorer,
+        scorer_evidence_dir,
+        verify_binding,
+    )
+    verify_error = (
+        verify_gate.outcome is ScoreOutcome.INFRA_ERROR
+        or score2.outcome is ScoreOutcome.INFRA_ERROR
+    )
+    ok = verify_gate.outcome is ScoreOutcome.PASS
+    artifact_correct2 = score2.outcome is ScoreOutcome.PASS
     out.append(
         RunRecord(
-            name, "verify", rep, "DONE" if ok else "FAILED",
-            ok, truth2, ok and not truth2, repairs,
-            _truth_detail(truth2), ok, sha2,
+            task=name,
+            condition="verify",
+            rep=rep,
+            status="ERROR" if verify_error else ("DONE" if ok else "FAILED"),
+            claimed_success=False if verify_error else ok,
+            artifact_correct=False if verify_error else artifact_correct2,
+            true_success=False if verify_error else ok and artifact_correct2,
+            false_success=False if verify_error else ok and not artifact_correct2,
+            repairs=repairs,
+            detail=(
+                f"gate: {verify_gate.detail}; {score2.detail}"
+                if verify_error
+                else score2.detail
+            ),
+            gate_prediction=(
+                None if verify_gate.outcome is ScoreOutcome.INFRA_ERROR else ok
+            ),
+            artifact_sha256=sha2,
+            scorer_outcome=score2.outcome.value,
+            scorer_evidence_sha256=score2.evidence_sha256,
+            scorer_expected_tests=score2.expected_tests,
+            scorer_passed_tests=score2.passed_tests,
         )
     )
     return out
-
-
-def _truth_detail(ok: bool) -> str:
-    return "scorer: tests pass" if ok else "scorer: tests fail"
 
 
 def _make_llm(
@@ -656,15 +1279,133 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+
+
 # --- provenance fingerprint ---------------------------------------------------
 def _repo_digest(source: Path) -> str:
     h = hashlib.sha256()
     for rel, p in sorted(_iter_files(source)):
         h.update(rel.encode())
         h.update(b"\0")
-        h.update(p.read_bytes())
+        _consume_stable_regular_file(
+            p,
+            h.update,
+            reject_hardlinks=False,
+        )
         h.update(b"\0")
     return h.hexdigest()
+
+
+def _input_snapshot_digest(task_sha256: str, corpus_sha256: str) -> str:
+    return _canonical_digest(
+        {
+            "schema_version": _INPUT_SNAPSHOT_SCHEMA,
+            "task_sha256": task_sha256,
+            "corpus_sha256": corpus_sha256,
+        }
+    )
+
+
+def _freeze_ablation_input(
+    *,
+    out_dir: Path,
+    name: str,
+    task_path: Path,
+    source: Path,
+) -> tuple[Path, Path, str, str, str]:
+    """Copy one task and corpus into an immutable, content-addressed snapshot.
+
+    Digests are measured before and after the copy. A source that changes while
+    the snapshot is being created is rejected instead of being cached under an
+    earlier fingerprint. All later cells read the snapshot, so edits to the
+    live corpus during a long run cannot affect results.
+    """
+    task_path = task_path.resolve()
+    source = source.resolve()
+    task_before = _read_bounded_bytes(task_path, max_bytes=_MAX_TASK_BYTES)
+    corpus_before = _repo_digest(source)
+    snapshots = out_dir / "input_snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{name}-", dir=snapshots))
+    try:
+        task_copy = temporary / "task.yaml"
+        task_copy.write_bytes(task_before)
+        repo_copy = temporary / "repo"
+        _copy_repo(source, repo_copy, include_tests=True)
+        task_after = _read_bounded_bytes(task_path, max_bytes=_MAX_TASK_BYTES)
+        corpus_after = _repo_digest(source)
+        task_digest = _sha256_bytes(task_before)
+        corpus_digest = _repo_digest(repo_copy)
+        if (
+            task_before != task_after
+            or corpus_before != corpus_after
+            or corpus_digest != corpus_before
+        ):
+            raise RuntimeError(
+                f"ablation input changed while snapshotting task {name!r}"
+            )
+        snapshot_digest = _input_snapshot_digest(task_digest, corpus_digest)
+        metadata = {
+            "schema_version": _INPUT_SNAPSHOT_SCHEMA,
+            "task": name,
+            "task_sha256": task_digest,
+            "corpus_sha256": corpus_digest,
+            "snapshot_sha256": snapshot_digest,
+        }
+        (temporary / "snapshot.json").write_bytes(
+            json.dumps(
+                metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+        )
+        destination = snapshots / snapshot_digest
+        if destination.exists():
+            if (
+                destination.is_symlink()
+                or not destination.is_dir()
+                or _read_bounded_bytes(
+                    destination / "task.yaml",
+                    max_bytes=_MAX_TASK_BYTES,
+                )
+                != task_before
+                or _repo_digest(destination / "repo") != corpus_digest
+                or json.loads(
+                    _read_bounded_text(
+                        destination / "snapshot.json",
+                        max_bytes=_MAX_TASK_BYTES,
+                    )
+                )
+                != metadata
+            ):
+                raise RuntimeError(
+                    f"ablation input snapshot is corrupt for {snapshot_digest}"
+                )
+            shutil.rmtree(temporary)
+        else:
+            os.replace(temporary, destination)
+        for path in destination.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                path.chmod(path.stat().st_mode & ~0o222)
+        return (
+            destination / "task.yaml",
+            destination / "repo",
+            task_digest,
+            corpus_digest,
+            snapshot_digest,
+        )
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -694,7 +1435,7 @@ def _source_file_digests(root: Path | None = None) -> dict[str, str]:
             or path.suffix in {".pyc", ".pyo"}
         ):
             continue
-        files[path.relative_to(package_root).as_posix()] = _sha256_bytes(path.read_bytes())
+        files[path.relative_to(package_root).as_posix()] = _sha256_regular_file(path)
     return files
 
 
@@ -759,20 +1500,22 @@ def _cli_version(llm: str, client: LLMClient, cli_path: str) -> str | None:
     return value if result.returncode == 0 and value else None
 
 
-def _docker_image_id(backend: ExecutionBackend) -> str | None:
-    image = getattr(backend, "image", None)
-    docker = getattr(backend, "docker", None)
-    if not isinstance(image, str) or not image or not isinstance(docker, str):
-        return None
-    try:
-        result = run(
-            [docker, "image", "inspect", "--format", "{{.Id}}", image],
-            timeout=30,
-        )
-    except OSError:
-        return None
+def _resolve_docker_image_id(image: str, *, docker: str = "docker") -> str:
+    """Resolve a mutable Docker reference once, before any experiment cell runs."""
+    result = run(
+        [docker, "image", "inspect", "--format", "{{.Id}}", image],
+        timeout=30,
+    )
     value = result.stdout.strip()
-    return value if result.returncode == 0 and value else None
+    if (
+        result.returncode != 0
+        or result.output_truncated
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+    ):
+        raise RuntimeError(
+            f"Docker image {image!r} could not be bound to an immutable image ID"
+        )
+    return value
 
 
 def _fingerprint(
@@ -791,7 +1534,9 @@ def _fingerprint(
     payload: dict[str, Any] = {
         "cache_schema": _CACHE_SCHEMA,
         "harness_version": __version__,
-        "task_sha256": _sha256_bytes(Path(task_path).read_bytes()),
+        "task_sha256": _sha256_bytes(
+            _read_bounded_bytes(Path(task_path), max_bytes=_MAX_TASK_BYTES)
+        ),
         "corpus_sha256": _repo_digest(source),
         "source_tree_sha256": _source_tree_digest(sources),
         "llm_backend": llm,
@@ -805,34 +1550,81 @@ def _fingerprint(
     return _canonical_digest(payload)
 
 
-def _read_cache(path: Path) -> tuple[str | None, list[RunRecord]] | None:
-    """Decode both legacy and current cache files without trusting legacy cells.
+def _record_from_raw(raw: dict[str, Any], *, schema_version: int) -> RunRecord:
+    """Decode historical records while keeping their old truth field explicit.
 
-    Pre-fingerprint caches remain inspectable, but ``_load_cached`` only reuses
-    records whose current fingerprint matches. This preserves compatibility
-    without allowing an unbound historical result into a new report.
+    Through schema 3, ``true_success`` meant artifact correctness even when a
+    condition rejected the artifact. Schema 4 stores ``artifact_correct``
+    separately and reserves ``true_success`` for a correct artifact that was
+    actually delivered.
     """
-    if not path.exists():
+    values = dict(raw)
+    if schema_version < 4 and "artifact_correct" not in values:
+        old_truth = values.get("true_success")
+        claimed = values.get("claimed_success")
+        if isinstance(old_truth, bool) and isinstance(claimed, bool):
+            values["artifact_correct"] = old_truth
+            values["true_success"] = claimed and old_truth
+    return RunRecord(**values)
+
+
+def _decode_cache(data: Any) -> tuple[str | None, list[RunRecord]] | None:
+    if isinstance(data, list):
+        raw_records = data
+        fingerprint = None
+        schema_version = 1
+    elif isinstance(data, dict) and isinstance(data.get("records"), list):
+        raw_records = data["records"]
+        value = data.get("fingerprint")
+        fingerprint = value if isinstance(value, str) and value else None
+        raw_schema = data.get("schema_version", 1)
+        schema_version = raw_schema if type(raw_schema) is int else 1
+    else:
         return None
     try:
-        data = json.loads(path.read_text())
-        if isinstance(data, list):
-            raw_records = data
-            fingerprint = None
-        elif isinstance(data, dict) and isinstance(data.get("records"), list):
-            raw_records = data["records"]
-            value = data.get("fingerprint")
-            fingerprint = value if isinstance(value, str) and value else None
-        else:
+        records = [
+            _record_from_raw(record, schema_version=schema_version)
+            for record in raw_records
+            if isinstance(record, dict)
+        ]
+        if len(records) != len(raw_records):
             return None
-        records = [RunRecord(**record) for record in raw_records]
         return fingerprint, records
-    except (OSError, json.JSONDecodeError, TypeError, KeyError):
+    except (TypeError, KeyError):
+        return None
+
+
+def _read_cache(path: Path) -> tuple[str | None, list[RunRecord]] | None:
+    """Decode a bounded, stable legacy or current cache file."""
+    try:
+        data = json.loads(
+            _read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES)
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None  # corrupt/partial cache -> recompute
+    return _decode_cache(data)
 
 
-def _load_cached(path: Path, fingerprint: str) -> list[RunRecord] | None:
-    decoded = _read_cache(path)
+def _load_cached(
+    path: Path,
+    fingerprint: str,
+    *,
+    input_snapshot_sha256: str | None = None,
+    scorer_backend: str | None = None,
+    scorer_image_id: str | None = None,
+) -> list[RunRecord] | None:
+    try:
+        cache_envelope = json.loads(
+            _read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES)
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if (
+        not isinstance(cache_envelope, dict)
+        or cache_envelope.get("schema_version") != _CACHE_SCHEMA
+    ):
+        return None
+    decoded = _decode_cache(cache_envelope)
     if decoded is None:
         return None
     cached_fingerprint, records = decoded
@@ -842,13 +1634,57 @@ def _load_cached(path: Path, fingerprint: str) -> list[RunRecord] | None:
     # a hand-edited or old cache that contains one.
     if any(record.status == "ERROR" for record in records):
         return None
+    if any(
+        record.true_success != (record.claimed_success and record.artifact_correct)
+        or record.false_success != (
+            record.claimed_success and not record.artifact_correct
+        )
+        for record in records
+    ):
+        return None
+    if (
+        not isinstance(input_snapshot_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", input_snapshot_sha256) is None
+        or not isinstance(scorer_backend, str)
+        or not scorer_backend
+    ):
+        return None
+    artifact_dir = path.parent.parent / "artifacts"
+    if any(
+        not _artifact_file_is_valid(
+            artifact_dir / f"{record.artifact_sha256}.json",
+            record.artifact_sha256,
+        )
+        for record in records
+    ):
+        return None
+    evidence_dir = path.parent.parent / "scorer_evidence"
+    if any(
+        not _scorer_evidence_file_is_valid(
+            evidence_dir / f"{record.scorer_evidence_sha256}.json",
+            record.scorer_evidence_sha256,
+            record,
+            ScorerEvidenceBinding(
+                task=record.task,
+                rep=record.rep,
+                artifact_sha256=record.artifact_sha256,
+                input_snapshot_sha256=input_snapshot_sha256,
+                scorer_backend=scorer_backend,
+                scorer_image_id=scorer_image_id,
+            ),
+        )
+        for record in records
+    ):
+        return None
     return records
 
 
 def _read_cached_audits(path: Path) -> list[dict[str, Any]]:
     try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        raw = json.loads(
+            _read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES)
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return []
     calls = raw.get("llm_calls") if isinstance(raw, dict) else None
     return [call for call in calls if isinstance(call, dict)] if isinstance(calls, list) else []
@@ -861,13 +1697,49 @@ def _run_cell(
     rep: int,
     out_dir: Path,
     fingerprint: str,
+    source_sha256: str,
+    input_snapshot_sha256: str,
     agent_exec: ExecutionBackend,
     scorer: ExecutionBackend,
+    scorer_backend: str,
+    scorer_image_id: str | None,
     audit_log: list[dict[str, Any]] | None = None,
 ) -> list[RunRecord]:
     name = task.inputs.get("_name", task.title)
     cache = out_dir / "results" / f"{name}__r{rep}.json"
-    cached = _load_cached(cache, fingerprint)
+
+    def error_records(detail: str) -> list[RunRecord]:
+        return [
+            RunRecord(
+                task=name,
+                condition=condition,
+                rep=rep,
+                status="ERROR",
+                claimed_success=False,
+                artifact_correct=False,
+                true_success=False,
+                false_success=False,
+                repairs=0,
+                detail=detail[:200],
+            )
+            for condition, _ in CONDITIONS
+        ]
+
+    def snapshot_matches() -> bool:
+        try:
+            return _repo_digest(source) == source_sha256
+        except (OSError, RuntimeError):
+            return False
+
+    if not snapshot_matches():
+        return error_records("content-addressed input snapshot failed validation")
+    cached = _load_cached(
+        cache,
+        fingerprint,
+        input_snapshot_sha256=input_snapshot_sha256,
+        scorer_backend=scorer_backend,
+        scorer_image_id=scorer_image_id,
+    )
     if cached is not None:
         if audit_log is not None:
             audit_log.extend(
@@ -889,6 +1761,10 @@ def _run_cell(
                 rep,
                 agent_exec,
                 scorer,
+                out_dir / "artifacts",
+                input_snapshot_sha256,
+                scorer_backend,
+                scorer_image_id,
                 cell_audits,
             )
         except _Transient as e:
@@ -898,10 +1774,26 @@ def _run_cell(
                     {"task": name, "rep": rep, "cache_hit": False, **call}
                     for call in cell_audits
                 )
-            return [
-                RunRecord(name, c, rep, "ERROR", False, False, False, 0, str(e)[:200])
-                for c, _ in CONDITIONS
-            ]
+            return error_records(f"transient cell failure: {type(e).__name__}")
+        except Exception as error:
+            # A malformed patch, filesystem error, or corrupt evidence store is
+            # a missing cell measurement. Keep it in the denominator and let
+            # later cells run. BaseException subclasses still interrupt.
+            logger.error(
+                "infrastructure failure on %s rep %d: %s",
+                name,
+                rep,
+                type(error).__name__,
+                exc_info=True,
+            )
+            if audit_log is not None:
+                audit_log.extend(
+                    {"task": name, "rep": rep, "cache_hit": False, **call}
+                    for call in cell_audits
+                )
+            return error_records(
+                f"cell infrastructure failure: {type(error).__name__}"
+            )
     if audit_log is not None:
         audit_log.extend(
             {"task": name, "rep": rep, "cache_hit": False, **call}
@@ -909,18 +1801,30 @@ def _run_cell(
         )
     if any(record.status == "ERROR" for record in records):
         return records
-    _atomic_write(
-        cache,
-        json.dumps(
-            {
-                "schema_version": _CACHE_SCHEMA,
-                "fingerprint": fingerprint,
-                "records": [asdict(r) for r in records],
-                "llm_calls": cell_audits,
-            },
-            indent=2,
-        ),
-    )
+    if not snapshot_matches():
+        return error_records("content-addressed input snapshot changed during the cell")
+    try:
+        _atomic_write(
+            cache,
+            json.dumps(
+                {
+                    "schema_version": _CACHE_SCHEMA,
+                    "fingerprint": fingerprint,
+                    "records": [asdict(r) for r in records],
+                    "llm_calls": cell_audits,
+                },
+                indent=2,
+            ),
+        )
+    except Exception as error:
+        logger.error(
+            "cache write failure on %s rep %d: %s",
+            name,
+            rep,
+            type(error).__name__,
+            exc_info=True,
+        )
+        return error_records(f"cell cache write failure: {type(error).__name__}")
     return records
 
 
@@ -990,26 +1894,40 @@ def _aggregate(records: list[RunRecord]) -> list[ConditionStats]:
         errors = len(all_recs) - len(recs)
         n = len(recs)
         if n == 0:
-            stats.append(ConditionStats(name, blurb, 0, 0.0, 0.0, 0.0, 0.0, errors=errors))
+            stats.append(
+                ConditionStats(
+                    condition=name,
+                    blurb=blurb,
+                    n=0,
+                    claimed_success_rate=0.0,
+                    artifact_correct_rate=0.0,
+                    true_success_rate=0.0,
+                    false_success_rate=0.0,
+                    mean_repairs=0.0,
+                    errors=errors,
+                )
+            )
             continue
         s = ConditionStats(
             condition=name,
             blurb=blurb,
             n=n,
             claimed_success_rate=sum(r.claimed_success for r in recs) / n,
+            artifact_correct_rate=sum(r.artifact_correct for r in recs) / n,
             true_success_rate=sum(r.true_success for r in recs) / n,
             false_success_rate=sum(r.false_success for r in recs) / n,
             mean_repairs=sum(r.repairs for r in recs) / n,
             errors=errors,
+            artifact_ci=_rate_ci(recs, "artifact_correct"),
             true_ci=_rate_ci(recs, "true_success"),
             false_ci=_rate_ci(recs, "false_success"),
         )
         preds = [r for r in recs if r.gate_prediction is not None]
         if preds:
-            tp = sum(bool(r.gate_prediction) and r.true_success for r in preds)
-            fp = sum(bool(r.gate_prediction) and not r.true_success for r in preds)
-            tn = sum(not r.gate_prediction and not r.true_success for r in preds)
-            fn = sum(not r.gate_prediction and r.true_success for r in preds)
+            tp = sum(bool(r.gate_prediction) and r.artifact_correct for r in preds)
+            fp = sum(bool(r.gate_prediction) and not r.artifact_correct for r in preds)
+            tn = sum(not r.gate_prediction and not r.artifact_correct for r in preds)
+            fn = sum(not r.gate_prediction and r.artifact_correct for r in preds)
             s.tp, s.fp, s.tn, s.fn = tp, fp, tn, fn
             s.precision = tp / (tp + fp) if (tp + fp) else None
             s.recall = tp / (tp + fn) if (tp + fn) else None
@@ -1071,30 +1989,40 @@ def _client_runtime(
 
 
 def _execution_runtime(
-    backend: ExecutionBackend, *, requested: str
+    backend: ExecutionBackend,
+    *,
+    requested: str,
+    requested_image: str | None = None,
+    pinned_image_id: str | None = None,
 ) -> dict[str, Any]:
     image = getattr(backend, "image", None)
     return {
         "requested": requested,
         "actual": getattr(backend, "name", type(backend).__name__) or "unknown",
         "implementation": f"{type(backend).__module__}.{type(backend).__qualname__}",
-        "image": image if isinstance(image, str) and image else None,
-        "image_id": _docker_image_id(backend),
+        "image": requested_image
+        if isinstance(requested_image, str) and requested_image
+        else (image if isinstance(image, str) and image else None),
+        "execution_image": image if isinstance(image, str) and image else None,
+        "image_id": pinned_image_id,
     }
 
 
 def _read_condition_stats(raw: dict[str, Any]) -> ConditionStats:
     values = dict(raw)
-    for name in ("true_ci", "false_ci"):
+    if "artifact_correct_rate" not in values:
+        # Historical reports used true_success_rate for artifact correctness.
+        values["artifact_correct_rate"] = values.get("true_success_rate", 0.0)
+    for name in ("artifact_ci", "true_ci", "false_ci"):
         interval = values.get(name)
         if isinstance(interval, list) and len(interval) == 2:
             values[name] = (float(interval[0]), float(interval[1]))
     return ConditionStats(**values)
 
 
-def load_ablation_report(path: str | Path) -> AblationReport:
-    """Read both the pre-provenance report format and schema-2 reports."""
-    raw = json.loads(Path(path).read_text())
+def _ablation_report_from_raw(raw: dict[str, Any]) -> AblationReport:
+    raw_schema = raw.get("schema_version", 1)
+    schema_version = raw_schema if type(raw_schema) is int else 1
     provenance_raw = raw.get("provenance")
     provenance = (
         AblationProvenance(**provenance_raw) if isinstance(provenance_raw, dict) else None
@@ -1104,12 +2032,16 @@ def load_ablation_report(path: str | Path) -> AblationReport:
         model=str(raw.get("model", "")),
         reps=int(raw.get("reps", 0)),
         tasks=[str(task) for task in raw.get("tasks", [])],
-        records=[RunRecord(**record) for record in raw.get("records", [])],
+        records=[
+            _record_from_raw(record, schema_version=schema_version)
+            for record in raw.get("records", [])
+            if isinstance(record, dict)
+        ],
         stats=[_read_condition_stats(stat) for stat in raw.get("stats", [])],
         scorer=str(raw.get("scorer", "unknown")),
         fingerprint=str(raw.get("fingerprint", "")),
         backend_version=str(raw.get("backend_version", "")),
-        schema_version=int(raw.get("schema_version", 1)),
+        schema_version=schema_version,
         provenance=provenance,
         llm_calls=[
             call for call in raw.get("llm_calls", []) if isinstance(call, dict)
@@ -1117,11 +2049,21 @@ def load_ablation_report(path: str | Path) -> AblationReport:
     )
 
 
+def load_ablation_report(path: str | Path) -> AblationReport:
+    """Read a bounded, stable historical or current ablation report."""
+    raw = json.loads(
+        _read_bounded_text(Path(path), max_bytes=_MAX_REPORT_BYTES)
+    )
+    if not isinstance(raw, dict):
+        raise ValueError("ablation report must contain a JSON object")
+    return _ablation_report_from_raw(raw)
+
+
 def run_ablation(
     base: Config,
     task_paths: list[str],
     *,
-    llm: str = "claude_cli",
+    llm: str = "codex_cli",
     model: str | None = None,
     reps: int = 1,
     out_dir: Path | None = None,
@@ -1140,6 +2082,14 @@ def run_ablation(
     else:
         model = model or (base.claude_cli_model or None)
         cli_path, effort = base.claude_cli_path, "medium"
+    requested_docker_image: str | None = None
+    pinned_scorer_image_id: str | None = None
+    if scorer_backend == "docker":
+        requested_docker_image = base.exec_image
+        # Resolve the mutable tag before constructing the model client or
+        # running any cell. Both prediction and truth execute the same immutable
+        # image bytes even if the tag moves during a long experiment.
+        pinned_scorer_image_id = _resolve_docker_image_id(requested_docker_image)
     client = llm_client or _make_llm(llm, model, cli_path=cli_path, effort=effort)
     # Pin whatever the backend can say about itself (CLI version, reasoning
     # effort) into the fingerprint, so an upgrade or a settings change re-samples
@@ -1151,14 +2101,25 @@ def run_ablation(
             backend_version = str(probe())
         except Exception:  # a probe failure must not stop the experiment
             logger.warning("could not read the backend provenance", exc_info=True)
-    # The agent-side gate and the final scorer never share an execution backend
-    # instance; the scorer can be a container while the gate stays local.
-    agent_exec: ExecutionBackend = TrustedLocalBackend()
-    scorer: ExecutionBackend = (
-        make_backend("docker", image=base.exec_image)
-        if scorer_backend == "docker"
-        else make_backend(scorer_backend)
-    )
+    # Prediction and truth use separate backend instances, but the same
+    # isolation class. Selecting Docker must never execute model-influenced code
+    # in a host-side gate before the container scorer runs.
+    if scorer_backend == "docker":
+        if pinned_scorer_image_id is None:  # defensive; resolution above is fail-closed
+            raise RuntimeError("Docker scorer image was not pinned")
+        agent_exec = make_backend("docker", image=pinned_scorer_image_id)
+        scorer = make_backend("docker", image=pinned_scorer_image_id)
+        if any(
+            getattr(backend, "name", None) != "docker"
+            or getattr(backend, "image", None) != pinned_scorer_image_id
+            for backend in (agent_exec, scorer)
+        ):
+            raise RuntimeError("Docker execution backends did not retain the pinned image ID")
+        agent_requested = "docker"
+    else:
+        agent_exec = TrustedLocalBackend()
+        scorer = make_backend(scorer_backend)
+        agent_requested = "trusted-local"
     source_files = _source_file_digests()
     source_tree_sha256 = _source_tree_digest(source_files)
     llm_runtime = _client_runtime(
@@ -1168,8 +2129,18 @@ def run_ablation(
         cli_path=cli_path,
         backend_details=backend_version,
     )
-    agent_runtime = _execution_runtime(agent_exec, requested="trusted-local")
-    scorer_runtime = _execution_runtime(scorer, requested=scorer_backend)
+    agent_runtime = _execution_runtime(
+        agent_exec,
+        requested=agent_requested,
+        requested_image=requested_docker_image,
+        pinned_image_id=pinned_scorer_image_id,
+    )
+    scorer_runtime = _execution_runtime(
+        scorer,
+        requested=scorer_backend,
+        requested_image=requested_docker_image,
+        pinned_image_id=pinned_scorer_image_id,
+    )
     runtime_packages = {
         name: _package_version(name)
         for name in ("lha", "pydantic", "PyYAML", "pytest", "pytest-json-report")
@@ -1186,26 +2157,42 @@ def run_ablation(
     tasks: list[tuple[str, TaskSpec, Path, str]] = []
     task_files_sha256: dict[str, str] = {}
     corpus_sha256: dict[str, str] = {}
+    input_snapshot_sha256: dict[str, str] = {}
     task_path_map: dict[str, str] = {}
     corpus_path_map: dict[str, str] = {}
     for tp in task_paths:
         name = Path(tp).stem
         if name in task_files_sha256:
             raise ValueError(f"duplicate ablation task name {name!r}")
-        spec = TaskSpec.from_file(tp)
+        original_task = Path(tp)
+        original_spec = TaskSpec.from_file(original_task)
+        original_source = Path(original_spec.target_repo or ".")
+        (
+            frozen_task,
+            source,
+            task_digest,
+            corpus_digest,
+            snapshot_digest,
+        ) = _freeze_ablation_input(
+            out_dir=out,
+            name=name,
+            task_path=original_task,
+            source=original_source,
+        )
+        spec = TaskSpec.from_file(frozen_task)
         spec.inputs["_name"] = name
-        source = Path(spec.target_repo or ".")
         task_path_map[name] = _provenance_path(tp)
-        corpus_path_map[name] = _provenance_path(source)
-        task_files_sha256[name] = _sha256_bytes(Path(tp).read_bytes())
-        corpus_sha256[name] = _repo_digest(source)
+        corpus_path_map[name] = _provenance_path(original_source)
+        task_files_sha256[name] = task_digest
+        corpus_sha256[name] = corpus_digest
+        input_snapshot_sha256[name] = snapshot_digest
         tasks.append(
             (
                 name,
                 spec,
                 source,
                 _fingerprint(
-                    tp,
+                    str(frozen_task),
                     source,
                     llm,
                     model,
@@ -1233,8 +2220,12 @@ def run_ablation(
                     rep,
                     out,
                     fp,
+                    corpus_sha256[name],
+                    input_snapshot_sha256[name],
                     agent_exec,
                     scorer,
+                    str(scorer_runtime["actual"]),
+                    pinned_scorer_image_id,
                     llm_calls,
                 )
             )
@@ -1249,6 +2240,11 @@ def run_ablation(
         "bootstrap_samples": _BOOTSTRAP_N,
         "cache_schema": _CACHE_SCHEMA,
         "report_schema": _REPORT_SCHEMA,
+        "frozen_artifact_schema": _FROZEN_ARTIFACT_SCHEMA,
+        "input_snapshot_schema": _INPUT_SNAPSHOT_SCHEMA,
+        "scorer_evidence_schema": _SCORER_EVIDENCE_SCHEMA,
+        "scorer_isolated_interpreter": True,
+        "scorer_result_source": "nonce-bound-pytest-hook-receipt",
         "client": llm_runtime["configuration"],
     }
     provenance = AblationProvenance(
@@ -1297,6 +2293,7 @@ def run_ablation(
         corpus_paths=corpus_path_map,
         task_files_sha256=task_files_sha256,
         corpus_sha256=corpus_sha256,
+        input_snapshot_sha256=input_snapshot_sha256,
         configuration=configuration,
     )
     combined = _canonical_digest(
@@ -1322,6 +2319,20 @@ def run_ablation(
         provenance=provenance,
         llm_calls=llm_calls,
     )
+    artifact_digests = sorted(
+        {
+            record.artifact_sha256
+            for record in report.records
+            if record.artifact_sha256
+        }
+    )
+    scorer_evidence_digests = sorted(
+        {
+            record.scorer_evidence_sha256
+            for record in report.records
+            if record.scorer_evidence_sha256
+        }
+    )
     _atomic_write(
         out / "ablation_report.json",
         json.dumps(
@@ -1336,6 +2347,18 @@ def run_ablation(
                 "backend_version": report.backend_version,
                 "harness_version": __version__,
                 "provenance": asdict(provenance),
+                "artifact_store": {
+                    "schema_version": _FROZEN_ARTIFACT_SCHEMA,
+                    "path": "artifacts",
+                    "encoding": "canonical-json",
+                    "count": len(artifact_digests),
+                },
+                "scorer_evidence_store": {
+                    "schema_version": _SCORER_EVIDENCE_SCHEMA,
+                    "path": "scorer_evidence",
+                    "encoding": "canonical-json",
+                    "count": len(scorer_evidence_digests),
+                },
                 "llm_calls": report.llm_calls,
                 "stats": [asdict(s) for s in report.stats],
                 "records": [asdict(r) for r in report.records],
