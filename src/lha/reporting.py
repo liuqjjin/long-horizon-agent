@@ -51,6 +51,7 @@ from .harness.transaction import (
     state_for_paths,
     transaction_log_path,
     transaction_path,
+    validate_terminal_transaction_state,
     validate_transaction_journals,
 )
 from .live_context.models import ContextBundle
@@ -444,7 +445,7 @@ def render_html(report: RunReport) -> str:
 <body>
 <main>
   <header>
-    <div class="label">Verification-first run trace</div>
+    <div class="label">Validated run trace</div>
     <h1>{_h(report.state.task.title)}</h1>
     <p class="muted">{_h(report.state.run_id)} · updated {_h(report.updated_at.isoformat())}</p>
   </header>
@@ -920,17 +921,19 @@ def validate_terminal_evidence(
         unfinished = [
             transaction
             for transaction in transactions
-            if transaction.status != "VERIFIED"
+            if transaction.status in ("PREPARED", "APPLIED")
         ]
         if unfinished:
             raise ReportingError(
-                "DONE run contains a patch transaction that is not VERIFIED"
+                "DONE run contains an unresolved patch transaction"
             )
         # A verdict proves what was checked at completion time. Retention must
         # also prove those bytes still exist now: for a path touched by several
         # attempts or steps, the last VERIFIED transaction is authoritative.
         expected_worktree = {}
         for transaction in transactions:
+            if transaction.status != "VERIFIED":
+                continue
             for relative in transaction.resolved_paths:
                 expected_worktree[relative] = transaction.applied_state[relative]
         if expected_worktree:
@@ -965,6 +968,17 @@ def validate_terminal_evidence(
             raise ReportingError(
                 "FAILED run contains an applied or prepared patch transaction"
             )
+    terminal_status: Literal["DONE", "FAILED"] = (
+        "DONE" if state.status == "DONE" else "FAILED"
+    )
+    try:
+        validate_terminal_transaction_state(
+            run_dir,
+            run_dir / "workdir",
+            terminal_status,
+        )
+    except Exception as error:
+        raise ReportingError(str(error)) from error
 
 
 def _validate_approval_record(

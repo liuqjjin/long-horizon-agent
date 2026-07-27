@@ -1,9 +1,9 @@
-"""Orchestrator: run many tasks in parallel via process-isolated workers.
+"""Run independent tasks concurrently in process-isolated workers.
 
 The live-context facade is a process-global singleton, so cross-task parallelism
 uses worker subprocesses (`lha run --json`) for clean isolation. This is the
-orchestrator-worker pattern, applied only where parallelism actually helps:
-independent tasks. (Within a single run, verifiers already run concurrently.)
+only level that needs process isolation; verifiers within one run already use
+threads where useful.
 """
 
 from __future__ import annotations

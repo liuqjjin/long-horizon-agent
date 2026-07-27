@@ -11,6 +11,7 @@ Covers the invariants:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from datetime import timedelta
@@ -33,7 +34,12 @@ from lha.live_context import (
     reject_stale,
 )
 from lha.live_context import freshness as fr
-from lha.live_context.backends.ccc_backend import CccBackend, _checked_results
+from lha.live_context.backends.ccc_backend import (
+    CccBackend,
+    _await_mcp,
+    _checked_results,
+    _env_with_local_bin,
+)
 from lha.live_context.backends.coco_flow import CocoFlowBackend
 from lha.live_context.backends.vector_query import IndexRecordError
 from lha.verifiers import VerifyContext
@@ -405,6 +411,74 @@ def test_ccc_mcp_error_is_not_an_empty_result():
         _checked_results(result)
 
 
+def test_ccc_unsuccessful_structured_result_is_not_empty():
+    result = SimpleNamespace(
+        isError=False,
+        structuredContent={"success": False, "results": [], "message": "broken index"},
+        content=[],
+    )
+    with pytest.raises(BackendUnavailable, match="unsuccessful"):
+        _checked_results(result)
+
+
+def test_ccc_unsuccessful_text_result_is_not_empty():
+    result = SimpleNamespace(
+        isError=False,
+        structuredContent=None,
+        content=[
+            SimpleNamespace(
+                text='{"success": false, "results": [], "message": "broken index"}'
+            )
+        ],
+    )
+    with pytest.raises(BackendUnavailable, match="unsuccessful"):
+        _checked_results(result)
+
+
+def test_ccc_subprocess_environment_excludes_host_credentials(monkeypatch):
+    monkeypatch.setenv("PATH", "/custom/bin")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("CODEX_HOME", "/tmp/codex")
+
+    env = _env_with_local_bin()
+
+    assert env["LANG"] == "en_US.UTF-8"
+    assert "/custom/bin" in env["PATH"].split(os.pathsep)
+    assert "" not in env["PATH"].split(os.pathsep)
+    assert set(env) <= {"PATH", "LANG", "LC_ALL", "LC_CTYPE"}
+    assert not {
+        "OPENAI_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_TOKEN",
+        "SSH_AUTH_SOCK",
+        "CODEX_HOME",
+    } & env.keys()
+
+
+def test_ccc_mcp_operation_timeout_fails_as_backend_unavailable():
+    async def wait_forever():
+        await asyncio.Event().wait()
+
+    with pytest.raises(BackendUnavailable, match="initialization timed out"):
+        asyncio.run(
+            _await_mcp(
+                wait_forever(),
+                timeout_s=0.001,
+                operation="initialization",
+            )
+        )
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True, float("inf"), float("nan")])
+def test_ccc_rejects_invalid_mcp_timeout(tmp_path, timeout):
+    with pytest.raises(ValueError, match="finite positive"):
+        CccBackend(tmp_path, mcp_search_timeout_s=timeout)
+
+
 def test_corrupt_vector_index_is_reported_as_index_failed(tmp_path, monkeypatch):
     from lha.live_context import facade
 
@@ -487,7 +561,14 @@ def test_ccc_hit_binds_full_source_digest_and_detects_same_mtime_tamper(
     backend._ccc = "/fake/ccc"
 
     async def search(*args, **kwargs):
-        return [{"path": "a.py", "code": "value = 1", "line_start": 1}]
+        return [
+            {
+                "path": "a.py",
+                "code": "value = 1",
+                "line_start": 1,
+                "line_end": 1,
+            }
+        ]
 
     monkeypatch.setattr(backend, "_search_async", search)
     hit = backend.search("value", refresh=False)[0]
@@ -508,6 +589,81 @@ def test_ccc_hit_binds_full_source_digest_and_detects_same_mtime_tamper(
     )
     assert changed.is_stale()
     assert any("indexed SHA-256" in reason for reason in changed.reasons)
+
+
+def test_ccc_rejects_snippet_that_does_not_match_claimed_lines(tmp_path, monkeypatch):
+    source = tmp_path / "a.py"
+    source.write_text("first = 1\nsecond = 2\n")
+    backend = CccBackend(tmp_path)
+    backend._ccc = "/fake/ccc"
+
+    async def search(*args, **kwargs):
+        return [
+            {
+                "path": "a.py",
+                "content": "second = 2",
+                "start_line": 1,
+                "end_line": 1,
+            }
+        ]
+
+    monkeypatch.setattr(backend, "_search_async", search)
+    with pytest.raises(BackendUnavailable, match="snippet does not match"):
+        backend.search("second", refresh=False)
+
+
+@pytest.mark.parametrize(
+    ("line_start", "line_end"),
+    [(0, 1), (2, 1), (1, 3), ("1", 1), (True, 1)],
+)
+def test_ccc_rejects_invalid_or_out_of_bounds_line_range(
+    tmp_path, monkeypatch, line_start, line_end
+):
+    source = tmp_path / "a.py"
+    source.write_text("value = 1\n")
+    backend = CccBackend(tmp_path)
+    backend._ccc = "/fake/ccc"
+
+    async def search(*args, **kwargs):
+        return [
+            {
+                "path": "a.py",
+                "code": "value = 1",
+                "line_start": line_start,
+                "line_end": line_end,
+            }
+        ]
+
+    monkeypatch.setattr(backend, "_search_async", search)
+    with pytest.raises(BackendUnavailable, match="source provenance"):
+        backend.search("value", refresh=False)
+
+
+def test_ccc_accepts_trimmed_multiline_snippet_with_exact_line_range(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "a.py"
+    source.write_text("  first = 1\nsecond = 2  \nthird = 3\n")
+    backend = CccBackend(tmp_path)
+    backend._ccc = "/fake/ccc"
+
+    async def search(*args, **kwargs):
+        return [
+            {
+                "file_path": "a.py",
+                "content": "first = 1\nsecond = 2",
+                "start_line": 1,
+                "end_line": 2,
+            }
+        ]
+
+    monkeypatch.setattr(backend, "_search_async", search)
+    hit = backend.search("value", refresh=False)[0]
+
+    assert hit.text == "first = 1\nsecond = 2"
+    assert hit.line_start == 1
+    assert hit.line_end == 2
+    assert hit.provenance.locator == "a.py:1-2"
 
 
 def test_ccc_rejects_symlink_source_provenance(tmp_path, monkeypatch):

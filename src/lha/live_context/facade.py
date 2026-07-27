@@ -144,7 +144,7 @@ def search_experiments(query: str, *, k: int = 5, metric: str | None = None) -> 
 
 
 def search_skills(query: str, *, k: int = 5) -> list[SkillHit]:
-    """Retrieve past successes/skills (episodic memory)."""
+    """Retrieve reusable records from earlier successful runs."""
     hits = _backend_for("skill").search(query, k=k)
     return [h if isinstance(h, SkillHit) else SkillHit(**h.model_dump()) for h in hits]
 

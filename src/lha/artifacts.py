@@ -142,6 +142,7 @@ class ExperimentResult(BaseModel):
     repro: dict[str, Any] = Field(default_factory=dict)  # seed, versions, git_commit, ...
     returncode: int = 0
     stdout_tail: str = ""
+    output_truncated: bool = False
     based_on_context: list[str] = Field(default_factory=list)
 
 

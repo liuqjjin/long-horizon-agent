@@ -2,7 +2,7 @@
 
 The Implementer depends only on ``LLMClient``. The walking skeleton uses the
 ``DeterministicStub`` so a real pytest verifies a real fix with no network. Real
-runs swap in ``ClaudeCLIClient`` (default) or ``AnthropicClient`` via config.
+runs can select a CLI or API backend through configuration.
 """
 
 from __future__ import annotations
@@ -25,8 +25,9 @@ _FILE_BLOCK = re.compile(
 )
 
 _PLAN_SYSTEM = (
-    "You are the planning agent of a verification-first harness. Decompose the task "
-    "into an ordered list of verifiable steps. Output ONLY a JSON object in a ```json "
+    "You plan work for a task runner that advances only after registered checks pass. "
+    "Decompose the task into an ordered list of verifiable steps. Output ONLY a JSON "
+    "object in a ```json "
     "fenced block with keys `summary` (string) and `steps` (array). Each step has: "
     "`step_id`, `kind` (code|experiment|context), `action` "
     "(gather_context|edit_code|run_experiment|answer_query), `goal`, and `verifiers` "
@@ -178,8 +179,8 @@ class LLMClient(ABC):
     def _is_test_file(rel: Path) -> bool:
         """Test files are the oracle. Keeping them out of the prompt forces a genuine
         fix from the issue (the failing-test summary still returns via repair
-        feedback) instead of the model reverse-engineering the assertions — and it
-        keeps the ACI context compact (a large test suite would crowd the budget)."""
+        feedback) instead of the model reverse-engineering the assertions. Omitting
+        a large test suite also leaves more context space for the source files."""
         name = rel.name
         return (
             "tests" in rel.parts

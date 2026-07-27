@@ -18,8 +18,9 @@ from lha.clock import now
 from lha.config import Config
 from lha.harness import Harness
 from lha.harness.checkpoint import load_state, save_state
-from lha.harness.errors import CheckpointCorrupt
+from lha.harness.errors import CheckpointCorrupt, TransactionCorrupt
 from lha.harness.state import RunState
+from lha.harness.transaction import list_transactions
 from lha.reporting import ReportingError, collect_run, prune_runs
 from lha.verifiers.verdict import Verdict
 
@@ -222,6 +223,27 @@ def test_stale_resumer_reloads_terminal_state_after_lock_barrier(
     assert not writer_errors
     assert result.status == "FAILED"
     assert load_state(state.run_dir).status == "FAILED"
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_terminal_resume_validates_redundant_transaction_backups(
+    runtime: str, tmp_path: Path
+) -> None:
+    config = _config(tmp_path)
+    runner, _runtime_module = _runtime(runtime, config)
+    completed = runner.run(
+        hermetic_task("data/tasks/fix_average.yaml"),
+        run_id=f"{runtime}-damaged-terminal-backup",
+    )
+    assert completed.status == "DONE"
+    run_dir = Path(completed.state.run_dir)
+    transaction = list_transactions(run_dir, "s2-fix")[0]
+    (run_dir / transaction.backup_ref).write_text("{broken")
+
+    with pytest.raises(
+        TransactionCorrupt, match="terminal transaction backup is unusable"
+    ):
+        runner.resume(completed.state.run_id)
 
 
 @pytest.mark.parametrize("runtime", ["loop", "langgraph"])

@@ -20,8 +20,9 @@ from lha.repo_adapter import (
     inspect_repo_integrity,
     repository_tree_sha256,
 )
-from lha.sandbox import TrustedLocalBackend
+from lha.sandbox import ExecutionBackend, TrustedLocalBackend
 from lha.tasks.spec import TaskSpec
+from lha.tools.shell import ProcResult
 
 ROOT = Path(__file__).resolve().parents[1]
 LONG_TASKS = ROOT / "data" / "long_tasks"
@@ -124,6 +125,9 @@ def test_repo_adapter_rejects_undeclared_tools_and_escaping_cwds(tmp_path: Path)
     with pytest.raises(ValidationError, match="may never pass"):
         RepoCommand(id="timeout", tool="python", expected_returncodes={124})
 
+    with pytest.raises(ValidationError, match="may never pass"):
+        RepoCommand(id="truncated", tool="python", expected_returncodes={125})
+
     with pytest.raises(ValidationError, match="shell tools"):
         RepoAdapterSpec(allowed_tools={"sh"})
 
@@ -148,6 +152,40 @@ def test_repo_adapter_rejects_undeclared_tools_and_escaping_cwds(tmp_path: Path)
     assert result.status == "failed"
     assert result.commands[0].returncode == 126
     assert "outside the repository" in result.commands[0].stderr
+
+
+class _TruncatedBackend(ExecutionBackend):
+    name = "truncated"
+
+    def run(self, cmd, *, cwd, timeout=300.0, input=None, limits=None):
+        return ProcResult(
+            125,
+            "partial",
+            "output exceeded capture limit",
+            0.01,
+            output_truncated=True,
+        )
+
+    def python(self) -> str:
+        return "python"
+
+    def tool(self, name: str) -> str:
+        return name
+
+
+def test_repo_stage_records_and_rejects_truncated_output(tmp_path: Path) -> None:
+    spec = RepoAdapterSpec(
+        allowed_tools={"python"},
+        setup=(RepoCommand(id="noisy", tool="python"),),
+    )
+
+    result = RepoAdapter(tmp_path, spec, _TruncatedBackend()).run_stage(
+        RepoStageRequest(stage="setup")
+    )
+
+    assert result.status == "failed"
+    assert result.commands[0].output_truncated is True
+    assert result.commands[0].passed is False
 
 
 @pytest.mark.parametrize(

@@ -45,7 +45,7 @@ _STAGES: tuple[RepoStage, ...] = (
     "build",
     "cleanup",
 )
-_INFRASTRUCTURE_FAILURE_CODES = frozenset({124, 126, 127})
+_INFRASTRUCTURE_FAILURE_CODES = frozenset({124, 125, 126, 127})
 _SHELL_TOOLS = frozenset({"bash", "cmd", "powershell", "pwsh", "sh", "zsh"})
 
 
@@ -236,12 +236,19 @@ class RepoCommandResult(BaseModel):
     stdout: str
     stderr: str
     duration_s: float = Field(ge=0.0)
+    output_truncated: bool = False
     passed: bool
 
     @model_validator(mode="after")
     def _passed_matches_returncode(self) -> Self:
-        if self.passed != (self.returncode in self.expected_returncodes):
-            raise ValueError("passed must match expected_returncodes")
+        expected = (
+            self.returncode in self.expected_returncodes
+            and not self.output_truncated
+        )
+        if self.passed != expected:
+            raise ValueError(
+                "passed must match expected_returncodes and complete output"
+            )
         return self
 
 
@@ -372,7 +379,11 @@ class RepoAdapter:
             stdout=proc.stdout,
             stderr=proc.stderr,
             duration_s=proc.duration_s,
-            passed=proc.returncode in command.expected_returncodes,
+            output_truncated=proc.output_truncated,
+            passed=(
+                proc.returncode in command.expected_returncodes
+                and not proc.output_truncated
+            ),
         )
 
     def _safe_cwd(self, relative: str) -> Path:

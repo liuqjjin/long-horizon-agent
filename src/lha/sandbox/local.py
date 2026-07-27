@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import os
 import signal
-import subprocess
 import sys
-import time
 from pathlib import Path
 
 from ..tools.shell import ProcResult, venv_tool
-from .base import ExecutionBackend, ResourceLimits, scrub_env
+from .base import (
+    ExecutionBackend,
+    ResourceLimits,
+    run_bounded_process,
+    scrub_env,
+)
 
 
 def _limit_preexec(limits: ResourceLimits):
@@ -66,34 +69,30 @@ class TrustedLocalBackend(ExecutionBackend):
         limits: ResourceLimits | None = None,
     ) -> ProcResult:
         limits = limits or self.limits
-        start = time.monotonic()
+
+        def kill_tree(process) -> str:
+            # The child owns a process group, so descendants that inherited its
+            # output descriptors are stopped before the drain threads join.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except OSError:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            return "process tree killed"
+
         try:
-            proc = subprocess.Popen(
+            return run_bounded_process(
                 cmd,
                 cwd=str(cwd),
                 env=scrub_env(),
-                stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                timeout=timeout,
+                input=input,
+                output_bytes=limits.output_bytes,
                 start_new_session=True,  # own process group -> killable as a tree
                 preexec_fn=_limit_preexec(limits),
+                on_timeout=kill_tree,
             )
         except OSError as e:
             return ProcResult(127, "", f"failed to start {cmd[0]!r}: {e}", 0.0)
-        try:
-            stdout, stderr = proc.communicate(input=input, timeout=timeout)
-            return ProcResult(proc.returncode, stdout, stderr, time.monotonic() - start)
-        except subprocess.TimeoutExpired:
-            # Kill the whole process group, not just the direct child.
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-            stdout, stderr = proc.communicate()
-            return ProcResult(
-                124,
-                stdout or "",
-                f"timeout after {timeout}s (process tree killed)",
-                time.monotonic() - start,
-            )

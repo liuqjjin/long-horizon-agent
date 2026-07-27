@@ -116,7 +116,7 @@ def _cmd_ablate(args) -> int:
     if not tasks:
         print("no tasks (pass paths or add data/tasks/bench_*.yaml)")
         return 1
-    llm = getattr(args, "llm", None) or "claude_cli"
+    llm = getattr(args, "llm", None) or "codex_cli"
     out = Path(args.out) if args.out else Path(cfg.runs_dir) / "ablation"
     model = args.model or None
     print(
@@ -544,7 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
     pres.add_argument("--json", action="store_true")
     pres.set_defaults(func=_cmd_resume)
 
-    pb = sub.add_parser("batch", help="run multiple tasks in parallel (orchestrator-worker)")
+    pb = sub.add_parser("batch", help="run multiple tasks concurrently")
     pb.add_argument("tasks", nargs="+")
     pb.add_argument("--workers", type=int, default=4)
     pb.set_defaults(func=_cmd_batch)
@@ -557,7 +557,9 @@ def build_parser() -> argparse.ArgumentParser:
     pab.add_argument("tasks", nargs="*", help="task yamls (default: data/tasks/bench_*.yaml)")
     pab.add_argument("--reps", type=int, default=1, help="repetitions per condition")
     pab.add_argument(
-        "--model", default="", help="implementer model (e.g. haiku) to calibrate difficulty"
+        "--model",
+        default="",
+        help="implementer model (for example gpt-5.4-mini)",
     )
     pab.add_argument("--out", default="", help="output dir (default: <runs>/ablation)")
     pab.add_argument(

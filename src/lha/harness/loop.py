@@ -90,6 +90,7 @@ from .transaction import (
     save_transaction,
     state_for_paths,
     validate_applied_state,
+    validate_terminal_transaction_state,
     validate_transaction_journals,
 )
 
@@ -193,6 +194,16 @@ def _claim_run_dir(runs_dir: str | Path, run_id: str) -> Path:
     return run_dir
 
 
+def _discard_uninitialized_run_dir(run_dir: Path) -> None:
+    """Remove a reservation that never reached its first durable checkpoint."""
+    if (run_dir / "state.json").exists():
+        return
+    try:
+        shutil.rmtree(run_dir)
+    except FileNotFoundError:
+        pass
+
+
 def _policy_verdict(step_id: str, e: PolicyViolation) -> Verdict:
     """A failing verdict for a policy-refused patch (never applied)."""
     return Verdict.from_checks(
@@ -243,18 +254,22 @@ class Harness:
     def run(self, task: TaskSpec, *, run_id: str | None = None) -> RunResult:
         run_id = run_id or _gen_run_id(task)
         run_dir = _claim_run_dir(self.config.runs_dir, run_id)
-        with run_lock(run_dir):
-            workdir = run_dir / "workdir"
-            self._prepare_workdir(task, workdir)
-            state = RunState.new(
-                task,
-                run_id,
-                str(run_dir),
-                str(workdir),
-                config=self.config,
-            )
-            save_state(state)
-            return self._drive(state)
+        try:
+            with run_lock(run_dir):
+                workdir = run_dir / "workdir"
+                self._prepare_workdir(task, workdir)
+                state = RunState.new(
+                    task,
+                    run_id,
+                    str(run_dir),
+                    str(workdir),
+                    config=self.config,
+                )
+                save_state(state)
+                return self._drive(state)
+        except BaseException:
+            _discard_uninitialized_run_dir(run_dir)
+            raise
 
     def resume(self, run_id: str) -> RunResult:
         validate_run_id(run_id)
@@ -271,18 +286,24 @@ class Harness:
                     f"schema {RUN_STATE_SCHEMA} is required for safe resume"
                 )
             limits = state.require_matching_budget_limits(self.config)
-            if state.status in ("DONE", "FAILED"):
-                return RunResult(state, state.status, "run already terminal")
-            state.recover_active_elapsed()
             records = read_ledger(state.run_dir)
-            if records:
-                state.seq = max(state.seq, *(record.seq for record in records))
             try:
                 validate_transaction_journals(Path(state.run_dir))
+                if state.status in ("DONE", "FAILED"):
+                    validate_terminal_transaction_state(
+                        Path(state.run_dir),
+                        Path(state.workdir),
+                        state.status,
+                    )
             except TransactionCorrupt as error:
                 raise TransactionCorrupt(
                     f"run recovery evidence is invalid: {error}"
                 ) from error
+            if state.status in ("DONE", "FAILED"):
+                return RunResult(state, state.status, "run already terminal")
+            state.recover_active_elapsed()
+            if records:
+                state.seq = max(state.seq, *(record.seq for record in records))
             records = self._reconcile_durable_ledger(state, records)
             if records:
                 # A ledger append is durable before the following state save.
@@ -888,6 +909,7 @@ class Harness:
                 )
                 state.active_since = None
                 state.elapsed_s = budget.elapsed()
+                budget.check_deadline()
                 self._save(state)
 
             while not state.is_terminal():
@@ -909,9 +931,14 @@ class Harness:
                 self._save(state)
                 self._run_step(state, step, budget)
                 in_flight = None  # finished cleanly (cursor may have advanced)
+                # A last step may consume the remaining wall-clock budget. Check
+                # before committing a terminal status, not only before the next
+                # iteration that may never exist.
+                budget.check_deadline()
                 state.active_since = None
                 state.elapsed_s = budget.elapsed()
                 self._save(state)
+            budget.check_deadline()
         except BudgetExceeded as e:
             state.steps_used = budget.steps_used
             state.elapsed_s = budget.elapsed()
@@ -927,6 +954,27 @@ class Harness:
         except ApprovalRejected as e:
             state.elapsed_s = budget.elapsed()
             state.active_since = None
+            rollback_error: Exception | None = None
+            if (
+                in_flight is not None
+                and in_flight.step_id not in state.completed_steps
+            ):
+                try:
+                    self._revert_step(in_flight, workdir)
+                except Exception as error:
+                    rollback_error = error
+                    logger.exception(
+                        "revert failed for step %s", in_flight.step_id
+                    )
+            if rollback_error is not None:
+                state.status = "PAUSED"
+                self._save(state)
+                return RunResult(
+                    state,
+                    "PAUSED",
+                    f"{type(e).__name__}: {e}; rollback incomplete: "
+                    f"{type(rollback_error).__name__}: {rollback_error}",
+                )
             state.status = "FAILED"
             self._save(state)
             return RunResult(state, "FAILED", str(e))
@@ -935,10 +983,24 @@ class Harness:
             # crashing tool) must not leave the run wedged at RUNNING with a
             # half-applied sandbox: revert the in-flight step, fail closed, checkpoint.
             if in_flight is not None and in_flight.step_id not in state.completed_steps:
+                rollback_error: Exception | None = None
                 try:
                     self._revert_step(in_flight, workdir)
-                except Exception:  # a revert failure must not abort the fail-closed path
+                except Exception as error:
+                    rollback_error = error
                     logger.exception("revert failed for step %s", in_flight.step_id)
+                if rollback_error is not None:
+                    state.elapsed_s = budget.elapsed()
+                    state.active_since = None
+                    state.status = "PAUSED"
+                    self._save(state)
+                    return RunResult(
+                        state,
+                        "PAUSED",
+                        f"{type(e).__name__}: {e}; rollback incomplete: "
+                        f"{type(rollback_error).__name__}: {rollback_error}",
+                    )
+                attempt_id = state.attempt_id(in_flight)
                 append_ledger(
                     state,
                     StepRecord(
@@ -946,6 +1008,8 @@ class Harness:
                         step_id=in_flight.step_id,
                         phase="fail",
                         notes=f"error: {type(e).__name__}: {e}"[:300],
+                        attempt_id=attempt_id,
+                        idempotency_key=f"{attempt_id}:fail",
                     ),
                 )
                 state.fail_current(in_flight)

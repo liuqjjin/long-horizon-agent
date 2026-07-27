@@ -11,6 +11,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from conftest import hermetic_task
@@ -19,7 +20,12 @@ from lha.artifacts import Patch
 from lha.config import Config
 from lha.harness import Harness
 from lha.harness.approval import HumanApprovalGate
-from lha.harness.checkpoint import append_ledger, load_state, run_lock
+from lha.harness.checkpoint import (
+    append_ledger,
+    load_state,
+    run_lock,
+    save_state,
+)
 from lha.harness.errors import (
     BudgetExceeded,
     CheckpointCorrupt,
@@ -29,15 +35,19 @@ from lha.harness.errors import (
 from lha.harness.loop import _claim_run_dir
 from lha.harness.state import LLMUsageState, StepRecord
 from lha.harness.transaction import (
+    build_transaction,
     list_transactions,
+    load_transaction,
     read_transaction_events,
     save_transaction,
     state_for_paths,
     transaction_log_path,
     transaction_path,
+    validate_terminal_transaction_state,
 )
 from lha.llm.stub import DeterministicStub
 from lha.llm.trace import TracedLLM
+from lha.reporting import ReportingError, collect_run
 from lha.tasks.spec import TaskSpec
 from lha.tools import policy
 from lha.tools.patch import (
@@ -65,6 +75,56 @@ def _paused(tmp_path: Path):
     return Harness(_cfg(tmp_path)).run(
         hermetic_task("data/tasks/fix_average_approval.yaml")
     )
+
+
+def _record_terminal_transaction(
+    *,
+    run_dir: Path,
+    workdir: Path,
+    step_id: str,
+    attempt_id: str,
+    contents: str,
+    created_at: str,
+    status: Literal["VERIFIED", "REVERTED"],
+):
+    patch = Patch(
+        step_id=step_id,
+        file_contents={"module.py": contents},
+    )
+    patch_bytes = patch.model_dump_json(indent=2).encode()
+    resolved = resolve_patch(patch, patch_bytes=patch_bytes)
+    backup = snapshot_paths(resolved.paths, workdir)
+    primary = run_dir / "backups" / step_id / f"{attempt_id}.json"
+    backup_digest = save_backup(backup, primary)
+    transaction = build_transaction(
+        run_dir=run_dir,
+        step_id=step_id,
+        attempt_id=attempt_id,
+        resolved=resolved,
+        backup_sha256=backup_digest,
+    ).model_copy(
+        update={
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+    )
+    save_backup(backup, run_dir / transaction.backup_mirror_ref)
+    save_transaction(run_dir, transaction)
+    apply_patch(patch, workdir, resolved=resolved, backup=backup)
+    transaction = transaction.transition("APPLIED", workdir=workdir)
+    save_transaction(run_dir, transaction)
+    if status == "VERIFIED":
+        transaction = transaction.transition("VERIFIED", workdir=workdir)
+        save_transaction(run_dir, transaction)
+    elif status == "REVERTED":
+        transaction = transaction.transition("VERIFIED", workdir=workdir)
+        save_transaction(run_dir, transaction)
+        revert_patch(backup, workdir)
+        transaction = transaction.transition("REVERTED")
+        save_transaction(run_dir, transaction)
+    else:
+        raise AssertionError(f"unsupported terminal transaction status: {status}")
+    return transaction
 
 
 def test_resolved_patch_uses_the_executable_write_set_only():
@@ -142,6 +202,56 @@ def test_resolved_diff_matches_git_apply_p1_for_custom_prefixes(tmp_path):
     assert target.read_text() == "new\n"
     revert_patch(backup, workdir)
     assert target.read_text() == "old\n"
+
+
+def test_unified_diff_can_delete_and_revert_a_file(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    target = workdir / "obsolete.py"
+    target.write_text("old = True\n")
+    diff = (
+        "diff --git a/obsolete.py b/obsolete.py\n"
+        "deleted file mode 100644\n"
+        "index 8a6cda1..0000000\n"
+        "--- a/obsolete.py\n"
+        "+++ /dev/null\n"
+        "@@ -1 +0,0 @@\n"
+        "-old = True\n"
+    )
+    patch = Patch(step_id="s", unified_diff=diff)
+    resolved = resolve_patch(patch)
+
+    assert resolved.paths == ["obsolete.py"]
+    _paths, backup = apply_patch(patch, workdir, resolved=resolved)
+    assert not target.exists()
+
+    revert_patch(backup, workdir)
+    assert target.read_text() == "old = True\n"
+
+
+def test_unified_diff_can_rename_and_revert_a_file(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    source = workdir / "old_name.py"
+    destination = workdir / "new_name.py"
+    source.write_text("value = 1\n")
+    diff = (
+        "diff --git a/old_name.py b/new_name.py\n"
+        "similarity index 100%\n"
+        "rename from old_name.py\n"
+        "rename to new_name.py\n"
+    )
+    patch = Patch(step_id="s", unified_diff=diff)
+    resolved = resolve_patch(patch)
+
+    assert resolved.paths == ["new_name.py", "old_name.py"]
+    _paths, backup = apply_patch(patch, workdir, resolved=resolved)
+    assert not source.exists()
+    assert destination.read_text() == "value = 1\n"
+
+    revert_patch(backup, workdir)
+    assert source.read_text() == "value = 1\n"
+    assert not destination.exists()
 
 
 def test_symlink_diff_is_removed_when_apply_fails_closed(tmp_path):
@@ -303,6 +413,28 @@ def test_prepare_workdir_never_follows_repository_symlinks(
     assert not workdir.exists()
 
 
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_failed_workdir_preparation_removes_uninitialized_run(tmp_path, runtime):
+    if runtime == "langgraph":
+        pytest.importorskip("langgraph")
+        from lha.runtime.langgraph_runner import LangGraphHarness
+
+        harness = LangGraphHarness(_cfg(tmp_path))
+    else:
+        harness = Harness(_cfg(tmp_path))
+    task = TaskSpec(
+        kind="issue_to_pr",
+        title="missing repository",
+        target_repo=str(tmp_path / "does-not-exist"),
+        context_requirement="optional",
+    )
+
+    with pytest.raises(FileNotFoundError, match="target_repo not found"):
+        harness.run(task, run_id=f"{runtime}-prepare-failed")
+
+    assert not (tmp_path / "runs" / f"{runtime}-prepare-failed").exists()
+
+
 @pytest.mark.parametrize(
     "paths",
     [
@@ -314,6 +446,18 @@ def test_prepare_workdir_never_follows_repository_symlinks(
 )
 def test_resolved_patch_rejects_traversal_and_aliases(paths):
     with pytest.raises(ValueError):
+        resolve_patch(Patch(step_id="s", file_contents=paths))
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        {"src": "file\n", "src/app.py": "child\n"},
+        {"SRC": "file\n", "src/app.py": "child\n"},
+    ],
+)
+def test_resolved_patch_rejects_parent_child_path_conflicts(paths):
+    with pytest.raises(ValueError, match="parent/child paths"):
         resolve_patch(Patch(step_id="s", file_contents=paths))
 
 
@@ -369,6 +513,305 @@ def test_corrupt_primary_backup_restores_from_mirror_and_fails(tmp_path):
     assert "primary backup is corrupt" in failed.message
     assert "len(values) - 1" in (run_dir / "workdir" / "mathutils.py").read_text()
     assert list_transactions(run_dir, "s2-fix")[0].status == "REVERTED"
+    with pytest.raises(
+        TransactionCorrupt, match="terminal transaction backup is unusable"
+    ):
+        Harness(_cfg(tmp_path)).resume(paused.state.run_id)
+
+
+def test_rollback_failure_stays_paused_and_resume_does_not_reapply(
+    tmp_path, monkeypatch
+):
+    import lha.harness.loop as loop_module
+
+    paused = _paused(tmp_path)
+    run_dir = Path(paused.state.run_dir)
+    target = run_dir / "workdir" / "mathutils.py"
+    target.write_text("def average(values):\n    return 999\n")
+    HumanApprovalGate(run_dir).resolve(approved=True)
+
+    def fail_rollback(*_args, **_kwargs):
+        raise OSError("simulated rollback failure")
+
+    monkeypatch.setattr(Harness, "_revert_step", fail_rollback)
+    first = Harness(_cfg(tmp_path)).resume(paused.state.run_id)
+
+    assert first.status == "PAUSED"
+    assert not first.state.is_terminal()
+    assert list_transactions(run_dir, "s2-fix")[0].status == "APPLIED"
+
+    monkeypatch.undo()
+    apply_calls = 0
+    real_apply = loop_module.apply_patch
+
+    def count_apply(*args, **kwargs):
+        nonlocal apply_calls
+        apply_calls += 1
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(loop_module, "apply_patch", count_apply)
+    second = Harness(_cfg(tmp_path)).resume(paused.state.run_id)
+
+    assert second.status == "FAILED"
+    assert apply_calls == 0
+    assert "len(values) - 1" in target.read_text()
+    assert [
+        event.status
+        for event in read_transaction_events(
+            run_dir, "s2-fix", "s2-fix-r0"
+        )
+    ] == ["PREPARED", "APPLIED", "REVERTED"]
+
+
+def test_unusable_redundant_backups_never_become_a_terminal_failure(tmp_path):
+    paused = _paused(tmp_path)
+    run_dir = Path(paused.state.run_dir)
+    transaction = list_transactions(run_dir, "s2-fix")[0]
+    for reference in (
+        transaction.backup_ref,
+        transaction.backup_mirror_ref,
+    ):
+        (run_dir / reference).write_text("{broken")
+    HumanApprovalGate(run_dir).resolve(approved=True)
+    before = (run_dir / "workdir" / "mathutils.py").read_bytes()
+    before_events = read_transaction_events(
+        run_dir, transaction.step_id, transaction.attempt_id
+    )
+
+    first = Harness(_cfg(tmp_path)).resume(paused.state.run_id)
+    second = Harness(_cfg(tmp_path)).resume(paused.state.run_id)
+
+    assert first.status == second.status == "PAUSED"
+    assert not second.state.is_terminal()
+    assert (run_dir / "workdir" / "mathutils.py").read_bytes() == before
+    assert read_transaction_events(
+        run_dir, transaction.step_id, transaction.attempt_id
+    ) == before_events
+    with pytest.raises(ReportingError, match="backup"):
+        collect_run(run_dir.parent, paused.state.run_id)
+
+
+def test_terminal_resume_rejects_an_unreverted_transaction(tmp_path):
+    paused = _paused(tmp_path)
+    run_dir = Path(paused.state.run_dir)
+    state = load_state(run_dir)
+    state.status = "FAILED"
+    save_state(state)
+
+    with pytest.raises(TransactionCorrupt, match="unresolved transaction"):
+        Harness(_cfg(tmp_path)).resume(paused.state.run_id)
+    with pytest.raises(ReportingError):
+        collect_run(run_dir.parent, paused.state.run_id)
+
+
+def test_reverted_terminal_worktree_drift_is_not_trusted(tmp_path):
+    paused = _paused(tmp_path)
+    run_dir = Path(paused.state.run_dir)
+    HumanApprovalGate(run_dir).resolve(approved=False, note="reject")
+    failed = Harness(_cfg(tmp_path)).resume(paused.state.run_id)
+    assert failed.status == "FAILED"
+    collect_run(run_dir.parent, paused.state.run_id)
+
+    target = run_dir / "workdir" / "mathutils.py"
+    target.write_text("def average(values):\n    return 999\n")
+
+    with pytest.raises(
+        TransactionCorrupt, match="confirmed transaction state"
+    ):
+        Harness(_cfg(tmp_path)).resume(paused.state.run_id)
+    with pytest.raises(
+        ReportingError, match="confirmed transaction state"
+    ):
+        collect_run(run_dir.parent, paused.state.run_id)
+
+
+def test_terminal_state_allows_a_new_verified_transaction_after_rollback(tmp_path):
+    run_dir = tmp_path / "run"
+    workdir = run_dir / "workdir"
+    workdir.mkdir(parents=True)
+    target = workdir / "module.py"
+    target.write_text("value = 0\n")
+
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s1-edit",
+        attempt_id="s1-edit-r0",
+        contents="value = 1\n",
+        created_at="2026-01-01T00:00:00+00:00",
+        status="VERIFIED",
+    )
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s2-edit",
+        attempt_id="s2-edit-r0",
+        contents="value = 2\n",
+        created_at="2026-01-01T00:00:01+00:00",
+        status="REVERTED",
+    )
+    assert target.read_text() == "value = 1\n"
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s3-edit",
+        attempt_id="s3-edit-r0",
+        contents="value = 3\n",
+        created_at="2026-01-01T00:00:02+00:00",
+        status="VERIFIED",
+    )
+
+    validate_terminal_transaction_state(run_dir, workdir, "DONE")
+    assert target.read_text() == "value = 3\n"
+
+
+def test_terminal_state_rejects_an_unjournaled_base_after_rollback(tmp_path):
+    run_dir = tmp_path / "run"
+    workdir = run_dir / "workdir"
+    workdir.mkdir(parents=True)
+    target = workdir / "module.py"
+    target.write_text("value = 0\n")
+
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s1-edit",
+        attempt_id="s1-edit-r0",
+        contents="value = 1\n",
+        created_at="2026-01-01T00:00:00+00:00",
+        status="VERIFIED",
+    )
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s2-edit",
+        attempt_id="s2-edit-r0",
+        contents="value = 2\n",
+        created_at="2026-01-01T00:00:01+00:00",
+        status="REVERTED",
+    )
+    target.write_text("value = 999\n")
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s3-edit",
+        attempt_id="s3-edit-r0",
+        contents="value = 3\n",
+        created_at="2026-01-01T00:00:02+00:00",
+        status="VERIFIED",
+    )
+
+    with pytest.raises(
+        TransactionCorrupt,
+        match="transaction after rollback does not start from the restored state",
+    ):
+        validate_terminal_transaction_state(run_dir, workdir, "DONE")
+
+
+def test_transaction_sequence_ignores_equal_and_reversed_wall_clock_times(tmp_path):
+    run_dir = tmp_path / "run"
+    workdir = run_dir / "workdir"
+    workdir.mkdir(parents=True)
+    (workdir / "module.py").write_text("value = 0\n")
+
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s-edit",
+        attempt_id="s-edit-r0",
+        contents="value = 1\n",
+        created_at="2026-01-01T00:00:02+00:00",
+        status="VERIFIED",
+    )
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s-edit",
+        attempt_id="s-edit-r1",
+        contents="value = 2\n",
+        created_at="2026-01-01T00:00:01+00:00",
+        status="REVERTED",
+    )
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s-edit",
+        attempt_id="s-edit-r2",
+        contents="value = 3\n",
+        created_at="2026-01-01T00:00:01+00:00",
+        status="VERIFIED",
+    )
+
+    transactions = list_transactions(run_dir, "s-edit")
+    assert [transaction.attempt_id for transaction in transactions] == [
+        "s-edit-r0",
+        "s-edit-r1",
+        "s-edit-r2",
+    ]
+    assert [transaction.sequence for transaction in transactions] == [1, 2, 3]
+    validate_terminal_transaction_state(run_dir, workdir, "DONE")
+
+
+def test_duplicate_transaction_sequence_fails_closed(tmp_path):
+    run_dir = tmp_path / "run"
+    workdir = run_dir / "workdir"
+    workdir.mkdir(parents=True)
+    (workdir / "module.py").write_text("value = 0\n")
+    _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s-edit",
+        attempt_id="s-edit-r0",
+        contents="value = 1\n",
+        created_at="2026-01-01T00:00:00+00:00",
+        status="VERIFIED",
+    )
+    second = _record_terminal_transaction(
+        run_dir=run_dir,
+        workdir=workdir,
+        step_id="s-edit",
+        attempt_id="s-edit-r1",
+        contents="value = 2\n",
+        created_at="2026-01-01T00:00:01+00:00",
+        status="VERIFIED",
+    )
+    path = transaction_path(run_dir, second.step_id, second.attempt_id)
+    envelope = json.loads(path.read_text())
+    envelope["payload"]["sequence"] = 1
+    canonical = json.dumps(
+        envelope["payload"], sort_keys=True, separators=(",", ":")
+    ).encode()
+    envelope["sha256"] = hashlib.sha256(canonical).hexdigest()
+    path.write_text(json.dumps(envelope))
+
+    with pytest.raises(
+        TransactionCorrupt, match="sequences must be unique and contiguous"
+    ):
+        list_transactions(run_dir, "s-edit")
+
+
+def test_tampered_or_duplicate_event_sequence_fails_closed(tmp_path):
+    paused = _paused(tmp_path)
+    run_dir = Path(paused.state.run_dir)
+    transaction = list_transactions(run_dir, "s2-fix")[0]
+    path = transaction_log_path(
+        run_dir, transaction.step_id, transaction.attempt_id
+    )
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [line["payload"]["event_sequence"] for line in lines] == [1, 2]
+    lines[1]["payload"]["event_sequence"] = 1
+    canonical = json.dumps(
+        lines[1]["payload"], sort_keys=True, separators=(",", ":")
+    ).encode()
+    lines[1]["sha256"] = hashlib.sha256(canonical).hexdigest()
+    path.write_text(
+        "\n".join(json.dumps(line, sort_keys=True) for line in lines) + "\n"
+    )
+
+    with pytest.raises(TransactionCorrupt, match="event sequences are not contiguous"):
+        read_transaction_events(
+            run_dir, transaction.step_id, transaction.attempt_id
+        )
 
 
 def test_worktree_drift_before_approval_fails_and_reverts(tmp_path):
@@ -733,6 +1176,33 @@ def test_transaction_writes_one_checksummed_event_per_phase(tmp_path):
         "PREPARED",
         "APPLIED",
     ]
+
+
+def test_single_schema_two_transaction_remains_loadable(tmp_path):
+    patch = Patch(step_id="legacy", file_contents={"module.py": "value = 1\n"})
+    resolved = resolve_patch(patch)
+    current = build_transaction(
+        run_dir=tmp_path,
+        step_id="legacy",
+        attempt_id="legacy-r0",
+        resolved=resolved,
+        backup_sha256="0" * 64,
+    )
+    payload = current.model_dump(mode="json")
+    payload["schema_version"] = 2
+    payload.pop("sequence")
+    legacy = type(current).model_validate(payload)
+
+    save_transaction(tmp_path, legacy)
+    loaded = load_transaction(tmp_path, "legacy", "legacy-r0")
+
+    assert loaded is not None
+    assert loaded.schema_version == 2
+    assert loaded.sequence is None
+    events = read_transaction_events(tmp_path, "legacy", "legacy-r0")
+    assert len(events) == 1
+    assert events[0].schema_version == 1
+    assert events[0].event_sequence is None
 
 
 def test_transaction_log_corruption_fails_closed(tmp_path):

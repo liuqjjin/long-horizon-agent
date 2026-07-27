@@ -1,12 +1,13 @@
-"""LLM call accounting: count, time, and cost every model call.
+"""LLM call accounting: count, time, and cost every model process attempt.
 
 ``TracedLLM`` wraps any ``LLMClient``: it enforces a max-calls budget (a run
 that would otherwise loop on a broken backend pauses instead of burning money)
 and, when bound to a run directory, appends one JSONL record per call to
 ``llm_trace.jsonl`` — kind, duration, and token/cost usage when the backend
 reports it (``last_usage``). The call count is durably reserved before control
-passes to the backend, so a process crash during a model call cannot reset the
-budget on resume.
+passes to the backend. Backends with internal retry, such as Codex CLI, reserve
+each process attempt separately before starting it, so a crash or retry cannot
+reset or exceed the budget on resume.
 """
 
 from __future__ import annotations
@@ -153,6 +154,17 @@ class TracedLLM(LLMClient):
         self.totals = LLMUsageTotals()
         self._sink: Path | None = None
         self._next_call_context: dict[str, Any] = {}
+        self._active_call_kind: str | None = None
+        self._backend_reserves_attempts = bool(
+            getattr(inner, "reserves_cli_attempts", False)
+        )
+        if self._backend_reserves_attempts:
+            set_reserver = getattr(inner, "set_attempt_reserver", None)
+            if not callable(set_reserver):
+                raise TypeError(
+                    "an attempt-accounting backend must provide set_attempt_reserver"
+                )
+            set_reserver(self._reserve_backend_attempt)
         self.name = f"traced:{getattr(inner, 'name', type(inner).__name__)}"
 
     def bind(self, run_dir: str | Path) -> "TracedLLM":
@@ -343,19 +355,38 @@ class TracedLLM(LLMClient):
                 f"max_llm_calls={self.max_calls} exhausted (before another {kind})"
             )
 
+    def _reserve_backend_attempt(self) -> None:
+        kind = self._active_call_kind or "model"
+        self._reserve_call(f"{kind} CLI attempt")
+
+    def _reserve_call(self, kind: str) -> None:
+        self._check_call_budget(kind)
+        # Persist a new value before exposing it in memory or starting the
+        # process. If the checkpoint write fails, no model attempt has begun.
+        reserved = LLMUsageTotals(
+            calls=self.totals.calls + 1,
+            wall_s=self.totals.wall_s,
+            input_tokens=self.totals.input_tokens,
+            output_tokens=self.totals.output_tokens,
+            cost_usd=self.totals.cost_usd,
+        )
+        if self._sink is not None:
+            _save_usage_checkpoint(self._sink.parent, reserved)
+        self.totals = reserved
+
     def _call(self, kind: str, fn):
         self._check_call_budget(kind)
-        # Reserve the call before invoking a process or network backend. A hard
-        # crash cannot run ``finally``; persisting here deliberately counts an
-        # uncertain call as consumed instead of allowing it to be replayed for
-        # free after resume.
-        self.totals.calls += 1
-        if self._sink is not None:
-            _save_usage_checkpoint(self._sink.parent, self.totals)
+        calls_before = self.totals.calls
+        previous_kind = self._active_call_kind
+        if not self._backend_reserves_attempts:
+            # A backend without its own retry loop has exactly one attempt.
+            self._reserve_call(kind)
+        self._active_call_kind = kind
         start = time.monotonic()
         try:
             return fn()
         finally:
+            self._active_call_kind = previous_kind
             duration = time.monotonic() - start
             self.totals.wall_s += duration
             usage = getattr(self.inner, "last_usage", None)
@@ -373,9 +404,21 @@ class TracedLLM(LLMClient):
                 # This is the accounting commit point. It precedes the optional
                 # detail trace and the coarser RunState checkpoint.
                 _save_usage_checkpoint(self._sink.parent, self.totals)
-            self._record(kind, duration, usage)
+            self._record(
+                kind,
+                duration,
+                usage,
+                attempt_count=self.totals.calls - calls_before,
+            )
 
-    def _record(self, kind: str, duration: float, usage: dict | None) -> None:
+    def _record(
+        self,
+        kind: str,
+        duration: float,
+        usage: dict | None,
+        *,
+        attempt_count: int,
+    ) -> None:
         if self._sink is None:
             return
         rec = {
@@ -383,6 +426,7 @@ class TracedLLM(LLMClient):
             "kind": kind,
             "backend": getattr(self.inner, "name", type(self.inner).__name__),
             "duration_s": round(duration, 3),
+            "attempt_count": attempt_count,
             "usage": usage,
             "totals": asdict(self.totals),
         }

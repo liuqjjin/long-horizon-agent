@@ -31,13 +31,20 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from ..bench.codex_exec_events import (
+    CodexEventError as StrictCodexEventError,
+)
+from ..bench.codex_exec_events import (
+    CodexJsonlValidator,
+)
 from .base import LLMClient
 
 # Event items that are a model *talking*. Anything else means the model reached
@@ -100,6 +107,10 @@ _PASSTHROUGH_ENV = (
 )
 _PROCESS_TERM_GRACE_S = 0.25
 _PROCESS_KILL_GRACE_S = 2.0
+_SUPPORTED_CLI_VERSION = "codex-cli 0.141.0"
+_MAX_JSONL_LINE_BYTES = 2 * 1024 * 1024
+_MAX_JSONL_BYTES = 16 * 1024 * 1024
+_MAX_FINAL_MESSAGE_BYTES = 4 * 1024 * 1024
 
 # Why this preamble exists, measured rather than assumed: the implementer prompt
 # lists files as "### <path>", and codex reads that as "you are in a repository".
@@ -271,12 +282,17 @@ class CodexInvocationError(CodexCLIError):
     """The local CLI could not be invoked correctly; retrying would not help."""
 
 
+class CodexCleanupError(CodexCLIError):
+    """Attempt-local files could not be removed and must be inspected or retried."""
+
+
 class CodexToolUse(CodexProtocolError):
     """The model reached outside the supplied prompt, invalidating the result."""
 
 
 class CodexCLIClient(LLMClient):
     name = "codex_cli"
+    reserves_cli_attempts = True
 
     def __init__(
         self,
@@ -319,6 +335,9 @@ class CodexCLIClient(LLMClient):
         self.last_event_summary: dict[str, Any] = self._new_event_summary()
         self._home: Path | None = None
         self._workspace: Path | None = None
+        self._output_dirs: set[Path] = set()
+        self.last_cleanup_failures: tuple[str, ...] = ()
+        self._attempt_reserver: Callable[[], None] | None = None
         self._version: str | None = None
 
     # --- isolated environment ------------------------------------------------
@@ -335,17 +354,20 @@ class CodexCLIClient(LLMClient):
         source = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"
         if not source.exists():
             raise CodexInvocationError(
-                f"codex is not logged in ({source} is missing); run `codex login` first"
+                "codex is not logged in; run `codex login` before starting LHA"
             )
         home = Path(tempfile.mkdtemp(prefix="lha_codex_home_"))
+        self._home = home
         try:
             home.chmod(0o700)
             shutil.copy2(source, home / "auth.json")
             (home / "auth.json").chmod(0o600)
-        except Exception:
-            shutil.rmtree(home, ignore_errors=True)
+        except BaseException as setup_error:
+            try:
+                self.cleanup()
+            except CodexCleanupError as cleanup_error:
+                raise cleanup_error from setup_error
             raise
-        self._home = home
         return home
 
     def _empty_workspace(self) -> Path:
@@ -360,11 +382,54 @@ class CodexCLIClient(LLMClient):
         return self._workspace
 
     def cleanup(self) -> None:
-        """Remove all attempt-local state, including the credential copy."""
-        for path in (self._home, self._workspace):
-            if path is not None:
-                shutil.rmtree(path, ignore_errors=True)
-        self._home = self._workspace = None
+        """Remove attempt-local state; retain failed paths so cleanup can be retried."""
+        failures: list[str] = []
+
+        def remove(path: Path | None, label: str) -> bool:
+            if path is None:
+                return True
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                return True
+            except Exception as error:
+                # A concurrent remover may have won after rmtree raised. Verify
+                # absence before deciding that a credential-bearing path remains.
+                if not os.path.lexists(path):
+                    return True
+                errno = getattr(error, "errno", None)
+                detail = type(error).__name__
+                if isinstance(errno, int):
+                    detail = f"{detail} errno={errno}"
+                failures.append(f"{label}: {detail}")
+                return False
+            return True
+
+        if remove(self._home, "temporary Codex home"):
+            self._home = None
+        if remove(self._workspace, "temporary Codex workspace"):
+            self._workspace = None
+        for path in tuple(self._output_dirs):
+            if remove(path, "temporary Codex output"):
+                self._output_dirs.discard(path)
+
+        self.last_cleanup_failures = tuple(failures)
+        if failures:
+            labels = ", ".join(failure.split(":", 1)[0] for failure in failures)
+            raise CodexCleanupError(
+                f"could not remove {labels}; paths remain retained for a cleanup retry"
+            )
+
+    @property
+    def pending_cleanup_paths(self) -> tuple[Path, ...]:
+        """Return local paths still awaiting cleanup; never serialize these paths."""
+        paths = [path for path in (self._home, self._workspace) if path is not None]
+        paths.extend(sorted(self._output_dirs))
+        return tuple(paths)
+
+    def set_attempt_reserver(self, reserver: Callable[[], None] | None) -> None:
+        """Install the tracer's write-ahead reservation for each CLI process attempt."""
+        self._attempt_reserver = reserver
 
     def _cli_version(self) -> str:
         if self._version is not None:
@@ -440,7 +505,32 @@ class CodexCLIClient(LLMClient):
         call_started = time.monotonic()
         version = self._cli_version()
         attempts: list[dict[str, Any]] = []
+        if version != _SUPPORTED_CLI_VERSION:
+            error = CodexProtocolError(
+                "unsupported Codex CLI protocol version: "
+                f"expected {_SUPPORTED_CLI_VERSION!r}, got {version!r}"
+            )
+            self._finish_call(
+                started=call_started,
+                version=version,
+                attempts=attempts,
+                status="failed",
+                error=error,
+            )
+            raise error
         for attempt in range(self.max_retries + 1):
+            if self._attempt_reserver is not None:
+                try:
+                    self._attempt_reserver()
+                except Exception as exc:
+                    self._finish_call(
+                        started=call_started,
+                        version=version,
+                        attempts=attempts,
+                        status="failed",
+                        error=exc,
+                    )
+                    raise
             attempt_started = time.monotonic()
             try:
                 answer = self._complete_once(system, prompt)
@@ -451,7 +541,7 @@ class CodexCLIClient(LLMClient):
                         "status": "failed",
                         "duration_s": round(time.monotonic() - attempt_started, 3),
                         "error_type": type(exc).__name__,
-                        "error": str(exc)[:400],
+                        "retryable": bool(getattr(exc, "retryable", False)),
                         "event_summary": self.last_event_summary,
                     }
                 )
@@ -485,9 +575,9 @@ class CodexCLIClient(LLMClient):
         raise AssertionError("unreachable")
 
     def _complete_once(self, system: str, prompt: str) -> str:
-        out_dir: Path | None = None
         try:
             out_dir = Path(tempfile.mkdtemp(prefix="lha_codex_out_"))
+            self._output_dirs.add(out_dir)
             out_path = out_dir / "last_message.txt"
             env = _minimal_subprocess_env(
                 codex_home=self._clean_home(),
@@ -505,7 +595,9 @@ class CodexCLIClient(LLMClient):
             except subprocess.TimeoutExpired as e:
                 raise CodexTransientError(f"codex CLI timed out after {self.timeout}s") from e
             except OSError as e:
-                raise CodexInvocationError(f"could not execute codex CLI: {e}") from e
+                raise CodexInvocationError(
+                    f"could not execute codex CLI ({type(e).__name__})"
+                ) from e
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout)[-400:]
                 error_type = (
@@ -513,19 +605,62 @@ class CodexCLIClient(LLMClient):
                     if proc.returncode == 124 or self._looks_transient(detail)
                     else CodexInvocationError
                 )
-                raise error_type(f"codex CLI failed ({proc.returncode}): {detail}")
-            self._audit(proc.stdout)
+                category = (
+                    "transient service or transport failure"
+                    if error_type is CodexTransientError
+                    else "invocation failure"
+                )
+                raise error_type(
+                    f"codex CLI failed ({proc.returncode}): {category}"
+                )
+            audited_answer = self._audit(proc.stdout)
             try:
-                answer = out_path.read_text()
-            except OSError as e:
-                raise CodexProtocolError(f"codex produced no final message: {e}") from e
+                answer = self._read_final_message(out_path)
+            except (OSError, UnicodeDecodeError, ValueError) as e:
+                raise CodexProtocolError(
+                    f"codex produced no readable final message ({type(e).__name__})"
+                ) from e
             if not answer.strip():
                 raise CodexProtocolError("codex produced an empty final message")
+            if answer != audited_answer:
+                raise CodexProtocolError(
+                    "codex final-message file does not match the audited agent_message"
+                )
             return answer
         finally:
-            if out_dir is not None:
-                shutil.rmtree(out_dir, ignore_errors=True)
             self.cleanup()
+
+    @staticmethod
+    def _read_final_message(path: Path) -> str:
+        """Read the CLI result without following links or accepting unbounded output."""
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size <= 0
+                or before.st_size > _MAX_FINAL_MESSAGE_BYTES
+            ):
+                raise ValueError("final message is not a bounded standalone file")
+            payload = bytearray()
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise ValueError("final message changed while it was being read")
+                payload.extend(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise ValueError("final message grew while it was being read")
+            after = os.fstat(descriptor)
+            stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+            if any(getattr(before, field) != getattr(after, field) for field in stable):
+                raise ValueError("final message changed while it was being read")
+            return bytes(payload).decode("utf-8")
+        finally:
+            os.close(descriptor)
 
     def _finish_call(
         self,
@@ -551,7 +686,6 @@ class CodexCLIClient(LLMClient):
         }
         if error is not None:
             metadata["error_type"] = type(error).__name__
-            metadata["error"] = str(error)[:400]
             metadata["retryable"] = bool(getattr(error, "retryable", False))
         self.last_call = metadata
         if self.last_usage is None:
@@ -576,20 +710,23 @@ class CodexCLIClient(LLMClient):
             }
         )
 
-    def _audit(self, event_stream: str) -> None:
-        """Validate the complete JSONL protocol and reject every external action."""
+    def _audit(self, event_stream: str) -> str:
+        """Validate one exact Codex 0.141 turn and return its last agent message."""
         self.last_usage = None
         summary = self._new_event_summary()
         self.last_event_summary = summary
         self.last_tool_use = []
-        thread_started = False
-        turn_started = False
-        turn_completed = False
-        saw_agent_message = False
-        parsed_usage: dict[str, Any] | None = None
+        validator = CodexJsonlValidator(
+            max_tool_calls=1,
+            max_line_bytes=_MAX_JSONL_LINE_BYTES,
+            max_total_bytes=_MAX_JSONL_BYTES,
+        )
+        last_agent_message: str | None = None
 
-        for line_number, line in enumerate(event_stream.splitlines(), start=1):
-            line = line.strip()
+        for line_number, raw_line in enumerate(
+            event_stream.splitlines(keepends=True), start=1
+        ):
+            line = raw_line.strip()
             if not line:
                 continue
             try:
@@ -615,22 +752,7 @@ class CodexCLIClient(LLMClient):
                 )
             summary["total_events"] += 1
             self._increment(summary["events"], kind)
-            if turn_completed:
-                raise CodexProtocolError(f"codex emitted {kind!r} after turn.completed")
-
-            if kind == "thread.started":
-                if thread_started or turn_started or summary["total_events"] != 1:
-                    raise CodexProtocolError(
-                        "thread.started must be the first and only thread start"
-                    )
-                thread_started = True
-            elif kind == "turn.started":
-                if not thread_started or turn_started:
-                    raise CodexProtocolError("turn.started must follow one thread.started")
-                turn_started = True
-            elif kind in {"item.started", "item.updated", "item.completed"}:
-                if not turn_started:
-                    raise CodexProtocolError(f"{kind} arrived before turn.started")
+            if kind in {"item.started", "item.updated", "item.completed"}:
                 item = event.get("item")
                 if not isinstance(item, dict):
                     raise CodexProtocolError(f"{kind} must contain an object-valued item")
@@ -647,35 +769,37 @@ class CodexCLIClient(LLMClient):
                         f"codex used forbidden item {item_type!r}; refusing a result that may "
                         f"have reached outside the prompt. evidence={evidence}"
                     )
-                if kind == "item.completed" and item_type == "agent_message":
-                    saw_agent_message = True
-            elif kind == "turn.completed":
-                if not turn_started:
-                    raise CodexProtocolError("turn.completed arrived before turn.started")
-                usage = event.get("usage") or {}
-                if not isinstance(usage, dict):
-                    raise CodexProtocolError("turn.completed usage must be an object")
-                parsed_usage = {
-                    "input_tokens": usage.get("input_tokens"),
-                    "output_tokens": (usage.get("output_tokens") or 0)
-                    + (usage.get("reasoning_output_tokens") or 0),
-                    "cached_input_tokens": usage.get("cached_input_tokens"),
-                    "cost_usd": None,  # a ChatGPT subscription reports no per-call cost
-                    "model": self.model,
-                }
-                turn_completed = True
             elif kind in {"turn.failed", "error"}:
                 raise self._error_event(event)
+            try:
+                validator.feed_line(raw_line)
+            except StrictCodexEventError as exc:
+                if "invalid JSON" in str(exc):
+                    summary["invalid_json_lines"] += 1
+                raise CodexProtocolError(str(exc)) from exc
+            if kind == "item.completed":
+                item = event["item"]
+                if item.get("type") == "agent_message":
+                    last_agent_message = item["text"]
 
-        if not thread_started:
-            raise CodexProtocolError("codex JSONL stream is empty or missing thread.started")
-        if not turn_started:
-            raise CodexProtocolError("codex JSONL stream is missing turn.started")
-        if not turn_completed:
-            raise CodexProtocolError("codex JSONL stream is missing turn.completed")
-        if not saw_agent_message:
-            raise CodexProtocolError("codex turn completed without a completed agent_message")
-        self.last_usage = parsed_usage
+        try:
+            audit = validator.finish()
+        except StrictCodexEventError as exc:
+            raise CodexProtocolError(str(exc)) from exc
+        if last_agent_message is None:
+            # The strict validator checks this too; retain a local assertion so
+            # the returned result cannot become optional if its audit model changes.
+            raise CodexProtocolError(
+                "codex turn completed without a completed agent_message"
+            )
+        self.last_usage = {
+            "input_tokens": audit.input_tokens,
+            "output_tokens": audit.output_tokens + audit.reasoning_output_tokens,
+            "cached_input_tokens": audit.cached_input_tokens,
+            "cost_usd": None,  # a ChatGPT subscription reports no per-call cost
+            "model": self.model,
+        }
+        return last_agent_message
 
     @staticmethod
     def _new_event_summary() -> dict[str, Any]:
@@ -726,8 +850,8 @@ class CodexCLIClient(LLMClient):
             or "no detail"
         )
         if cls._looks_transient(detail):
-            return CodexTransientError(f"codex reported a transient failure: {detail[:400]}")
-        return CodexProtocolError(f"codex reported a non-transient failure: {detail[:400]}")
+            return CodexTransientError("codex reported a transient failure")
+        return CodexProtocolError("codex reported a non-transient failure")
 
     @staticmethod
     def _looks_transient(detail: str) -> bool:

@@ -22,22 +22,44 @@ import pytest
 
 import lha.llm.codex_cli as codex_backend
 from lha.config import Config
+from lha.harness.errors import BudgetExceeded
+from lha.harness.state import LLMUsageState
 from lha.llm import get_llm
 from lha.llm.codex_cli import (
+    CodexCleanupError,
     CodexCLIClient,
     CodexInvocationError,
     CodexProtocolError,
     CodexToolUse,
     CodexTransientError,
 )
-from lha.llm.trace import TracedLLM
+from lha.llm.trace import TracedLLM, load_usage_checkpoint
 
 
 def _events(*items: dict, usage: dict | None = None) -> str:
     """A codex `--json` event stream carrying the given completed items."""
-    lines = [json.dumps({"type": "thread.started"}), json.dumps({"type": "turn.started"})]
-    lines += [json.dumps({"type": "item.completed", "item": item}) for item in items]
-    lines.append(json.dumps({"type": "turn.completed", "usage": usage or {}}))
+    normalized_items = []
+    for index, item in enumerate(items, start=1):
+        normalized = dict(item)
+        normalized.setdefault("id", f"item-{index}")
+        normalized_items.append(normalized)
+    complete_usage = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+    if usage is not None:
+        complete_usage.update(usage)
+    lines = [
+        json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+        json.dumps({"type": "turn.started"}),
+    ]
+    lines += [
+        json.dumps({"type": "item.completed", "item": item})
+        for item in normalized_items
+    ]
+    lines.append(json.dumps({"type": "turn.completed", "usage": complete_usage}))
     return "\n".join(lines) + "\n"
 
 
@@ -133,7 +155,7 @@ def test_unknown_top_level_event_fails_closed(event_type):
     client = CodexCLIClient()
     stream = "\n".join(
         [
-            json.dumps({"type": "thread.started"}),
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
             json.dumps({"type": "turn.started"}),
             json.dumps({"type": event_type}),
         ]
@@ -158,7 +180,7 @@ def test_unknown_top_level_event_fails_closed(event_type):
 )
 def test_is_error_anywhere_in_an_event_fails_closed(event):
     client = CodexCLIClient()
-    lines = [json.dumps({"type": "thread.started"})]
+    lines = [json.dumps({"type": "thread.started", "thread_id": "thread-1"})]
     if event["type"] != "turn.started":
         lines.append(json.dumps({"type": "turn.started"}))
     lines.append(json.dumps(event))
@@ -169,15 +191,24 @@ def test_is_error_anywhere_in_an_event_fails_closed(event):
 @pytest.mark.parametrize(
     "stream",
     [
-        "\n".join([json.dumps({"type": "thread.started"}), json.dumps({"type": "turn.started"})]),
         "\n".join(
             [
-                json.dumps({"type": "thread.started"}),
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps({"type": "turn.started"}),
+            ]
+        ),
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
                 json.dumps({"type": "turn.started"}),
                 json.dumps(
                     {
                         "type": "item.completed",
-                        "item": {"type": "agent_message", "text": "partial"},
+                        "item": {
+                            "id": "message-1",
+                            "type": "agent_message",
+                            "text": "partial",
+                        },
                     }
                 ),
             ]
@@ -194,19 +225,144 @@ def test_started_item_without_a_completed_agent_message_fails_closed():
     client = CodexCLIClient()
     stream = "\n".join(
         [
-            json.dumps({"type": "thread.started"}),
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
             json.dumps({"type": "turn.started"}),
             json.dumps(
                 {
                     "type": "item.started",
-                    "item": {"id": "item_1", "type": "agent_message", "text": ""},
+                    "item": {
+                        "id": "item_1",
+                        "type": "todo_list",
+                        "items": [],
+                    },
                 }
             ),
-            json.dumps({"type": "turn.completed", "usage": {}}),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                    },
+                }
+            ),
         ]
     )
-    with pytest.raises(CodexProtocolError, match="without a completed agent_message"):
+    with pytest.raises(CodexProtocolError, match="unfinished items"):
         client._audit(stream)
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "final",
+                            "type": "agent_message",
+                            "text": "done",
+                        },
+                    }
+                ),
+            ]
+        ),
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "missing id"},
+                    }
+                ),
+            ]
+        ),
+    ],
+)
+def test_malformed_required_fields_fail_closed(stream):
+    with pytest.raises(CodexProtocolError, match="does not match 0.141"):
+        CodexCLIClient()._audit(stream)
+
+
+def test_duplicate_item_id_fails_closed():
+    stream = _events(
+        {"id": "same", "type": "agent_message", "text": "first"},
+        {"id": "same", "type": "agent_message", "text": "second"},
+    )
+    with pytest.raises(CodexProtocolError, match="reused completed-only item"):
+        CodexCLIClient()._audit(stream)
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {
+            "input_tokens": -1,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+        },
+        {
+            "input_tokens": "1",
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+        },
+        {"input_tokens": 1, "output_tokens": 0, "reasoning_output_tokens": 0},
+    ],
+)
+def test_invalid_or_incomplete_usage_fails_closed(usage):
+    stream = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "final",
+                        "type": "agent_message",
+                        "text": "done",
+                    },
+                }
+            ),
+            json.dumps({"type": "turn.completed", "usage": usage}),
+        ]
+    )
+    with pytest.raises(CodexProtocolError, match="does not match 0.141"):
+        CodexCLIClient()._audit(stream)
+
+
+def test_unfinished_tool_is_rejected_before_result_use():
+    stream = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {
+                        "id": "tool-1",
+                        "type": "command_execution",
+                        "command": "cat withheld-test.py",
+                        "aggregated_output": "",
+                        "exit_code": None,
+                        "status": "in_progress",
+                    },
+                }
+            ),
+        ]
+    )
+    with pytest.raises(CodexToolUse, match="command_execution"):
+        CodexCLIClient()._audit(stream)
 
 
 # --- invocation ---------------------------------------------------------------
@@ -229,6 +385,43 @@ def test_argv_isolates_the_run(tmp_path):
     client.cleanup()
 
 
+def test_unknown_cli_version_is_rejected_before_execution(monkeypatch):
+    client = CodexCLIClient(max_retries=0)
+    called = False
+
+    def fake_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("unsupported CLI must not execute")
+
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.142.0")
+    monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+    with pytest.raises(CodexProtocolError, match="unsupported Codex CLI protocol"):
+        client.complete("SYSTEM", "PROMPT")
+    assert called is False
+    assert client.last_call is not None
+    assert client.last_call["attempt_count"] == 0
+
+
+def test_output_file_must_match_audited_agent_message(monkeypatch):
+    client = CodexCLIClient(max_retries=0)
+
+    def fake_run(argv, *, input, capture_output, text, timeout, env):
+        Path(argv[argv.index("-o") + 1]).write_text("different")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=_events({"type": "agent_message", "text": "audited"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+    monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
+    monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+    with pytest.raises(CodexProtocolError, match="does not match"):
+        client.complete("SYSTEM", "PROMPT")
+
+
 def test_danger_full_access_requires_an_external_sandbox():
     with pytest.raises(ValueError, match="externally_sandboxed"):
         CodexCLIClient(sandbox_mode="danger-full-access")
@@ -247,7 +440,7 @@ def test_prompt_only_mode_tells_the_model_there_is_no_filesystem(monkeypatch):
 
     class _Proc:
         returncode = 0
-        stdout = _events({"type": "agent_message", "text": "ok"})
+        stdout = _events({"type": "agent_message", "text": "answer"})
         stderr = ""
 
     def fake_run(argv, *, input, capture_output, text, timeout, env):
@@ -256,7 +449,9 @@ def test_prompt_only_mode_tells_the_model_there_is_no_filesystem(monkeypatch):
         Path(out).write_text("answer")
         return _Proc()
 
-    monkeypatch.setattr(CodexCLIClient, "_cli_version", lambda self: "codex-cli test")
+    monkeypatch.setattr(
+        CodexCLIClient, "_cli_version", lambda self: "codex-cli 0.141.0"
+    )
     monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
     monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
     assert client.complete("SYSTEM", "PROMPT") == "answer"
@@ -327,7 +522,7 @@ def test_protocol_errors_are_not_retried(monkeypatch):
         Path(argv[argv.index("-o") + 1]).write_text("answer")
         return subprocess.CompletedProcess(argv, 0, stdout="not json\n", stderr="")
 
-    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.test")
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
     monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
     monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
     with pytest.raises(CodexProtocolError):
@@ -340,7 +535,7 @@ def test_protocol_errors_are_not_retried(monkeypatch):
     assert client.last_call["error_type"] == "CodexProtocolError"
     assert client.last_usage is not None
     assert client.last_usage["status"] == "failed"
-    assert client.last_usage["cli_version"] == "codex-cli 0.test"
+    assert client.last_usage["cli_version"] == "codex-cli 0.141.0"
     assert client.last_usage["event_summary"]["invalid_json_lines"] == 1
 
 
@@ -351,7 +546,7 @@ def test_failed_call_audit_metadata_is_persisted_by_the_standard_tracer(tmp_path
         Path(argv[argv.index("-o") + 1]).write_text("answer")
         return subprocess.CompletedProcess(argv, 0, stdout="not json\n", stderr="")
 
-    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.test")
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
     monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
     monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
     traced = TracedLLM(client).bind(tmp_path)
@@ -360,8 +555,40 @@ def test_failed_call_audit_metadata_is_persisted_by_the_standard_tracer(tmp_path
 
     record = json.loads((tmp_path / "llm_trace.jsonl").read_text().strip())
     assert record["usage"]["status"] == "failed"
-    assert record["usage"]["cli_version"] == "codex-cli 0.test"
+    assert record["usage"]["cli_version"] == "codex-cli 0.141.0"
     assert record["usage"]["event_summary"]["invalid_json_lines"] == 1
+
+
+def test_codex_stderr_and_temporary_paths_never_enter_durable_trace(
+    tmp_path,
+    monkeypatch,
+):
+    client = CodexCLIClient(max_retries=0)
+    protected = "token-super-secret"
+    credential_path = "/tmp/lha_codex_home_private/auth.json"
+
+    def fake_run(argv, *, input, capture_output, text, timeout, env):
+        return subprocess.CompletedProcess(
+            argv,
+            2,
+            stdout="",
+            stderr=f"authentication failed for {credential_path}: {protected}",
+        )
+
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+    monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
+    monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+    traced = TracedLLM(client).bind(tmp_path)
+
+    with pytest.raises(CodexInvocationError, match="invocation failure"):
+        traced.complete("SYSTEM", "PROMPT")
+
+    durable = (tmp_path / "llm_trace.jsonl").read_text()
+    assert protected not in durable
+    assert credential_path not in durable
+    assert client.last_call is not None
+    assert "error" not in client.last_call
+    assert all("error" not in attempt for attempt in client.last_call["attempts"])
 
 
 def test_only_transient_failures_retry_and_record_audit_metadata(monkeypatch):
@@ -391,14 +618,14 @@ def test_only_transient_failures_retry_and_record_audit_metadata(monkeypatch):
             stderr="",
         )
 
-    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.test")
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
     monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
     monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
     assert client.complete("SYSTEM", "PROMPT") == "answer"
 
     assert calls == 2
     assert client.last_call is not None
-    assert client.last_call["cli_version"] == "codex-cli 0.test"
+    assert client.last_call["cli_version"] == "codex-cli 0.141.0"
     assert client.last_call["model"] == "gpt-5.4-mini"
     assert client.last_call["reasoning_effort"] == "high"
     assert client.last_call["retries"] == 1
@@ -410,8 +637,89 @@ def test_only_transient_failures_retry_and_record_audit_metadata(monkeypatch):
         "succeeded",
     ]
     assert client.last_usage is not None
-    assert client.last_usage["cli_version"] == "codex-cli 0.test"
+    assert client.last_usage["cli_version"] == "codex-cli 0.141.0"
     assert client.last_usage["retries"] == 1
+
+
+def test_tracer_counts_each_real_codex_retry_against_the_budget(tmp_path, monkeypatch):
+    client = CodexCLIClient(max_retries=2, retry_backoff_s=0)
+    process_calls = 0
+
+    def fake_run(argv, *, input, capture_output, text, timeout, env):
+        nonlocal process_calls
+        process_calls += 1
+        if process_calls == 1:
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                stdout="",
+                stderr="503 service temporarily unavailable",
+            )
+        Path(argv[argv.index("-o") + 1]).write_text("answer")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=_events(
+                {"type": "agent_message", "text": "answer"},
+                usage={"input_tokens": 5, "output_tokens": 2},
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+    monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
+    monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+    traced = TracedLLM(client, max_calls=2).bind(tmp_path)
+    traced.restore_totals(LLMUsageState())
+
+    assert traced.complete("SYSTEM", "PROMPT") == "answer"
+    assert process_calls == 2
+    assert traced.totals.calls == 2
+    durable = load_usage_checkpoint(tmp_path)
+    assert durable is not None and durable.calls == 2
+    record = json.loads((tmp_path / "llm_trace.jsonl").read_text())
+    assert record["attempt_count"] == 2
+    assert record["call"]["attempt_count"] == 2
+
+
+def test_codex_retry_cannot_exceed_or_reset_the_durable_attempt_budget(
+    tmp_path, monkeypatch
+):
+    process_calls = 0
+
+    def make_client() -> CodexCLIClient:
+        client = CodexCLIClient(max_retries=2, retry_backoff_s=0)
+
+        def fake_run(argv, *, input, capture_output, text, timeout, env):
+            nonlocal process_calls
+            process_calls += 1
+            return subprocess.CompletedProcess(
+                argv,
+                1,
+                stdout="",
+                stderr="503 service temporarily unavailable",
+            )
+
+        monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+        monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
+        monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+        return client
+
+    first = TracedLLM(make_client(), max_calls=1).bind(tmp_path)
+    first.restore_totals(LLMUsageState())
+    with pytest.raises(BudgetExceeded, match="max_llm_calls=1"):
+        first.complete("SYSTEM", "PROMPT")
+    assert process_calls == 1
+    assert first.totals.calls == 1
+    durable = load_usage_checkpoint(tmp_path)
+    assert durable is not None and durable.calls == 1
+
+    resumed = TracedLLM(make_client(), max_calls=1).bind(tmp_path)
+    resumed.restore_totals(LLMUsageState())
+    assert resumed.totals.calls == 1
+    with pytest.raises(BudgetExceeded, match="max_llm_calls=1"):
+        resumed.complete("SYSTEM", "PROMPT")
+    assert process_calls == 1
 
 
 def test_non_transient_cli_failure_is_not_retried(monkeypatch):
@@ -423,10 +731,10 @@ def test_non_transient_cli_failure_is_not_retried(monkeypatch):
         calls += 1
         return subprocess.CompletedProcess(argv, 2, stdout="", stderr="invalid model name")
 
-    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.test")
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
     monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
     monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
-    with pytest.raises(CodexInvocationError, match="invalid model"):
+    with pytest.raises(CodexInvocationError, match="invocation failure"):
         client.complete("SYSTEM", "PROMPT")
     assert calls == 1
 
@@ -469,7 +777,7 @@ def test_all_temporary_state_is_cleaned_on_every_exit(
         )
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.test")
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
     monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
     if expected_error is None:
         assert client.complete("SYSTEM", "PROMPT") == "answer"
@@ -481,6 +789,59 @@ def test_all_temporary_state_is_cleaned_on_every_exit(
     assert all(not path.exists() for path in paths_seen)
     assert (source_home / "auth.json").exists()
     assert client._home is None and client._workspace is None
+
+
+def test_cleanup_failure_is_fail_closed_and_retains_the_credential_home(
+    tmp_path, monkeypatch
+):
+    source_home = tmp_path / "real_codex_home"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"token": "secret"}')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    client = CodexCLIClient(max_retries=0)
+    real_rmtree = codex_backend.shutil.rmtree
+    failed_home: Path | None = None
+
+    def fake_run(argv, *, input, capture_output, text, timeout, env):
+        nonlocal failed_home
+        failed_home = Path(env["CODEX_HOME"])
+        Path(argv[argv.index("-o") + 1]).write_text("answer")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=_events({"type": "agent_message", "text": "answer"}),
+            stderr="",
+        )
+
+    def fail_credential_cleanup(path, *args, **kwargs):
+        if failed_home is not None and Path(path) == failed_home:
+            raise PermissionError(13, "permission denied")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+    monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+    monkeypatch.setattr(codex_backend.shutil, "rmtree", fail_credential_cleanup)
+
+    with pytest.raises(CodexCleanupError, match="paths remain retained") as error:
+        client.complete("SYSTEM", "PROMPT")
+
+    assert failed_home is not None and failed_home.exists()
+    assert (failed_home / "auth.json").exists()
+    assert failed_home in client.pending_cleanup_paths
+    assert client.last_cleanup_failures == (
+        "temporary Codex home: PermissionError errno=13",
+    )
+    assert str(failed_home) not in str(error.value)
+    assert client.last_call is not None
+    assert client.last_call["status"] == "failed"
+    assert client.last_call["error_type"] == "CodexCleanupError"
+    assert "error" not in client.last_call
+    assert source_home.exists()
+
+    monkeypatch.setattr(codex_backend.shutil, "rmtree", real_rmtree)
+    client.cleanup()
+    assert not failed_home.exists()
+    assert client.pending_cleanup_paths == ()
 
 
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])

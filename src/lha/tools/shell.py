@@ -16,10 +16,11 @@ class ProcResult:
     stdout: str
     stderr: str
     duration_s: float
+    output_truncated: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.returncode == 0
+        return self.returncode == 0 and not self.output_truncated
 
 
 def run(

@@ -66,7 +66,7 @@ class ExperimentHit(Hit):
 
 
 class SkillHit(Hit):
-    """A retrieved past success/skill (episodic memory)."""
+    """A reusable record distilled from an earlier successful run."""
 
     title: str | None = None
     skill_id: str | None = None

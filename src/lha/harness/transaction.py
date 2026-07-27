@@ -16,7 +16,7 @@ from ..clock import now
 from ..step_ids import canonical_artifact_segment
 from ..tools.patch import ResolvedPatch
 from .errors import TransactionCorrupt
-from .manifest import FileState, file_state
+from .manifest import FileState, file_state, saved_file_state
 
 TransactionStatus = Literal["PREPARED", "APPLIED", "VERIFIED", "REVERTED"]
 _TRANSITIONS: dict[TransactionStatus, frozenset[TransactionStatus]] = {
@@ -28,7 +28,8 @@ _TRANSITIONS: dict[TransactionStatus, frozenset[TransactionStatus]] = {
 
 
 class PatchTransaction(BaseModel):
-    schema_version: Literal[2] = 2
+    schema_version: Literal[2, 3] = 3
+    sequence: int | None = Field(default=None, ge=1)
     step_id: str
     attempt_id: str
     patch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -43,6 +44,10 @@ class PatchTransaction(BaseModel):
 
     @model_validator(mode="after")
     def _state_matches_phase(self) -> "PatchTransaction":
+        if self.schema_version == 3 and self.sequence is None:
+            raise ValueError("schema-3 transaction requires a sequence")
+        if self.schema_version == 2 and self.sequence is not None:
+            raise ValueError("schema-2 transaction cannot carry a sequence")
         checked_paths = [_canonical_transaction_path(path) for path in self.resolved_paths]
         if checked_paths != sorted(set(checked_paths)):
             raise ValueError("resolved_paths must be canonical, unique, and sorted")
@@ -95,13 +100,24 @@ class PatchTransaction(BaseModel):
 class PatchTransactionEvent(BaseModel):
     """One checksummed, append-only transaction phase record."""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     event_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    event_sequence: int | None = Field(default=None, ge=1)
+    transaction_sequence: int | None = Field(default=None, ge=1)
     at: str
     step_id: str
     attempt_id: str
     status: TransactionStatus
     transaction_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _sequence_matches_schema(self) -> "PatchTransactionEvent":
+        if self.schema_version == 2:
+            if self.event_sequence is None or self.transaction_sequence is None:
+                raise ValueError("schema-2 transaction event requires both sequences")
+        elif self.event_sequence is not None or self.transaction_sequence is not None:
+            raise ValueError("schema-1 transaction event cannot carry sequences")
+        return self
 
 
 def state_for_paths(workdir: Path, paths: list[str]) -> dict[str, FileState]:
@@ -187,6 +203,92 @@ def _safe_seg(value: str) -> str:
     return canonical_artifact_segment(value)
 
 
+def _read_transaction_state(path: Path) -> tuple[PatchTransaction, str]:
+    raw = json.loads(path.read_text())
+    payload = raw["payload"]
+    digest = hashlib.sha256(_canonical(payload)).hexdigest()
+    if digest != raw["sha256"]:
+        raise ValueError("checksum mismatch")
+    return PatchTransaction.model_validate(payload), digest
+
+
+def _persisted_transactions(
+    run_dir: Path,
+) -> list[tuple[Path, PatchTransaction, str]]:
+    root = run_dir / "transactions"
+    if not root.exists():
+        return []
+    records: list[tuple[Path, PatchTransaction, str]] = []
+    for path in sorted(root.rglob("*.json")):
+        try:
+            transaction, digest = _read_transaction_state(path)
+        except Exception as error:
+            raise TransactionCorrupt(
+                f"invalid patch transaction {path}: {error}"
+            ) from error
+        expected = transaction_path(
+            run_dir, transaction.step_id, transaction.attempt_id
+        )
+        if path != expected:
+            raise TransactionCorrupt(
+                f"transaction path does not match its identity: {path}"
+            )
+        records.append((path, transaction, digest))
+    return records
+
+
+def _ordered_transactions(
+    transactions: list[PatchTransaction],
+) -> list[PatchTransaction]:
+    """Order current transactions without trusting wall-clock timestamps.
+
+    Schema 2 predates durable ordering. A single old transaction is still safe
+    to load or recover because no ordering choice exists. More than one remains
+    individually inspectable, but ordered recovery fails closed: timestamps
+    cannot prove which write happened first.
+    """
+    legacy = [
+        transaction
+        for transaction in transactions
+        if transaction.schema_version == 2
+    ]
+    current = [
+        transaction
+        for transaction in transactions
+        if transaction.schema_version == 3
+    ]
+    if legacy and current:
+        raise TransactionCorrupt(
+            "cannot mix legacy and sequenced transaction histories"
+        )
+    if legacy:
+        if len(legacy) > 1:
+            raise TransactionCorrupt(
+                "legacy transaction history has no durable ordering"
+            )
+        return legacy
+
+    sequences = [int(transaction.sequence or 0) for transaction in current]
+    expected = list(range(1, len(current) + 1))
+    if sorted(sequences) != expected:
+        raise TransactionCorrupt(
+            "transaction sequences must be unique and contiguous from 1"
+        )
+    return sorted(current, key=lambda transaction: int(transaction.sequence or 0))
+
+
+def _next_transaction_sequence(run_dir: Path) -> int:
+    existing = [
+        transaction
+        for _path, transaction, _digest in _persisted_transactions(run_dir)
+    ]
+    if any(transaction.schema_version == 2 for transaction in existing):
+        raise TransactionCorrupt(
+            "cannot append a sequenced transaction to a legacy history"
+        )
+    return len(_ordered_transactions(existing)) + 1
+
+
 def build_transaction(
     *,
     run_dir: Path,
@@ -202,6 +304,7 @@ def build_transaction(
     )
     mirror = attempt_artifact_dir(run_dir, step_id, attempt_id).relative_to(run_dir) / "backup.json"
     return PatchTransaction(
+        sequence=_next_transaction_sequence(run_dir),
         step_id=step_id,
         attempt_id=attempt_id,
         patch_sha256=resolved.patch_sha256,
@@ -253,8 +356,54 @@ def durable_artifact_write(path: Path, data: bytes) -> None:
 
 
 def save_transaction(run_dir: Path, tx: PatchTransaction) -> None:
+    try:
+        tx = PatchTransaction.model_validate(tx.model_dump(mode="json"))
+    except Exception as error:
+        raise TransactionCorrupt(f"invalid patch transaction: {error}") from error
     path = transaction_path(run_dir, tx.step_id, tx.attempt_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    records = _persisted_transactions(run_dir)
+    _ordered_transactions(
+        [transaction for _path, transaction, _digest in records]
+    )
+    persisted = next(
+        (
+            transaction
+            for existing_path, transaction, _digest in records
+            if existing_path == path
+        ),
+        None,
+    )
+    if persisted is None:
+        if tx.schema_version == 3:
+            existing = [transaction for _path, transaction, _digest in records]
+            if any(transaction.schema_version == 2 for transaction in existing):
+                raise TransactionCorrupt(
+                    "cannot append a sequenced transaction to a legacy history"
+                )
+            if tx.sequence != len(_ordered_transactions(existing)) + 1:
+                raise TransactionCorrupt(
+                    "new transaction does not use the next durable sequence"
+                )
+        elif any(
+            transaction.schema_version == 3
+            for _path, transaction, _digest in records
+        ):
+            raise TransactionCorrupt(
+                "cannot append a legacy transaction to a sequenced history"
+            )
+    else:
+        if (
+            persisted.schema_version != tx.schema_version
+            or persisted.sequence != tx.sequence
+        ):
+            raise TransactionCorrupt(
+                f"transaction sequence changed for {tx.step_id}/{tx.attempt_id}"
+            )
+        if tx.status not in _TRANSITIONS[persisted.status]:
+            raise TransactionCorrupt(
+                f"invalid transaction transition: {persisted.status} -> {tx.status}"
+            )
     payload = tx.model_dump(mode="json")
     envelope = {
         "schema_version": 1,
@@ -273,14 +422,46 @@ def _append_transaction_event(
     path = transaction_log_path(run_dir, tx.step_id, tx.attempt_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     events = read_transaction_events(run_dir, tx.step_id, tx.attempt_id)
-    if any(event.transaction_sha256 == transaction_sha256 for event in events):
-        return
+    if tx.schema_version == 3:
+        for event in events:
+            if (
+                event.schema_version != 2
+                or event.transaction_sequence != tx.sequence
+            ):
+                raise TransactionCorrupt(
+                    f"transaction event sequence does not match "
+                    f"{tx.step_id}/{tx.attempt_id}"
+                )
+    elif any(event.schema_version != 1 for event in events):
+        raise TransactionCorrupt(
+            f"legacy transaction has sequenced events: {tx.step_id}/{tx.attempt_id}"
+        )
+    matching = [
+        index
+        for index, event in enumerate(events)
+        if event.transaction_sha256 == transaction_sha256
+    ]
+    if matching:
+        if matching == [len(events) - 1]:
+            return
+        raise TransactionCorrupt(
+            f"transaction state repeats an earlier journal event for "
+            f"{tx.step_id}/{tx.attempt_id}"
+        )
     if not events and tx.status != "PREPARED":
         raise TransactionCorrupt(
             f"transaction history for {tx.step_id}/{tx.attempt_id} "
             "does not start at PREPARED"
         )
+    if events and tx.status not in _TRANSITIONS[events[-1].status]:
+        raise TransactionCorrupt(
+            f"invalid transaction log transition: "
+            f"{events[-1].status} -> {tx.status}"
+        )
     event = PatchTransactionEvent(
+        schema_version=2 if tx.schema_version == 3 else 1,
+        event_sequence=len(events) + 1 if tx.schema_version == 3 else None,
+        transaction_sequence=tx.sequence,
         at=tx.updated_at,
         step_id=tx.step_id,
         attempt_id=tx.attempt_id,
@@ -333,6 +514,25 @@ def read_transaction_events(
         raise TransactionCorrupt(
             f"transaction log {path} does not start at PREPARED"
         )
+    versions = {event.schema_version for event in events}
+    if len(versions) > 1:
+        raise TransactionCorrupt(
+            f"transaction log {path} mixes event schemas"
+        )
+    if versions == {2}:
+        event_sequences = [event.event_sequence for event in events]
+        expected = list(range(1, len(events) + 1))
+        if event_sequences != expected:
+            raise TransactionCorrupt(
+                f"transaction log {path} event sequences are not contiguous"
+            )
+        transaction_sequences = {
+            event.transaction_sequence for event in events
+        }
+        if len(transaction_sequences) != 1:
+            raise TransactionCorrupt(
+                f"transaction log {path} changes transaction sequence"
+            )
     return events
 
 
@@ -361,23 +561,23 @@ def load_transaction(
 
 
 def list_transactions(run_dir: Path, step_id: str) -> list[PatchTransaction]:
-    root = transaction_dir(run_dir, step_id)
-    if not root.exists():
-        return []
-    transactions: list[PatchTransaction] = []
-    for path in sorted(root.glob("*.json")):
-        try:
-            raw = json.loads(path.read_text())
-            payload = raw["payload"]
-            digest = hashlib.sha256(_canonical(payload)).hexdigest()
-            if digest != raw["sha256"]:
-                raise ValueError("checksum mismatch")
-            tx = PatchTransaction.model_validate(payload)
-            _append_transaction_event(run_dir, tx, digest)
-            transactions.append(tx)
-        except Exception as e:
-            raise TransactionCorrupt(f"invalid patch transaction {path}: {e}") from e
-    return sorted(transactions, key=lambda tx: tx.created_at)
+    records = _persisted_transactions(run_dir)
+    ordered = _ordered_transactions(
+        [transaction for _path, transaction, _digest in records]
+    )
+    digests = {
+        (transaction.step_id, transaction.attempt_id): digest
+        for _path, transaction, digest in records
+    }
+    for transaction in ordered:
+        _append_transaction_event(
+            run_dir,
+            transaction,
+            digests[(transaction.step_id, transaction.attempt_id)],
+        )
+    return [
+        transaction for transaction in ordered if transaction.step_id == step_id
+    ]
 
 
 def validate_transaction_journals(run_dir: Path) -> None:
@@ -410,6 +610,11 @@ def validate_transaction_journals(run_dir: Path) -> None:
             state_paths.append(descendant)
         else:
             raise TransactionCorrupt(f"unknown transaction evidence: {descendant}")
+
+    records = _persisted_transactions(run_dir)
+    _ordered_transactions(
+        [transaction for _path, transaction, _digest in records]
+    )
 
     for path in state_paths:
         try:
@@ -446,6 +651,17 @@ def validate_transaction_journals(run_dir: Path) -> None:
             ):
                 raise TransactionCorrupt(
                     f"transaction log identity does not match persisted state: {path}"
+                )
+            if transaction.schema_version == 3 and (
+                event.schema_version != 2
+                or event.transaction_sequence != transaction.sequence
+            ):
+                raise TransactionCorrupt(
+                    f"transaction log sequence does not match persisted state: {path}"
+                )
+            if transaction.schema_version == 2 and event.schema_version != 1:
+                raise TransactionCorrupt(
+                    f"legacy transaction has sequenced events: {path}"
                 )
         for previous, current in zip(events, events[1:]):
             if current.status not in _TRANSITIONS[previous.status]:
@@ -486,4 +702,133 @@ def validate_applied_state(tx: PatchTransaction, workdir: Path) -> None:
         raise TransactionCorrupt(
             f"worktree drift for {tx.step_id}/{tx.attempt_id}: "
             "current files do not match the applied transaction"
+        )
+
+
+def validate_terminal_transaction_state(
+    run_dir: Path,
+    workdir: Path,
+    status: Literal["DONE", "FAILED"],
+) -> None:
+    """Prove that a terminal run has no unresolved patch side effects.
+
+    The transaction journal proves which phase was durably recorded, while the
+    two backups and the worktree prove the resulting bytes.  This check is
+    intentionally usable by both resume and reporting so a terminal label
+    cannot bypass the recovery boundary.
+    """
+    from ..tools.patch import backup_sha256, load_backup
+
+    validate_transaction_journals(run_dir)
+    root = run_dir / "transactions"
+    if not root.exists():
+        return
+
+    transactions = _ordered_transactions(
+        [
+            transaction
+            for _path, transaction, _digest in _persisted_transactions(run_dir)
+        ]
+    )
+    bases: dict[tuple[str, str], dict[str, FileState]] = {}
+    for transaction in transactions:
+        backups = []
+        for reference in (
+            transaction.backup_ref,
+            transaction.backup_mirror_ref,
+        ):
+            try:
+                backup = load_backup(
+                    resolve_transaction_evidence(run_dir, reference),
+                    required=True,
+                )
+                assert backup is not None
+            except Exception as error:
+                raise TransactionCorrupt(
+                    f"terminal transaction backup is unusable for "
+                    f"{transaction.step_id}/{transaction.attempt_id}: {error}"
+                ) from error
+            if backup_sha256(backup) != transaction.backup_sha256:
+                raise TransactionCorrupt(
+                    f"terminal transaction backup checksum mismatch for "
+                    f"{transaction.step_id}/{transaction.attempt_id}"
+                )
+            if (
+                set(backup.originals) != set(transaction.resolved_paths)
+                or set(backup.modes) != set(transaction.resolved_paths)
+            ):
+                raise TransactionCorrupt(
+                    f"terminal transaction backup write set mismatch for "
+                    f"{transaction.step_id}/{transaction.attempt_id}"
+                )
+            backups.append(backup)
+        bases[(transaction.step_id, transaction.attempt_id)] = {
+            relative: saved_file_state(
+                backups[0].originals[relative],
+                backups[0].modes[relative],
+            )
+            for relative in transaction.resolved_paths
+        }
+
+    unresolved = [
+        transaction
+        for transaction in transactions
+        if transaction.status in ("PREPARED", "APPLIED")
+    ]
+    if unresolved:
+        first = unresolved[0]
+        raise TransactionCorrupt(
+            f"{status} run contains unresolved transaction "
+            f"{first.step_id}/{first.attempt_id}: {first.status}"
+        )
+
+    by_path: dict[str, list[PatchTransaction]] = {}
+    for transaction in transactions:
+        for relative in transaction.resolved_paths:
+            by_path.setdefault(relative, []).append(transaction)
+
+    expected: dict[str, FileState] = {}
+    for relative, history in by_path.items():
+        confirmed: FileState | None = None
+        rollback_open = False
+        for transaction in history:
+            if transaction.status == "VERIFIED":
+                if rollback_open:
+                    restarted_base = bases[
+                        (transaction.step_id, transaction.attempt_id)
+                    ][relative]
+                    if restarted_base != confirmed:
+                        raise TransactionCorrupt(
+                            f"transaction after rollback does not start from "
+                            f"the restored state for {relative}"
+                        )
+                    rollback_open = False
+                confirmed = transaction.applied_state[relative]
+                continue
+            if transaction.status == "REVERTED" and not rollback_open:
+                restored = bases[
+                    (transaction.step_id, transaction.attempt_id)
+                ][relative]
+                if confirmed is not None and restored != confirmed:
+                    raise TransactionCorrupt(
+                        f"rollback base does not match the preceding verified "
+                        f"state for {relative}"
+                    )
+                confirmed = restored
+                rollback_open = True
+        if confirmed is not None:
+            expected[relative] = confirmed
+
+    if not expected:
+        return
+    actual = state_for_paths(workdir, sorted(expected))
+    mismatches = [
+        relative
+        for relative, expected_state in expected.items()
+        if actual.get(relative) != expected_state
+    ]
+    if mismatches:
+        raise TransactionCorrupt(
+            "terminal worktree does not match the confirmed transaction state: "
+            + ", ".join(sorted(mismatches))
         )

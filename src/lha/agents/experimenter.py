@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..array_evidence import (
     array_summary,
+    load_bounded_npy,
     output_sha256,
     raw_array_sha256,
     safe_artifact_path,
@@ -36,7 +37,6 @@ _LEGACY_OUTPUT_FILES = {
     "reference.npy",
     "repro.json",
 }
-
 
 class ExperimentIntent(BaseModel):
     """Durable declaration written before an experiment command can run."""
@@ -131,6 +131,7 @@ class Experimenter:
             repro=repro or {},
             returncode=res.returncode,
             stdout_tail=(res.stdout or res.stderr)[-1000:],
+            output_truncated=res.output_truncated,
             based_on_context=bundle.locators(),
         )
 
@@ -346,9 +347,9 @@ def _collect_array_evidence(
     if reference_path is None or prediction_path is None:
         return None
     try:
-        reference = np.load(reference_path, allow_pickle=False)
-        prediction = np.load(prediction_path, allow_pickle=False)
-    except (OSError, ValueError):
+        reference = load_bounded_npy(reference_path)
+        prediction = load_bounded_npy(prediction_path)
+    except (MemoryError, OSError, OverflowError, ValueError):
         return None
     if (
         reference.size == 0

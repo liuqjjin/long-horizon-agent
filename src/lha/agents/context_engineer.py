@@ -31,7 +31,7 @@ class ContextEngineer:
 
     def gather(self, step: Step, workdir: str | Path | None = None) -> ContextBundle:
         kinds = list(_KINDS_BY_STEP.get(step.kind, ("code", "paper", "experiment")))
-        # Episodic memory: retrieve relevant past skills (cheap no-op until indexed).
+        # Include records distilled from earlier successful runs when that index exists.
         if self.config.use_skill_memory and "skill" not in kinds:
             kinds.append("skill")
         kinds = tuple(kinds)

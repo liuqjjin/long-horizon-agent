@@ -30,7 +30,8 @@ class ResolvedPatch(BaseModel):
 
     ``Patch.touched_files`` is model-authored metadata and is intentionally not
     trusted. Whole-file patches write exactly ``file_contents``; unified diffs
-    write exactly the paths parsed from their headers.
+    mutate exactly the paths parsed from their headers, including both sides of
+    a deletion or rename.
     """
 
     step_id: str
@@ -77,6 +78,16 @@ def resolve_patch(patch: Patch, *, patch_bytes: bytes | None = None) -> Resolved
         if rel not in paths:
             paths.append(rel)
     paths.sort()
+    ordered_aliases = sorted((alias, rel) for alias, rel in seen.items())
+    for index, (parent_alias, parent_rel) in enumerate(ordered_aliases):
+        prefix = f"{parent_alias}/"
+        for child_alias, child_rel in ordered_aliases[index + 1 :]:
+            if child_alias.startswith(prefix):
+                raise ValueError(
+                    f"patch contains parent/child paths: {parent_rel!r} and {child_rel!r}"
+                )
+            if child_alias > prefix and not child_alias.startswith(parent_alias):
+                break
 
     encoded = patch_bytes if patch_bytes is not None else patch.model_dump_json().encode("utf-8")
     return ResolvedPatch(
@@ -241,7 +252,9 @@ def apply_patch(
         try:
             for rel in resolved.paths:
                 target = _safe_target(workdir, rel)
-                if not target.exists() or not target.is_file():
+                # Missing is a valid terminal state for a deletion or the source
+                # side of a rename. Symlinks and other file types remain invalid.
+                if target.exists() and not target.is_file():
                     raise ValueError(f"patch produced a non-regular file: {rel!r}")
         except Exception:
             revert_patch(backup, workdir)

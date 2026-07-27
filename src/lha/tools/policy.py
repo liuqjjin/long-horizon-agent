@@ -23,6 +23,10 @@ from .patch import ResolvedPatch
 _PROTECTED_NAMES = frozenset(
     {
         "conftest.py",
+        "pytest.py",
+        "pytest_jsonreport.py",
+        "sitecustomize.py",
+        "usercustomize.py",
         "pyproject.toml",
         "setup.py",
         "setup.cfg",
@@ -68,8 +72,19 @@ _PROTECTED_NAMES = frozenset(
 
 # Directories whose entire contents are protected.
 _PROTECTED_DIRS = frozenset(
-    {"tests", "test", ".github", ".gitlab", ".circleci", ".ci"}
+    {
+        "tests",
+        "test",
+        "pytest",
+        "_pytest",
+        "pytest_jsonreport",
+        ".github",
+        ".gitlab",
+        ".circleci",
+        ".ci",
+    }
 )
+
 
 def is_protected(rel: str) -> bool:
     """Whether a (relative) path is part of the oracle/config surface.

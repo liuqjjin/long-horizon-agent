@@ -54,6 +54,7 @@ from ..harness.loop import (
     Harness,
     RunResult,
     _claim_run_dir,
+    _discard_uninitialized_run_dir,
     _gen_run_id,
     _initial_plan_ref,
     _persist_verdict,
@@ -64,7 +65,10 @@ from ..harness.loop import (
 )
 from ..harness.manifest import sha256_bytes
 from ..harness.state import RUN_STATE_SCHEMA, Phase, RunState, StepRecord
-from ..harness.transaction import validate_transaction_journals
+from ..harness.transaction import (
+    validate_terminal_transaction_state,
+    validate_transaction_journals,
+)
 from ..live_context.models import ContextBundle
 from ..repo_adapter import RepoIntegrityResult, RepoStageResult
 from ..verifiers import VerifyContext
@@ -90,18 +94,22 @@ class LangGraphHarness:
     def run(self, task, *, run_id: str | None = None) -> RunResult:
         run_id = run_id or _gen_run_id(task)
         run_dir = _claim_run_dir(self.config.runs_dir, run_id)
-        with run_lock(run_dir):
-            workdir = run_dir / "workdir"
-            self._h._prepare_workdir(task, workdir)
-            state = RunState.new(
-                task,
-                run_id,
-                str(run_dir),
-                str(workdir),
-                config=self.config,
-            )
-            save_state(state)
-            return self._drive(state)
+        try:
+            with run_lock(run_dir):
+                workdir = run_dir / "workdir"
+                self._h._prepare_workdir(task, workdir)
+                state = RunState.new(
+                    task,
+                    run_id,
+                    str(run_dir),
+                    str(workdir),
+                    config=self.config,
+                )
+                save_state(state)
+                return self._drive(state)
+        except BaseException:
+            _discard_uninitialized_run_dir(run_dir)
+            raise
 
     def resume(self, run_id: str) -> RunResult:
         validate_run_id(run_id)
@@ -116,18 +124,24 @@ class LangGraphHarness:
                     f"schema {RUN_STATE_SCHEMA} is required for safe resume"
                 )
             limits = state.require_matching_budget_limits(self.config)
-            if state.is_terminal():
-                return RunResult(state, state.status, "run already terminal")
-            state.recover_active_elapsed()
             records = read_ledger(state.run_dir)
-            if records:
-                state.seq = max(state.seq, *(record.seq for record in records))
             try:
                 validate_transaction_journals(Path(state.run_dir))
+                if state.status in ("DONE", "FAILED"):
+                    validate_terminal_transaction_state(
+                        Path(state.run_dir),
+                        Path(state.workdir),
+                        state.status,
+                    )
             except TransactionCorrupt as error:
                 raise TransactionCorrupt(
                     f"run recovery evidence is invalid: {error}"
                 ) from error
+            if state.is_terminal():
+                return RunResult(state, state.status, "run already terminal")
+            state.recover_active_elapsed()
+            if records:
+                state.seq = max(state.seq, *(record.seq for record in records))
             records = self._h._reconcile_durable_ledger(state, records)
             if records:
                 state.seq = max(state.seq, *(record.seq for record in records))
@@ -271,12 +285,10 @@ class LangGraphHarness:
                     final = load_state_by_id(
                         self.config.runs_dir, state.run_id
                     )
-                    final.status = "FAILED"
-                    self._h._save(final)
-                    return RunResult(
+                    return self._fail_after_safe_revert(
                         final,
-                        "FAILED",
                         "approval interrupt does not match the current attempt",
+                        step=current_step,
                     )
                 try:
                     request = gate.request_evidence(
@@ -341,9 +353,11 @@ class LangGraphHarness:
             except ApprovalRejected as e:
                 final = load_state_by_id(self.config.runs_dir, state.run_id)
                 final.recover_active_elapsed()
-                final.status = "FAILED"
-                self._h._save(final)
-                return RunResult(final, "FAILED", str(e))
+                return self._fail_after_safe_revert(
+                    final,
+                    str(e),
+                    step=final.next_step(),
+                )
             except Exception as e:
                 # Same fail-closed contract as the default loop: a mid-node fault
                 # must not leave the run wedged at RUNNING with an unverified
@@ -351,16 +365,12 @@ class LangGraphHarness:
                 final = load_state_by_id(self.config.runs_dir, state.run_id)
                 final.recover_active_elapsed()
                 step = final.next_step()
-                if step is not None and step.step_id not in final.completed_steps:
-                    try:
-                        self._h._revert_step(step, workdir)
-                    except Exception:
-                        logger.exception("revert failed for step %s", step.step_id)
-                    final.fail_current(step)
-                else:
-                    final.status = "FAILED"
-                self._h._save(final)
-                return RunResult(final, "FAILED", f"{type(e).__name__}: {e}")
+                return self._fail_after_safe_revert(
+                    final,
+                    f"{type(e).__name__}: {e}",
+                    step=step,
+                    mark_failed_step=True,
+                )
 
             # paused on a fresh interrupt?
             snap = graph.get_state(gcfg)
@@ -372,9 +382,12 @@ class LangGraphHarness:
                 return RunResult(final, "AWAITING_APPROVAL", "awaiting approval")
             if snap.next:  # stopped mid-graph without an interrupt: wedged, fail closed
                 final = load_state_by_id(self.config.runs_dir, state.run_id)
-                final.status = "FAILED"
-                self._h._save(final)
-                return RunResult(final, "FAILED", "graph stopped mid-run without an interrupt")
+                return self._fail_after_safe_revert(
+                    final,
+                    "graph stopped mid-run without an interrupt",
+                    step=final.next_step(),
+                    mark_failed_step=True,
+                )
         finally:
             conn.close()
 
@@ -382,6 +395,15 @@ class LangGraphHarness:
         final.recover_active_elapsed()
         if final.status == "PAUSED":  # budget exhausted mid-graph
             return RunResult(final, "PAUSED", "budget exceeded")
+        limits = final.require_matching_budget_limits(self.config)
+        if (
+            not final.is_terminal()
+            and limits.deadline_s is not None
+            and final.elapsed_s > limits.deadline_s
+        ):
+            final.status = "PAUSED"
+            self._h._save(final)
+            return RunResult(final, "PAUSED", "deadline exceeded")
         if not final.is_terminal():
             final.status = "DONE"
         if final.status == "DONE":
@@ -701,6 +723,13 @@ class LangGraphHarness:
             self._repair_or_fail(state, step, verdict, workdir)
         state.elapsed_s = self._prior_elapsed + (time.monotonic() - self._t0)
         state.active_since = None
+        limits = state.require_matching_budget_limits(self.config)
+        if (
+            not state.is_terminal()
+            and limits.deadline_s is not None
+            and state.elapsed_s > limits.deadline_s
+        ):
+            state.status = "PAUSED"
         self._h._save(state)
         nxt = "done" if (state.is_terminal() or state.next_step() is None) else "continue"
         return {"rs": state.model_dump(mode="json"), "next": nxt}
@@ -734,11 +763,39 @@ class LangGraphHarness:
         message: str,
     ) -> RunResult:
         final = load_state_by_id(self.config.runs_dir, state.run_id)
-        try:
-            self._h._revert_step(step, Path(final.workdir))
-        except Exception:
-            logger.exception("revert failed for step %s", step.step_id)
-        final.status = "FAILED"
+        return self._fail_after_safe_revert(
+            final,
+            message,
+            step=step,
+        )
+
+    def _fail_after_safe_revert(
+        self,
+        final: RunState,
+        message: str,
+        *,
+        step,
+        mark_failed_step: bool = False,
+    ) -> RunResult:
+        if step is not None and step.step_id not in final.completed_steps:
+            try:
+                self._h._revert_step(step, Path(final.workdir))
+            except Exception as error:
+                logger.exception("revert failed for step %s", step.step_id)
+                final.status = "PAUSED"
+                self._h._save(final)
+                return RunResult(
+                    final,
+                    "PAUSED",
+                    f"{message}; rollback incomplete: "
+                    f"{type(error).__name__}: {error}",
+                )
+            if mark_failed_step and step.step_id not in final.failed_steps:
+                final.fail_current(step)
+            else:
+                final.status = "FAILED"
+        else:
+            final.status = "FAILED"
         self._h._save(final)
         return RunResult(final, "FAILED", message)
 
