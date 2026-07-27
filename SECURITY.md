@@ -1,7 +1,7 @@
 # Security policy
 
-LHA is a research and portfolio project, not a production service. Security
-reports are welcome.
+LHA is maintained for research and engineering evaluation, not as a production
+service. Security reports are welcome.
 
 ## Scope
 
@@ -32,7 +32,8 @@ commands you trust.
 
 The Docker backend runs a disposable container with network disabled, an empty
 task environment, memory and process limits, and read-only source mounts where
-the operation permits. Use it for external repositories and independent scoring.
+the operation permits. Use it for external repositories and the separate
+ablation scoring path.
 
 The execution image must contain every command a task needs. The default
 `python:3.12-slim` image does not include pytest, `pytest-json-report`, or Ruff;

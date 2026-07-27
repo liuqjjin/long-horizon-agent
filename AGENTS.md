@@ -1,39 +1,37 @@
-# AGENTS.md — repository guide for coding agents
+# AGENTS.md
 
-These are operational notes for anyone editing this repository. They summarize
-the checked implementation; `docs/ARCHITECTURE.md`, `CONTRIBUTING.md`, and
-`SECURITY.md` contain the longer explanations.
+This file records the repository rules that matter when editing or evaluating
+LHA. Longer explanations are in `docs/ARCHITECTURE.md`, `CONTRIBUTING.md`, and
+`SECURITY.md`.
 
-The repository has one non-negotiable rule:
+The main rule is:
 
-> **No claim without a runnable check.** Do not publish a behavior, benchmark
-> number, test count, or coverage figure until a command in this checkout has
-> produced it.
+> Do not publish a behavior, test count, coverage value, or benchmark number
+> until a command in the current checkout has produced it.
 
-## 1. Project scope
+## Scope
 
-`lha` is a Python 3.11+ task runner for code changes, experiments, and
-retrieval-backed work. A run follows:
+LHA is a Python 3.11+ runner for code changes, experiments, and indexed
+context. A run follows:
 
+```text
+context → execute → [approval] → verify → repair or advance → checkpoint
 ```
-context → execute → [approval] → verify → (repair | advance) → checkpoint
-```
 
-A step advances only after its registered checks pass. A check that cannot run
-fails; it is never treated as a pass or an implicit skip.
+The runner owns transitions, budgets, approval, recovery, and rollback. A check
+that cannot run fails.
 
-This is a research and portfolio project, not a production service. Its main
-implementation boundaries are:
+Implementation boundaries:
 
-1. The harness owns state transitions, budgets, approval, recovery, and rollback.
-2. `lha.live_context` is the only entry point to code and document indexes.
-3. The internal gate predicts whether to accept work; an independent scorer
-   supplies truth in ablation and public-benchmark adapters.
+1. `lha.live_context` is the only entry point to code and document indexes.
+2. Target- or model-influenced commands use `ExecutionBackend`.
+3. The internal gate decides whether a run advances. An independent scorer
+   supplies truth labels for the ablation and public benchmarks.
+4. This is a research and portfolio project, not a production service.
 
-## 2. Setup and commands
+## Setup
 
-Use [`uv`](https://docs.astral.sh/uv/) from the repository root. Python is pinned
-by `.python-version`.
+Run project commands from the repository root with `uv`:
 
 ```bash
 uv sync
@@ -42,194 +40,157 @@ LHA_RUNS_DIR=runs/_scratch uv run lha eval
 uv run pytest -q
 ```
 
-Current CLI surface:
+Useful CLI commands:
 
 ```text
 lha run <task.yaml> [--runtime loop|langgraph] [--auto-approve] [--json]
 lha resume <run_id> [--runtime loop|langgraph] [--auto-approve] [--json]
 lha approve|reject <run_id> [--note TEXT]
 lha trace <run_id> [--html] [--out PATH]
-lha runs list
-lha runs show <run_id>
-lha runs prune --older-than-days N [--apply]
+lha runs list|show|prune ...
 lha batch <task.yaml>... [--workers N]
 lha eval [--quick]
 lha ablate [task.yaml...] [--reps N] [--model MODEL]
-           [--scorer-backend trusted-local|docker] [--out DIR]
 lha horizon [--from-report PATH] [--out DIR] [--seed N]
 lha index <path>
 lha index-docs
 lha ask <query...> [--root PATH] [--kinds code,paper,...] [--k N]
-
-Global: --llm {stub,claude_cli,codex_cli,anthropic}  -v/-vv  --version
 ```
 
-Configuration is read once at startup in `src/lha/config.py`. `.env.example`
-lists every supported `LHA_*` variable. The settings that most affect behavior
-are:
+Global options include
+`--llm {stub,claude_cli,codex_cli,anthropic}`, `-v`, `-vv`, and `--version`.
 
-| variable | default | purpose |
-|---|---|---|
-| `LHA_LLM_BACKEND` | `stub` | deterministic offline backend for tests and self-eval |
-| `LHA_MAX_STEPS` / `LHA_MAX_REPAIRS` | `20` / `3` | persisted run budgets |
-| `LHA_DEADLINE_S` / `LHA_MAX_LLM_CALLS` | unset | resumable time and call limits |
-| `LHA_EXEC_BACKEND` | `trusted-local` | `trusted-local` or `docker` execution |
-| `LHA_EXEC_IMAGE` | `python:3.12-slim` | image used by the Docker execution backend |
-| `LHA_CODE_BACKEND` | `auto` | `ccc`, `null`, or automatic selection |
-| `LHA_RUNS_DIR` / `LHA_DATA_DIR` | `runs` / `data` | durable state locations |
-| `LHA_CODEX_MODEL` / `LHA_CODEX_EFFORT` | unset / `medium` | Codex run provenance |
+Configuration is loaded once in `src/lha/config.py`. `.env.example` lists the
+supported `LHA_*` variables. Important defaults:
+
+| setting | default |
+|---|---|
+| `LHA_LLM_BACKEND` | `stub` |
+| `LHA_MAX_STEPS` / `LHA_MAX_REPAIRS` | `20` / `3` |
+| `LHA_DEADLINE_S` / `LHA_MAX_LLM_CALLS` | unset |
+| `LHA_EXEC_BACKEND` | `trusted-local` |
+| `LHA_EXEC_IMAGE` | `python:3.12-slim` |
+| `LHA_CODE_BACKEND` | `auto` |
+| `LHA_RUNS_DIR` / `LHA_DATA_DIR` | `runs` / `data` |
+| `LHA_CODEX_MODEL` / `LHA_CODEX_EFFORT` | unset / `medium` |
 
 Optional extras are `context`, `bench`, `llm`, and `typecheck`. Harbor requires
-Python 3.12 or newer even though the core package supports Python 3.11.
+Python 3.12 or newer even though LHA itself supports Python 3.11.
 
-### `uv` pitfalls
+Do not run project commands from a benchmark fixture; each fixture has its own
+`pyproject.toml`. For an isolated package probe, change to a scratch directory
+and use `uv run --no-project`.
 
-- Running `uv run --python X.Y` or `uv run --with ...` inside this project can
-  recreate `.venv`. For an isolated package probe, change to a scratch directory
-  and use `uv run --no-project`.
-- Every benchmark fixture has its own `pyproject.toml`. Run project commands from
-  this repository root so `uv` does not select a fixture as the active project.
-
-## 3. Directory map
+## Repository map
 
 ```text
 src/lha/
   harness/        loop, state, checkpoint, approval, manifest, transaction
-  live_context/   facade, freshness, backends, packaged CocoIndex flows
-  agents/         supervisor, context engineer, implementer, experimenter, verifier
-  verifiers/      code, experiment, and context verifier families
-  llm/            stub, Claude CLI, Codex CLI, Anthropic, tracing
-  sandbox/        trusted-local and Docker execution backends
-  runtime/        opt-in LangGraph runner
-  bench/          SWE-bench and Terminal-Bench adapters, statistics
-  tasks/ tools/   task models, patch resolution, policy, shell helpers
-  reporting.py    validated inspection, static HTML, run retention
-  repo_adapter.py typed repository stages for long tasks
+  live_context/   facade, freshness, backends, packaged index flows
+  agents/         planning, context, implementation, experiments, verification
+  verifiers/      code, experiment, and context checks
+  llm/            stub, CLI and SDK backends, tracing
+  sandbox/        trusted-local and Docker execution
+  runtime/        optional LangGraph runner
+  bench/          ablation, SWE-bench, Terminal-Bench, statistics
+  tasks/ tools/   task models, patch resolution, policy, command helpers
+  reporting.py    run inspection, HTML reports, retention
+  repo_adapter.py typed repository stages
 data/
-  tasks/          normal tasks and the 17 fixed ablation tasks
-  bench/          planted-bug repositories and their pytest oracles
-  long_tasks/     five fixed multi-file repositories and reference evidence
-tests/            hermetic unit, integration, recovery, and packaging checks
-benchmarks/       committed measured reports; regenerate, never hand-edit numbers
-runs/<id>/        state, ledger, transactions, artifacts, reports, worktree
+  tasks/          normal tasks and 17 fixed ablation tasks
+  bench/          fixed defect repositories and their oracles
+  long_tasks/     five fixed multi-file fixtures
+tests/            unit, integration, recovery, and packaging checks
+benchmarks/       committed generated reports
+runs/<id>/        generated state, evidence, worktree, and reports
 ```
 
-Generated state is ignored by Git: `runs/`, `data/.lha_index/`, `data/skills/`,
-`.cocoindex_code/`, caches, coverage output, and build output.
+Do not commit `runs/`, indexes, caches, coverage output, build output, or nested
+fixture lock files.
 
-## 4. Runtime and recovery
+## Runtime and recovery
 
-`Harness.run` copies `task.target_repo` into a per-run worktree and creates
-schema-v2 `RunState`. The state persists the cursor, attempts, repair counters,
-the original step/repair/deadline/model-call limits, their consumption, and model
-usage. Resume rejects any change to those four limits. `state.json` is a
-checksummed envelope written with `fsync` and atomic replacement;
-`ledger.jsonl` is append-only.
+`Harness.run` copies the target repository into a per-run worktree and creates
+schema-v2 `RunState`. State stores the cursor, attempts, repair counters, original
+limits, elapsed time, and model usage. Resume rejects limit drift.
 
-Code edits use two typed values:
+`state.json` is checksummed and atomically replaced after `fsync`.
+`ledger.jsonl` is append-only. A run lock rejects concurrent resume. Stable
+attempt IDs and idempotency keys prevent duplicate completion and approval
+events. Schema-v1 runs can be inspected but not resumed as schema v2.
 
-- `ResolvedPatch` computes the write set from the actual diff or file contents.
-  Policy, backup, apply, approval, manifest, and rollback use this same set.
-- `PatchTransaction` records `PREPARED`, `APPLIED`, `VERIFIED`, or `REVERTED`.
-  Recovery validates the patch, manifest, transaction journal, and redundant
-  backups before replaying or rolling back.
+`ResolvedPatch` derives the write set from the real diff or file contents.
+Policy, backup, apply, approval, manifest, and rollback use that set.
 
-A per-run file lock rejects concurrent resume. Stable attempt IDs and ledger
-idempotency keys prevent duplicate completion and approval events. State schema
-v1 remains inspectable but is not resumed as schema v2.
+`PatchTransaction` records `PREPARED`, `APPLIED`, `VERIFIED`, or `REVERTED`.
+Recovery validates patch bytes, manifests, journals, and redundant backups
+before applying, accepting, or reverting anything.
 
-The LangGraph runtime uses the same execute and verification helpers. Its
-prepare, approval interrupt, and verify nodes are separate so resume cannot
-regenerate an artifact after a person reviewed it.
+The LangGraph runtime uses the same execution and verification helpers. Prepare,
+approval interrupt, and verify are separate nodes so resume cannot replace a
+reviewed artifact.
 
-## 5. Long-task fixtures
+## Long-task fixtures
 
-`data/long_tasks/` contains five pre-fixed multi-file cases:
+`data/long_tasks/` contains five fixed cases for configuration parsing, SQLite
+migration, concurrency, CLI contracts, and experiment reproduction. Each has a
+task, repository adapter, repository, reference patch, and digests.
 
-- configuration parsing and precedence;
-- SQLite migration and persistence;
-- concurrent update and exception propagation;
-- CLI stdout/stderr/exit-code contracts;
-- seeded experiment and artifact digests.
+The ten stages are integrity, setup, baseline, reproduction, context, approved
+edit, targeted tests, full tests, lint, and build. Tests cover a rejected first
+patch, repair, approval resumes, safe interruption, and equality with an
+uninterrupted result.
 
-Each case has `task.yaml`, `adapter.yaml`, a repository, a reference patch, and
-a reference manifest with source and oracle digests. The Supervisor emits a
-fixed 10-step plan: integrity, setup, baseline, reproduction, context, approved
-edit, targeted tests, full tests, lint, and build.
+Do not edit a fixture, oracle, or reference patch after model output has been
+observed.
 
-Tests exercise an initial rejected patch, repair, two approval resumptions, a
-process interruption at a safe boundary, and equality with an uninterrupted
-terminal state. A repository stage that may have started but lacks durable
-completion evidence fails closed instead of replaying a possible side effect.
+## Codex backend
 
-Reference patches and their oracles are corpus evidence. Do not edit them to
-improve a result.
+`src/lha/llm/codex_cli.py` runs `codex exec --json` in an attempt-local home and
+workspace. It copies only required authentication, starts a separate process
+group, stops descendants on timeout or interruption, and removes temporary
+credentials on every exit path.
 
-## 6. Codex CLI backend
+The parser rejects malformed JSONL, unknown events, incomplete turns, error
+events, and unfinished or disallowed tool use. The no-tools ablation path
+rejects any tool item. Successful provenance includes model settings, CLI
+version, event summary, usage, and outcome.
 
-`src/lha/llm/codex_cli.py` runs `codex exec --json` in a temporary home and
-workspace. Authentication is copied into the attempt-local `CODEX_HOME`; parent
-secrets are not inherited. The process runs in its own group, descendants are
-terminated on timeout or interruption, and temporary credentials and files are
-removed on every exit path.
+Never log `auth.json`, API keys, session cookies, or credential paths.
 
-The JSONL parser fails closed on malformed JSON, unknown events, incomplete
-turns, error events, and unfinished or disallowed tool use. Provenance records
-the selected model, reasoning effort, CLI version, event summary, usage, and
-outcome. In the no-tools ablation path, any tool item invalidates the attempt.
+## Verification and evaluation
 
-Do not log `auth.json`, API keys, session cookies, or direct credential paths.
-
-## 7. Verification and statistics
-
-Registered verifier families are:
-
-| family | checks | source of evidence |
+| family | checks | evidence |
 |---|---|---|
-| code | pytest, Ruff, repository stages | real subprocess output |
-| experiment | PSNR, SSIM, reproducibility | arrays, hashes, and a fresh rerun |
-| context | freshness, citation | source digests and resolvable locators |
+| code | Pytest, Ruff, repository stages | subprocess output |
+| experiment | PSNR, SSIM, reproducibility | arrays, hashes, fresh rerun |
+| context | freshness, citations | source digests, status, locators |
 
-Experiment reruns use fresh directories and reject missing, stale, non-finite,
-or digest-mismatched arrays. Context bundles distinguish `empty`,
-`backend_unavailable`, `index_failed`, and stale or partially unavailable kinds.
+Experiment reruns use new directories and reject missing, stale, non-finite, or
+mismatched arrays. Context records distinguish empty results, unavailable
+backends, failed indexes, stale data, and partial availability.
 
-`lha ablate` pairs the same first attempt under `trust`, `gate`, and `verify`.
-The internal gate is a prediction. Truth comes from applying the frozen source
-change to a fresh canonical repository and running an independent scorer.
+`lha ablate` shares the first attempt across `trust`, `gate`, and `verify`.
+Ground truth comes from a frozen source change applied to a fresh repository and
+scored through a separate backend. Read current numbers from
+`benchmarks/ablation_report.json`; do not reconstruct them from prose.
 
-`lha horizon` keeps three units separate:
+`lha horizon` keeps paired cells, complete-corpus repetitions, and descriptive
+composition separate. Cell and episode tests can differ. Composition adds no
+samples and has no McNemar p-value.
 
-1. paired `(task, repetition)` cells;
-2. observed whole-corpus repetitions;
-3. a descriptive independent-step composition.
+For Terminal-Bench 2.1:
 
-Cell- and episode-level McNemar tests may differ. Composition adds no independent
-samples and has no McNemar p-value. Boundary proportions use Wilson intervals.
-Do not replace them with a percentile bootstrap that reports a zero-width
-interval for all-zero or all-one samples.
+- preregister task IDs before model execution;
+- run three smoke tasks before the fixed 20-task scored subset;
+- use one task, one attempt, and zero Harbor retries per job;
+- keep task and protocol failures in the denominator;
+- record model settings, versions, hashes, image digests, and official results;
+- do not report direct-Harbor runs as evidence for LHA gate or repair behavior;
+- do not publish a score until protocol, manifest, raw results, and summary are
+  committed together.
 
-### Current measured baseline
-
-The committed schema-v2 report fixes the protocol at 17 tasks × 12 repetitions,
-Codex CLI 0.141.0, `gpt-5.4-mini`, low reasoning effort, read-only mode, and a
-Docker independent scorer. All 204 paired cells have truth labels; there are
-zero `ERROR` cells.
-
-| condition | independently correct | delivery decision |
-|---|---:|---|
-| `trust` | 194/204 | delivered all 204, including 10 incorrect patches |
-| `gate` | 194/204 | accepted 194 correct patches and rejected 10 incorrect patches |
-| `verify` | 204/204 | repaired the 10 rejected attempts, then passed independent scoring |
-
-For `trust` versus `verify`, the exact two-sided McNemar result is
-`p = 0.00195` (`10` versus `0` discordant cells). At the observed
-whole-corpus level, `trust` completes 2/12 episodes and `verify` completes
-12/12. The composition curve adds zero independent samples and is only a
-model-based projection. The raw source is `benchmarks/ablation_report.json`;
-never reconstruct these numbers from prose.
-
-## 8. Reporting and retention
+## Reporting and retention
 
 ```bash
 uv run lha trace <run_id>
@@ -239,15 +200,10 @@ uv run lha runs show <run_id>
 uv run lha runs prune --older-than-days 30
 ```
 
-The HTML trace is a self-contained rendering of steps, patches, approvals,
-verdicts, repairs, and recorded model usage. Reporting validates persisted
-evidence and refuses damaged runs. Pruning is a dry run unless `--apply` is
-present, deletes only validated `DONE` or `FAILED` runs, and refuses locked or
-corrupt state.
+Reporting validates saved evidence. Pruning is a dry run unless `--apply` is
+present and refuses active, locked, unfinished, or corrupt runs.
 
-## 9. Required gate
-
-Run the release gate from the repository root:
+## Required release gate
 
 ```bash
 uv run ruff check .
@@ -267,51 +223,39 @@ LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
 docker run --rm lha:release lha --version
 ```
 
-Also install both `dist/*.whl` and `dist/*.tar.gz` from scratch directories with
-`uv run --no-project --with ...`, then import
+Also install the wheel and source archive from empty directories and import
 `lha.live_context.flows.common`. `.github/workflows/ci.yml` contains the exact
 package and container smoke checks.
 
-Do not write a final test count, coverage percentage, ablation result, or public
-benchmark score into docs until these commands have run on the release candidate.
-For the current release candidate, the measured local baseline is
-`523 passed, 3 skipped`, 83% statement coverage, and `lha eval` at 6/6.
+## Coding rules
 
-## 10. Coding rules
-
-- Ruff line length is 100 with import sorting enabled; Pyright targets Python 3.11.
+- Ruff line length is 100; Pyright targets Python 3.11.
 - Put `from __future__ import annotations` at the top of Python modules.
-- Use Pydantic models for boundary data and dataclasses for internal value objects.
+- Use Pydantic models for boundary data and dataclasses for internal values.
 - Use `lha.clock.now()` for timestamps.
-- Route target/model-influenced subprocesses through `ExecutionBackend`.
 - Import optional dependencies inside the function that needs them.
-- Comments explain the failure mode a decision prevents, not the obvious syntax.
-- Use conventional commit subjects: `feat:`, `fix:`, `docs:`, `test:`, `ci:`,
-  `chore:`, or `refactor:`.
-- Add a registered verifier rather than a special case in the harness loop.
+- Explain failure modes in comments instead of restating syntax.
+- Use conventional commit subjects.
+- Add a registered verifier instead of a special case in the main loop.
 
-## 11. Prohibited changes
+## Prohibited changes
 
-- Never skip, delete, weaken, or mark a test `xfail` to make the gate green.
-- Never turn “could not verify” into success.
-- Never import CocoIndex or execute `ccc` outside `src/lha/live_context/`.
-- Never let an internal gate verdict serve as ablation ground truth.
-- Never edit the ablation or long-task corpus after observing model output.
-- Never commit generated run, index, cache, coverage, or nested fixture-lock state.
-- Never publish a benchmark number without its raw report and provenance.
-- Never store Codex, Anthropic, GitHub, SSH, or cloud credentials in the repository,
-  a container image, an artifact, or a log.
+- Do not skip, weaken, delete, or mark a test `xfail` to make checks pass.
+- Do not turn “could not verify” into success.
+- Do not import CocoIndex or run `ccc` outside `src/lha/live_context/`.
+- Do not use an internal gate decision as benchmark ground truth.
+- Do not edit ablation or long-task corpora after observing model output.
+- Do not publish a number without its raw report and provenance.
+- Do not store model, GitHub, SSH, or cloud credentials in the repository,
+  image, artifact, or log.
 
-## 12. Known limits
+## Known limits
 
-- `trusted-local` scrubs the environment and manages process groups, but it is not
-  isolation against hostile code. Use Docker for external repositories.
-- The default Docker execution image does not include pytest or Ruff; supply a
-  task image containing every required tool.
-- Prompt injection from indexed content is reduced by objective checks, not
-  eliminated.
-- Context freshness and citations are weaker evidence than an executable oracle.
-- Public benchmark adapters are not leaderboard results. No Terminal-Bench or
-  SWE-bench score is claimed until an official run is completed and committed.
-- A horizon composition is a projection over measured cells, not an additional
-  long-task experiment.
+- `trusted-local` is not isolation against hostile code.
+- The default Docker execution image does not contain Pytest or Ruff.
+- `LHA_DEADLINE_S` is a persisted boundary check, not asynchronous preemption
+  of a blocking operation; each such operation needs its own timeout.
+- Checks reduce, but do not eliminate, prompt injection from indexed content.
+- Source freshness and citation checks are weaker than executable oracles.
+- Public benchmark adapters are not benchmark results.
+- A horizon composition is a projection, not an executed long task.

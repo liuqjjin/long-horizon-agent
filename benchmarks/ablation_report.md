@@ -1,4 +1,4 @@
-# Verification ablation
+# Verification ablation — legacy snapshot
 
 implementer: `codex_cli` (codex-cli 0.141.0 model=gpt-5.4-mini effort=low sandbox=read-only) · model: `gpt-5.4-mini` · tasks: 17 · repetitions: 12 · paired (trust/gate score the same attempt) · final scorer: `docker` (fresh copy, canonical tests, independent of the internal gate)
 

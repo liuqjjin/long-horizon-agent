@@ -4,35 +4,22 @@ This directory contains committed, machine-checkable reports. Generated runs
 under `runs/` are ignored by Git; files are copied here only after the report,
 source revision, and execution provenance have been validated.
 
-## Current formal run
+## Historical schema-v2 record
 
-The current ablation report uses schema v2:
+The committed ablation and horizon files were produced with the schema-v2
+protocol. They are retained so the earlier run and its raw cells can be
+inspected.
 
-- Codex CLI 0.141.0;
-- model `gpt-5.4-mini`, reasoning effort `low`, sandbox `read-only`;
-- 17 fixed Python tasks × 12 repetitions = 204 paired cells;
-- Docker final scorer on fresh repository copies;
-- zero `ERROR` cells.
-
-The measured outcomes are:
-
-| condition | independent-scorer outcome |
-|---|---|
-| `trust` | 194/204 correct; 10 incorrect attempts accepted |
-| `gate` | 194 correct attempts accepted; all 10 incorrect attempts blocked |
-| `verify` | 204/204 correct after repair |
-
-The 204 paired cells have an exact two-sided McNemar value of `0.001953125`.
-The generated Markdown currently formats that field to two decimal places and
-therefore prints `0.00`; this is display rounding, not a zero p-value. Public
-summary text uses `0.00195`. Twelve complete-corpus repetitions provide 12
-observed episodes: `trust` succeeds on 2/12 and `verify` on 12/12. The
-composition curve is only a projection over empirical per-task rates and adds
-zero independent samples.
+The scoring boundary, error classification, and evidence format have since
+changed. The schema-v2 files are therefore not the current project result and
+their numbers should not be copied into the README or a resume. New claims
+require a complete schema-v4 rerun with its raw records, configuration, and
+rendered reports committed together.
 
 ## Files
 
-- [`ablation_report.json`](ablation_report.json) is the source of record. It
+- [`ablation_report.json`](ablation_report.json) is the machine-readable source
+  for the historical run. It
   contains schema version, every cell, condition summaries, model-call audits,
   source hashes, clean-worktree status, runtime versions, scorer image, and a
   report fingerprint.
@@ -43,9 +30,9 @@ zero independent samples.
   [`horizon_curve.svg`](horizon_curve.svg) are generated renderings.
 
 `trust` and `gate` score the same first attempt. The internal gate predicts
-whether work may advance; it never supplies benchmark truth. The Docker scorer
-applies the frozen change to a fresh canonical repository and runs the original
-tests independently.
+whether work may advance; it is not reused as the benchmark result. The
+schema-v2 scoring path applies the frozen change to a fresh repository and runs
+the original tests through a separate execution backend.
 
 ## Reproduce
 
@@ -69,10 +56,10 @@ uv run lha horizon \
   --out runs/horizon
 ```
 
-A rerun is new evidence and may differ from the committed result. Do not
-overwrite this directory unless the generated report records a clean source
-tree, the intended CLI/model configuration, all 204 cells, and zero errors.
-Copy both machine-readable and rendered artifacts together.
+A rerun is new evidence and may differ from the historical record. Do not
+overwrite this directory unless the schema-v4 run is complete and its protocol
+accepts every result or error into the denominator. Copy machine-readable and
+rendered artifacts together.
 
 Before publishing or changing any number, run:
 

@@ -1,25 +1,24 @@
-# Build and deployment checks
+# Build and release checks
 
-LHA is distributed as a Python CLI and an application container. It is not a
-hosted service. A release candidate is valid only when the wheel, source
-distribution, container image, and Docker execution backend all pass their
-respective checks.
+LHA is distributed as a Python CLI and an application image. It is not a hosted
+service. A release candidate must be tested as source, wheel, source archive,
+container image, and Docker execution backend.
 
-## Build Python distributions
+## Build Python packages
 
 ```bash
 uv build
 ```
 
-The packaged context flows are runtime resources, so check both archives:
+The context flows are package data. Check both archives:
 
 ```bash
 unzip -l dist/*.whl | grep 'lha/live_context/flows/common.py'
 tar -tf dist/*.tar.gz | grep 'src/lha/live_context/flows/common.py'
 ```
 
-Test installation outside the checkout. Using `--no-project` prevents `uv` from
-importing the source tree by accident:
+Install from directories outside the checkout so imports cannot fall back to
+local source:
 
 ```bash
 REPO_ROOT="$PWD"
@@ -28,23 +27,21 @@ WHEEL_TMP="$(mktemp -d)"
 cd "$WHEEL_TMP"
 uv run --no-project --with "$REPO_ROOT"/dist/*.whl lha --version
 uv run --no-project --with "$REPO_ROOT"/dist/*.whl \
-  python -c "import importlib.util; assert importlib.util.find_spec('lha.live_context.flows.common')"
+  python -c "import lha.live_context.flows.common"
 
 SDIST_TMP="$(mktemp -d)"
 cd "$SDIST_TMP"
 uv run --no-project --with "$REPO_ROOT"/dist/*.tar.gz lha --version
 uv run --no-project --with "$REPO_ROOT"/dist/*.tar.gz \
-  python -c "import importlib.util; assert importlib.util.find_spec('lha.live_context.flows.common')"
+  python -c "import lha.live_context.flows.common"
 ```
 
 Return to the repository root before running project commands.
 
-These commands test the core package. On Linux and Windows, this repository's
-uv configuration binds `torch` to the official CPU wheel index. That source
-mapping is not part of wheel metadata: consumers installing `lha[context]`
-outside this checkout must make the same binding in their own uv project or use
-the application image. Do not describe a bare external `lha[context]` install
-as lightweight.
+This repository points Linux and Windows installs at the official CPU-only
+PyTorch index. Wheel metadata does not carry that source setting. Projects that
+install the `context` extra must configure the CPU index themselves or use the
+application image.
 
 ## Build the application image
 
@@ -55,24 +52,21 @@ docker run --rm lha:release \
   python -c "import lha, cocoindex, sentence_transformers"
 ```
 
-The image runs as the unprivileged `lha` user. It includes the `context` extra,
-but intentionally excludes the external `ccc` executable.
+The image runs as the unprivileged `lha` user and includes the `context` extra.
+It does not include the external `ccc` executable.
 
-The build context must not copy local secrets or release output. Verify the
-known sensitive paths:
+Check that common credential and build paths are absent:
 
 ```bash
 docker run --rm lha:release python -c \
   "from pathlib import Path; assert not any((Path('/app') / p).exists() for p in ('.env', '.codex', '.claude', '.mcp.json', 'auth.json', '.ssh', '.aws', '.config/gcloud', '.netrc', '.pypirc', 'dist'))"
 ```
 
-`.dockerignore` also excludes `.env.*` except `.env.example`, credentials
-directories, run state, coverage output, and build artifacts. Do not pass
-authentication as a build argument or bake it into a layer.
+Do not pass authentication as a build argument or copy it into an image layer.
 
-## Run the self-evaluation in the image
+## Run in the application image
 
-Use named volumes for writable state and the model cache:
+Use volumes for run state and the optional model cache:
 
 ```bash
 docker volume create lha-runs
@@ -84,62 +78,46 @@ docker run --rm \
   lha:release lha eval
 ```
 
-The command must exit zero. Its first invocation can download the configured
-embedding model, which is why the Hugging Face cache is persisted separately
-from run evidence.
+The command must exit zero. The model cache is separate from run evidence.
 
-Run a single offline task the same way:
+## Test the Docker execution backend
 
-```bash
-docker run --rm \
-  -v lha-runs:/app/runs \
-  lha:release lha run data/tasks/fix_average.yaml
-```
+The application image contains the LHA CLI. The execution image is the
+disposable environment used for commands from a target repository.
 
-## Validate the Docker execution backend
-
-The application image and the Docker execution backend serve different
-purposes:
-
-- `lha:release` contains the LHA CLI.
-- `LHA_EXEC_IMAGE` is the disposable environment in which target or
-  model-influenced commands run.
-
-The default execution image, `python:3.12-slim`, does not contain pytest, the
-pytest JSON plugin, or Ruff. Code tasks need a purpose-built execution image
-with all declared tools installed.
+`python:3.12-slim`, the default execution image, does not contain Pytest,
+`pytest-json-report`, or Ruff. Code tasks need an image with every declared
+tool.
 
 Run the real-container backend tests:
 
 ```bash
-docker build -t lha:release .
-LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
-  uv run pytest tests/test_sandbox.py -q
+LHA_DOCKER_TESTS=1 \
+LHA_DOCKER_TEST_IMAGE=lha:release \
+uv run pytest tests/test_sandbox.py -q
 ```
 
-These tests require a working Docker daemon. A missing daemon is not a successful
-release check.
+A missing Docker daemon is a failed release check.
 
-## Codex credentials
+## Credentials
 
-The normal Codex CLI backend reads the locally authenticated CLI state, copies
-only the required authentication into a temporary `CODEX_HOME`, and removes it
-after the attempt. Do not mount a developer's complete home directory into the
-application image.
+The normal Codex backend copies the required local CLI authentication into a
+temporary `CODEX_HOME` and deletes it after the attempt. Do not mount a
+developer home directory into the application image.
 
-For an official benchmark container, inject authentication only at task runtime:
+For benchmark containers:
 
-- mount or copy credentials into a task-local temporary directory;
-- never add them to the image, repository, command output, or run report;
-- terminate the Codex process group before deleting the temporary directory;
-- record CLI version, model, reasoning effort, image digest, and budgets, but
-  not credential contents.
+- inject authentication only when the task starts;
+- keep it out of images, repositories, arguments, logs, and reports;
+- stop the Codex process group before deleting temporary files;
+- record versions, model settings, image digests, and budgets, not credential
+  contents or paths.
 
-`danger-full-access` for Codex is rejected unless
-`LHA_CODEX_EXTERNAL_SANDBOX=1` explicitly states that an outer disposable
-container is already the security boundary.
+Codex `danger-full-access` is allowed only when
+`LHA_CODEX_EXTERNAL_SANDBOX=1` confirms that a disposable outer container is
+the security boundary.
 
-## Release checklist
+## Release gate
 
 From the repository root:
 
@@ -148,6 +126,7 @@ uv run ruff check .
 uv run pyright src/lha
 uv run pytest -q
 LHA_RUNS_DIR=runs/_release uv run lha eval
+
 uv build
 docker build -t lha:release .
 LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
@@ -155,6 +134,6 @@ LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
 docker run --rm lha:release lha --version
 ```
 
-Also run the facade-isolation scan in `CONTRIBUTING.md` and both empty-directory
-package installs above. Record the actual output in the pull request; do not copy
-test counts or benchmark numbers from an earlier commit.
+Also run the facade-isolation scan in `CONTRIBUTING.md` and both package installs
+above. Record command output from the release candidate; do not reuse test counts
+or benchmark numbers from an earlier commit.

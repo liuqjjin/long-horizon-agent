@@ -1,4 +1,4 @@
-# Error compounding over a horizon
+# Error compounding over a horizon — legacy snapshot
 
 corpus: 17 independent subtasks · model: `gpt-5.4-mini` · complete paired repetitions: 12 → **12 independent observed episodes** · per-step truth from `benchmarks/ablation_report.json`
 

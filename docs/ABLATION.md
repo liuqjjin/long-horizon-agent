@@ -1,143 +1,138 @@
 # Verification ablation
 
-`lha ablate` measures whether executable checks prevent incorrect code changes
-from being delivered, and whether bounded repair recovers work the gate rejects.
-It is a mechanism experiment, not a public-model leaderboard.
+`lha ablate` measures two questions on a fixed internal corpus:
+
+1. do executable checks stop incorrect patches from being delivered?
+2. can a bounded repair recover patches rejected by those checks?
+
+It is not a public-model leaderboard.
 
 ## Paired design
 
-The fixed corpus contains 17 small Python repositories under `data/bench/`.
-Each has a planted defect, a symptom-level task, and a canonical pytest oracle.
-The corpus and its oracles must not be modified after observing model output.
+The corpus contains 17 small Python repositories under `data/bench/`. Each has
+a planted defect, a symptom-level task, and a fixed Pytest oracle. At startup,
+the task file and repository are copied to a content-addressed input snapshot.
+Every cell reads that snapshot rather than the live corpus directory.
 
-For each `(task, repetition)`, the harness draws one first attempt and evaluates
-that same attempt under:
+For each `(task, repetition)`, one first attempt is reused across three
+conditions:
 
-| condition | gate | repair | delivered when |
+| condition | internal gate | repair | delivery rule |
 |---|---|---|---|
-| `trust` | off | none | the model returns a patch |
-| `gate` | on | none | the original patch passes the checks |
-| `verify` | on | bounded | the original or a repaired patch passes |
+| `trust` | off | no | deliver the first patch |
+| `gate` | on | no | deliver only when the first patch passes |
+| `verify` | on | bounded | deliver the first or repaired patch after it passes |
 
-`trust` and `gate` therefore differ in verification, not in the sampled first
-attempt. `verify` may make additional model calls after receiving concrete
-failure evidence.
+This keeps the first attempt paired. `verify` may make additional calls only
+after receiving check failures.
 
-## Prediction and truth
+## Independent scoring
 
-The internal gate only predicts whether a patch should be accepted. It does not
-grade itself.
+The internal gate decides whether LHA may advance; it does not supply the
+experiment's truth label.
 
-For every evaluated output, the independent scorer:
+For every output, the scorer:
 
 1. freezes the effective source change and records its SHA-256;
-2. creates a fresh copy of the canonical repository;
-3. restores the original tests and protected configuration;
+2. creates a new copy of the canonical repository;
+3. restores original tests and protected configuration;
 4. applies only the frozen source change;
-5. runs pytest through a separate `ExecutionBackend` instance.
+5. runs the canonical tests through a separate execution backend.
 
-The scorer's result is `true_success`. A patch that is claimed as successful but
-fails this scorer is `false_success`. Gate predictions are compared with truth
-as TP, FP, TN, and FN.
+The report keeps two fields separate:
 
-For external or untrusted repositories, use
-`--scorer-backend docker`. A `trusted-local` scorer is state-independent but not
-host-isolated.
+- `artifact_correct`: the scorer's verdict on the frozen patch;
+- `true_success`: the condition delivered the patch and `artifact_correct` is
+  true.
 
-## Oracle protection
+A correct patch rejected by `gate` therefore has
+`artifact_correct=true` and `true_success=false`. Gate TP, FP, TN, and FN use
+`artifact_correct`. Chain success and delivered-success rates use
+`true_success`.
 
-The first-attempt worktree excludes test files. Model output is reduced to its
-effective source write set; changes to tests, `conftest.py`, package/build
-configuration, or CI files are rejected by policy unless a task explicitly
-allowlists an exact protected path.
+Before a candidate patch is applied, the scorer collects the canonical Pytest
+node IDs. The scored process must then produce all of the following:
 
-The scorer starts from the canonical corpus rather than the gate's worktree. A
-dirty or stale gate directory therefore cannot silently become ground truth.
+- the expected node-ID set;
+- a normal Pytest return code;
+- per-phase hook records;
+- a post-session receipt containing a random nonce;
+- a matching content-addressed scorer-evidence file.
 
-Repair prompts may include compact pytest failure excerpts. That feedback is the
-repair mechanism being measured; repaired output still has to pass the complete
-canonical oracle.
+The receipt is written only after `pytest.main` returns. Printing a forged
+summary and calling `os._exit(0)` produces no receipt and is classified as
+`ERROR`, not pass.
 
-## Codex no-tools protocol
+This is not containment against hostile Python running with the scorer's UID.
+Such code can inspect the process and its writable mount; Docker protects the
+host but does not by itself make the in-container oracle immutable. The current
+ablation assumes fixed, non-adversarial corpus programs. A hostile-code scorer
+would additionally need a separate control process and read-only oracle mount.
+`trusted-local` must only be used for repositories already trusted by the user.
 
-The Codex CLI does not expose the same file-tool deny-list as the Claude CLI.
-For an ablation attempt, LHA therefore audits the complete `codex exec --json`
-stream and rejects the result if any tool item appears.
+The first-attempt workspace excludes tests. Changes to tests, `conftest.py`,
+package or build configuration, and CI files are rejected unless an exact path
+is allowlisted. The scorer starts from the canonical corpus, not the gate's
+working directory.
 
-The parser also fails closed on:
+## Codex protocol
 
-- malformed JSONL or an unknown event type;
-- an error or failed-turn event;
-- a turn that starts but does not complete;
-- a started item that never reaches a valid completion;
+The ablation path asks Codex for a single no-tools attempt. The complete JSONL
+stream is audited, and any tool item invalidates the attempt. The parser also
+rejects:
+
+- malformed JSON or an unknown event;
+- an error or failed turn;
+- a turn or item without a valid completion;
 - a missing completed agent message;
-- non-zero exit, timeout, authentication failure, or interrupted process.
+- non-zero exit, timeout, authentication failure, or interruption.
 
-Each call uses a temporary `HOME`, `CODEX_HOME`, workspace, and temp directory.
-The parent environment is reduced to an explicit allowlist, the CLI process and
-descendants are stopped before cleanup, and temporary authentication is removed
-on every exit path.
+Each call gets a temporary home, `CODEX_HOME`, workspace, and temporary
+directory. The parent environment is reduced to an allowlist. The process group
+is stopped before temporary credentials are removed.
 
-The report records secret-free provenance: selected model, reasoning effort,
-Codex CLI version, event summary, usage, outcome, Python and pytest versions,
-Git state, source-tree digest, task digests, corpus digests, scorer backend, and
-Docker image identity when applicable.
+Other model backends remain available for exploratory runs, but the public
+release check accepts only evidence produced by the hardened `codex_cli`
+backend. Formal reports also require Docker for both the prediction-side gate
+and the independent scorer, with the scorer image bound by its immutable image
+ID.
 
-## Cache and transient failures
+The report records model and CLI settings, event summary, usage, runtime
+versions, Git state, source and task digests, scorer backend, and container
+identity where applicable. It does not record credentials.
 
-Completed non-error cells can be reused only when the provenance fingerprint
-matches. The fingerprint binds the task bytes, corpus bytes, complete installed
-`lha` source tree, model/backend settings, scorer settings, repair/retry
-configuration, versions, and runtime details.
+## Errors, cache, and statistics
 
-Protocol violations are deterministic failures and are not retried as transport
-errors. Only failures explicitly classified as transient service or connection
-problems use the configured bounded retry path.
+A completed cell can be reused only if its schema-6 cache fingerprint still
+matches and its patch artifact and scorer receipt both validate. The
+fingerprint covers the input snapshot, LHA source, model settings, scorer,
+repair and retry settings, and runtime versions.
 
-If a transient problem persists, the cell is written as `ERROR`, shown in the
-report, excluded from rate denominators, and never cached. It is not counted as
-a model failure or quietly dropped from the record.
+Only errors classified as transient service or connection failures use the
+configured bounded retry path. A persistent failure is written as `ERROR`,
+remains visible, is excluded from rate estimates, and is never cached.
 
-## Statistics
+The report uses:
 
-The report gives exact counts and rates per condition. For uncertainty:
+- a seeded task-cluster bootstrap for interior rates;
+- Wilson score intervals for all-zero or all-one rates;
+- an exact two-sided McNemar test for paired contrasts.
 
-- interior rates use a seeded task-cluster bootstrap because repetitions from
-  one task are correlated;
-- all-zero or all-one boundary rates use a Wilson score interval, because a
-  percentile bootstrap would produce a false zero-width interval;
-- paired contrasts use the exact two-sided McNemar test on matched
-  `(task, repetition)` cells.
+An observed rate of zero incorrect deliveries is not proof that the underlying
+rate is zero.
 
-The gate confusion matrix and error count should be read alongside headline
-rates. A zero observed false-success rate is not proof that the underlying rate
-is exactly zero.
+## Report status
 
-## Committed schema-v2 result
+Schema 4 is the first report format that binds delivery correctness, immutable
+inputs, patch artifacts, and scorer receipts. Reports through schema 3 remain
+readable as historical records but cannot be published as current formal
+evidence.
 
-The committed report uses 17 fixed tasks and 12 repetitions, giving 204 paired
-`(task, repetition)` cells. Its protocol is Codex CLI 0.141.0,
-`gpt-5.4-mini`, low reasoning effort, read-only mode, and an independent Docker
-scorer. All 204 cells were scored; the report contains 0 `ERROR` cells.
+The 17-task × 12-repetition run must be repeated under schema 4 before this
+document or the README states a current result. Values from the older schema-2
+run are not carried forward.
 
-| condition | delivered | independently correct | incorrect delivery | result |
-|---|---:|---:|---:|---|
-| `trust` | 204 | 194 | 10 | every first attempt was delivered |
-| `gate` | 194 | 194 | 0 | accepted 194 correct attempts and rejected all 10 incorrect attempts |
-| `verify` | 204 | 204 | 0 | repaired the 10 rejected attempts before delivery |
-
-For `trust` versus `verify`, the discordant counts are 10 in favor of
-`verify` and 0 in favor of `trust`. The exact two-sided McNemar result is
-`p = 0.001953125`, reported in prose as `p = 0.00195`.
-
-These are mechanism results on the repository's fixed corpus. They are not a
-Terminal-Bench, SWE-bench, or general model-quality score. Raw records,
-provenance, configuration, and the generated table are in
-`benchmarks/ablation_report.{json,md}`.
-
-## Run the experiment
-
-The committed protocol can be rerun after building the scorer image:
+## Reproduce
 
 ```bash
 docker build -t lha:release .
@@ -152,44 +147,27 @@ uv run lha --llm codex_cli ablate \
   --out runs/ablation
 ```
 
-The scorer image selected by `LHA_EXEC_IMAGE` must contain pytest and
-`pytest-json-report`. The default slim Python image does not.
+The scorer image must contain Pytest and `pytest-json-report`.
 
-Output layout:
+Output:
 
 ```text
 runs/ablation/
   ablation_report.json
   ablation_report.md
+  input_snapshots/<sha256>/
+  artifacts/<sha256>.json
+  scorer_evidence/<sha256>.json
   results/<task>__r<rep>.json
 ```
 
-The per-cell files allow an interrupted run to continue only when their
-fingerprint still matches. `ERROR` files are recomputed.
+Before publishing a result, finish the registered repetitions, keep every
+`ERROR`, and commit the JSON report, generated Markdown, patch artifacts, and
+scorer evidence together. `release_claims` recomputes the LHA source tree plus
+the task and corpus digests from the checkout.
 
-## Result policy
-
-The summary above mirrors the current generated artifacts. The authoritative
-values and full precision remain:
-
-- `benchmarks/ablation_report.json` for raw records and provenance;
-- `benchmarks/ablation_report.md` for the generated table;
-- `benchmarks/horizon_report.*` for the separate horizon analysis.
-
-Before publishing a result:
-
-1. freeze the code and corpus;
-2. use a new output directory or a matching fingerprint;
-3. complete the registered repetition count;
-4. review every `ERROR` and keep it visible;
-5. confirm the report's Git state and source digest;
-6. copy the generated reports without editing their numbers;
-7. update every public statement that cites the old report.
-
-Do not write a planned sample count as a completed result, substitute a
-different model or scorer into this result, or report a Terminal-Bench or
-SWE-bench score from this internal corpus.
-
-Hermetic tests for pairing, scoring independence, cache invalidation, Wilson
-boundaries, error handling, and report provenance are in
-`tests/test_ablation.py` and `tests/test_codex_backend.py`.
+The authoritative committed files are
+[`benchmarks/ablation_report.json`](../benchmarks/ablation_report.json) and
+[`benchmarks/ablation_report.md`](../benchmarks/ablation_report.md).
+Statistical and recovery tests are in `tests/test_ablation.py` and
+`tests/test_codex_backend.py`.
