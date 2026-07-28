@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import stat
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, Self, TypeVar
@@ -20,7 +18,8 @@ from typing import Literal, Self, TypeVar
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .sandbox.base import ExecutionBackend
+from .durable_io import atomic_replace_text, durable_mkdir_chain
+from .sandbox.base import ExecutionBackend, ProcessCleanupUnconfirmed
 from .step_ids import canonical_artifact_segment
 
 RepoStage = Literal[
@@ -237,13 +236,20 @@ class RepoCommandResult(BaseModel):
     stderr: str
     duration_s: float = Field(ge=0.0)
     output_truncated: bool = False
+    cleanup_unconfirmed: bool = False
+    cleanup_detail: str = ""
     passed: bool
 
     @model_validator(mode="after")
     def _passed_matches_returncode(self) -> Self:
+        if self.cleanup_unconfirmed and self.returncode != 126:
+            raise ValueError(
+                "cleanup_unconfirmed requires the process cleanup return code"
+            )
         expected = (
             self.returncode in self.expected_returncodes
             and not self.output_truncated
+            and not self.cleanup_unconfirmed
         )
         if self.passed != expected:
             raise ValueError(
@@ -337,7 +343,13 @@ class RepoAdapter:
         for command in commands:
             result = self._run_command(request.stage, command)
             results.append(result)
-            if request.stop_on_failure and not result.passed:
+            # A process whose cleanup is unconfirmed may still mutate the
+            # repository. Never start another stage command across that
+            # boundary, even when ordinary command failures were configured to
+            # continue.
+            if result.cleanup_unconfirmed or (
+                request.stop_on_failure and not result.passed
+            ):
                 break
         status: StageStatus = "passed" if all(result.passed for result in results) else "failed"
         return RepoStageResult(stage=request.stage, status=status, commands=tuple(results))
@@ -380,9 +392,12 @@ class RepoAdapter:
             stderr=proc.stderr,
             duration_s=proc.duration_s,
             output_truncated=proc.output_truncated,
+            cleanup_unconfirmed=proc.cleanup_unconfirmed,
+            cleanup_detail=proc.cleanup_detail[-1000:],
             passed=(
                 proc.returncode in command.expected_returncodes
                 and not proc.output_truncated
+                and not proc.cleanup_unconfirmed
             ),
         )
 
@@ -594,7 +609,7 @@ def execute_repo_stage_once(
     safe_step = _safe_segment(step_id)
     safe_attempt = _safe_segment(attempt_id)
     attempt_dir = run_root / "steps" / safe_step / "attempts" / safe_attempt
-    attempt_dir.mkdir(parents=True, exist_ok=True)
+    durable_mkdir_chain(attempt_dir, anchor=run_root)
     intent_path = attempt_dir / "repo_stage_intent.json"
     evidence_path = attempt_dir / "repo_stage_evidence.json"
     spec_payload = json.dumps(
@@ -647,6 +662,19 @@ def execute_repo_stage_once(
 
     _write_checksummed_model(intent_path, intent)
     result = RepoAdapter(root, spec, backend).run_stage(RepoStageRequest(stage=stage))
+    cleanup_failures = [
+        command for command in result.commands if command.cleanup_unconfirmed
+    ]
+    if cleanup_failures:
+        command = cleanup_failures[0]
+        # Do not hash, publish, or otherwise inspect the repository after this
+        # boundary. The Harness catches this typed signal and durably pauses the
+        # run before transaction recovery or another step can touch the tree.
+        raise ProcessCleanupUnconfirmed(
+            command.cleanup_detail
+            or command.stderr[-1000:]
+            or f"repository command {command.command_id!r} cleanup was not confirmed"
+        )
     evidence = RepoStageEvidence(
         intent=intent,
         worktree_sha256=repository_tree_sha256(root),
@@ -671,7 +699,6 @@ def _safe_segment(value: str) -> str:
 def _publish_stage_result(run_dir: Path, safe_step: str, result: RepoStageResult) -> None:
     payload = result.model_dump_json(indent=2)
     step_path = run_dir / "steps" / safe_step / "repo_stage.json"
-    step_path.parent.mkdir(parents=True, exist_ok=True)
     _durable_replace(step_path, payload)
     _durable_replace(run_dir / "repo_stage.json", payload)
 
@@ -718,32 +745,9 @@ def _read_checksummed_model(
 
 
 def _durable_replace(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise ValueError(f"artifact path is unsafe: {path}")
-    descriptor, temp_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        text=True,
-    )
-    temp = Path(temp_name)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, path)
-    finally:
-        temp.unlink(missing_ok=True)
-    try:
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError:  # pragma: no cover - platforms without directory fsync
-        pass
+    atomic_replace_text(path, text)
 
 
 __all__ = [

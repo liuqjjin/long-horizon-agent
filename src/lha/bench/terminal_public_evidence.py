@@ -605,7 +605,7 @@ def export_terminal_bench_public_evidence(
     target = Path(output_dir).resolve()
     if target.exists():
         raise FileExistsError(f"public evidence directory already exists: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _durable_mkdir_chain(target.parent)
     temporary = Path(
         tempfile.mkdtemp(
             prefix=f".{target.name}.",
@@ -721,7 +721,7 @@ def upgrade_terminal_bench_public_evidence(
         or source_root.is_relative_to(target)
     ):
         raise ValueError("source and attested evidence directories may not overlap")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _durable_mkdir_chain(target.parent)
     lock_path = target.parent / f".{target.name}.attestation.lock"
     lock_descriptor = _open_upgrade_lock(lock_path)
     temporary: Path | None = None
@@ -1696,7 +1696,7 @@ def _open_upgrade_lock(path: Path) -> int:
 
 
 def _write_new_file(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _durable_mkdir_chain(path.parent)
     descriptor = os.open(
         path,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
@@ -1716,14 +1716,32 @@ def _write_new_file(path: Path, payload: bytes) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
-    except OSError:
-        return
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+    )
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _durable_mkdir_chain(path: Path) -> None:
+    """Create missing parents and persist each new name in its parent."""
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        if current.is_symlink():
+            raise ValueError(f"directory path is a symbolic link: {current}")
+        missing.append(current)
+        if current.parent == current:
+            raise ValueError(f"directory path has no existing ancestor: {path}")
+        current = current.parent
+    if current.is_symlink() or not current.is_dir():
+        raise ValueError(f"directory ancestor is unsafe: {current}")
+    for directory in reversed(missing):
+        directory.mkdir()
+        _fsync_directory(directory.parent)
 
 
 def _maximum_for_relative_path(relative_path: str) -> int:

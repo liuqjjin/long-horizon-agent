@@ -143,7 +143,17 @@ class ExperimentResult(BaseModel):
     returncode: int = 0
     stdout_tail: str = ""
     output_truncated: bool = False
+    cleanup_unconfirmed: bool = False
+    cleanup_detail: str = ""
     based_on_context: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _cleanup_status_matches_returncode(self) -> "ExperimentResult":
+        if self.cleanup_unconfirmed and self.returncode != 126:
+            raise ValueError(
+                "cleanup_unconfirmed requires the process cleanup return code"
+            )
+        return self
 
 
 class ExperimentSummary(BaseModel):

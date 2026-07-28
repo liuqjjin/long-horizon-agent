@@ -29,8 +29,19 @@ from ..agents.experimenter import execute_experiment_once
 from ..artifacts import ExperimentResult, ExperimentSummary, Patch, Plan, PRSummary
 from ..clock import now
 from ..config import Config
+from ..durable_io import (
+    atomic_replace_text,
+    durable_mkdir_chain,
+    fsync_directory,
+)
 from ..live_context.models import ContextBundle
 from ..llm import get_llm
+from ..oracle_inventory import (
+    OracleInventoryError,
+    build_pytest_oracle_inventory,
+    validate_pytest_oracle_inventory,
+)
+from ..oracle_models import PytestOracleInventory
 from ..repo_adapter import (
     RepoAdapterSpec,
     RepoReferenceManifest,
@@ -38,6 +49,7 @@ from ..repo_adapter import (
     execute_repo_stage_once,
     inspect_repo_integrity,
 )
+from ..sandbox import ProcessCleanupUnconfirmed
 from ..step_ids import canonical_artifact_segment
 from ..tasks.spec import TaskSpec
 from ..tools import policy
@@ -54,7 +66,12 @@ from ..tools.patch import (
     snapshot_paths,
 )
 from ..verifiers import VerifyContext
-from ..verifiers.verdict import Check, Verdict
+from ..verifiers.verdict import (
+    PROCESS_CLEANUP_UNCONFIRMED,
+    Check,
+    Verdict,
+    verdict_requires_process_quarantine,
+)
 from .approval import (
     ApprovalDecision,
     HumanApprovalGate,
@@ -78,7 +95,13 @@ from .errors import (
     TransactionCorrupt,
 )
 from .manifest import ArtifactManifest, build_manifest, saved_file_state, sha256_bytes
-from .state import RUN_STATE_SCHEMA, LLMUsageState, RunState, StepRecord
+from .state import (
+    RUN_STATE_SCHEMA,
+    LLMUsageState,
+    RunQuarantine,
+    RunState,
+    StepRecord,
+)
 from .transaction import (
     PatchTransaction,
     attempt_artifact_dir,
@@ -86,6 +109,7 @@ from .transaction import (
     durable_artifact_write,
     list_transactions,
     load_transaction,
+    recover_transaction_journals,
     resolve_transaction_evidence,
     save_transaction,
     state_for_paths,
@@ -129,10 +153,10 @@ def _dump(run_dir: Path, step_id: str, name: str, text: str) -> None:
     """Write an artifact both flat (back-compat / last-writer) and per-step under
     ``steps/<step_id>/`` so a multi-step plan keeps every step's provenance."""
     segment = _safe_seg(step_id)
-    (run_dir / name).write_text(text)
     step_dir = run_dir / "steps" / segment
-    step_dir.mkdir(parents=True, exist_ok=True)
-    (step_dir / name).write_text(text)
+    durable_mkdir_chain(step_dir, anchor=run_dir)
+    atomic_replace_text(run_dir / name, text, anchor=run_dir)
+    atomic_replace_text(step_dir / name, text, anchor=run_dir)
 
 
 def _write_immutable(path: Path, data: bytes) -> None:
@@ -144,6 +168,29 @@ def _write_immutable(path: Path, data: bytes) -> None:
             raise CheckpointCorrupt(f"immutable artifact changed: {path}")
         return
     durable_artifact_write(path, data)
+
+
+def _validate_optional_aliases(
+    authoritative: bytes,
+    aliases: list[Path],
+    *,
+    label: str,
+) -> None:
+    """Treat compatibility files as diagnostics, never as recovery authority."""
+    for alias in aliases:
+        if not (alias.exists() or alias.is_symlink()):
+            continue
+        if alias.is_symlink() or not alias.is_file():
+            raise CheckpointCorrupt(f"{label} alias is unsafe: {alias}")
+        try:
+            alias_bytes = alias.read_bytes()
+        except OSError as error:
+            raise CheckpointCorrupt(f"{label} alias is unreadable: {alias}") from error
+        if alias_bytes != authoritative:
+            raise CheckpointCorrupt(
+                f"{label} alias does not match immutable attempt evidence "
+                f"(hash mismatch): {alias}"
+            )
 
 
 def _verdict_ref(attempt_id: str) -> str:
@@ -184,13 +231,14 @@ def _gen_run_id(task: TaskSpec) -> str:
 def _claim_run_dir(runs_dir: str | Path, run_id: str) -> Path:
     """Atomically reserve a run id before copying or checkpointing anything."""
     validate_run_id(run_id)
-    root = Path(runs_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    root = durable_mkdir_chain(runs_dir)
     run_dir = root / run_id
     try:
         run_dir.mkdir()
     except FileExistsError as error:
         raise FileExistsError(f"run already exists: {run_id}") from error
+    fsync_directory(run_dir)
+    fsync_directory(root)
     return run_dir
 
 
@@ -250,12 +298,201 @@ class Harness:
             return make_backend("docker", image=config.exec_image)
         return make_backend(config.exec_backend)
 
+    def _bind_execution_backend(self, run_dir: str | Path) -> None:
+        """Bind subprocess recovery to the run, independent of command cwd."""
+        expected = Path(run_dir).resolve()
+        bound = self.exec.bind_operation_lease_dir(run_dir)
+        if bound != expected:
+            raise CheckpointCorrupt(
+                "execution backend did not bind the requested operation lease directory"
+            )
+
+    def _resume_preflight(self, state: RunState) -> RunResult | None:
+        """Reap old commands and validate baseline tests before recovery mutates state."""
+        try:
+            recovery_backend = self.exec
+            recorded = state.runtime_contract
+            if recorded is not None:
+                recorded.verify_recorded_docker_control()
+            if recorded is not None and (
+                recorded.exec_backend == "docker"
+                or recorded.exec_backend != getattr(self.exec, "name", None)
+            ):
+                from ..sandbox import make_backend
+
+                if recorded.exec_backend == "docker":
+                    recovery_backend = make_backend(
+                        "docker",
+                        image=recorded.exec_image_id or recorded.exec_image,
+                    )
+                else:
+                    recovery_backend = make_backend(recorded.exec_backend)
+            if (
+                recorded is not None
+                and recorded.exec_backend == "docker"
+                and recorded.docker_cli is not None
+            ):
+                setattr(recovery_backend, "docker", recorded.docker_cli.path)
+            recovery = recovery_backend.recover_active_operations(state.run_dir)
+        except Exception as error:
+            detail = (
+                "active-operation recovery failed closed: "
+                f"{type(error).__name__}: {error}"
+            )
+            state.quarantine = RunQuarantine(
+                kind="active_operation_recovery_unconfirmed",
+                step_id="-",
+                attempt_id="resume",
+                detail=detail,
+            )
+            state.status = "PAUSED"
+            save_state(state)
+            return RunResult(state, "PAUSED", detail)
+        if recovery.requires_quarantine:
+            detail = recovery.detail or (
+                "one or more active operations could not be confirmed stopped"
+            )
+            state.quarantine = RunQuarantine(
+                kind="active_operation_recovery_unconfirmed",
+                step_id="-",
+                attempt_id="resume",
+                detail=detail[-1000:],
+            )
+            state.status = "PAUSED"
+            save_state(state)
+            return RunResult(state, "PAUSED", detail)
+        try:
+            self._validate_pytest_oracle_inventories(state)
+        except (OSError, OracleInventoryError, CheckpointCorrupt) as error:
+            detail = f"pytest oracle inventory is invalid: {error}"
+            state.quarantine = RunQuarantine(
+                kind="pytest_oracle_inventory_invalid",
+                step_id="-",
+                attempt_id="resume",
+                detail=detail[-1000:],
+            )
+            state.status = "PAUSED"
+            save_state(state)
+            return RunResult(state, "PAUSED", detail)
+        return None
+
+    @staticmethod
+    def _oracle_inventory_ref(step_id: str) -> Path:
+        return Path("oracle_inventories") / f"{_safe_seg(step_id)}.json"
+
+    def _validate_pytest_oracle_inventories(
+        self,
+        state: RunState,
+    ) -> None:
+        run_dir = Path(state.run_dir)
+        inventory_dir = run_dir / "oracle_inventories"
+        expected_names = {
+            self._oracle_inventory_ref(step_id).name
+            for step_id in state.pytest_oracle_inventories
+        }
+        if inventory_dir.is_symlink() or (
+            inventory_dir.exists() and not inventory_dir.is_dir()
+        ):
+            raise CheckpointCorrupt(
+                f"pytest oracle inventory directory is unsafe: {inventory_dir}"
+            )
+        if inventory_dir.exists():
+            actual_names = {
+                path.name
+                for path in inventory_dir.iterdir()
+                if path.is_file() or path.is_symlink()
+            }
+            if actual_names != expected_names:
+                raise CheckpointCorrupt(
+                    "pytest oracle inventory files do not match RunState"
+                )
+        elif expected_names:
+            raise CheckpointCorrupt("pytest oracle inventory directory is missing")
+        for step_id, inventory in state.pytest_oracle_inventories.items():
+            path = run_dir / self._oracle_inventory_ref(step_id)
+            expected = inventory.model_dump_json(indent=2).encode("utf-8")
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.read_bytes() != expected
+            ):
+                raise CheckpointCorrupt(
+                    f"immutable pytest oracle inventory changed for {step_id}"
+                )
+            validate_pytest_oracle_inventory(
+                state.workdir,
+                inventory,
+                allowed_changes=tuple(
+                    state.task.allowed_protected_files
+                ),
+            )
+
+    def _pytest_oracle_inventory(
+        self,
+        state: RunState,
+        step,
+        *,
+        allow_build: bool,
+    ) -> PytestOracleInventory | None:
+        if "pytest" not in step.verifiers:
+            return None
+        inventory = state.pytest_oracle_inventories.get(step.step_id)
+        if inventory is None:
+            if not allow_build:
+                raise CheckpointCorrupt(
+                    f"pytest oracle inventory is missing for {step.step_id}"
+                )
+            inventory = build_pytest_oracle_inventory(
+                state.workdir,
+                self.exec,
+                timeout=float(step.params.get("timeout", 300.0)),
+            )
+            path = (
+                Path(state.run_dir)
+                / self._oracle_inventory_ref(step.step_id)
+            )
+            data = inventory.model_dump_json(indent=2).encode("utf-8")
+            _write_immutable(path, data)
+            state.pytest_oracle_inventories[step.step_id] = inventory
+            # This checkpoint precedes every implementation-model call.
+            self._save(state)
+        else:
+            validate_pytest_oracle_inventory(
+                state.workdir,
+                inventory,
+                allowed_changes=tuple(
+                    state.task.allowed_protected_files
+                ),
+            )
+            path = (
+                Path(state.run_dir)
+                / self._oracle_inventory_ref(step.step_id)
+            )
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or path.read_bytes()
+                != inventory.model_dump_json(indent=2).encode("utf-8")
+            ):
+                raise CheckpointCorrupt(
+                    f"immutable pytest oracle inventory changed for {step.step_id}"
+                )
+        set_trusted_oracle_paths = getattr(
+            self.llm,
+            "set_trusted_oracle_paths",
+            None,
+        )
+        if callable(set_trusted_oracle_paths):
+            set_trusted_oracle_paths(inventory)
+        return inventory
+
     # --- public entry points ------------------------------------------------
     def run(self, task: TaskSpec, *, run_id: str | None = None) -> RunResult:
         run_id = run_id or _gen_run_id(task)
         run_dir = _claim_run_dir(self.config.runs_dir, run_id)
         try:
             with run_lock(run_dir):
+                self._bind_execution_backend(run_dir)
                 workdir = run_dir / "workdir"
                 self._prepare_workdir(task, workdir)
                 state = RunState.new(
@@ -264,6 +501,9 @@ class Harness:
                     str(run_dir),
                     str(workdir),
                     config=self.config,
+                    runtime="loop",
+                    exec_backend=self.exec,
+                    llm=self.llm,
                 )
                 save_state(state)
                 return self._drive(state)
@@ -285,9 +525,28 @@ class Harness:
                     f"run {run_id} uses state schema {state.schema_version}; "
                     f"schema {RUN_STATE_SCHEMA} is required for safe resume"
                 )
+            self._bind_execution_backend(run_dir)
+            blocked = self._resume_preflight(state)
+            if blocked is not None:
+                return blocked
+            state.require_matching_runtime_contract(
+                self.config,
+                runtime="loop",
+                exec_backend=self.exec,
+                llm=self.llm,
+            )
             limits = state.require_matching_budget_limits(self.config)
+            if state.quarantine is not None:
+                state.status = "PAUSED"
+                save_state(state)
+                return RunResult(
+                    state,
+                    "PAUSED",
+                    state.quarantine.detail,
+                )
             records = read_ledger(state.run_dir)
             try:
+                recover_transaction_journals(Path(state.run_dir))
                 validate_transaction_journals(Path(state.run_dir))
                 if state.status in ("DONE", "FAILED"):
                     validate_terminal_transaction_state(
@@ -310,6 +569,14 @@ class Harness:
                 # Preserve its sequence number after a crash so replayed work
                 # cannot create a second event with an already-used sequence.
                 state.seq = max(state.seq, *(record.seq for record in records))
+            if state.quarantine is not None:
+                state.status = "PAUSED"
+                save_state(state)
+                return RunResult(
+                    state,
+                    "PAUSED",
+                    state.quarantine.detail,
+                )
             if state.is_terminal():
                 save_state(state)
                 return RunResult(
@@ -385,6 +652,7 @@ class Harness:
         checkpoint_failed = list(state.failed_steps)
         checkpoint_repairs = dict(state.repairs)
         checkpoint_attempts = dict(state.attempt_ids)
+        checkpoint_quarantine = state.quarantine
 
         # The immutable initial plan plus ledger-bound repair snapshots are the
         # source of truth. Replaying them prevents a consistently edited
@@ -395,6 +663,7 @@ class Harness:
         state.failed_steps = []
         state.repairs = {}
         state.attempt_ids = {}
+        state.quarantine = None
         state.status = "RUNNING"
         valid_plan_snapshots = [initial_plan]
 
@@ -577,6 +846,14 @@ class Harness:
                 state, step, attempt_id, verify_records[0]
             )
             terminal = terminal_records[0] if terminal_records else None
+            if verdict_requires_process_quarantine(verdict):
+                if terminal is not None:
+                    raise CheckpointCorrupt(
+                        f"cleanup-failure attempt {attempt_id} has an unsafe "
+                        f"{terminal.phase} transition"
+                    )
+                self._quarantine_process_failure(state, step, verdict)
+                break
             if terminal is None:
                 if verdict.passed:
                     self._mark_step_verified(state, step, Path(state.workdir))
@@ -602,6 +879,8 @@ class Harness:
                         ),
                         Path(state.workdir),
                     )
+                    if state.quarantine is not None:
+                        break
                 records = read_ledger(run_dir)
                 continue
 
@@ -641,6 +920,14 @@ class Harness:
                         f"failed attempt {attempt_id} has unreverted transactions"
                     )
                 state.fail_current(step)
+
+        if (
+            checkpoint_quarantine is not None
+            and checkpoint_quarantine != state.quarantine
+        ):
+            raise CheckpointCorrupt(
+                "checkpoint quarantine is not bound to a cleanup-failure verdict"
+            )
 
         if checkpoint_plan is not None and not any(
             checkpoint_plan == snapshot for snapshot in valid_plan_snapshots
@@ -844,6 +1131,7 @@ class Harness:
     def _drive(self, state: RunState) -> RunResult:
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
+        self._bind_execution_backend(run_dir)
         from ..llm.trace import TracedLLM
 
         if isinstance(self.llm, TracedLLM):
@@ -931,6 +1219,16 @@ class Harness:
                 self._save(state)
                 self._run_step(state, step, budget)
                 in_flight = None  # finished cleanly (cursor may have advanced)
+                if state.quarantine is not None:
+                    state.active_since = None
+                    state.elapsed_s = budget.elapsed()
+                    state.status = "PAUSED"
+                    self._save(state)
+                    return RunResult(
+                        state,
+                        "PAUSED",
+                        state.quarantine.detail,
+                    )
                 # A last step may consume the remaining wall-clock budget. Check
                 # before committing a terminal status, not only before the next
                 # iteration that may never exist.
@@ -946,6 +1244,14 @@ class Harness:
             state.status = "PAUSED"
             self._save(state)
             return RunResult(state, "PAUSED", str(e))
+        except ProcessCleanupUnconfirmed as error:
+            state.steps_used = budget.steps_used
+            state.elapsed_s = budget.elapsed()
+            state.active_since = None
+            step = in_flight or state.next_step()
+            self._quarantine_cleanup_interruption(state, step, error)
+            self._save(state)
+            return RunResult(state, "PAUSED", str(error))
         except ApprovalPending as e:
             state.elapsed_s = budget.elapsed()
             state.active_since = None
@@ -1072,6 +1378,7 @@ class Harness:
                 step,
                 artifact_ref="patch.json",
                 attempt_id=attempt_id,
+                require_transaction=False,
             )
             verdict_json = verdict.model_dump_json(indent=2)
             verdict_sha = sha256_bytes(verdict_json.encode("utf-8"))
@@ -1124,6 +1431,12 @@ class Harness:
                 bundle=bundle,
                 exec=self.exec,
                 attempt_id=attempt_id,
+                pytest_oracle_inventory=state.pytest_oracle_inventories.get(
+                    step.step_id
+                ),
+                allowed_oracle_changes=tuple(
+                    state.task.allowed_protected_files
+                ),
             ),
         )
         verdict = self._bind_verdict(
@@ -1306,6 +1619,7 @@ class Harness:
         *,
         artifact_ref: str,
         attempt_id: str,
+        require_transaction: bool = True,
     ) -> Verdict:
         stored_ref = {
             "edit_code": _attempt_ref(attempt_id, "patch.json"),
@@ -1326,16 +1640,34 @@ class Harness:
             raise TransactionCorrupt(
                 f"cannot bind verdict to missing artifact: {path}"
             )
+        artifact_sha256 = sha256_bytes(path.read_bytes())
+        if step.action == "edit_code" and require_transaction:
+            tx = load_transaction(
+                Path(state.run_dir), step.step_id, attempt_id
+            )
+            if tx is None:
+                raise TransactionCorrupt(
+                    f"cannot bind verdict without a patch transaction: "
+                    f"{step.step_id}/{attempt_id}"
+                )
+            if artifact_sha256 != tx.patch_sha256:
+                raise TransactionCorrupt(
+                    f"verdict artifact hash does not match the patch transaction: "
+                    f"{step.step_id}/{attempt_id}"
+                )
         return verdict.model_copy(
             update={
                 "artifact_ref": stored_ref,
-                "artifact_sha256": sha256_bytes(path.read_bytes()),
+                "artifact_sha256": artifact_sha256,
                 "attempt_id": attempt_id,
             }
         )
 
     def _repair_or_fail(self, state: RunState, step, verdict: Verdict, budget, workdir) -> None:
         """Re-issue the step as a repair with the verdict's failures, or fail the run."""
+        if verdict_requires_process_quarantine(verdict):
+            self._quarantine_process_failure(state, step, verdict)
+            return
         attempt_id = state.attempt_id(step)
         non_retryable = any(check.detail.get("non_retryable") for check in verdict.checks)
         if not non_retryable and state.repairs_for(step) < budget.max_repairs:
@@ -1378,6 +1710,54 @@ class Harness:
                     idempotency_key=f"{attempt_id}:fail",
                 ),
             )
+
+    @staticmethod
+    def _quarantine_process_failure(
+        state: RunState,
+        step,
+        verdict: Verdict,
+    ) -> None:
+        check = next(
+            check
+            for check in verdict.checks
+            if check.detail.get(PROCESS_CLEANUP_UNCONFIRMED) is True
+        )
+        cleanup = check.detail.get("process_cleanup")
+        cleanup_detail = (
+            cleanup.get("detail") if isinstance(cleanup, dict) else None
+        )
+        detail = (
+            cleanup_detail
+            if isinstance(cleanup_detail, str)
+            else str(
+                check.detail.get("summary")
+                or "process cleanup was not confirmed"
+            )
+        )
+        state.quarantine = RunQuarantine(
+            step_id=step.step_id,
+            attempt_id=state.attempt_id(step),
+            detail=detail,
+        )
+        state.status = "PAUSED"
+        state.active_since = None
+
+    @staticmethod
+    def _quarantine_cleanup_interruption(
+        state: RunState,
+        step,
+        error: ProcessCleanupUnconfirmed,
+    ) -> None:
+        step_id = step.step_id if step is not None else "-"
+        attempt_id = state.attempt_id(step) if step is not None else "plan"
+        state.quarantine = RunQuarantine(
+            kind="process_cleanup_interrupted",
+            step_id=step_id,
+            attempt_id=attempt_id,
+            detail=error.detail[-1000:],
+        )
+        state.status = "PAUSED"
+        state.active_since = None
 
     # --- execute dispatch ---------------------------------------------------
     def _execute(self, state: RunState, step, bundle) -> tuple[Any, str]:
@@ -1456,6 +1836,15 @@ class Harness:
         attempt_id = state.attempt_id(step)
         artifact_dir = attempt_artifact_dir(run_dir, step.step_id, attempt_id)
         tx = load_transaction(run_dir, step.step_id, attempt_id)
+        inventory = self._pytest_oracle_inventory(
+            state,
+            step,
+            allow_build=(
+                tx is None
+                and not (artifact_dir / "patch.json").exists()
+                and not (artifact_dir / "patch.json").is_symlink()
+            ),
+        )
 
         if tx is not None:
             data = self._patch_bytes(state, step)
@@ -1536,7 +1925,7 @@ class Harness:
         patch = Implementer(self.llm).implement(step, bundle, workdir)
         patch_json = patch.model_dump_json(indent=2)
         patch_bytes = patch_json.encode("utf-8")
-        artifact_dir.mkdir(parents=True, exist_ok=True)
+        durable_mkdir_chain(artifact_dir, anchor=run_dir)
         _write_immutable(artifact_dir / "patch.json", patch_bytes)
         _dump(run_dir, step.step_id, "patch.json", patch_json)
         if patch.step_id != step.step_id:
@@ -1551,7 +1940,11 @@ class Harness:
             artifact_dir / "review.diff", review_diff.encode("utf-8")
         )
         _dump(run_dir, step.step_id, "patch.diff", review_diff)
-        violations = policy.check_resolved(resolved, state.task.allowed_protected_files)
+        violations = policy.check_resolved(
+            resolved,
+            state.task.allowed_protected_files,
+            additional_protected_files=inventory or (),
+        )
         if violations:
             # Persist the refused proposal for audit, but do not create a
             # transaction because the sandbox was never touched.
@@ -1616,17 +2009,21 @@ class Harness:
             expected_review = render_review_diff(
                 patch, resolved, backup
             ).encode("utf-8")
-            review_paths = [
-                artifact_dir / "review.diff",
-                artifact_dir.parents[1] / "patch.diff",
-            ]
-            for review_path in review_paths:
-                if review_path.is_symlink() or not review_path.is_file():
-                    raise ValueError(f"review artifact is missing: {review_path}")
-                if review_path.read_bytes() != expected_review:
-                    raise ValueError(
-                        f"review artifact does not match executable patch: {review_path}"
-                    )
+            review_path = artifact_dir / "review.diff"
+            if review_path.is_symlink() or not review_path.is_file():
+                raise ValueError(f"review artifact is missing: {review_path}")
+            if review_path.read_bytes() != expected_review:
+                raise ValueError(
+                    f"review artifact does not match executable patch: {review_path}"
+                )
+            _validate_optional_aliases(
+                expected_review,
+                [
+                    artifact_dir.parents[1] / "patch.diff",
+                    artifact_dir.parents[3] / "patch.diff",
+                ],
+                label="review artifact",
+            )
             expected_base = {
                 rel: saved_file_state(backup.originals[rel], backup.modes[rel])
                 for rel in tx.resolved_paths
@@ -1740,18 +2137,37 @@ class Harness:
         return bool(transactions)
 
     def _patch_bytes(self, state: RunState, step) -> bytes | None:
-        """The persisted patch.json bytes for this step (per-step file first)."""
-        candidates = [
-            Path(state.run_dir) / "steps" / _safe_seg(step.step_id) / "patch.json",
-            Path(state.run_dir) / "patch.json",
-        ]
-        for path in candidates:
-            if path.exists():
-                try:
-                    return path.read_bytes()
-                except OSError:
-                    return None
-        return None
+        """Read immutable attempt bytes and only cross-check compatibility aliases."""
+        run_dir = Path(state.run_dir)
+        attempt_id = state.attempt_id(step)
+        authoritative_path = (
+            attempt_artifact_dir(run_dir, step.step_id, attempt_id)
+            / "patch.json"
+        )
+        if not (
+            authoritative_path.exists()
+            or authoritative_path.is_symlink()
+        ):
+            return None
+        if authoritative_path.is_symlink() or not authoritative_path.is_file():
+            raise CheckpointCorrupt(
+                f"immutable patch artifact is unsafe: {authoritative_path}"
+            )
+        try:
+            data = authoritative_path.read_bytes()
+        except OSError as error:
+            raise CheckpointCorrupt(
+                f"immutable patch artifact is unreadable: {authoritative_path}"
+            ) from error
+        _validate_optional_aliases(
+            data,
+            [
+                run_dir / "steps" / _safe_seg(step.step_id) / "patch.json",
+                run_dir / "patch.json",
+            ],
+            label="patch",
+        )
+        return data
 
     def _artifact_sha(self, state: RunState, step) -> str | None:
         """The reviewable artifact hash for an approval — patches only.
@@ -2059,7 +2475,7 @@ class Harness:
                 shutil.rmtree(workdir)
                 raise
         else:
-            workdir.mkdir(parents=True, exist_ok=True)
+            durable_mkdir_chain(workdir, anchor=workdir.parent)
 
     @staticmethod
     def _reject_repo_symlinks(root: Path) -> None:

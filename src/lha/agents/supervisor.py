@@ -128,15 +128,15 @@ class Supervisor:
                     goal=task.title,
                     context_query=cq,
                     verifiers=["freshness", "citation"],
-                    success_criteria=["answer cites fresh sources"],
+                    success_criteria=["retrieved context has fresh source locations"],
                     context_requirement=creq,
                 )
             ]
             return Plan(
                 task_id=task.title,
-                summary=f"Answer with fresh, cited context: {task.title}",
+                summary=f"Retrieve fresh context with source locations: {task.title}",
                 steps=steps,
-                overall_success=["answer cites fresh sources"],
+                overall_success=["retrieved context has fresh source locations"],
             )
 
         if task.kind == "paper_to_experiment":
@@ -323,6 +323,24 @@ def _valid_experiment_protocol(
     template_runs = [step for step in template.steps if step.action == "run_experiment"]
     if not runs or len(runs) != len(template_runs):
         return False
+    context_steps = [
+        step for step in candidate.steps if step.action == "gather_context"
+    ]
+    template_context_steps = [
+        step for step in template.steps if step.action == "gather_context"
+    ]
+    for expected in template_context_steps:
+        if not any(
+            step.kind == expected.kind
+            and set(expected.verifiers).issubset(step.verifiers)
+            and (
+                expected.context_requirement != "required"
+                or step.context_requirement == "required"
+            )
+            and step.params == expected.params
+            for step in context_steps
+        ):
+            return False
     if any(
         step.action not in {"gather_context", "run_experiment"}
         for step in candidate.steps

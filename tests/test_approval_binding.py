@@ -33,8 +33,8 @@ from lha.harness.approval import (
 )
 from lha.harness.checkpoint import append_ledger, load_state, read_ledger
 from lha.harness.manifest import ArtifactManifest, sha256_bytes
-from lha.harness.state import StepRecord
-from lha.harness.transaction import list_transactions
+from lha.harness.state import RunState, StepRecord
+from lha.harness.transaction import attempt_artifact_dir, list_transactions
 from lha.reporting import ReportingError, collect_run
 
 APPROVAL_TASK = "data/tasks/fix_average_approval.yaml"
@@ -454,3 +454,110 @@ def test_langgraph_tampered_artifact_fails_closed(tmp_path, lg):
     assert resumed.status == "FAILED"
     src = (run_dir / "workdir" / "mathutils.py").read_text()
     assert "return 0" not in src
+
+
+def test_langgraph_republishes_approval_after_request_crash(
+    tmp_path, lg, monkeypatch
+):
+    config = _cfg(tmp_path)
+    runner = lg(config)
+
+    def crash_before_request(*_args, **_kwargs):
+        raise KeyboardInterrupt("request publication interrupted")
+
+    monkeypatch.setattr(runner, "_request_approval", crash_before_request)
+    with pytest.raises(KeyboardInterrupt, match="request publication"):
+        runner.run(
+            hermetic_task(APPROVAL_TASK),
+            run_id="langgraph-request-crash",
+        )
+
+    run_dir = Path(config.runs_dir) / "langgraph-request-crash"
+    assert not (run_dir / "pending_approval.json").exists()
+    assert not approval_request_path(
+        run_dir, "s2-fix", "s2-fix-r0"
+    ).exists()
+
+    paused = lg(config).resume("langgraph-request-crash")
+    assert paused.status == "AWAITING_APPROVAL"
+    assert paused.state.status == "AWAITING_APPROVAL"
+    assert (run_dir / "pending_approval.json").is_file()
+    assert approval_request_path(
+        run_dir, "s2-fix", "s2-fix-r0"
+    ).is_file()
+
+    HumanApprovalGate(run_dir).resolve(approved=True, note="request recovered")
+    done = lg(config).resume("langgraph-request-crash")
+    assert done.status == "DONE"
+
+
+def test_langgraph_does_not_recreate_request_after_decision(tmp_path, lg):
+    paused = _pause_at_approval(tmp_path, lg)
+    run_dir = Path(paused.state.run_dir)
+    HumanApprovalGate(run_dir).resolve(approved=True, note="durable decision")
+    approval_request_path(
+        run_dir, "s2-fix", "s2-fix-r0"
+    ).unlink()
+
+    result = lg(_cfg(tmp_path)).resume(paused.state.run_id)
+    assert result.status == "FAILED"
+    assert not approval_request_path(
+        run_dir, "s2-fix", "s2-fix-r0"
+    ).exists()
+    assert "len(values) - 1" in (
+        run_dir / "workdir" / "mathutils.py"
+    ).read_text()
+
+
+@pytest.mark.parametrize("damage", ["alias_missing", "attempt_changed"])
+def test_langgraph_pending_verify_revalidates_patch_transaction(
+    tmp_path, lg, monkeypatch, damage
+):
+    config = _cfg(tmp_path)
+    original_verify = lg._verify_node
+    interrupted = False
+
+    def interrupt_patch_verify(self, gstate):
+        nonlocal interrupted
+        state = RunState.model_validate(gstate["rs"])
+        step = state.next_step()
+        if (
+            not interrupted
+            and step is not None
+            and step.action == "edit_code"
+        ):
+            interrupted = True
+            raise KeyboardInterrupt("stopped after patch prepare")
+        return original_verify(self, gstate)
+
+    monkeypatch.setattr(lg, "_verify_node", interrupt_patch_verify)
+    with pytest.raises(KeyboardInterrupt, match="after patch prepare"):
+        lg(config).run(
+            hermetic_task("data/tasks/fix_average.yaml"),
+            run_id=f"langgraph-pending-verify-{damage}",
+        )
+    monkeypatch.setattr(lg, "_verify_node", original_verify)
+
+    run_dir = Path(config.runs_dir) / f"langgraph-pending-verify-{damage}"
+    state = load_state(run_dir)
+    step = state.next_step()
+    assert step is not None and step.step_id == "s2-fix"
+    tx = list_transactions(run_dir, step.step_id)[0]
+    if damage == "alias_missing":
+        (run_dir / "steps" / "s2-fix" / "patch.json").unlink()
+    else:
+        immutable = (
+            attempt_artifact_dir(
+                run_dir, step.step_id, tx.attempt_id
+            )
+            / "patch.json"
+        )
+        payload = json.loads(immutable.read_text())
+        payload["rationale"] = "changed after prepare"
+        immutable.write_text(json.dumps(payload, indent=2))
+
+    result = lg(config).resume(state.run_id)
+    assert result.status == "FAILED"
+    assert "len(values) - 1" in (
+        run_dir / "workdir" / "mathutils.py"
+    ).read_text()

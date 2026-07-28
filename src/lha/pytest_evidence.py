@@ -124,6 +124,8 @@ class DriverResult:
     receipt_sha256: str
     detail: str
     duration_s: float
+    cleanup_unconfirmed: bool = False
+    cleanup_detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,8 @@ class PytestEvidenceResult:
     receipt: dict[str, Any] | None
     receipt_sha256: str
     duration_s: float
+    cleanup_unconfirmed: bool = False
+    cleanup_detail: str = ""
 
 
 def canonical_json_bytes(value: dict[str, Any]) -> bytes:
@@ -252,6 +256,22 @@ def run_driver(
             sort_keys=True,
         ),
     )
+    if result.cleanup_unconfirmed:
+        # A surviving process may still replace or write the receipt path.
+        # Quarantine without touching any candidate-controlled filesystem
+        # evidence, including cleanup of the path itself.
+        return DriverResult(
+            result.returncode,
+            None,
+            "",
+            (
+                "process cleanup could not be confirmed: "
+                f"{(result.cleanup_detail or result.stderr)[-500:]}"
+            ),
+            result.duration_s,
+            cleanup_unconfirmed=True,
+            cleanup_detail=result.cleanup_detail[-1000:],
+        )
     try:
         if report_path.is_symlink():
             payload = b""
@@ -410,6 +430,8 @@ def run_with_evidence(
             None,
             "",
             driver.duration_s,
+            cleanup_unconfirmed=driver.cleanup_unconfirmed,
+            cleanup_detail=driver.cleanup_detail,
         )
     outcome, passed = classify_receipt(
         process_returncode=driver.returncode,
@@ -425,6 +447,8 @@ def run_with_evidence(
         driver.receipt,
         driver.receipt_sha256,
         driver.duration_s,
+        cleanup_unconfirmed=driver.cleanup_unconfirmed,
+        cleanup_detail=driver.cleanup_detail,
     )
 
 

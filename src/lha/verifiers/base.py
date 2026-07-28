@@ -14,6 +14,7 @@ from typing import Any
 
 from ..artifacts import Step
 from ..live_context.models import ContextBundle
+from ..oracle_models import PytestOracleInventory
 from ..sandbox import ExecutionBackend, TrustedLocalBackend
 from .verdict import Check, VerifierFamily
 
@@ -29,6 +30,11 @@ class VerifyContext:
     exec: ExecutionBackend = field(default_factory=TrustedLocalBackend)
     # Stable across process crashes, different for each repair attempt.
     attempt_id: str | None = None
+    # Established before the implementation model runs and persisted in RunState.
+    pytest_oracle_inventory: PytestOracleInventory | None = None
+    # Exact, task-authorized oracle files that may change while the baseline
+    # node IDs remain fixed. New unlisted files under protected roots still fail.
+    allowed_oracle_changes: tuple[str, ...] = ()
 
 
 class Verifier(ABC):

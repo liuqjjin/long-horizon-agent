@@ -1290,7 +1290,7 @@ def sha256_file(path: str | Path) -> str:
 
 def _atomic_write_text(path: Path, payload: str) -> None:
     """Persist attempt evidence without exposing a partially written JSON file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _durable_mkdir_chain(path.parent)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         with temporary.open("w") as stream:
@@ -1298,16 +1298,38 @@ def _atomic_write_text(path: Path, payload: str) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        try:
-            descriptor = os.open(path.parent, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_mkdir_chain(path: Path) -> None:
+    """Create missing parents one at a time and persist every directory entry."""
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        if current.is_symlink():
+            raise ValueError(f"directory path is a symbolic link: {current}")
+        missing.append(current)
+        if current.parent == current:
+            raise ValueError(f"directory path has no existing ancestor: {path}")
+        current = current.parent
+    if current.is_symlink() or not current.is_dir():
+        raise ValueError(f"directory ancestor is unsafe: {current}")
+    for directory in reversed(missing):
+        directory.mkdir()
+        _fsync_directory(directory.parent)
 
 
 def _read_stable_regular_bytes(path: Path, *, maximum_bytes: int) -> bytes:
@@ -1364,7 +1386,7 @@ def _write_execution_manifest_once(
 ) -> None:
     """Publish a canonical manifest once, or prove an identical one already exists."""
     payload = (manifest.model_dump_json(indent=2) + "\n").encode()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _durable_mkdir_chain(path.parent)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
     try:

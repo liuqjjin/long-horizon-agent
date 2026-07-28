@@ -1,7 +1,7 @@
-"""The live-context facade — the ONLY public door to code/paper/experiment search.
+"""The only public entry point for code, paper, and experiment indexes.
 
-The rest of the system imports exactly these five functions (plus the models and
-``configure``). It must never import CocoIndex or ``ccc`` directly.
+Other modules use this facade for search, indexing, configuration, and backend
+selection. They must not import CocoIndex or ``ccc`` directly.
 """
 
 from __future__ import annotations
@@ -56,19 +56,37 @@ def configure(*, code_root: str | Path | None = None, config: Config | None = No
     _state.reset_cache()
 
 
+def resolve_code_backend_name(
+    *,
+    code_root: str | Path,
+    config: Config,
+) -> str:
+    """Return the concrete code backend selected by a configured mode.
+
+    ``auto`` is mutable process configuration: installing or removing ``ccc``
+    changes what it means. Durable runs record this resolution so a resume
+    cannot silently switch its source of code context.
+    """
+    if config.code_backend == "ccc":
+        return "ccc"
+    if config.code_backend == "auto":
+        return "ccc" if CccBackend(Path(code_root)).available() else "null"
+    return "null"
+
+
 def _code_backend() -> SearchBackend:
     key = f"code:{_state.code_root}"
     if key in _state._cache:
         return _state._cache[key]
-    mode = _state.config.code_backend
-    backend: SearchBackend
-    if mode in ("auto", "ccc"):
-        candidate = CccBackend(_state.code_root)
-        backend = candidate if candidate.available() else NullBackend("code")
-        if mode == "ccc":  # explicit request: use it even if not yet indexed
-            backend = candidate
-    else:
-        backend = NullBackend("code")
+    resolved = resolve_code_backend_name(
+        code_root=_state.code_root,
+        config=_state.config,
+    )
+    backend: SearchBackend = (
+        CccBackend(_state.code_root)
+        if resolved == "ccc"
+        else NullBackend("code")
+    )
     _state._cache[key] = backend
     return backend
 

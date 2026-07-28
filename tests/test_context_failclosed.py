@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -443,8 +444,13 @@ def test_ccc_unsuccessful_text_result_is_not_empty():
         _checked_results(result)
 
 
-def test_ccc_subprocess_environment_excludes_host_credentials(monkeypatch):
-    monkeypatch.setenv("PATH", "/custom/bin")
+def test_ccc_subprocess_environment_excludes_host_credentials(tmp_path, monkeypatch):
+    absolute_bin = tmp_path / "custom" / "bin"
+    absolute_bin.mkdir(parents=True)
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join((".", "relative/bin", str(absolute_bin))),
+    )
     monkeypatch.setenv("LANG", "en_US.UTF-8")
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
@@ -455,8 +461,14 @@ def test_ccc_subprocess_environment_excludes_host_credentials(monkeypatch):
     env = _env_with_local_bin()
 
     assert env["LANG"] == "en_US.UTF-8"
-    assert "/custom/bin" in env["PATH"].split(os.pathsep)
+    assert str(absolute_bin) in env["PATH"].split(os.pathsep)
     assert "" not in env["PATH"].split(os.pathsep)
+    assert "." not in env["PATH"].split(os.pathsep)
+    assert "relative/bin" not in env["PATH"].split(os.pathsep)
+    assert all(
+        Path(component).is_absolute()
+        for component in env["PATH"].split(os.pathsep)
+    )
     assert set(env) <= {"PATH", "LANG", "LC_ALL", "LC_CTYPE"}
     assert not {
         "OPENAI_API_KEY",
@@ -465,6 +477,19 @@ def test_ccc_subprocess_environment_excludes_host_credentials(monkeypatch):
         "SSH_AUTH_SOCK",
         "CODEX_HOME",
     } & env.keys()
+
+
+def test_ccc_discovery_ignores_a_relative_worktree_path(tmp_path, monkeypatch):
+    fake = tmp_path / "ccc"
+    fake.write_text("#!/bin/sh\nexit 0\n")
+    fake.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", ".")
+
+    found = ccc_backend.find_ccc()
+
+    assert found is None or Path(found) != fake
+    assert found is None or Path(found).is_absolute()
 
 
 def test_ccc_control_command_uses_bounded_process_group(tmp_path, monkeypatch):

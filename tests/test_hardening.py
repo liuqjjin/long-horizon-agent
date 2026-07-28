@@ -102,6 +102,26 @@ def test_ruff_fails_on_inconsistent_exit_codes(tmp_path):
     )
     assert not c2.passed
 
+    # JSON syntax is insufficient: Ruff's output contract is a list of
+    # violations. Empty objects and malformed violation records fail closed.
+    for returncode, stdout in (
+        (0, "{}"),
+        (0, ""),
+        (1, '[{"code": "F401"}]'),
+        (0, '[{"code": "F401", "message": "unused", "filename": "x.py",'
+             ' "location": {"row": 1, "column": 1}}]'),
+    ):
+        malformed = RuffVerifier().verify(
+            Patch(step_id="s"),
+            VerifyContext(
+                workdir=tmp_path,
+                step=_step("ruff"),
+                exec=_CannedExec(ProcResult(returncode, stdout, "", 0.0)),
+            ),
+        )
+        assert not malformed.passed
+        assert malformed.detail.get("parse_error")
+
 
 def test_pytest_fails_when_every_collected_test_is_skipped(tmp_path):
     (tmp_path / "test_only.py").write_text(

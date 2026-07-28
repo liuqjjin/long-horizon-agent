@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from ...array_evidence import load_bounded_npy, safe_artifact_path
-from ..verdict import Check, VerifierFamily
+from ..verdict import (
+    Check,
+    VerifierFamily,
+    process_cleanup_failure_detail,
+)
 
 
 def is_finite(x: Any) -> bool:
@@ -90,6 +94,26 @@ def precheck(artifact: Any, name: str, family: VerifierFamily = "experiment") ->
     verifier should pass regardless of what files were left behind.
     """
     rc = getattr(artifact, "returncode", 0)
+    cleanup_unconfirmed = bool(
+        getattr(artifact, "cleanup_unconfirmed", False)
+    )
+    if cleanup_unconfirmed:
+        detail = {
+            "summary": "experiment process cleanup could not be confirmed"
+        }
+        detail.update(
+            process_cleanup_failure_detail(
+                returncode=rc,
+                cleanup_unconfirmed=cleanup_unconfirmed,
+                detail=str(getattr(artifact, "stdout_tail", ""))[-500:],
+            )
+        )
+        return Check(
+            name=name,
+            family=family,
+            passed=False,
+            detail=detail,
+        )
     if getattr(artifact, "output_truncated", False):
         return Check(
             name=name,
@@ -103,11 +127,19 @@ def precheck(artifact: Any, name: str, family: VerifierFamily = "experiment") ->
             },
         )
     if rc != 0:
+        detail = {"summary": f"experiment command failed (returncode={rc})"}
+        detail.update(
+            process_cleanup_failure_detail(
+                returncode=rc,
+                cleanup_unconfirmed=cleanup_unconfirmed,
+                detail=str(getattr(artifact, "stdout_tail", ""))[-500:],
+            )
+        )
         return Check(
             name=name,
             family=family,
             passed=False,
-            detail={"summary": f"experiment command failed (returncode={rc})"},
+            detail=detail,
         )
     return None
 

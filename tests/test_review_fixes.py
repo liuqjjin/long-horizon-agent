@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from datetime import timedelta
 from pathlib import Path
@@ -13,6 +14,7 @@ from lha.artifacts import Patch, Step
 from lha.clock import now
 from lha.live_context import freshness as fr
 from lha.live_context.models import ContextItem, Provenance
+from lha.process_result import ProcResult
 from lha.sandbox.base import run_bounded_process
 from lha.tools.patch import apply_patch, make_unified_diff
 from lha.verifiers import VerifyContext
@@ -106,6 +108,36 @@ def test_diff_apply_rejects_unsupported_process_groups_before_spawn(
         apply_patch(patch, tmp_path)
 
     assert target.read_text() == original
+
+
+def test_target_git_probe_uses_an_absolute_control_executable(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.agents.verifier_agent as verifier_module
+
+    observed: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(cmd, *, cwd=None, env=None, **_kwargs):
+        assert cwd is not None
+        assert env is not None
+        observed.append((cmd, env))
+        if "--show-toplevel" in cmd:
+            return ProcResult(0, f"{tmp_path}\n", "", 0.0)
+        return ProcResult(0, f"{'a' * 40}\n", "", 0.0)
+
+    monkeypatch.setenv("PATH", ".")
+    monkeypatch.setattr(verifier_module, "run", fake_run)
+
+    assert verifier_module._target_git_commit(tmp_path) == "a" * 40
+    assert len(observed) == 2
+    for argv, environment in observed:
+        assert Path(argv[0]).is_absolute()
+        assert all(
+            Path(component).is_absolute()
+            for component in environment["PATH"].split(os.pathsep)
+            if component
+        )
 
 
 def test_backup_persists_to_disk_and_reverts(tmp_path):

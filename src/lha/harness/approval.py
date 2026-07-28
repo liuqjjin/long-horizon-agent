@@ -17,7 +17,6 @@ import hashlib
 import json
 import os
 import stat
-import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +24,11 @@ from typing import Generic, Iterator, Literal, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
+from ..durable_io import (
+    atomic_replace_text,
+    durable_mkdir_chain,
+    fsync_directory,
+)
 from .transaction import attempt_artifact_dir, durable_artifact_write
 
 _Model = TypeVar("_Model", bound=BaseModel)
@@ -144,20 +148,8 @@ class HumanApprovalGate:
     def _atomic_write(path: Path, text: str) -> None:
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise ValueError(f"unsafe approval path: {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-        )
-        temporary = Path(name)
-        try:
-            with os.fdopen(descriptor, "w") as stream:
-                stream.write(text)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-            _fsync_directory(path.parent)
-        finally:
-            temporary.unlink(missing_ok=True)
+        durable_mkdir_chain(path.parent)
+        atomic_replace_text(path, text)
 
     @contextmanager
     def _decision_lock(self) -> Iterator[None]:
@@ -470,11 +462,4 @@ def _sha256(data: bytes) -> str:
 
 
 def _fsync_directory(path: Path) -> None:
-    try:
-        directory = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except OSError:  # pragma: no cover - platform without directory fsync
-        pass
+    fsync_directory(path)

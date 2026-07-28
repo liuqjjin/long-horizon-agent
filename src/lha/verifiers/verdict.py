@@ -10,6 +10,35 @@ from pydantic import BaseModel, Field, FiniteFloat, model_validator
 from ..clock import now
 
 VerifierFamily = Literal["code", "experiment", "context"]
+PROCESS_CLEANUP_UNCONFIRMED = "process_cleanup_unconfirmed"
+
+
+def process_cleanup_failure_detail(
+    *,
+    returncode: int,
+    cleanup_unconfirmed: bool,
+    detail: str = "",
+) -> dict[str, Any]:
+    """Structured verdict fields for a backend whose process may still run."""
+    if not cleanup_unconfirmed:
+        return {}
+    return {
+        "non_retryable": True,
+        PROCESS_CLEANUP_UNCONFIRMED: True,
+        "process_cleanup": {
+            "returncode": returncode,
+            "confirmed": False,
+            "detail": detail or "backend process cleanup was not confirmed",
+        },
+    }
+
+
+def verdict_requires_process_quarantine(verdict: "Verdict") -> bool:
+    """Whether proceeding could race a process still mutating the worktree."""
+    return any(
+        check.detail.get(PROCESS_CLEANUP_UNCONFIRMED) is True
+        for check in verdict.checks
+    )
 
 
 class Check(BaseModel):

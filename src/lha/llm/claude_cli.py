@@ -26,6 +26,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from ..operation_lease import (
+    OperationLeaseError,
+    OperationLeaseStore,
+    build_local_launcher,
+    recover_local_operation,
+    wait_until_local_active,
+)
 from .base import LLMClient
 
 _PASSTHROUGH_ENV = (
@@ -90,11 +97,74 @@ class ClaudeCleanupError(ClaudeCLIError):
     """Attempt-local state could not be removed."""
 
 
-class ClaudeProcessCleanupError(ClaudeCleanupError):
-    """The CLI process group could not be confirmed absent."""
+class ClaudeOperationCleanupError(ClaudeCleanupError):
+    """A run-owned operation could not be reconciled safely."""
 
-    def __init__(self, message: str, *, process: subprocess.Popen[Any]):
+    def __init__(
+        self,
+        message: str,
+        *,
+        primary_error: BaseException | None = None,
+        cleanup_error: BaseException | None = None,
+        operation_id: str | None = None,
+        operation_run_dir: Path | None = None,
+        spawned: bool,
+    ):
         super().__init__(message)
+        self.operation_id = operation_id
+        self.operation_run_dir = operation_run_dir
+        self.spawned = spawned
+        self.primary_error_type = (
+            type(primary_error).__name__ if primary_error is not None else None
+        )
+        self.cleanup_error_type = (
+            type(cleanup_error).__name__ if cleanup_error is not None else None
+        )
+
+
+class ClaudeLeaseCleanupError(ClaudeOperationCleanupError):
+    """A pre-spawn lease could not be cleared durably."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        primary_error: BaseException | None,
+        cleanup_error: BaseException,
+        operation_id: str,
+        operation_run_dir: Path,
+    ):
+        super().__init__(
+            message,
+            primary_error=primary_error,
+            cleanup_error=cleanup_error,
+            operation_id=operation_id,
+            operation_run_dir=operation_run_dir,
+            spawned=False,
+        )
+
+
+class ClaudeProcessCleanupError(ClaudeOperationCleanupError):
+    """The CLI process group or its active lease could not be confirmed absent."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        process: subprocess.Popen[Any],
+        primary_error: BaseException | None = None,
+        cleanup_error: BaseException | None = None,
+        operation_id: str | None = None,
+        operation_run_dir: Path | None = None,
+    ):
+        super().__init__(
+            message,
+            primary_error=primary_error,
+            cleanup_error=cleanup_error,
+            operation_id=operation_id,
+            operation_run_dir=operation_run_dir,
+            spawned=True,
+        )
         self.process = process
 
 
@@ -226,6 +296,19 @@ def _join_started_threads(
     return first_error
 
 
+def _close_process_pipes(proc: subprocess.Popen[Any]) -> BaseException | None:
+    """Close parent pipe endpoints after every process-group cleanup."""
+    first_error: BaseException | None = None
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
+        try:
+            pipe.close()
+        except BaseException as error:
+            first_error = first_error or error
+    return first_error
+
+
 def _run_isolated_process(
     argv: list[str],
     *,
@@ -235,132 +318,247 @@ def _run_isolated_process(
     env: Mapping[str, str],
     max_stdout_bytes: int = _MAX_STDOUT_BYTES,
     max_stderr_bytes: int = _MAX_STDERR_BYTES,
+    operation_lease_dir: str | Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Capture a subprocess without allowing unbounded output or descendants."""
-    common: dict[str, Any] = {
-        "cwd": str(cwd),
-        "stdin": subprocess.PIPE,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "env": dict(env),
-    }
+    command = list(argv)
+    execution_cwd = cwd.resolve()
+    store: OperationLeaseStore | None = None
+    lease = None
+    operation_id: str | None = None
+    release_read: int | None = None
+    release_write: int | None = None
+    spawn_argv = command
     try:
+        if operation_lease_dir is not None:
+            store = OperationLeaseStore(operation_lease_dir)
+            operation_id = os.urandom(16).hex()
+            lease = store.prepare_local(
+                command,
+                cwd=execution_cwd,
+                operation_id=operation_id,
+            )
+            release_read, release_write = os.pipe()
+            spawn_argv = build_local_launcher(
+                store,
+                lease,
+                command,
+                release_fd=release_read,
+            )
+        common: dict[str, Any] = {
+            "cwd": str(execution_cwd),
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": dict(env),
+        }
         if os.name == "posix":
             proc: subprocess.Popen[Any] = subprocess.Popen(
-                argv, start_new_session=True, **common
+                spawn_argv,
+                start_new_session=True,
+                pass_fds=((release_read,) if release_read is not None else ()),
+                **common,
             )
         else:
+            if lease is not None:
+                raise OSError("durable Claude operations require a POSIX host")
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            proc = subprocess.Popen(argv, creationflags=creationflags, **common)
-    except (OSError, ValueError) as error:
-        raise ClaudeInvocationError("could not start the Claude CLI") from error
+            proc = subprocess.Popen(
+                spawn_argv,
+                creationflags=creationflags,
+                **common,
+            )
+    except BaseException as primary_error:
+        lease_error: BaseException | None = None
+        if store is not None and operation_id is not None:
+            try:
+                store.clear(operation_id)
+            except BaseException as error:
+                lease_error = error
+        for descriptor in (release_read, release_write):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if lease_error is not None:
+            assert store is not None
+            assert operation_id is not None
+            raise ClaudeLeaseCleanupError(
+                "Claude CLI was not spawned, but its preparing lease "
+                "could not be cleared durably",
+                primary_error=primary_error,
+                cleanup_error=lease_error,
+                operation_id=operation_id,
+                operation_run_dir=store.run_dir,
+            ) from lease_error
+        if isinstance(primary_error, (OSError, ValueError, OperationLeaseError)):
+            raise ClaudeInvocationError("could not start the Claude CLI") from primary_error
+        raise
 
     threads: tuple[threading.Thread, ...] = ()
     timed_out = False
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    overflow: threading.Event | None = None
+    io_errors: list[BaseException] = []
+    io_errors_lock: threading.Lock | None = None
+
+    def clear_lease() -> BaseException | None:
+        if store is None or lease is None:
+            return None
+        try:
+            store.clear(lease.operation_id)
+        except BaseException as error:
+            return error
+        return None
+
     try:
-        stdout_buffer = bytearray()
-        stderr_buffer = bytearray()
-        overflow = threading.Event()
-        io_errors: list[BaseException] = []
-        io_errors_lock = threading.Lock()
+        try:
+            if store is not None and lease is not None:
+                assert release_write is not None
+                wait_until_local_active(
+                    store,
+                    lease.operation_id,
+                    pid=proc.pid,
+                )
+                if os.write(release_write, b"G") != 1:
+                    raise OperationLeaseError(
+                        f"could not release operation {lease.operation_id}"
+                    )
+            overflow = threading.Event()
+            io_errors_lock = threading.Lock()
 
-        def read_stream(
-            stream,
-            destination: bytearray,
-            limit: int,
-        ) -> None:
-            try:
-                while True:
-                    chunk = os.read(stream.fileno(), _READ_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    remaining = max(0, limit - len(destination))
-                    if remaining:
-                        destination.extend(chunk[:remaining])
-                    if len(chunk) > remaining:
-                        overflow.set()
-            except BaseException as error:
-                with io_errors_lock:
-                    io_errors.append(error)
+            def read_stream(
+                stream,
+                destination: bytearray,
+                limit: int,
+            ) -> None:
+                try:
+                    while True:
+                        chunk = os.read(stream.fileno(), _READ_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        remaining = max(0, limit - len(destination))
+                        if remaining:
+                            destination.extend(chunk[:remaining])
+                        if len(chunk) > remaining:
+                            overflow.set()
+                except BaseException as error:
+                    assert io_errors_lock is not None
+                    with io_errors_lock:
+                        io_errors.append(error)
 
-        def write_input() -> None:
-            try:
-                assert proc.stdin is not None
-                proc.stdin.write(input_text.encode("utf-8"))
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass
-            except BaseException as error:
-                with io_errors_lock:
-                    io_errors.append(error)
+            def write_input() -> None:
+                try:
+                    assert proc.stdin is not None
+                    proc.stdin.write(input_text.encode("utf-8"))
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+                except BaseException as error:
+                    assert io_errors_lock is not None
+                    with io_errors_lock:
+                        io_errors.append(error)
 
-        if proc.stdout is None or proc.stderr is None:
-            raise ClaudeInvocationError("Claude CLI pipes were not created")
-        readers = (
-            threading.Thread(
-                target=read_stream,
-                args=(proc.stdout, stdout_buffer, max_stdout_bytes),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=read_stream,
-                args=(proc.stderr, stderr_buffer, max_stderr_bytes),
-                daemon=True,
-            ),
-        )
-        writer = threading.Thread(target=write_input, daemon=True)
-        threads = (*readers, writer)
-        for thread in threads:
-            thread.start()
-        deadline = time.monotonic() + timeout
-        while proc.poll() is None:
-            if overflow.is_set():
-                break
-            if io_errors:
-                break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                break
-            time.sleep(0.01)
-    except BaseException as primary_error:
+            if proc.stdout is None or proc.stderr is None:
+                raise ClaudeInvocationError("Claude CLI pipes were not created")
+            readers = (
+                threading.Thread(
+                    target=read_stream,
+                    args=(proc.stdout, stdout_buffer, max_stdout_bytes),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=read_stream,
+                    args=(proc.stderr, stderr_buffer, max_stderr_bytes),
+                    daemon=True,
+                ),
+            )
+            writer = threading.Thread(target=write_input, daemon=True)
+            threads = (*readers, writer)
+            for thread in threads:
+                thread.start()
+            deadline = time.monotonic() + timeout
+            while proc.poll() is None:
+                if overflow.is_set():
+                    break
+                if io_errors:
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                time.sleep(0.01)
+        except BaseException as primary_error:
+            cleaned, cleanup_error = _attempt_process_group_cleanup(proc)
+            join_error = _join_started_threads(threads)
+            pipe_error = _close_process_pipes(proc)
+            lease_error = clear_lease() if cleaned else None
+            if not cleaned or lease_error is not None:
+                raise ClaudeProcessCleanupError(
+                    "Claude CLI process group or active lease "
+                    "could not be confirmed cleaned",
+                    process=proc,
+                    primary_error=primary_error,
+                    cleanup_error=cleanup_error or lease_error,
+                    operation_id=lease.operation_id if lease is not None else None,
+                    operation_run_dir=store.run_dir if store is not None else None,
+                ) from (cleanup_error or lease_error or primary_error)
+            if join_error is not None or pipe_error is not None:
+                raise ClaudeInvocationError(
+                    "Claude CLI pipes did not close after process cleanup"
+                ) from (join_error or pipe_error)
+            raise
+
         cleaned, cleanup_error = _attempt_process_group_cleanup(proc)
         join_error = _join_started_threads(threads)
-        if not cleaned:
+        pipe_error = _close_process_pipes(proc)
+        lease_error = clear_lease() if cleaned else None
+        if not cleaned or lease_error is not None:
             raise ClaudeProcessCleanupError(
-                "Claude CLI process group could not be confirmed stopped",
+                "Claude CLI process group or active lease "
+                "could not be confirmed cleaned",
                 process=proc,
-            ) from (cleanup_error or primary_error)
-        if join_error is not None:
+                cleanup_error=cleanup_error or lease_error,
+                operation_id=lease.operation_id if lease is not None else None,
+                operation_run_dir=store.run_dir if store is not None else None,
+            ) from (cleanup_error or lease_error)
+        if join_error is not None or pipe_error is not None:
             raise ClaudeInvocationError(
                 "Claude CLI pipes did not close after process cleanup"
-            ) from join_error
-        raise
-
-    cleaned, cleanup_error = _attempt_process_group_cleanup(proc)
-    join_error = _join_started_threads(threads)
-    if not cleaned:
-        raise ClaudeProcessCleanupError(
-            "Claude CLI process group could not be confirmed stopped",
-            process=proc,
-        ) from cleanup_error
-    if join_error is not None:
-        raise ClaudeInvocationError(
-            "Claude CLI pipes did not close after process cleanup"
-        ) from join_error
-    if proc.returncode is None:
-        raise ClaudeInvocationError("Claude CLI did not terminate after process cleanup")
-    if timed_out:
-        raise ClaudeTimeoutError(f"Claude CLI timed out after {timeout:g}s")
-    if overflow.is_set():
-        raise ClaudeOutputLimitError("Claude CLI output exceeded the capture limit")
-    if io_errors:
-        raise ClaudeInvocationError("Claude CLI pipe handling failed") from io_errors[0]
-    try:
-        stdout = bytes(stdout_buffer).decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ClaudeProtocolError("Claude CLI stdout is not valid UTF-8") from error
-    stderr = bytes(stderr_buffer).decode("utf-8", errors="replace")
-    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+            ) from (join_error or pipe_error)
+        if proc.returncode is None:
+            raise ClaudeInvocationError(
+                "Claude CLI did not terminate after process cleanup"
+            )
+        if timed_out:
+            raise ClaudeTimeoutError(f"Claude CLI timed out after {timeout:g}s")
+        assert overflow is not None
+        if overflow.is_set():
+            raise ClaudeOutputLimitError(
+                "Claude CLI output exceeded the capture limit"
+            )
+        if io_errors:
+            raise ClaudeInvocationError(
+                "Claude CLI pipe handling failed"
+            ) from io_errors[0]
+        try:
+            stdout = bytes(stdout_buffer).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ClaudeProtocolError(
+                "Claude CLI stdout is not valid UTF-8"
+            ) from error
+        stderr = bytes(stderr_buffer).decode("utf-8", errors="replace")
+        return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    finally:
+        for descriptor in (release_read, release_write):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _non_negative_int(value: Any, field: str) -> int:
@@ -387,6 +585,92 @@ def _usage_counts(value: Any, source: str) -> tuple[int, int]:
     )
 
 
+def _reconcile_pending_operation(
+    run_dir: Path,
+    operation_id: str,
+    *,
+    spawned: bool,
+) -> None:
+    """Confirm one retained lease before attempt-local state is removed."""
+    try:
+        store = OperationLeaseStore(run_dir)
+    except (OSError, RuntimeError) as error:
+        raise ClaudeCleanupError(
+            "Claude operation lease store could not be opened; "
+            "temporary state remains retained"
+        ) from error
+    lease_path = store.directory / f"{operation_id}.json"
+    try:
+        lease = store.load(operation_id)
+    except OperationLeaseError as error:
+        if lease_path.exists() or lease_path.is_symlink():
+            raise ClaudeCleanupError(
+                "Claude operation lease is invalid; "
+                "temporary state remains retained"
+            ) from error
+        # clear() may have removed the directory entry and then failed fsync.
+        # Repeat that durability boundary before accepting an absent record.
+        try:
+            if store.directory.is_symlink():
+                raise OSError("operation lease directory is a symlink")
+            if store.directory.exists():
+                if not store.directory.is_dir():
+                    raise OSError("operation lease directory is not a directory")
+                sync_root = store.directory
+            else:
+                if store.run_dir.is_symlink() or not store.run_dir.is_dir():
+                    raise OSError("operation run directory is unsafe")
+                sync_root = store.run_dir
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_DIRECTORY", 0)
+            descriptor = os.open(sync_root, flags)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            if lease_path.exists() or lease_path.is_symlink():
+                raise OSError("operation lease reappeared during cleanup")
+        except OSError as sync_error:
+            raise ClaudeCleanupError(
+                "Claude operation lease absence could not be confirmed; "
+                "temporary state remains retained"
+            ) from sync_error
+        return
+
+    if lease.backend != "trusted-local":
+        raise ClaudeCleanupError(
+            "Claude operation lease has an unexpected backend; "
+            "temporary state remains retained"
+        )
+    if not spawned or lease.phase == "PREPARING":
+        if lease.phase != "PREPARING":
+            raise ClaudeCleanupError(
+                "Claude pre-spawn operation lease became active; "
+                "temporary state remains retained"
+            )
+        try:
+            store.clear(operation_id)
+        except (OSError, OperationLeaseError) as error:
+            raise ClaudeCleanupError(
+                "Claude preparing operation lease could not be cleared; "
+                "temporary state remains retained"
+            ) from error
+        return
+
+    try:
+        recovery = recover_local_operation(store, lease)
+    except (OSError, OperationLeaseError) as error:
+        raise ClaudeCleanupError(
+            "Claude operation lease could not be recovered; "
+            "temporary state remains retained"
+        ) from error
+    if not recovery.confirmed:
+        raise ClaudeCleanupError(
+            "Claude operation lease remains active; "
+            "temporary state remains retained"
+        )
+
+
 class ClaudeCLIClient(LLMClient):
     """Prompt-only local convenience backend; never formal benchmark evidence."""
 
@@ -400,6 +684,7 @@ class ClaudeCLIClient(LLMClient):
         timeout: float = 180.0,
         model: str | None = None,
         no_tools: bool = False,
+        operation_lease_dir: str | Path | None = None,
     ):
         if (
             isinstance(timeout, bool)
@@ -416,6 +701,11 @@ class ClaudeCLIClient(LLMClient):
         self.timeout = timeout
         self.model = model
         self.no_tools = no_tools
+        self.operation_lease_dir = (
+            Path(operation_lease_dir).resolve()
+            if operation_lease_dir is not None
+            else None
+        )
         self.last_usage: dict[str, Any] | None = None
         self.last_call: dict[str, Any] | None = None
         self.last_tool_use: list[str] = []
@@ -423,6 +713,7 @@ class ClaudeCLIClient(LLMClient):
         self.last_cleanup_failures: tuple[str, ...] = ()
         self._attempt_root: Path | None = None
         self._pending_process: subprocess.Popen[Any] | None = None
+        self._pending_operation: tuple[Path, str, bool] | None = None
         self._version: str | None = None
 
     @staticmethod
@@ -507,6 +798,22 @@ class ClaudeCLIClient(LLMClient):
                     process=pending_process,
                 )
             self._pending_process = None
+        pending_operation = self._pending_operation
+        if pending_operation is not None:
+            operation_run_dir, operation_id, spawned = pending_operation
+            try:
+                _reconcile_pending_operation(
+                    operation_run_dir,
+                    operation_id,
+                    spawned=spawned,
+                )
+            except ClaudeCleanupError:
+                self.last_cleanup_failures = (
+                    "temporary Claude state: durable operation "
+                    "cleanup unconfirmed",
+                )
+                raise
+            self._pending_operation = None
         if root is None:
             self.last_cleanup_failures = ()
             return
@@ -533,13 +840,69 @@ class ClaudeCLIClient(LLMClient):
         self._attempt_root = None
         self.last_cleanup_failures = ()
 
+    def set_operation_lease_dir(self, run_dir: str | Path) -> None:
+        """Bind future CLI processes to one durable run-owned lease store."""
+        resolved = Path(run_dir).resolve()
+        if (
+            self.operation_lease_dir is not None
+            and self.operation_lease_dir != resolved
+            and (
+                self._pending_process is not None
+                or self._pending_operation is not None
+                or self.pending_cleanup_paths
+            )
+        ):
+            raise ClaudeCleanupError(
+                "cannot move Claude operation leases while state is pending"
+            )
+        self.operation_lease_dir = resolved
+
+    def _run_process(
+        self,
+        argv: list[str],
+        *,
+        input_text: str,
+        timeout: float,
+        cwd: Path,
+        env: Mapping[str, str],
+        max_stdout_bytes: int = _MAX_STDOUT_BYTES,
+        max_stderr_bytes: int = _MAX_STDERR_BYTES,
+    ) -> subprocess.CompletedProcess[str]:
+        kwargs: dict[str, Any] = {}
+        if self.operation_lease_dir is not None:
+            kwargs["operation_lease_dir"] = self.operation_lease_dir
+        try:
+            return _run_isolated_process(
+                argv,
+                input_text=input_text,
+                timeout=timeout,
+                cwd=cwd,
+                env=env,
+                max_stdout_bytes=max_stdout_bytes,
+                max_stderr_bytes=max_stderr_bytes,
+                **kwargs,
+            )
+        except ClaudeOperationCleanupError as error:
+            if isinstance(error, ClaudeProcessCleanupError):
+                self._pending_process = error.process
+            if error.operation_id is not None and error.operation_run_dir is not None:
+                self._pending_operation = (
+                    error.operation_run_dir,
+                    error.operation_id,
+                    error.spawned,
+                )
+            self.last_cleanup_failures = (
+                "temporary Claude state: durable operation cleanup unconfirmed",
+            )
+            raise
+
     def _cli_version(
         self,
         *,
         cwd: Path,
         env: Mapping[str, str],
     ) -> str:
-        result = _run_isolated_process(
+        result = self._run_process(
             [self.cli_path, "--version"],
             input_text="",
             timeout=min(self.timeout, 30.0),
@@ -605,7 +968,7 @@ class ClaudeCLIClient(LLMClient):
             _home, workspace, _temporary, env = self._prepare_attempt()
             explicit_auth = _BARE_AUTH_ENV in env
             self._version = self._cli_version(cwd=workspace, env=env)
-            result = _run_isolated_process(
+            result = self._run_process(
                 self._command(system, explicit_auth=explicit_auth),
                 input_text=prompt,
                 timeout=self.timeout,
@@ -631,8 +994,18 @@ class ClaudeCLIClient(LLMClient):
             return answer
         except BaseException as error:
             active_error = error
-            if isinstance(error, ClaudeProcessCleanupError):
-                self._pending_process = error.process
+            if isinstance(error, ClaudeOperationCleanupError):
+                if isinstance(error, ClaudeProcessCleanupError):
+                    self._pending_process = error.process
+                if (
+                    error.operation_id is not None
+                    and error.operation_run_dir is not None
+                ):
+                    self._pending_operation = (
+                        error.operation_run_dir,
+                        error.operation_id,
+                        error.spawned,
+                    )
             self.last_call = {
                 "status": "failed",
                 "experimental": True,
@@ -642,13 +1015,18 @@ class ClaudeCLIClient(LLMClient):
                 "event_summary": self.last_event_summary,
                 "duration_s": time.monotonic() - started,
                 "error_type": type(error).__name__,
-                "primary_error_type": type(error).__name__,
+                "primary_error_type": (
+                    error.primary_error_type
+                    if isinstance(error, ClaudeOperationCleanupError)
+                    and error.primary_error_type is not None
+                    else type(error).__name__
+                ),
             }
             raise
         finally:
-            if isinstance(active_error, ClaudeProcessCleanupError):
+            if isinstance(active_error, ClaudeOperationCleanupError):
                 self.last_cleanup_failures = (
-                    "temporary Claude state: process group still present",
+                    "temporary Claude state: durable operation cleanup unconfirmed",
                 )
                 self.last_call = {
                     **(self.last_call or {}),

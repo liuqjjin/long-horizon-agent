@@ -18,7 +18,6 @@ import math
 import os
 import re
 import stat
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -26,9 +25,10 @@ from typing import Any, Callable, TypeVar
 
 from ..artifacts import Patch, Plan
 from ..clock import now
+from ..durable_io import atomic_replace_text
 from ..harness.errors import BudgetExceeded, CheckpointCorrupt
 from ..harness.transaction import durable_artifact_write
-from .base import LLMClient
+from .base import LLMClient, _normalize_oracle_paths, _without_oracle_context
 
 _USAGE_FILE = "llm_usage.json"
 _USAGE_SCHEMA = 1
@@ -116,33 +116,17 @@ def _save_usage_checkpoint(run_dir: Path, totals: LLMUsageTotals) -> None:
     path = run_dir / _USAGE_FILE
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise CheckpointCorrupt(f"LLM usage checkpoint path is unsafe: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(_validated_totals(totals))
     envelope = {
         "schema_version": _USAGE_SCHEMA,
         "sha256": hashlib.sha256(_canonical(payload)).hexdigest(),
         "payload": payload,
     }
-    fd, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    atomic_replace_text(
+        path,
+        json.dumps(envelope, sort_keys=True),
+        anchor=run_dir,
     )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w") as stream:
-            json.dump(envelope, stream, sort_keys=True)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        try:
-            descriptor = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-        except OSError:  # pragma: no cover - platform without directory fsync
-            pass
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 class TracedLLM(LLMClient):
@@ -169,7 +153,15 @@ class TracedLLM(LLMClient):
 
     def bind(self, run_dir: str | Path) -> "TracedLLM":
         """Direct per-call records to ``<run_dir>/llm_trace.jsonl``."""
-        self._sink = Path(run_dir) / "llm_trace.jsonl"
+        resolved = Path(run_dir).resolve()
+        set_operation_lease_dir = getattr(
+            self.inner,
+            "set_operation_lease_dir",
+            None,
+        )
+        if callable(set_operation_lease_dir):
+            set_operation_lease_dir(resolved)
+        self._sink = resolved / "llm_trace.jsonl"
         return self
 
     def restore_totals(self, totals) -> None:
@@ -205,22 +197,36 @@ class TracedLLM(LLMClient):
         """
         self._next_call_context = context
 
+    def set_trusted_oracle_paths(self, paths) -> None:
+        """Bind prompt filtering and the durable call input to one oracle set."""
+        normalized = _normalize_oracle_paths(paths)
+        self._trusted_oracle_paths = normalized
+        self.inner.set_trusted_oracle_paths(normalized)
+
     # --- delegation with accounting -----------------------------------------
     def complete(self, system: str, prompt: str) -> str:
         return self._call("complete", lambda: self.inner.complete(system, prompt))
 
     def propose_patch(self, step, bundle, workdir):
+        visible_bundle = _without_oracle_context(
+            bundle,
+            Path(workdir),
+            getattr(self, "_trusted_oracle_paths", ()),
+        )
         payload = {
             "context": self._consume_call_context(),
             "backend": self._backend_identity(),
             "step": step.model_dump(mode="json"),
-            "bundle": _semantic_bundle(bundle),
+            "bundle": _semantic_bundle(visible_bundle),
             "worktree_sha256": _worktree_sha256(Path(workdir)),
+            "trusted_oracle_paths": sorted(
+                getattr(self, "_trusted_oracle_paths", ())
+            ),
         }
         return self._journaled_call(
             "propose_patch",
             payload,
-            lambda: self.inner.propose_patch(step, bundle, workdir),
+            lambda: self.inner.propose_patch(step, visible_bundle, workdir),
             encode=lambda value: {
                 "type": "Patch",
                 "value": value.model_dump(mode="json"),

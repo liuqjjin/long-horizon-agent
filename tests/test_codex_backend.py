@@ -1,12 +1,4 @@
-"""The codex backend's leak audit, tested without touching the network.
-
-The reason this file matters: `codex` has no `--disallowed-tools` flag, and its
-most restrictive sandbox (`-s read-only`) still permits reading the whole
-filesystem — verified by hand, the model will read a withheld test file if asked.
-So leak-freedom for the ablation rests entirely on the audit below refusing any
-answer that was produced with a tool. If that check silently stops firing, the
-experiment silently stops being leak-free.
-"""
+"""Codex protocol, permission-profile and lifecycle tests without network use."""
 
 from __future__ import annotations
 
@@ -36,6 +28,26 @@ from lha.llm.codex_cli import (
     CodexTransientError,
 )
 from lha.llm.trace import TracedLLM, load_usage_checkpoint
+
+_REAL_PERMISSION_BARRIER = CodexCLIClient._verify_permission_barrier
+_REAL_RESOLVED_CLI_PATH = CodexCLIClient._resolved_cli_path
+
+
+@pytest.fixture(autouse=True)
+def _stub_permission_barrier(monkeypatch):
+    """Protocol unit tests must not depend on a locally installed Codex binary."""
+
+    def mark_verified(client: CodexCLIClient, home: Path) -> None:
+        client._verified_permission_roots.add(
+            (str(home.parent.resolve()), client._permission_profile_name())
+        )
+
+    monkeypatch.setattr(CodexCLIClient, "_verify_permission_barrier", mark_verified)
+    monkeypatch.setattr(
+        CodexCLIClient,
+        "_resolved_cli_path",
+        lambda client: client.cli_path,
+    )
 
 
 def _events(*items: dict, usage: dict | None = None) -> str:
@@ -373,10 +385,11 @@ def test_argv_isolates_the_run(tmp_path):
     argv = client._argv(tmp_path / "last.txt")
     joined = " ".join(argv)
     assert "--ephemeral" in argv  # 200+ cells must not leave 200+ session files
-    assert "--ignore-user-config" in argv  # no user config survives the temporary home
+    assert "--strict-config" in argv  # unsupported permission keys fail closed
+    assert "--ignore-user-config" not in argv  # load only our generated config.toml
     assert "--skip-git-repo-check" in argv  # cells run in temp dirs
     assert "--ignore-rules" in argv  # no project execpolicy files
-    assert "--sandbox read-only" in joined  # the model may not write
+    assert "--sandbox" not in argv  # profiles do not compose with legacy sandbox flags
     assert argv[argv.index("-m") + 1] == "gpt-5.4-mini"
     assert "model_reasoning_effort='low'" in joined
     assert argv[-1] == "-"  # prompt arrives on stdin
@@ -408,7 +421,16 @@ def test_unknown_cli_version_is_rejected_before_execution(monkeypatch):
 def test_output_file_must_match_audited_agent_message(monkeypatch):
     client = CodexCLIClient(max_retries=0)
 
-    def fake_run(argv, *, input, capture_output, text, timeout, env):
+    def fake_run(
+        argv,
+        *,
+        input,
+        capture_output,
+        text,
+        timeout,
+        env,
+        operation_lease_dir=None,
+    ):
         Path(argv[argv.index("-o") + 1]).write_text("different")
         return subprocess.CompletedProcess(
             argv,
@@ -432,7 +454,307 @@ def test_danger_full_access_requires_an_external_sandbox():
         externally_sandboxed=True,
     )
     assert "--sandbox danger-full-access" in " ".join(client._argv(Path("/tmp/out")))
+    assert "--ignore-user-config" in client._argv(Path("/tmp/out"))
+    assert "--strict-config" not in client._argv(Path("/tmp/out"))
     client.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("sandbox_mode", "expected_access"),
+    [("read-only", "read"), ("workspace-write", "write")],
+)
+def test_generated_permission_profile_denies_host_and_temp_reads(
+    tmp_path, monkeypatch, sandbox_mode, expected_access
+):
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"token": "secret"}')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    client = CodexCLIClient(sandbox_mode=sandbox_mode)
+
+    home = client._clean_home()
+    config = (home / "config.toml").read_text()
+    profile = client._permission_profile_name()
+    assert f'default_permissions = "{profile}"' in config
+    assert '":root" = "deny"' in config
+    assert '":minimal" = "read"' in config
+    assert '":tmpdir" = "deny"' in config
+    assert '":slash_tmp" = "deny"' in config
+    assert f"{json.dumps(str(client._workspace.resolve()))} = " in config
+    assert f'= "{expected_access}"' in config
+    assert "enabled = false" in config
+    assert "sandbox_mode" not in config
+    assert stat.S_IMODE((home / "config.toml").stat().st_mode) == 0o600
+    client.cleanup()
+
+
+def test_permission_barrier_requires_control_read_and_denied_home(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "attempt-home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    client = CodexCLIClient(cli_path="/usr/bin/false")
+    client._workspace = workspace
+    (home / "config.toml").write_text(client._permission_profile_config())
+
+    def fake_run(
+        argv,
+        *,
+        input,
+        capture_output,
+        text,
+        timeout,
+        env,
+        operation_lease_dir=None,
+    ):
+        del input, capture_output, text, timeout, env
+        path = Path(argv[-1])
+        if path.parent == workspace:
+            return subprocess.CompletedProcess(argv, 0, stdout=path.read_text(), stderr="")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Operation not permitted")
+
+    monkeypatch.setattr(client, "_resolved_cli_path", lambda: "/usr/bin/false")
+    monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+
+    _REAL_PERMISSION_BARRIER(client, home)
+
+    assert client.credential_barrier == "verified"
+    assert not (home / ".lha-credential-sentinel").exists()
+    assert not (workspace / ".lha-permission-control").exists()
+
+
+def test_permission_barrier_fails_before_credentials_when_home_is_readable(
+    tmp_path, monkeypatch
+):
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"token": "must-not-copy"}')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    client = CodexCLIClient(cli_path="/usr/bin/false")
+
+    def fake_run(
+        argv,
+        *,
+        input,
+        capture_output,
+        text,
+        timeout,
+        env,
+        operation_lease_dir=None,
+    ):
+        del input, capture_output, text, timeout, env
+        path = Path(argv[-1])
+        return subprocess.CompletedProcess(argv, 0, stdout=path.read_text(), stderr="")
+
+    monkeypatch.setattr(client, "_resolved_cli_path", lambda: "/usr/bin/false")
+    monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+    monkeypatch.setattr(
+        CodexCLIClient,
+        "_verify_permission_barrier",
+        _REAL_PERMISSION_BARRIER,
+    )
+
+    with pytest.raises(CodexInvocationError, match="credential directory"):
+        client._clean_home()
+
+    assert client._home is None
+    assert (source_home / "auth.json").read_text() == '{"token": "must-not-copy"}'
+
+
+def test_preflight_proves_setup_and_cleanup_before_a_batch(
+    tmp_path, monkeypatch
+):
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"token": "preflight"}')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    client = CodexCLIClient(model="gpt-5.4-mini", reasoning_effort="low")
+    monkeypatch.setattr(
+        client,
+        "_cli_version",
+        lambda: "codex-cli 0.141.0",
+    )
+
+    client.preflight()
+
+    assert client.credential_barrier == "verified"
+    assert client.pending_cleanup_paths == ()
+    assert (source_home / "auth.json").is_file()
+
+
+def test_credential_source_must_not_be_a_symlink(tmp_path, monkeypatch):
+    source_home = tmp_path / "source-path-must-not-leak"
+    source_home.mkdir()
+    real_credential = tmp_path / "credential-target-must-not-leak"
+    secret = "credential-body-must-not-leak"
+    real_credential.write_text(secret)
+    (source_home / "auth.json").symlink_to(real_credential)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    client = CodexCLIClient()
+
+    with pytest.raises(
+        CodexInvocationError,
+        match="not a stable regular file",
+    ) as error:
+        client._clean_home()
+
+    rendered = str(error.value)
+    assert str(source_home) not in rendered
+    assert str(real_credential) not in rendered
+    assert secret not in rendered
+    assert client._home is None
+    assert real_credential.read_text() == secret
+
+
+def test_credential_source_must_be_a_regular_file(tmp_path, monkeypatch):
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "auth.json").mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    client = CodexCLIClient()
+
+    with pytest.raises(CodexInvocationError, match="stable regular file"):
+        client._clean_home()
+
+    assert client._home is None
+    assert (source_home / "auth.json").is_dir()
+
+
+def test_credential_source_has_a_bounded_size(tmp_path, monkeypatch):
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    credential = source_home / "auth.json"
+    with credential.open("wb") as stream:
+        stream.truncate(codex_backend._MAX_AUTH_BYTES + 1)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    client = CodexCLIClient()
+
+    with pytest.raises(CodexInvocationError, match="size limit"):
+        client._clean_home()
+
+    assert client._home is None
+    assert credential.stat().st_size == codex_backend._MAX_AUTH_BYTES + 1
+
+
+def test_credential_copy_rejects_source_changes_during_read(
+    tmp_path,
+    monkeypatch,
+):
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    credential = source_home / "auth.json"
+    payload = b"x" * (codex_backend._AUTH_READ_CHUNK_BYTES + 32)
+    credential.write_bytes(payload)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    real_read = codex_backend.os.read
+    changed = False
+
+    def mutate_after_first_read(descriptor, size):
+        nonlocal changed
+        result = real_read(descriptor, size)
+        if not changed:
+            changed = True
+            metadata = credential.stat()
+            os.utime(
+                credential,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns - 1_000_000_000),
+            )
+        return result
+
+    monkeypatch.setattr(codex_backend.os, "read", mutate_after_first_read)
+    client = CodexCLIClient()
+
+    with pytest.raises(CodexInvocationError, match="copied securely"):
+        client._clean_home()
+
+    assert changed is True
+    assert client._home is None
+    assert credential.read_bytes() == payload
+
+
+def test_credential_copy_handles_partial_writes_and_uses_secure_open_flags(
+    tmp_path,
+    monkeypatch,
+):
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    source = source_home / "auth.json"
+    payload = b'{"token":"credential"}'
+    source.write_bytes(payload)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    real_open = codex_backend.os.open
+    real_write = codex_backend.os.write
+    opened: list[tuple[Path, int, tuple, dict]] = []
+    shortened = False
+
+    def record_open(path, flags, *args, **kwargs):
+        opened.append((Path(path), flags, args, kwargs))
+        return real_open(path, flags, *args, **kwargs)
+
+    def partial_first_write(descriptor, data):
+        nonlocal shortened
+        if not shortened and len(data) > 1:
+            shortened = True
+            partial = data[: len(data) // 2]
+            return real_write(descriptor, partial)
+        return real_write(descriptor, data)
+
+    monkeypatch.setattr(codex_backend.os, "open", record_open)
+    monkeypatch.setattr(codex_backend.os, "write", partial_first_write)
+    client = CodexCLIClient()
+    home = client._clean_home()
+
+    copied = home / "auth.json"
+    assert copied.read_bytes() == payload
+    assert shortened is True
+    source_open = next(entry for entry in opened if entry[0] == source)
+    destination_open = next(entry for entry in opened if entry[0] == copied)
+    assert source_open[1] & getattr(os, "O_NOFOLLOW", 0)
+    assert source_open[1] & getattr(os, "O_CLOEXEC", 0)
+    assert destination_open[1] & os.O_EXCL
+    assert destination_open[1] & getattr(os, "O_NOFOLLOW", 0)
+    assert destination_open[1] & getattr(os, "O_CLOEXEC", 0)
+    assert destination_open[2] == (0o600,)
+    assert stat.S_IMODE(copied.stat().st_mode) == 0o600
+    client.cleanup()
+
+
+def test_credential_copy_fails_closed_when_write_makes_no_progress(
+    tmp_path,
+    monkeypatch,
+):
+    source_home = tmp_path / "source-path-must-not-leak"
+    source_home.mkdir()
+    credential = source_home / "auth.json"
+    secret = "credential-body-must-not-leak"
+    credential.write_text(secret)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(codex_backend.os, "write", lambda _descriptor, _data: 0)
+    client = CodexCLIClient()
+
+    with pytest.raises(CodexInvocationError, match="copied securely") as error:
+        client._clean_home()
+
+    rendered = str(error.value)
+    assert str(source_home) not in rendered
+    assert secret not in rendered
+    assert client._home is None
+    assert credential.read_text() == secret
+
+
+def test_codex_executable_identity_rejects_byte_changes(tmp_path):
+    executable = tmp_path / "codex"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    client = CodexCLIClient(cli_path=str(executable))
+
+    assert _REAL_RESOLVED_CLI_PATH(client) == str(executable)
+    executable.write_text("#!/bin/sh\nexit 1\n")
+
+    with pytest.raises(CodexInvocationError, match="changed"):
+        _REAL_RESOLVED_CLI_PATH(client)
 
 
 def test_prompt_only_mode_tells_the_model_there_is_no_filesystem(monkeypatch):
@@ -492,6 +814,9 @@ def test_codex_process_receives_only_the_environment_allowlist(tmp_path, monkeyp
         copied_auth = Path(env["CODEX_HOME"]) / "auth.json"
         assert copied_auth.read_text() == '{"token": "only-auth-source"}'
         assert stat.S_IMODE(copied_auth.stat().st_mode) == 0o600
+        policy = (Path(env["CODEX_HOME"]) / "config.toml").read_text()
+        assert '":root" = "deny"' in policy
+        assert '":tmpdir" = "deny"' in policy
         Path(argv[argv.index("-o") + 1]).write_text("answer")
         return subprocess.CompletedProcess(
             argv,
@@ -544,7 +869,17 @@ def test_protocol_errors_are_not_retried(monkeypatch):
 def test_failed_call_audit_metadata_is_persisted_by_the_standard_tracer(tmp_path, monkeypatch):
     client = CodexCLIClient(max_retries=0)
 
-    def fake_run(argv, *, input, capture_output, text, timeout, env):
+    def fake_run(
+        argv,
+        *,
+        input,
+        capture_output,
+        text,
+        timeout,
+        env,
+        operation_lease_dir=None,
+    ):
+        assert operation_lease_dir == tmp_path.resolve()
         Path(argv[argv.index("-o") + 1]).write_text("answer")
         return subprocess.CompletedProcess(argv, 0, stdout="not json\n", stderr="")
 
@@ -569,7 +904,16 @@ def test_codex_stderr_and_temporary_paths_never_enter_durable_trace(
     protected = "token-super-secret"
     credential_path = "/tmp/lha_codex_home_private/auth.json"
 
-    def fake_run(argv, *, input, capture_output, text, timeout, env):
+    def fake_run(
+        argv,
+        *,
+        input,
+        capture_output,
+        text,
+        timeout,
+        env,
+        operation_lease_dir=None,
+    ):
         return subprocess.CompletedProcess(
             argv,
             2,
@@ -647,7 +991,16 @@ def test_tracer_counts_each_real_codex_retry_against_the_budget(tmp_path, monkey
     client = CodexCLIClient(max_retries=2, retry_backoff_s=0)
     process_calls = 0
 
-    def fake_run(argv, *, input, capture_output, text, timeout, env):
+    def fake_run(
+        argv,
+        *,
+        input,
+        capture_output,
+        text,
+        timeout,
+        env,
+        operation_lease_dir=None,
+    ):
         nonlocal process_calls
         process_calls += 1
         if process_calls == 1:
@@ -692,7 +1045,16 @@ def test_codex_retry_cannot_exceed_or_reset_the_durable_attempt_budget(
     def make_client() -> CodexCLIClient:
         client = CodexCLIClient(max_retries=2, retry_backoff_s=0)
 
-        def fake_run(argv, *, input, capture_output, text, timeout, env):
+        def fake_run(
+            argv,
+            *,
+            input,
+            capture_output,
+            text,
+            timeout,
+            env,
+            operation_lease_dir=None,
+        ):
             nonlocal process_calls
             process_calls += 1
             return subprocess.CompletedProcess(
@@ -1046,6 +1408,396 @@ def test_post_popen_resource_failure_reaps_process_group_once(
         assert not codex_backend._process_group_exists(terminated[0].pid)
 
 
+def test_isolated_process_clears_its_durable_operation_lease(tmp_path):
+    from lha.operation_lease import OperationLeaseStore
+
+    result = codex_backend._run_isolated_process(
+        [sys.executable, "-c", "print('lease-ok')"],
+        input=None,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={"PATH": os.defpath},
+        operation_lease_dir=tmp_path,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "lease-ok"
+    assert OperationLeaseStore(tmp_path).list() == []
+
+
+def test_popen_failure_clears_the_preparing_operation_lease(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(codex_backend.subprocess, "Popen", fail_popen)
+
+    with pytest.raises(FileNotFoundError, match="spawn failed"):
+        codex_backend._run_isolated_process(
+            ["codex", "exec"],
+            input="prompt",
+            capture_output=True,
+            text=True,
+            timeout=1,
+            env={"PATH": os.defpath},
+            operation_lease_dir=tmp_path,
+        )
+
+    assert OperationLeaseStore(tmp_path).list() == []
+
+
+def test_popen_failure_does_not_hide_a_preparing_lease_clear_failure(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    def fail_clear(_store, _operation_id):
+        raise PermissionError(13, "lease directory cannot be synced")
+
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(codex_backend.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(OperationLeaseStore, "clear", fail_clear)
+
+    with pytest.raises(codex_backend.CodexLeaseCleanupError) as caught:
+        codex_backend._run_isolated_process(
+            ["codex", "exec"],
+            input="prompt",
+            capture_output=True,
+            text=True,
+            timeout=1,
+            env={"PATH": os.defpath},
+            operation_lease_dir=tmp_path,
+        )
+
+    assert caught.value.spawned is False
+    assert caught.value.primary_error_type == "FileNotFoundError"
+    assert caught.value.cleanup_error_type == "PermissionError"
+    assert caught.value.operation_run_dir == tmp_path.resolve()
+    assert caught.value.operation_id is not None
+    lease_path = (
+        tmp_path
+        / "active-operations"
+        / f"{caught.value.operation_id}.json"
+    )
+    assert lease_path.is_file()
+
+
+def test_client_retries_a_failed_preparing_lease_clear_before_local_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    retained_home = tmp_path / "codex-home"
+    retained_workspace = tmp_path / "codex-workspace"
+    retained_output = tmp_path / "codex-output"
+    for path in (retained_home, retained_workspace, retained_output):
+        path.mkdir()
+    (retained_home / "auth.json").write_text('{"token": "copy"}')
+    client = CodexCLIClient(operation_lease_dir=run_dir)
+    client._home = retained_home
+    client._workspace = retained_workspace
+    client._output_dirs.add(retained_output)
+    real_clear = OperationLeaseStore.clear
+    clear_calls = 0
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    def fail_first_clear(store, operation_id):
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            raise PermissionError(13, "first clear failed")
+        return real_clear(store, operation_id)
+
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(codex_backend.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(OperationLeaseStore, "clear", fail_first_clear)
+
+    with pytest.raises(codex_backend.CodexLeaseCleanupError):
+        client._run_process(
+            ["codex", "exec"],
+            input="prompt",
+            timeout=1,
+            env={"PATH": os.defpath},
+        )
+
+    assert all(
+        path.exists()
+        for path in (retained_home, retained_workspace, retained_output)
+    )
+    assert client._pending_operation is not None
+
+    client.cleanup()
+
+    assert clear_calls == 2
+    assert client._pending_operation is None
+    assert client.pending_cleanup_paths == ()
+    assert OperationLeaseStore(run_dir).list() == []
+    assert all(
+        not path.exists()
+        for path in (retained_home, retained_workspace, retained_output)
+    )
+
+
+def test_complete_retries_preparing_lease_cleanup_before_removing_credentials(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    source_home = tmp_path / "real-codex-home"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"token": "source"}')
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    client = CodexCLIClient(
+        operation_lease_dir=run_dir,
+        max_retries=0,
+    )
+    real_clear = OperationLeaseStore.clear
+    clear_calls = 0
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    def fail_first_clear(store, operation_id):
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            raise PermissionError(13, "first clear failed")
+        return real_clear(store, operation_id)
+
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(codex_backend.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(OperationLeaseStore, "clear", fail_first_clear)
+
+    with pytest.raises(codex_backend.CodexLeaseCleanupError):
+        client.complete("SYSTEM", "PROMPT")
+
+    assert clear_calls == 2
+    assert client._pending_operation is None
+    assert client.pending_cleanup_paths == ()
+    assert OperationLeaseStore(run_dir).list() == []
+    assert (source_home / "auth.json").read_text() == '{"token": "source"}'
+    assert client.last_call is not None
+    assert client.last_call["error_type"] == "CodexLeaseCleanupError"
+    assert client.last_call["primary_error_type"] == "FileNotFoundError"
+    assert client.last_call["cleanup_error_type"] == "PermissionError"
+    assert client.last_call["attempts"][0]["error_type"] == (
+        "CodexLeaseCleanupError"
+    )
+
+
+def test_client_durably_confirms_an_unlinked_preparing_lease(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    retained_home = tmp_path / "codex-home"
+    retained_home.mkdir()
+    (retained_home / "auth.json").write_text('{"token": "copy"}')
+    client = CodexCLIClient(operation_lease_dir=run_dir)
+    client._home = retained_home
+    real_clear = OperationLeaseStore.clear
+    clear_calls = 0
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    def unlink_then_report_sync_failure(store, operation_id):
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            path = store.directory / f"{operation_id}.json"
+            path.unlink()
+            raise PermissionError(13, "directory fsync failed")
+        return real_clear(store, operation_id)
+
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(codex_backend.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(
+        OperationLeaseStore,
+        "clear",
+        unlink_then_report_sync_failure,
+    )
+
+    with pytest.raises(codex_backend.CodexLeaseCleanupError):
+        client._run_process(
+            ["codex", "exec"],
+            input="prompt",
+            timeout=1,
+            env={"PATH": os.defpath},
+        )
+
+    assert retained_home.exists()
+    client.cleanup()
+    assert clear_calls == 1
+    assert client._pending_operation is None
+    assert not retained_home.exists()
+
+
+def test_corrupt_pending_preparing_lease_blocks_credential_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    retained_home = tmp_path / "codex-home"
+    retained_home.mkdir()
+    (retained_home / "auth.json").write_text('{"token": "copy"}')
+    client = CodexCLIClient(operation_lease_dir=run_dir)
+    client._home = retained_home
+    real_clear = OperationLeaseStore.clear
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    def fail_clear(_store, _operation_id):
+        raise PermissionError(13, "clear failed")
+
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(codex_backend.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(OperationLeaseStore, "clear", fail_clear)
+    with pytest.raises(codex_backend.CodexLeaseCleanupError) as caught:
+        client._run_process(
+            ["codex", "exec"],
+            input="prompt",
+            timeout=1,
+            env={"PATH": os.defpath},
+        )
+
+    assert caught.value.operation_id is not None
+    lease_path = (
+        run_dir
+        / "active-operations"
+        / f"{caught.value.operation_id}.json"
+    )
+    valid_lease = lease_path.read_text()
+    lease_path.write_text("{not valid json")
+    monkeypatch.setattr(OperationLeaseStore, "clear", real_clear)
+
+    with pytest.raises(CodexCleanupError, match="lease is invalid"):
+        client.cleanup()
+
+    assert retained_home.is_dir()
+    assert (retained_home / "auth.json").is_file()
+    assert client._pending_operation is not None
+
+    lease_path.write_text(valid_lease)
+    client.cleanup()
+    assert not retained_home.exists()
+    assert client._pending_operation is None
+
+
+def test_nonzero_process_clears_its_durable_operation_lease(tmp_path):
+    from lha.operation_lease import OperationLeaseStore
+
+    result = codex_backend._run_isolated_process(
+        [sys.executable, "-c", "raise SystemExit(17)"],
+        input=None,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={"PATH": os.defpath},
+        operation_lease_dir=tmp_path,
+    )
+
+    assert result.returncode == 17
+    assert OperationLeaseStore(tmp_path).list() == []
+
+
+def test_timeout_clears_its_durable_operation_lease(tmp_path):
+    from lha.operation_lease import OperationLeaseStore
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        codex_backend._run_isolated_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            input=None,
+            capture_output=True,
+            text=True,
+            timeout=0.05,
+            env={"PATH": os.defpath},
+            operation_lease_dir=tmp_path,
+        )
+
+    assert OperationLeaseStore(tmp_path).list() == []
+
+
+def test_interruption_clears_its_durable_operation_lease(
+    tmp_path,
+    monkeypatch,
+):
+    from lha.operation_lease import OperationLeaseStore
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt("interrupted")
+
+    monkeypatch.setattr(codex_backend, "_communicate_bounded", interrupt)
+    with pytest.raises(KeyboardInterrupt, match="interrupted"):
+        codex_backend._run_isolated_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            input=None,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={"PATH": os.defpath},
+            operation_lease_dir=tmp_path,
+        )
+
+    assert OperationLeaseStore(tmp_path).list() == []
+
+
 def test_process_cleanup_failure_retains_credentials_and_error_provenance(
     tmp_path,
     monkeypatch,
@@ -1084,7 +1836,7 @@ def test_process_cleanup_failure_retains_credentials_and_error_provenance(
     with pytest.raises(CodexProcessCleanupError) as caught:
         client.complete("SYSTEM", "PROMPT")
 
-    assert cleanup_attempts == 1
+    assert cleanup_attempts == 2
     assert caught.value.primary_error_type == "TimeoutExpired"
     assert caught.value.cleanup_error_type == "PermissionError"
     assert caught.value.process.poll() is None

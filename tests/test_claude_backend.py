@@ -567,6 +567,409 @@ def test_stderr_and_temporary_paths_do_not_enter_audit_metadata(
     assert private_path not in str(error.value)
 
 
+def test_traced_bind_routes_version_and_main_processes_to_the_run_lease_store(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-only-key")
+    client = ClaudeCLIClient(cli_path="claude-test")
+    lease_dirs: list[Path | None] = []
+
+    def fake_run(
+        argv,
+        *,
+        input_text,
+        timeout,
+        cwd,
+        env,
+        max_stdout_bytes=claude_backend._MAX_STDOUT_BYTES,
+        max_stderr_bytes=claude_backend._MAX_STDERR_BYTES,
+        operation_lease_dir=None,
+    ):
+        del input_text, timeout, cwd, env, max_stdout_bytes, max_stderr_bytes
+        lease_dirs.append(
+            Path(operation_lease_dir)
+            if operation_lease_dir is not None
+            else None
+        )
+        if "--version" in argv:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "2.1.219 (Claude Code)\n",
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, _stream(), "")
+
+    monkeypatch.setattr(claude_backend, "_run_isolated_process", fake_run)
+    traced = TracedLLM(client).bind(tmp_path)
+
+    assert traced.complete("SYSTEM", "PROMPT") == "answer"
+    assert lease_dirs == [tmp_path.resolve(), tmp_path.resolve()]
+
+
+@pytest.mark.parametrize("return_code", [0, 19])
+def test_isolated_process_clears_run_owned_lease_on_exit(
+    return_code: int,
+    tmp_path: Path,
+) -> None:
+    from lha.operation_lease import OperationLeaseStore
+
+    result = claude_backend._run_isolated_process(
+        [
+            sys.executable,
+            "-c",
+            f"import sys; sys.stdin.buffer.read(); raise SystemExit({return_code})",
+        ],
+        input_text="prompt",
+        timeout=5,
+        cwd=tmp_path,
+        env={"PATH": os.defpath},
+        operation_lease_dir=tmp_path,
+    )
+
+    assert result.returncode == return_code
+    assert OperationLeaseStore(tmp_path).list() == []
+
+
+def test_timeout_clears_run_owned_lease(tmp_path: Path) -> None:
+    from lha.operation_lease import OperationLeaseStore
+
+    with pytest.raises(ClaudeTimeoutError, match="timed out"):
+        claude_backend._run_isolated_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            input_text="",
+            timeout=0.05,
+            cwd=tmp_path,
+            env={"PATH": os.defpath},
+            operation_lease_dir=tmp_path,
+        )
+
+    assert OperationLeaseStore(tmp_path).list() == []
+
+
+def test_keyboard_interrupt_clears_run_owned_lease(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from lha.operation_lease import OperationLeaseStore
+
+    def interrupt_event_allocation():
+        raise KeyboardInterrupt("interrupted")
+
+    monkeypatch.setattr(
+        claude_backend.threading,
+        "Event",
+        interrupt_event_allocation,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="interrupted"):
+        claude_backend._run_isolated_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            input_text="",
+            timeout=5,
+            cwd=tmp_path,
+            env={"PATH": os.defpath},
+            operation_lease_dir=tmp_path,
+        )
+
+    assert OperationLeaseStore(tmp_path).list() == []
+
+
+def test_popen_failure_clears_preparing_run_owned_lease(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(claude_backend.subprocess, "Popen", fail_popen)
+
+    with pytest.raises(ClaudeInvocationError, match="could not start"):
+        claude_backend._run_isolated_process(
+            ["claude", "--version"],
+            input_text="",
+            timeout=1,
+            cwd=tmp_path,
+            env={"PATH": os.defpath},
+            operation_lease_dir=tmp_path,
+        )
+
+    assert OperationLeaseStore(tmp_path).list() == []
+
+
+def test_popen_failure_does_not_hide_preparing_lease_clear_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    def fail_clear(_store, _operation_id):
+        raise PermissionError(13, "lease fsync failed")
+
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(claude_backend.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(OperationLeaseStore, "clear", fail_clear)
+
+    with pytest.raises(claude_backend.ClaudeLeaseCleanupError) as caught:
+        claude_backend._run_isolated_process(
+            ["claude", "--version"],
+            input_text="",
+            timeout=1,
+            cwd=tmp_path,
+            env={"PATH": os.defpath},
+            operation_lease_dir=tmp_path,
+        )
+
+    assert caught.value.spawned is False
+    assert caught.value.primary_error_type == "FileNotFoundError"
+    assert caught.value.cleanup_error_type == "PermissionError"
+    assert caught.value.operation_id is not None
+    lease_path = (
+        tmp_path
+        / "active-operations"
+        / f"{caught.value.operation_id}.json"
+    )
+    assert lease_path.is_file()
+
+
+def test_client_retains_attempt_until_preparing_lease_cleanup_is_confirmed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+    (attempt_root / "credential-copy").write_text("temporary")
+    client = ClaudeCLIClient(operation_lease_dir=run_dir)
+    client._attempt_root = attempt_root
+    real_clear = OperationLeaseStore.clear
+    clear_calls = 0
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    def fail_first_clear(store, operation_id):
+        nonlocal clear_calls
+        clear_calls += 1
+        if clear_calls == 1:
+            raise PermissionError(13, "first clear failed")
+        return real_clear(store, operation_id)
+
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(claude_backend.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(OperationLeaseStore, "clear", fail_first_clear)
+
+    with pytest.raises(claude_backend.ClaudeLeaseCleanupError):
+        client._run_process(
+            ["claude", "--version"],
+            input_text="",
+            timeout=1,
+            cwd=tmp_path,
+            env={"PATH": os.defpath},
+        )
+
+    assert attempt_root.exists()
+    assert client._pending_operation is not None
+    client.cleanup()
+    assert clear_calls == 2
+    assert client._pending_operation is None
+    assert not attempt_root.exists()
+    assert OperationLeaseStore(run_dir).list() == []
+
+
+def test_complete_fails_closed_when_main_process_lease_cleanup_is_unconfirmed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    client = ClaudeCLIClient(operation_lease_dir=run_dir)
+    real_clear = OperationLeaseStore.clear
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    def fail_clear(_store, _operation_id):
+        raise PermissionError(13, "clear failed")
+
+    monkeypatch.setattr(
+        client,
+        "_cli_version",
+        lambda **_kwargs: "2.1.219 (Claude Code)",
+    )
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(claude_backend.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(OperationLeaseStore, "clear", fail_clear)
+
+    with pytest.raises(claude_backend.ClaudeLeaseCleanupError):
+        client.complete("SYSTEM", "PROMPT")
+
+    retained = client.pending_cleanup_paths
+    assert len(retained) == 1
+    assert retained[0].exists()
+    assert client._pending_operation is not None
+    assert client.last_call is not None
+    assert client.last_call["status"] == "cleanup_failed"
+    assert client.last_call["primary_error_type"] == "FileNotFoundError"
+    assert client.last_call["cleanup_error_type"] == "ClaudeLeaseCleanupError"
+
+    monkeypatch.setattr(OperationLeaseStore, "clear", real_clear)
+    client.cleanup()
+    assert client.pending_cleanup_paths == ()
+    assert client._pending_operation is None
+    assert OperationLeaseStore(run_dir).list() == []
+
+
+def test_client_recovers_active_lease_before_removing_attempt_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from lha.operation_lease import OperationLeaseStore
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+    (attempt_root / "credential-copy").write_text("temporary")
+    script = tmp_path / "claude-hangs"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import time\n"
+        "time.sleep(60)\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    client = ClaudeCLIClient(operation_lease_dir=run_dir)
+    client._attempt_root = attempt_root
+    real_terminate = claude_backend._terminate_process_group
+
+    def fail_termination(_process):
+        raise PermissionError(1, "termination denied")
+
+    monkeypatch.setattr(
+        claude_backend,
+        "_terminate_process_group",
+        fail_termination,
+    )
+
+    with pytest.raises(ClaudeProcessCleanupError) as caught:
+        client._run_process(
+            [str(script)],
+            input_text="",
+            timeout=0.05,
+            cwd=tmp_path,
+            env={"PATH": os.defpath},
+        )
+
+    assert caught.value.operation_id is not None
+    assert client._pending_process is caught.value.process
+    assert client._pending_operation is not None
+    assert attempt_root.exists()
+    assert len(OperationLeaseStore(run_dir).list()) == 1
+
+    monkeypatch.setattr(
+        claude_backend,
+        "_terminate_process_group",
+        real_terminate,
+    )
+    client.cleanup()
+
+    assert client._pending_process is None
+    assert client._pending_operation is None
+    assert OperationLeaseStore(run_dir).list() == []
+    assert not attempt_root.exists()
+
+
+def test_corrupt_pending_preparing_lease_blocks_attempt_cleanup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import lha.operation_lease as operation_lease
+    from lha.operation_lease import OperationLeaseStore
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    attempt_root = tmp_path / "attempt"
+    attempt_root.mkdir()
+    (attempt_root / "credential-copy").write_text("temporary")
+    client = ClaudeCLIClient(operation_lease_dir=run_dir)
+    client._attempt_root = attempt_root
+    real_clear = OperationLeaseStore.clear
+
+    def fail_popen(*_args, **_kwargs):
+        raise FileNotFoundError("spawn failed")
+
+    def fail_clear(_store, _operation_id):
+        raise PermissionError(13, "clear failed")
+
+    monkeypatch.setattr(
+        operation_lease,
+        "_boot_identity",
+        lambda: "kern-boottime:darwin:1:0",
+    )
+    monkeypatch.setattr(claude_backend.subprocess, "Popen", fail_popen)
+    monkeypatch.setattr(OperationLeaseStore, "clear", fail_clear)
+    with pytest.raises(claude_backend.ClaudeLeaseCleanupError) as caught:
+        client._run_process(
+            ["claude", "--version"],
+            input_text="",
+            timeout=1,
+            cwd=tmp_path,
+            env={"PATH": os.defpath},
+        )
+
+    assert caught.value.operation_id is not None
+    lease_path = (
+        run_dir
+        / "active-operations"
+        / f"{caught.value.operation_id}.json"
+    )
+    valid_lease = lease_path.read_text()
+    lease_path.write_text("{not valid json")
+    monkeypatch.setattr(OperationLeaseStore, "clear", real_clear)
+
+    with pytest.raises(ClaudeCleanupError, match="lease is invalid"):
+        client.cleanup()
+    assert attempt_root.exists()
+    assert client._pending_operation is not None
+
+    lease_path.write_text(valid_lease)
+    client.cleanup()
+    assert not attempt_root.exists()
+    assert client._pending_operation is None
+
+
 def test_isolated_runner_bounds_stdout(tmp_path: Path) -> None:
     script = tmp_path / "noisy"
     script.write_text(

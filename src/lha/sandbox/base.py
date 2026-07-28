@@ -79,6 +79,16 @@ class ProcessCleanupResult:
     detail: str
 
 
+class ProcessCleanupUnconfirmed(RuntimeError):
+    """A command was interrupted while its process boundary remained live."""
+
+    def __init__(self, detail: str):
+        self.detail = detail
+        super().__init__(
+            f"process cleanup could not be confirmed: {detail}"
+        )
+
+
 def terminate_process_group(
     process: subprocess.Popen[bytes],
     *,
@@ -98,10 +108,15 @@ def terminate_process_group(
         )
 
     process_group = process.pid
+    permission_error: PermissionError | None = None
     try:
         os.killpg(process_group, signal.SIGKILL)
     except ProcessLookupError:
         return ProcessCleanupResult(True, "process group absent")
+    except PermissionError as error:
+        # Darwin can report EPERM while killed members are still zombies. That
+        # is not proof of absence, so keep polling until ESRCH or the deadline.
+        permission_error = error
     except OSError as error:
         return ProcessCleanupResult(
             False,
@@ -110,16 +125,30 @@ def terminate_process_group(
 
     deadline = time.monotonic() + confirmation_timeout_s
     while True:
+        # Reap the leader promptly. On Darwin an unreaped group-leader zombie
+        # can keep the process group visible and make a signal-0 probe return
+        # EPERM even though no member can execute.
+        process.poll()
         try:
             os.killpg(process_group, 0)
         except ProcessLookupError:
             return ProcessCleanupResult(True, "process group killed")
+        except PermissionError as error:
+            permission_error = error
         except OSError as error:
             return ProcessCleanupResult(
                 False,
                 f"could not confirm process group {process_group} cleanup: {error}",
             )
         if time.monotonic() >= deadline:
+            if permission_error is not None:
+                return ProcessCleanupResult(
+                    False,
+                    (
+                        f"could not confirm process group {process_group} cleanup: "
+                        f"{permission_error}"
+                    ),
+                )
             return ProcessCleanupResult(
                 False,
                 f"process group {process_group} still exists after cleanup",
@@ -178,10 +207,14 @@ def run_bounded_process(
     env: dict[str, str] | None = None,
     input: str | None = None,
     start_new_session: bool = False,
-    on_timeout: Callable[[subprocess.Popen[bytes]], str] | None = None,
+    on_timeout: (
+        Callable[[subprocess.Popen[bytes]], ProcessCleanupResult] | None
+    ) = None,
     on_exit: (
         Callable[[subprocess.Popen[bytes]], ProcessCleanupResult] | None
     ) = None,
+    on_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> ProcResult:
     """Run a process while continuously draining two bounded output pipes.
 
@@ -202,42 +235,70 @@ def run_bounded_process(
     if on_exit is not None and not start_new_session:
         raise ValueError("on_exit cleanup requires start_new_session=True")
     start = time.monotonic()
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-        start_new_session=start_new_session,
-    )
+    if pass_fds:
+        if os.name != "posix":
+            raise ValueError("pass_fds requires a POSIX host")
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            start_new_session=start_new_session,
+            pass_fds=pass_fds,
+        )
+    else:
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            start_new_session=start_new_session,
+        )
     stdout_capture = _BoundedPipe(output_bytes)
     stderr_capture = _BoundedPipe(output_bytes)
     readers: list[threading.Thread] = []
     writer: threading.Thread | None = None
     writer_started = False
     timed_out = False
-    timeout_detail = ""
+    timeout_cleanup: ProcessCleanupResult | None = None
     interrupted: BaseException | None = None
 
-    def stop_process() -> str:
+    def stop_process() -> ProcessCleanupResult | None:
         if on_timeout is None:
             try:
                 process.kill()
             except OSError:
                 pass
-            return "process killed"
+            return None
         try:
-            return on_timeout(process)
-        except Exception:
+            result = on_timeout(process)
+            if isinstance(result, ProcessCleanupResult):
+                return result
+        except Exception as error:
             # Cleanup diagnostics must not strand the process whose output is
             # currently being drained.
             try:
                 process.kill()
             except OSError:
                 pass
-            return "timeout cleanup failed"
+            return ProcessCleanupResult(
+                False,
+                f"timeout cleanup raised {type(error).__name__}: {error}",
+            )
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return ProcessCleanupResult(
+            False,
+            "timeout cleanup returned an invalid result",
+        )
 
     def reap_leader() -> None:
         try:
@@ -255,6 +316,8 @@ def run_bounded_process(
             pass
 
     try:
+        if on_started is not None:
+            on_started(process)
         if process.stdout is None or process.stderr is None:
             raise RuntimeError(
                 "bounded process capture requires stdout and stderr pipes"
@@ -305,13 +368,13 @@ def run_bounded_process(
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        timeout_detail = stop_process()
+        timeout_cleanup = stop_process()
         reap_leader()
     except BaseException as error:
         # KeyboardInterrupt and cancellation must not leave the process tree
         # behind merely because no ProcResult will be returned to the caller.
         interrupted = error
-        stop_process()
+        timeout_cleanup = stop_process()
         reap_leader()
 
     cleanup = ProcessCleanupResult(
@@ -331,6 +394,15 @@ def run_bounded_process(
                 False,
                 "process cleanup returned an invalid result",
             )
+    if timeout_cleanup is not None:
+        cleanup = ProcessCleanupResult(
+            timeout_cleanup.confirmed and cleanup.confirmed,
+            "; ".join(
+                detail
+                for detail in (timeout_cleanup.detail, cleanup.detail)
+                if detail
+            ),
+        )
 
     join_error: BaseException | None = None
     if writer is not None and writer_started:
@@ -415,9 +487,7 @@ def run_bounded_process(
     )
     if interrupted is not None:
         if not cleanup.confirmed:
-            interrupted.add_note(
-                f"process cleanup could not be confirmed: {cleanup.detail}"
-            )
+            raise ProcessCleanupUnconfirmed(cleanup.detail) from interrupted
         raise interrupted
     if not cleanup.confirmed:
         return ProcResult(
@@ -426,11 +496,13 @@ def run_bounded_process(
             stderr,
             time.monotonic() - start,
             output_truncated=incomplete,
+            cleanup_confirmed=False,
+            cleanup_detail=cleanup.detail,
         )
     if timed_out:
         detail = f"timeout after {timeout}s"
-        if timeout_detail:
-            detail += f" ({timeout_detail})"
+        if timeout_cleanup is not None and timeout_cleanup.detail:
+            detail += f" ({timeout_cleanup.detail})"
         stderr = _append_diagnostic(stderr, detail, output_bytes)
         return ProcResult(
             124,
@@ -438,6 +510,8 @@ def run_bounded_process(
             stderr,
             time.monotonic() - start,
             output_truncated=incomplete,
+            cleanup_confirmed=cleanup.confirmed,
+            cleanup_detail=cleanup.detail,
         )
     if incomplete:
         reason = (
@@ -460,12 +534,16 @@ def run_bounded_process(
             stderr,
             time.monotonic() - start,
             output_truncated=True,
+            cleanup_confirmed=cleanup.confirmed,
+            cleanup_detail=cleanup.detail,
         )
     return ProcResult(
         process.returncode,
         _bounded_text(stdout, output_bytes),
         _bounded_text(stderr, output_bytes),
         time.monotonic() - start,
+        cleanup_confirmed=cleanup.confirmed,
+        cleanup_detail=cleanup.detail,
     )
 
 
@@ -473,6 +551,47 @@ class ExecutionBackend(ABC):
     """Runs a command against a working directory, somewhere."""
 
     name: str = "base"
+
+    def bind_operation_lease_dir(self, run_dir: str | Path) -> Path:
+        """Route every subprocess lease to one explicit durable run directory.
+
+        Verification often executes from a disposable copy outside ``workdir``.
+        Inferring ownership from cwd would therefore miss the run that must
+        recover the command. A backend may be reused after a completed run, but
+        it cannot switch while its former run still has active leases.
+        """
+        candidate = Path(run_dir)
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise ValueError(
+                f"operation lease run directory is missing or unsafe: {candidate}"
+            )
+        target = candidate.resolve()
+        current_value = getattr(self, "operation_lease_dir", None)
+        if current_value is not None:
+            current = Path(current_value).resolve()
+            if current != target:
+                from ..operation_lease import OperationLeaseStore
+
+                pending = OperationLeaseStore(current).list()
+                if pending:
+                    operation_ids = ", ".join(
+                        lease.operation_id for lease in pending
+                    )
+                    raise RuntimeError(
+                        "execution backend cannot switch operation lease "
+                        f"directories with pending operations: {operation_ids}"
+                    )
+        inner = getattr(self, "inner", None)
+        if isinstance(inner, ExecutionBackend) and inner is not self:
+            inner.bind_operation_lease_dir(target)
+        setattr(self, "operation_lease_dir", target)
+        return target
+
+    def recover_active_operations(self, run_dir: str | Path):
+        """Reap durable command leases before the owning run resumes."""
+        from ..operation_lease import recover_active_operations
+
+        return recover_active_operations(run_dir)
 
     @abstractmethod
     def run(
@@ -487,7 +606,9 @@ class ExecutionBackend(ABC):
         """Execute ``cmd`` with ``cwd`` as the working directory.
 
         Must terminate the entire process tree on timeout and return a
-        ``ProcResult`` (returncode 124 on timeout) rather than raising.
+        ``ProcResult`` rather than raising. A confirmed timeout is 124;
+        cleanup that cannot be confirmed is 126 regardless of the command's
+        earlier status.
         """
 
     @abstractmethod

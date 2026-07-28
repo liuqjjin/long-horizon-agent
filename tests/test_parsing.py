@@ -6,8 +6,11 @@ LLM factory — real logic that was previously only exercised end-to-end (or not
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from lha.artifacts import Step
 from lha.clock import now
@@ -120,6 +123,12 @@ def test_patch_from_response_skips_unchanged(tmp_path):
     assert patch.is_empty()
 
 
+def test_patch_from_response_accepts_new_file_under_new_directory(tmp_path):
+    resp = "### pkg/new.py\n```python\nvalue = 1\n```\n"
+    patch = _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+    assert patch.file_contents == {"pkg/new.py": "value = 1\n"}
+
+
 def test_patch_from_response_single_block_fallback(tmp_path):
     # No '### path', but exactly one non-test source file -> map the lone block to it.
     (tmp_path / "only.py").write_text("v = 0\n")
@@ -135,6 +144,53 @@ def test_patch_from_response_rejects_path_escape(tmp_path):
     patch = _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
     assert patch.is_empty()
     assert not (tmp_path.parent / "evil.py").exists()
+
+
+def test_repo_prompt_rejects_python_symlink(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not reach the model")
+    (tmp_path / "leak.py").symlink_to(secret)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        _Echo._read_repo_python(tmp_path)
+
+
+def test_repo_prompt_rejects_python_hardlink(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not reach the model")
+    os.link(secret, tmp_path / "leak.py")
+
+    with pytest.raises(ValueError, match="standalone regular file"):
+        _Echo._read_repo_python(tmp_path)
+
+
+def test_patch_from_response_rejects_symlinked_target(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not be overwritten")
+    (tmp_path / "leak.py").symlink_to(secret)
+    resp = "### leak.py\n```python\nvalue = 1\n```\n"
+
+    with pytest.raises(ValueError, match="link"):
+        _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+
+
+def test_patch_from_response_rejects_hardlinked_target(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not be overwritten")
+    os.link(secret, tmp_path / "leak.py")
+    resp = "### leak.py\n```python\nvalue = 1\n```\n"
+
+    with pytest.raises(ValueError, match="standalone regular file"):
+        _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+
+
+def test_single_block_fallback_rejects_symlinked_source(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not be selected")
+    (tmp_path / "only.py").symlink_to(secret)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        _Echo._single_block_fallback(tmp_path, "```python\nvalue = 1\n```")
 
 
 # --- LLM factory ------------------------------------------------------------

@@ -8,7 +8,6 @@ crashing verifier becomes a failing Check, never an aborted verdict.
 from __future__ import annotations
 
 import importlib.metadata
-import os
 import platform
 import shutil
 import sys
@@ -19,24 +18,32 @@ from pathlib import Path
 from typing import Any
 
 from ..artifacts import Step
-from ..sandbox import ExecutionBackend
-from ..tools.shell import run
+from ..sandbox import ExecutionBackend, ProcessCleanupUnconfirmed
+from ..tools.shell import run, sanitized_absolute_path, trusted_executable
 from ..verifiers import VerifyContext, select_verifiers
 from ..verifiers.base import Verifier
-from ..verifiers.verdict import Check, Verdict
+from ..verifiers.verdict import (
+    PROCESS_CLEANUP_UNCONFIRMED,
+    Check,
+    Verdict,
+    process_cleanup_failure_detail,
+)
 
 
 def _target_git_commit(workdir: str | Path) -> str | None:
     """Return HEAD only when the verified directory is itself a Git worktree."""
     root = Path(workdir).resolve()
+    git = trusted_executable("git", require_unwritable=True)
+    if git is None:
+        return None
     environment = {
-        "PATH": os.environ.get("PATH", os.defpath),
+        "PATH": sanitized_absolute_path(require_unwritable=True),
         # A run worktree may live below the harness checkout. Do not let Git walk
         # upward and accidentally attribute the harness commit to the target.
         "GIT_CEILING_DIRECTORIES": str(root.parent),
     }
     top = run(
-        ["git", "rev-parse", "--show-toplevel"],
+        [git, "rev-parse", "--show-toplevel"],
         cwd=root,
         env=environment,
     )
@@ -48,7 +55,7 @@ def _target_git_commit(workdir: str | Path) -> str | None:
         return None
     if discovered != root:
         return None
-    revision = run(["git", "rev-parse", "HEAD"], cwd=root, env=environment)
+    revision = run([git, "rev-parse", "HEAD"], cwd=root, env=environment)
     value = revision.stdout.strip()
     return value if revision.returncode == 0 and len(value) == 40 else None
 
@@ -63,7 +70,16 @@ def _env_record(
             pkgs[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             pass
-    harness_rev = run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent)
+    git = trusted_executable("git", require_unwritable=True)
+    harness_rev = (
+        run(
+            [git, "rev-parse", "HEAD"],
+            cwd=Path(__file__).parent,
+            env={"PATH": sanitized_absolute_path(require_unwritable=True)},
+        )
+        if git is not None
+        else None
+    )
     backend_record: dict[str, Any] = {
         "name": execution_backend.name,
         "image": getattr(execution_backend, "image", None),
@@ -97,11 +113,34 @@ def _env_record(
         },
         "execution_backend": backend_record,
         "target_git_commit": _target_git_commit(workdir),
-        "harness_git_commit": harness_rev.stdout.strip() if harness_rev.returncode == 0 else None,
+        "harness_git_commit": (
+            harness_rev.stdout.strip()
+            if harness_rev is not None and harness_rev.returncode == 0
+            else None
+        ),
     }
 
 
 def _safe_verify(verifier: Verifier, artifact: Any, ctx: VerifyContext) -> Check:
+    cleanup_detail = _artifact_cleanup_detail(artifact)
+    if cleanup_detail is not None:
+        detail = {
+            "summary": "backend process cleanup could not be confirmed"
+        }
+        detail.update(
+            process_cleanup_failure_detail(
+                returncode=126,
+                cleanup_unconfirmed=True,
+                detail=cleanup_detail,
+            )
+        )
+        return Check(
+            name=verifier.name,
+            family=getattr(verifier, "family", "code"),
+            passed=False,
+            detail=detail,
+        )
+    check: Check | None = None
     try:
         source = Path(ctx.workdir).resolve()
         with tempfile.TemporaryDirectory(prefix="lha-verify-") as temporary:
@@ -116,17 +155,61 @@ def _safe_verify(verifier: Verifier, artifact: Any, ctx: VerifyContext) -> Check
                     ".lha_pytest.json",
                 ),
             )
-            return verifier.verify(
+            check = verifier.verify(
                 artifact,
                 replace(ctx, workdir=isolated),
             )
+            return check
+    except ProcessCleanupUnconfirmed as error:
+        detail = {
+            "summary": "verifier process cleanup could not be confirmed"
+        }
+        detail.update(
+            process_cleanup_failure_detail(
+                returncode=126,
+                cleanup_unconfirmed=True,
+                detail=error.detail[-1000:],
+            )
+        )
+        return Check(
+            name=verifier.name,
+            family=getattr(verifier, "family", "code"),
+            passed=False,
+            detail=detail,
+        )
     except Exception as e:  # a crashing verifier is a failure, not a lost verdict
+        if (
+            check is not None
+            and check.detail.get(PROCESS_CLEANUP_UNCONFIRMED) is True
+        ):
+            # TemporaryDirectory cleanup can itself race the process whose
+            # termination was unconfirmed. Preserve the quarantine signal
+            # instead of replacing it with an ordinary verifier crash.
+            return check
         return Check(
             name=verifier.name,
             family=getattr(verifier, "family", "code"),
             passed=False,
             detail={"summary": f"verifier crashed: {type(e).__name__}: {e}"},
         )
+
+
+def _artifact_cleanup_detail(artifact: Any) -> str | None:
+    if getattr(artifact, "cleanup_unconfirmed", False):
+        return str(
+            getattr(artifact, "cleanup_detail", "")
+            or getattr(artifact, "stdout_tail", "")
+            or "artifact command returned process-cleanup status 126"
+        )[-1000:]
+    commands = getattr(artifact, "commands", ())
+    for command in commands if isinstance(commands, (list, tuple)) else ():
+        if getattr(command, "cleanup_unconfirmed", False):
+            return str(
+                getattr(command, "cleanup_detail", "")
+                or getattr(command, "stderr", "")
+                or "repository command cleanup was not confirmed"
+            )[-1000:]
+    return None
 
 
 class VerifierAgent:

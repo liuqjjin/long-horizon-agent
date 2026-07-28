@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import stat
 import sys
-import tempfile
 from pathlib import Path
 from typing import Literal, Self
 
@@ -27,6 +25,12 @@ from ..array_evidence import (
     safe_artifact_path,
 )
 from ..artifacts import ExperimentResult, Step
+from ..durable_io import (
+    atomic_replace_bytes,
+    atomic_replace_text,
+    durable_mkdir_chain,
+    fsync_directory,
+)
 from ..live_context.models import ContextBundle
 from ..sandbox import ExecutionBackend, TrustedLocalBackend
 
@@ -92,6 +96,22 @@ class Experimenter:
                 based_on_context=bundle.locators(),
             )
         res = self.exec.run(cmd, cwd=workdir, timeout=float(step.params.get("timeout", 600)))
+        if res.cleanup_unconfirmed:
+            # Do not inspect output paths while a surviving process may still
+            # be replacing them. The verifier will quarantine this attempt.
+            return ExperimentResult(
+                step_id=step.step_id,
+                out_dir=out_dir,
+                command=cmd,
+                returncode=res.returncode,
+                stdout_tail=(res.cleanup_detail or res.stderr or res.stdout)[
+                    -1000:
+                ],
+                output_truncated=res.output_truncated,
+                cleanup_unconfirmed=True,
+                cleanup_detail=res.cleanup_detail[-1000:],
+                based_on_context=bundle.locators(),
+            )
 
         # Re-resolve after target code exits. A command that replaced the output
         # directory or one of its files with a symlink must not supply evidence.
@@ -161,7 +181,7 @@ def execute_experiment_once(
         raise ExperimentAmbiguous(
             f"experiment attempt path is unsafe: {attempt_dir}"
         )
-    attempt_dir.mkdir(parents=True, exist_ok=True)
+    durable_mkdir_chain(attempt_dir, anchor=run_root)
     intent_path = attempt_dir / "experiment_intent.json"
     evidence_path = attempt_dir / "experiment_evidence.json"
     params = json.dumps(
@@ -290,8 +310,13 @@ def _prepare_output_dir(workdir: Path, out_dir: str) -> Path:
         # ``safe_artifact_path`` rejected a symlink at every path component,
         # and the content check ruled out a mistyped source directory.
         shutil.rmtree(out_path)
-    out_path.mkdir(parents=True, exist_ok=False)
-    (out_path / _OUTPUT_OWNER).write_text("LHA experiment output\n")
+        fsync_directory(out_path.parent)
+    durable_mkdir_chain(out_path, anchor=workdir)
+    atomic_replace_text(
+        out_path / _OUTPUT_OWNER,
+        "LHA experiment output\n",
+        anchor=workdir,
+    )
     checked = safe_artifact_path(workdir, out_dir)
     if checked != out_path or not checked.is_dir():
         raise ValueError(f"experiment output directory could not be prepared: {out_dir}")
@@ -420,24 +445,4 @@ def _read_checksummed_model(path: Path, model_type):
 def _durable_replace(path: Path, data: bytes) -> None:
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise ValueError(f"artifact path is unsafe: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        try:
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        except OSError:  # pragma: no cover
-            pass
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_replace_bytes(path, data)

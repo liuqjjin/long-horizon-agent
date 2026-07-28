@@ -13,6 +13,12 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 from ..clock import now
+from ..durable_io import (
+    atomic_replace_bytes,
+    atomic_replace_text,
+    durable_mkdir_chain,
+    fsync_directory,
+)
 from ..step_ids import canonical_artifact_segment
 from ..tools.patch import ResolvedPatch
 from .errors import TransactionCorrupt
@@ -87,11 +93,16 @@ class PatchTransaction(BaseModel):
     ) -> "PatchTransaction":
         if status not in _TRANSITIONS[self.status]:
             raise ValueError(f"invalid transaction transition: {self.status} -> {status}")
-        if status in ("APPLIED", "VERIFIED") and workdir is None:
-            raise ValueError(f"{status} transition requires a workdir")
+        if status == "APPLIED" and workdir is None:
+            raise ValueError("APPLIED transition requires a workdir")
         update: dict = {"status": status, "updated_at": now().isoformat()}
-        if status in ("APPLIED", "VERIFIED") and workdir is not None:
+        if status == "APPLIED" and workdir is not None:
             update["applied_state"] = state_for_paths(workdir, self.resolved_paths)
+        elif status == "VERIFIED":
+            # APPLIED is the one point that captures the bytes produced by this
+            # attempt. A later repair may supersede one of those paths before the
+            # whole step verifies, so VERIFIED is a status-only transition.
+            update["applied_state"] = self.applied_state
         elif status == "REVERTED":
             update["applied_state"] = {}
         return self.model_copy(update=update)
@@ -320,39 +331,12 @@ def _canonical(payload: dict) -> bytes:
 
 
 def _fsync_replace(path: Path, data: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    try:
-        fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:  # pragma: no cover - platform without directory fsync
-        pass
+    atomic_replace_text(path, data)
 
 
 def durable_artifact_write(path: Path, data: bytes) -> None:
     """Atomically persist transaction evidence before PREPARED is recorded."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(tmp, path)
-    try:
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError:  # pragma: no cover - platform without directory fsync
-        pass
+    atomic_replace_bytes(path, data)
 
 
 def save_transaction(run_dir: Path, tx: PatchTransaction) -> None:
@@ -361,7 +345,10 @@ def save_transaction(run_dir: Path, tx: PatchTransaction) -> None:
     except Exception as error:
         raise TransactionCorrupt(f"invalid patch transaction: {error}") from error
     path = transaction_path(run_dir, tx.step_id, tx.attempt_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # A previous state-before-event crash must be repaired explicitly by the
+    # locked resume path.  Never replace the main record while its current
+    # journal binding is missing or corrupt.
+    validate_transaction_journals(run_dir)
     records = _persisted_transactions(run_dir)
     _ordered_transactions(
         [transaction for _path, transaction, _digest in records]
@@ -393,17 +380,12 @@ def save_transaction(run_dir: Path, tx: PatchTransaction) -> None:
                 "cannot append a legacy transaction to a sequenced history"
             )
     else:
-        if (
-            persisted.schema_version != tx.schema_version
-            or persisted.sequence != tx.sequence
-        ):
-            raise TransactionCorrupt(
-                f"transaction sequence changed for {tx.step_id}/{tx.attempt_id}"
-            )
+        _validate_transaction_update(persisted, tx)
         if tx.status not in _TRANSITIONS[persisted.status]:
             raise TransactionCorrupt(
                 f"invalid transaction transition: {persisted.status} -> {tx.status}"
             )
+    durable_mkdir_chain(path.parent, anchor=run_dir)
     payload = tx.model_dump(mode="json")
     envelope = {
         "schema_version": 1,
@@ -414,50 +396,58 @@ def save_transaction(run_dir: Path, tx: PatchTransaction) -> None:
     _append_transaction_event(run_dir, tx, envelope["sha256"])
 
 
+def _validate_transaction_update(
+    persisted: PatchTransaction,
+    candidate: PatchTransaction,
+) -> None:
+    """Freeze the patch and recovery bindings after PREPARED is durable."""
+    immutable_fields = (
+        "schema_version",
+        "sequence",
+        "step_id",
+        "attempt_id",
+        "patch_sha256",
+        "resolved_paths",
+        "backup_ref",
+        "backup_mirror_ref",
+        "backup_sha256",
+        "created_at",
+    )
+    changed = [
+        field
+        for field in immutable_fields
+        if getattr(persisted, field) != getattr(candidate, field)
+    ]
+    if changed:
+        raise TransactionCorrupt(
+            f"transaction binding changed for "
+            f"{persisted.step_id}/{persisted.attempt_id}: {', '.join(changed)}"
+        )
+
+    # PREPARED -> APPLIED captures the resulting bytes once.  Verification may
+    # confirm that evidence, but must not replace it with a different snapshot.
+    if (
+        persisted.status in ("APPLIED", "VERIFIED")
+        and candidate.status in ("APPLIED", "VERIFIED")
+        and persisted.applied_state != candidate.applied_state
+    ):
+        raise TransactionCorrupt(
+            f"applied transaction evidence changed for "
+            f"{persisted.step_id}/{persisted.attempt_id}"
+        )
+
+
 def _append_transaction_event(
     run_dir: Path,
     tx: PatchTransaction,
     transaction_sha256: str,
 ) -> None:
     path = transaction_log_path(run_dir, tx.step_id, tx.attempt_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir_chain(path.parent, anchor=run_dir)
     events = read_transaction_events(run_dir, tx.step_id, tx.attempt_id)
-    if tx.schema_version == 3:
-        for event in events:
-            if (
-                event.schema_version != 2
-                or event.transaction_sequence != tx.sequence
-            ):
-                raise TransactionCorrupt(
-                    f"transaction event sequence does not match "
-                    f"{tx.step_id}/{tx.attempt_id}"
-                )
-    elif any(event.schema_version != 1 for event in events):
-        raise TransactionCorrupt(
-            f"legacy transaction has sequenced events: {tx.step_id}/{tx.attempt_id}"
-        )
-    matching = [
-        index
-        for index, event in enumerate(events)
-        if event.transaction_sha256 == transaction_sha256
-    ]
-    if matching:
-        if matching == [len(events) - 1]:
-            return
-        raise TransactionCorrupt(
-            f"transaction state repeats an earlier journal event for "
-            f"{tx.step_id}/{tx.attempt_id}"
-        )
-    if not events and tx.status != "PREPARED":
-        raise TransactionCorrupt(
-            f"transaction history for {tx.step_id}/{tx.attempt_id} "
-            "does not start at PREPARED"
-        )
-    if events and tx.status not in _TRANSITIONS[events[-1].status]:
-        raise TransactionCorrupt(
-            f"invalid transaction log transition: "
-            f"{events[-1].status} -> {tx.status}"
-        )
+    _validate_transaction_event_history(tx, events, path)
+    if not _transaction_event_needs_append(tx, transaction_sha256, events):
+        return
     event = PatchTransactionEvent(
         schema_version=2 if tx.schema_version == 3 else 1,
         event_sequence=len(events) + 1 if tx.schema_version == 3 else None,
@@ -478,6 +468,74 @@ def _append_transaction_event(
         f.write(json.dumps(envelope, sort_keys=True) + "\n")
         f.flush()
         os.fsync(f.fileno())
+    fsync_directory(path.parent)
+
+
+def _validate_transaction_event_history(
+    tx: PatchTransaction,
+    events: list[PatchTransactionEvent],
+    path: Path,
+) -> None:
+    if tx.schema_version == 3:
+        for event in events:
+            if (
+                event.schema_version != 2
+                or event.transaction_sequence != tx.sequence
+            ):
+                raise TransactionCorrupt(
+                    f"transaction event sequence does not match "
+                    f"{tx.step_id}/{tx.attempt_id}"
+                )
+    elif any(event.schema_version != 1 for event in events):
+        raise TransactionCorrupt(
+            f"legacy transaction has sequenced events: {tx.step_id}/{tx.attempt_id}"
+        )
+    for event in events:
+        if event.step_id != tx.step_id or event.attempt_id != tx.attempt_id:
+            raise TransactionCorrupt(
+                f"transaction log identity does not match persisted state: {path}"
+            )
+    for previous, current in zip(events, events[1:]):
+        if current.status not in _TRANSITIONS[previous.status]:
+            raise TransactionCorrupt(
+                f"invalid transaction log transition: "
+                f"{previous.status} -> {current.status}"
+            )
+
+
+def _transaction_event_needs_append(
+    tx: PatchTransaction,
+    transaction_sha256: str,
+    events: list[PatchTransactionEvent],
+) -> bool:
+    matching = [
+        index
+        for index, event in enumerate(events)
+        if event.transaction_sha256 == transaction_sha256
+    ]
+    if matching:
+        if matching == [len(events) - 1]:
+            if events[-1].status != tx.status:
+                raise TransactionCorrupt(
+                    f"transaction event status does not match persisted state for "
+                    f"{tx.step_id}/{tx.attempt_id}"
+                )
+            return False
+        raise TransactionCorrupt(
+            f"transaction state repeats an earlier journal event for "
+            f"{tx.step_id}/{tx.attempt_id}"
+        )
+    if not events and tx.status != "PREPARED":
+        raise TransactionCorrupt(
+            f"transaction history for {tx.step_id}/{tx.attempt_id} "
+            "does not start at PREPARED"
+        )
+    if events and tx.status not in _TRANSITIONS[events[-1].status]:
+        raise TransactionCorrupt(
+            f"invalid transaction log transition: "
+            f"{events[-1].status} -> {tx.status}"
+        )
+    return True
 
 
 def read_transaction_events(
@@ -485,18 +543,37 @@ def read_transaction_events(
     step_id: str,
     attempt_id: str,
 ) -> list[PatchTransactionEvent]:
-    """Read the durable phase history, dropping only a torn final append."""
+    """Read the durable phase history without changing recovery evidence."""
+    _path, events, _committed_size = _read_transaction_events(
+        run_dir,
+        step_id,
+        attempt_id,
+        allow_torn_tail=False,
+    )
+    return events
+
+
+def _read_transaction_events(
+    run_dir: Path,
+    step_id: str,
+    attempt_id: str,
+    *,
+    allow_torn_tail: bool,
+) -> tuple[Path, list[PatchTransactionEvent], int | None]:
     path = transaction_log_path(run_dir, step_id, attempt_id)
     if not path.exists():
-        return []
+        return path, [], None
+    if path.is_symlink() or not path.is_file():
+        raise TransactionCorrupt(f"transaction log is unsafe: {path}")
     raw = path.read_bytes()
+    committed_size: int | None = None
     if raw and not raw.endswith(b"\n"):
-        last_newline = raw.rfind(b"\n")
-        raw = raw[: last_newline + 1]
-        with open(path, "rb+") as f:
-            f.truncate(last_newline + 1)
-            f.flush()
-            os.fsync(f.fileno())
+        if not allow_torn_tail:
+            raise TransactionCorrupt(
+                f"transaction log has a torn final append: {path}"
+            )
+        committed_size = raw.rfind(b"\n") + 1
+        raw = raw[:committed_size]
     events: list[PatchTransactionEvent] = []
     for line_number, line in enumerate(raw.splitlines(), start=1):
         try:
@@ -533,7 +610,17 @@ def read_transaction_events(
             raise TransactionCorrupt(
                 f"transaction log {path} changes transaction sequence"
             )
-    return events
+    return path, events, committed_size
+
+
+def _truncate_transaction_log(path: Path, committed_size: int) -> None:
+    """Discard one uncommitted append while the caller holds the run lock."""
+    if path.is_symlink() or not path.is_file():
+        raise TransactionCorrupt(f"transaction log is unsafe: {path}")
+    with open(path, "rb+") as stream:
+        stream.truncate(committed_size)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def load_transaction(
@@ -551,52 +638,48 @@ def load_transaction(
         if digest != raw["sha256"]:
             raise ValueError("checksum mismatch")
         tx = PatchTransaction.model_validate(payload)
-        # save_transaction writes the state before the append-only event. If a
-        # process died between those fsyncs, repair the missing audit record
-        # from the checksummed state before recovery continues.
-        _append_transaction_event(run_dir, tx, digest)
+        if (
+            tx.step_id != step_id
+            or tx.attempt_id != attempt_id
+            or path != transaction_path(run_dir, tx.step_id, tx.attempt_id)
+        ):
+            raise ValueError("transaction path does not match its identity")
+        events = read_transaction_events(run_dir, tx.step_id, tx.attempt_id)
+        _validate_transaction_event_history(tx, events, path)
+        if (
+            not events
+            or events[-1].status != tx.status
+            or events[-1].transaction_sha256 != digest
+        ):
+            raise ValueError("transaction log does not end at the persisted state")
         return tx
     except Exception as e:
         raise TransactionCorrupt(f"invalid patch transaction {path}: {e}") from e
 
 
 def list_transactions(run_dir: Path, step_id: str) -> list[PatchTransaction]:
+    validate_transaction_journals(run_dir)
     records = _persisted_transactions(run_dir)
     ordered = _ordered_transactions(
         [transaction for _path, transaction, _digest in records]
     )
-    digests = {
-        (transaction.step_id, transaction.attempt_id): digest
-        for _path, transaction, digest in records
-    }
-    for transaction in ordered:
-        _append_transaction_event(
-            run_dir,
-            transaction,
-            digests[(transaction.step_id, transaction.attempt_id)],
-        )
     return [
         transaction for transaction in ordered if transaction.step_id == step_id
     ]
 
 
-def validate_transaction_journals(run_dir: Path) -> None:
-    """Validate the durable transaction journal without pre-empting recovery.
-
-    Backups and reviewed artifacts are deliberately not inspected here.  The
-    step recovery path owns those checks because it can still restore from the
-    mirrored backup and return a terminal FAILED result.  Rejecting them before
-    recovery would strand an applied change in the worktree.
-    """
+def _transaction_journal_inventory(
+    run_dir: Path,
+) -> list[tuple[Path, PatchTransaction, str]]:
     root = run_dir / "transactions"
     if not root.exists() and not root.is_symlink():
-        return
+        return []
     if root.is_symlink() or not root.is_dir():
         raise TransactionCorrupt(f"transaction directory is unsafe: {root}")
 
     expected_logs: set[Path] = set()
     actual_logs: set[Path] = set()
-    state_paths: list[Path] = []
+    state_paths: set[Path] = set()
     for descendant in root.rglob("*"):
         if descendant.is_symlink():
             raise TransactionCorrupt(
@@ -607,7 +690,7 @@ def validate_transaction_journals(run_dir: Path) -> None:
         if descendant.name.endswith(".events.jsonl"):
             actual_logs.add(descendant)
         elif descendant.suffix == ".json":
-            state_paths.append(descendant)
+            state_paths.add(descendant)
         else:
             raise TransactionCorrupt(f"unknown transaction evidence: {descendant}")
 
@@ -615,73 +698,68 @@ def validate_transaction_journals(run_dir: Path) -> None:
     _ordered_transactions(
         [transaction for _path, transaction, _digest in records]
     )
+    if {path for path, _transaction, _digest in records} != state_paths:
+        raise TransactionCorrupt("transaction state inventory changed while reading")
 
-    for path in state_paths:
-        try:
-            raw = json.loads(path.read_text())
-            payload = raw["payload"]
-            digest = hashlib.sha256(_canonical(payload)).hexdigest()
-            if digest != raw["sha256"]:
-                raise ValueError("checksum mismatch")
-            transaction = PatchTransaction.model_validate(payload)
-        except Exception as error:
-            raise TransactionCorrupt(
-                f"invalid patch transaction {path}: {error}"
-            ) from error
-
-        expected_path = transaction_path(
-            run_dir, transaction.step_id, transaction.attempt_id
-        )
-        if path != expected_path:
-            raise TransactionCorrupt(
-                f"transaction path does not match its identity: {path}"
+    for _path, transaction, _digest in records:
+        expected_logs.add(
+            transaction_log_path(
+                run_dir, transaction.step_id, transaction.attempt_id
             )
-
-        log_path = transaction_log_path(
-            run_dir, transaction.step_id, transaction.attempt_id
         )
-        expected_logs.add(log_path)
+
+    orphaned = actual_logs - expected_logs
+    if orphaned:
+        raise TransactionCorrupt(f"orphaned transaction log: {sorted(orphaned)[0]}")
+    return records
+
+
+def recover_transaction_journals(run_dir: Path) -> None:
+    """Repair only the state-before-event crash window.
+
+    This function writes recovery evidence.  Its caller must hold ``run_lock``
+    for the run, and it must only be used by a resume entry point.  Inspection
+    and retention paths call ``validate_transaction_journals`` instead.
+    """
+    repairs: list[tuple[PatchTransaction, str]] = []
+    truncations: list[tuple[Path, int]] = []
+    records = _transaction_journal_inventory(run_dir)
+
+    # Validate every committed prefix before changing any journal.  A damaged
+    # second transaction must not cause an otherwise valid first one to be
+    # silently rewritten during inspection.
+    for path, transaction, digest in records:
+        log_path, events, committed_size = _read_transaction_events(
+            run_dir,
+            transaction.step_id,
+            transaction.attempt_id,
+            allow_torn_tail=True,
+        )
+        _validate_transaction_event_history(transaction, events, path)
+        if _transaction_event_needs_append(transaction, digest, events):
+            repairs.append((transaction, digest))
+        if committed_size is not None:
+            truncations.append((log_path, committed_size))
+
+    for log_path, committed_size in truncations:
+        _truncate_transaction_log(log_path, committed_size)
+    for transaction, digest in repairs:
+        _append_transaction_event(run_dir, transaction, digest)
+    validate_transaction_journals(run_dir)
+
+
+def validate_transaction_journals(run_dir: Path) -> None:
+    """Validate durable transaction journals without changing any file.
+
+    Backups and reviewed artifacts are deliberately not inspected here.  The
+    step recovery path owns those checks because it can still restore from the
+    mirrored backup and return a terminal FAILED result.
+    """
+    for path, transaction, digest in _transaction_journal_inventory(run_dir):
         events = read_transaction_events(
             run_dir, transaction.step_id, transaction.attempt_id
         )
-        for event in events:
-            if (
-                event.step_id != transaction.step_id
-                or event.attempt_id != transaction.attempt_id
-            ):
-                raise TransactionCorrupt(
-                    f"transaction log identity does not match persisted state: {path}"
-                )
-            if transaction.schema_version == 3 and (
-                event.schema_version != 2
-                or event.transaction_sequence != transaction.sequence
-            ):
-                raise TransactionCorrupt(
-                    f"transaction log sequence does not match persisted state: {path}"
-                )
-            if transaction.schema_version == 2 and event.schema_version != 1:
-                raise TransactionCorrupt(
-                    f"legacy transaction has sequenced events: {path}"
-                )
-        for previous, current in zip(events, events[1:]):
-            if current.status not in _TRANSITIONS[previous.status]:
-                raise TransactionCorrupt(
-                    f"invalid transaction log transition: "
-                    f"{previous.status} -> {current.status}"
-                )
-        # A crash can occur after the checksummed state rename but before the
-        # matching log append.  The state is authoritative in this narrow
-        # window, so restore the missing audit event before continuing.
-        if not events or events[-1].transaction_sha256 != digest:
-            if events and transaction.status not in _TRANSITIONS[events[-1].status]:
-                raise TransactionCorrupt(
-                    f"invalid transaction recovery transition: "
-                    f"{events[-1].status} -> {transaction.status}"
-                )
-            _append_transaction_event(run_dir, transaction, digest)
-            events = read_transaction_events(
-                run_dir, transaction.step_id, transaction.attempt_id
-            )
+        _validate_transaction_event_history(transaction, events, path)
         if (
             not events
             or events[-1].status != transaction.status
@@ -690,10 +768,6 @@ def validate_transaction_journals(run_dir: Path) -> None:
             raise TransactionCorrupt(
                 f"transaction log does not end at the persisted state: {path}"
             )
-
-    orphaned = actual_logs - expected_logs
-    if orphaned:
-        raise TransactionCorrupt(f"orphaned transaction log: {sorted(orphaned)[0]}")
 
 
 def validate_applied_state(tx: PatchTransaction, workdir: Path) -> None:

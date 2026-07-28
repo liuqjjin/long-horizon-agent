@@ -27,6 +27,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from ..durable_io import (
+    atomic_replace_text,
+    durable_mkdir_chain,
+    fsync_directory,
+)
 from .errors import CheckpointCorrupt, RunLocked
 from .state import RunState, StepRecord
 
@@ -43,26 +48,12 @@ def _canonical(payload: dict) -> str:
 
 
 def _fsync_write(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    # fsync the directory so the rename itself is durable
-    try:
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:  # pragma: no cover - platform without dir fsync
-        pass
+    atomic_replace_text(path, text)
 
 
 def save_state(state: RunState) -> None:
     run_dir = Path(state.run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    durable_mkdir_chain(run_dir)
     payload = state.model_dump(mode="json")
     envelope = {
         "schema_version": _ENVELOPE_VERSION,
@@ -152,6 +143,7 @@ def _ledger_sha256(record: StepRecord) -> str:
 
 def append_ledger(state: RunState, record: StepRecord) -> None:
     path = Path(state.run_dir) / LEDGER_FILE
+    durable_mkdir_chain(path.parent)
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise CheckpointCorrupt(f"ledger path is unsafe: {path}")
     # A crash can leave a torn final line. Appending after it would merge two
@@ -201,14 +193,7 @@ def append_ledger(state: RunState, record: StepRecord) -> None:
         f.write(record.model_dump_json() + "\n")
         f.flush()
         os.fsync(f.fileno())
-    try:
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except OSError:  # pragma: no cover - platform without directory fsync
-        pass
+    fsync_directory(path.parent)
 
 
 def read_ledger(run_dir: str | Path) -> list[StepRecord]:
@@ -289,7 +274,7 @@ def run_lock(run_dir: str | Path) -> Iterator[None]:
     released automatically on process exit.
     """
     path = Path(run_dir) / ".run.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir_chain(path.parent)
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise CheckpointCorrupt(f"run lock path is unsafe: {path}")
     flags = os.O_RDWR | os.O_CREAT
@@ -311,6 +296,7 @@ def run_lock(run_dir: str | Path) -> Iterator[None]:
         os.ftruncate(fd, 0)
         os.write(fd, f"pid={os.getpid()}\n".encode())
         os.fsync(fd)
+        fsync_directory(path.parent)
         yield
     finally:
         try:

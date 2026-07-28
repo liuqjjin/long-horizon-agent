@@ -15,7 +15,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 from bisect import bisect_right
 from collections.abc import Awaitable
 from datetime import datetime, timezone
@@ -29,7 +28,11 @@ from ...sandbox.base import (
     run_bounded_process,
     terminate_process_group,
 )
-from ...tools.shell import ProcResult
+from ...tools.shell import (
+    ProcResult,
+    sanitized_absolute_path,
+    trusted_executable,
+)
 from ..freshness import content_hash, strict_file_sha256
 from ..models import CodeHit, Hit, Provenance, ReindexResult
 from .base import BackendUnavailable, SearchBackend
@@ -42,11 +45,14 @@ _T = TypeVar("_T")
 
 def find_ccc() -> str | None:
     """Locate the ``ccc`` executable, including the pipx default bin dir."""
-    found = shutil.which("ccc")
-    if found:
-        return found
-    candidate = Path.home() / ".local" / "bin" / "ccc"
-    return str(candidate) if candidate.exists() else None
+    return trusted_executable(
+        "ccc",
+        extra_dirs=(
+            Path.home() / ".local" / "bin",
+            Path("/opt/homebrew/bin"),
+        ),
+        require_unwritable=False,
+    )
 
 
 def _env_with_local_bin() -> dict[str, str]:
@@ -57,13 +63,13 @@ def _env_with_local_bin() -> dict[str, str]:
     executable path and locale settings here; everything else is deliberately
     absent.
     """
-    search_dirs = [
-        str(Path.home() / ".local" / "bin"),
-        "/opt/homebrew/bin",
-        *os.environ.get("PATH", "").split(os.pathsep),
-    ]
     env = {
-        "PATH": os.pathsep.join(dict.fromkeys(item for item in search_dirs if item)),
+        "PATH": sanitized_absolute_path(
+            extra_dirs=(
+                Path.home() / ".local" / "bin",
+                Path("/opt/homebrew/bin"),
+            ),
+        ),
     }
     for key in ("LANG", "LC_ALL", "LC_CTYPE"):
         value = os.environ.get(key)
@@ -96,9 +102,13 @@ def _run_ccc_control(
             (
                 "ccc control command requires POSIX process-group cleanup; "
                 "use Linux, macOS, or WSL2"
-            ),
-            0.0,
-        )
+                ),
+                0.0,
+                cleanup_confirmed=False,
+                cleanup_detail=(
+                    "POSIX process-group cleanup is unavailable"
+                ),
+            )
     return run_bounded_process(
         argv,
         cwd=root,

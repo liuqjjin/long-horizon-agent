@@ -7,14 +7,19 @@ import stat
 from pathlib import Path
 from typing import Any, Iterable
 
+from ...oracle_inventory import (
+    OracleInventoryError,
+    collect_pytest_inventory_disposable,
+    validate_pytest_oracle_inventory,
+)
 from ...pytest_evidence import (
     PytestEvidenceOutcome,
     clear_pytest_caches,
-    collect_inventory,
     run_with_evidence,
 )
 from ..base import Verifier, VerifyContext
-from ..verdict import Check
+from ..verdict import Check, process_cleanup_failure_detail
+from .oracle_snapshot import OracleSnapshot, OracleSnapshotError, capture_oracle_snapshot
 
 _MAX_DIAGNOSTIC_BYTES = 2 * 1024 * 1024
 
@@ -28,37 +33,138 @@ class PytestVerifier(Verifier):
         self.isolated_interpreter = isolated_interpreter
 
     def verify(self, artifact: Any, ctx: VerifyContext) -> Check:
-        workdir = Path(ctx.workdir).resolve()
-        inventory = collect_inventory(
-            workdir,
-            ctx.exec,
-            timeout=self.timeout,
-            autoload_plugins=True,
-        )
-        duration_s = inventory.driver.duration_s
-        if not inventory.protocol_valid:
-            return self._check(
-                passed=False,
-                score=0,
-                summary="pytest inventory lacked a complete control-plane receipt",
-                failing=[],
-                messages=[],
-                returncode=inventory.driver.returncode,
-                outcome=PytestEvidenceOutcome.INFRA_ERROR,
-                report_status="not-run",
-                collected=0,
-                receipt_sha256="",
-                duration_s=duration_s,
-            )
+        workdir = Path(ctx.workdir)
+        try:
+            oracle = capture_oracle_snapshot(workdir)
+        except OracleSnapshotError as error:
+            return self._oracle_failure(str(error))
 
+        baseline = ctx.pytest_oracle_inventory
+        if baseline is None and ctx.attempt_id is not None:
+            return self._oracle_failure(
+                "persisted pytest oracle inventory is missing",
+                oracle=oracle,
+            )
+        duration_s = 0.0
+        expected_nodeids: tuple[str, ...] = ()
+        if baseline is not None:
+            try:
+                validate_pytest_oracle_inventory(
+                    workdir,
+                    baseline,
+                    allowed_changes=ctx.allowed_oracle_changes,
+                )
+            except OracleInventoryError as error:
+                return self._oracle_failure(
+                    f"persisted pytest oracle inventory is invalid ({error})",
+                    oracle=oracle,
+                )
+            if not baseline.nodeids:
+                return self._oracle_failure(
+                    "persisted pytest oracle inventory contains no tests",
+                    oracle=oracle,
+                )
+            expected_nodeids = baseline.nodeids
+
+        # An explicit task override may intentionally replace a test file and
+        # therefore its node IDs. The baseline still protects every unlisted
+        # oracle path; only this audited exception recollects after the patch.
+        if baseline is None or ctx.allowed_oracle_changes:
+            try:
+                inventory = collect_pytest_inventory_disposable(
+                    workdir,
+                    ctx.exec,
+                    timeout=self.timeout,
+                )
+            except OracleInventoryError as error:
+                summary = str(error)
+                summary = summary.replace(
+                    "pytest baseline collection changed repository files",
+                    "pytest collection changed protected files",
+                    1,
+                )
+                return self._oracle_failure(summary, oracle=oracle)
+            duration_s = inventory.driver.duration_s
+            if inventory.driver.cleanup_unconfirmed:
+                return self._cleanup_failure(
+                    summary="pytest collection process cleanup could not be confirmed",
+                    detail=inventory.driver.detail,
+                    duration_s=duration_s,
+                    oracle=oracle,
+                )
+            if not inventory.ready:
+                collection_failed = (
+                    inventory.protocol_valid and inventory.collection_failed
+                )
+                return self._check(
+                    passed=False,
+                    score=0,
+                    summary=(
+                        "pytest collection failed; test execution was not started"
+                        if collection_failed
+                        else "pytest inventory was not ready for test execution"
+                    ),
+                    failing=[],
+                    messages=[],
+                    returncode=inventory.driver.returncode,
+                    outcome=(
+                        PytestEvidenceOutcome.TEST_FAIL
+                        if collection_failed
+                        else PytestEvidenceOutcome.INFRA_ERROR
+                    ),
+                    report_status="not-run",
+                    collected=len(inventory.expected_nodeids),
+                    receipt_sha256=inventory.driver.receipt_sha256,
+                    oracle_snapshot_sha256=oracle.sha256,
+                    duration_s=duration_s,
+                )
+            expected_nodeids = inventory.expected_nodeids
+
+        if not expected_nodeids:
+            return self._oracle_failure(
+                "pytest inventory contains no executable tests",
+                oracle=oracle,
+            )
         evidence = run_with_evidence(
             workdir,
             ctx.exec,
-            expected_nodeids=inventory.expected_nodeids,
+            expected_nodeids=expected_nodeids,
             timeout=self.timeout,
-            autoload_plugins=True,
+            autoload_plugins=False,
         )
         duration_s += evidence.duration_s
+        if evidence.cleanup_unconfirmed:
+            return self._cleanup_failure(
+                summary="pytest execution process cleanup could not be confirmed",
+                detail=evidence.detail,
+                duration_s=duration_s,
+                receipt_sha256=evidence.receipt_sha256,
+                oracle=oracle,
+            )
+        integrity_failure = self._oracle_change(oracle, workdir)
+        if integrity_failure is not None:
+            return self._oracle_failure(
+                f"pytest execution changed protected files ({integrity_failure})",
+                returncode=evidence.returncode,
+                duration_s=duration_s,
+                receipt_sha256=evidence.receipt_sha256,
+                oracle=oracle,
+            )
+        if baseline is not None:
+            try:
+                validate_pytest_oracle_inventory(
+                    workdir,
+                    baseline,
+                    allowed_changes=ctx.allowed_oracle_changes,
+                )
+            except OracleInventoryError as error:
+                return self._oracle_failure(
+                    f"pytest execution changed persisted oracle files ({error})",
+                    returncode=evidence.returncode,
+                    duration_s=duration_s,
+                    receipt_sha256=evidence.receipt_sha256,
+                    oracle=oracle,
+                )
         receipt = evidence.receipt or {}
         reports = receipt.get("reports", [])
         if not isinstance(reports, list):
@@ -83,20 +189,35 @@ class PytestVerifier(Verifier):
             # The legacy json-report remains useful as repair feedback, but it
             # cannot change the receipt-based outcome. Candidate-writable JSON
             # is therefore never accepted as proof that tests passed.
-            report_status, messages, diagnostic_duration = self._failure_diagnostics(
+            (
+                report_status,
+                messages,
+                diagnostic_duration,
+                cleanup_detail,
+            ) = self._failure_diagnostics(
                 workdir,
                 ctx,
-                allowed_nodeids=set(failing) | set(inventory.expected_nodeids),
+                allowed_nodeids=set(failing) | set(expected_nodeids),
             )
             duration_s += diagnostic_duration
+            if cleanup_detail is not None:
+                return self._cleanup_failure(
+                    summary=(
+                        "pytest diagnostic process cleanup could not be confirmed"
+                    ),
+                    detail=cleanup_detail,
+                    duration_s=duration_s,
+                    receipt_sha256=evidence.receipt_sha256,
+                    oracle=oracle,
+                )
 
         passed_n = evidence.passed_tests
         failed_n = len(failing)
         error_n = collection_failures
-        collected = len(inventory.expected_nodeids)
+        collected = len(expected_nodeids)
         count_line = f"{passed_n} passed, {failed_n} failed, {error_n} error"
         detail_summary = count_line
-        if inventory.collection_failed:
+        if collection_failures:
             detail_summary += " (collection failed)"
         elif collected == 0:
             detail_summary += " (no tests collected)"
@@ -116,7 +237,66 @@ class PytestVerifier(Verifier):
             report_status=report_status,
             collected=collected,
             receipt_sha256=evidence.receipt_sha256,
+            oracle_snapshot_sha256=oracle.sha256,
             duration_s=duration_s,
+            baseline_inventory_sha256=baseline.sha256 if baseline is not None else "",
+        )
+
+    @staticmethod
+    def _oracle_change(oracle: OracleSnapshot, workdir: Path) -> str | None:
+        try:
+            current = capture_oracle_snapshot(workdir)
+        except OracleSnapshotError as error:
+            return str(error)
+        return oracle.difference(current)
+
+    def _oracle_failure(
+        self,
+        summary: str,
+        *,
+        returncode: int = 126,
+        duration_s: float = 0.0,
+        receipt_sha256: str = "",
+        oracle: OracleSnapshot | None = None,
+    ) -> Check:
+        return self._check(
+            passed=False,
+            score=0,
+            summary=summary,
+            failing=[],
+            messages=[],
+            returncode=returncode,
+            outcome=PytestEvidenceOutcome.INFRA_ERROR,
+            report_status="not-run",
+            collected=0,
+            receipt_sha256=receipt_sha256,
+            oracle_snapshot_sha256=oracle.sha256 if oracle is not None else "",
+            duration_s=duration_s,
+        )
+
+    def _cleanup_failure(
+        self,
+        *,
+        summary: str,
+        detail: str,
+        duration_s: float,
+        receipt_sha256: str = "",
+        oracle: OracleSnapshot | None = None,
+    ) -> Check:
+        return self._check(
+            passed=False,
+            score=0,
+            summary=summary,
+            failing=[],
+            messages=[],
+            returncode=126,
+            outcome=PytestEvidenceOutcome.INFRA_ERROR,
+            report_status="not-run",
+            collected=0,
+            receipt_sha256=receipt_sha256,
+            oracle_snapshot_sha256=oracle.sha256 if oracle is not None else "",
+            duration_s=duration_s,
+            cleanup_detail=detail,
         )
 
     def _failure_diagnostics(
@@ -125,7 +305,7 @@ class PytestVerifier(Verifier):
         ctx: VerifyContext,
         *,
         allowed_nodeids: set[str],
-    ) -> tuple[str, list[str], float]:
+    ) -> tuple[str, list[str], float, str | None]:
         """Read json-report only for bounded repair feedback after a proven failure."""
         report = workdir / ".lha_pytest.json"
         _unlink_diagnostic(report)
@@ -144,6 +324,13 @@ class PytestVerifier(Verifier):
             ]
         )
         result = ctx.exec.run(command, cwd=workdir, timeout=self.timeout)
+        if result.cleanup_unconfirmed:
+            return (
+                "not-run",
+                [],
+                result.duration_s,
+                result.cleanup_detail or result.stderr[-500:],
+            )
         data: dict[str, Any] = {}
         status = "missing"
         try:
@@ -178,7 +365,7 @@ class PytestVerifier(Verifier):
             and test.get("nodeid") in allowed_nodeids
         ]
         messages = [message for test in bad if (message := _failure_message(test))]
-        return status, messages[:10], result.duration_s
+        return status, messages[:10], result.duration_s, None
 
     def _check(
         self,
@@ -193,23 +380,37 @@ class PytestVerifier(Verifier):
         report_status: str,
         collected: int,
         receipt_sha256: str,
+        oracle_snapshot_sha256: str,
         duration_s: float,
+        baseline_inventory_sha256: str = "",
+        cleanup_detail: str | None = None,
     ) -> Check:
+        detail: dict[str, Any] = {
+            "summary": summary,
+            "failing": failing[:10],
+            "messages": messages[:10],
+            "returncode": returncode,
+            "outcome": outcome.value,
+            "report_status": report_status,
+            "collected": collected,
+            "receipt_sha256": receipt_sha256,
+            "oracle_snapshot_sha256": oracle_snapshot_sha256,
+            "baseline_inventory_sha256": baseline_inventory_sha256,
+        }
+        if cleanup_detail is not None:
+            detail.update(
+                process_cleanup_failure_detail(
+                    returncode=returncode,
+                    cleanup_unconfirmed=True,
+                    detail=cleanup_detail,
+                )
+            )
         return Check(
             name=self.name,
             family=self.family,
             passed=passed,
             score=float(score),
-            detail={
-                "summary": summary,
-                "failing": failing[:10],
-                "messages": messages[:10],
-                "returncode": returncode,
-                "outcome": outcome.value,
-                "report_status": report_status,
-                "collected": collected,
-                "receipt_sha256": receipt_sha256,
-            },
+            detail=detail,
             duration_s=duration_s,
         )
 

@@ -295,20 +295,36 @@ class _PlanLLM(LLMClient):
 
 
 def _dynamic_experiment_plan(
-    params: dict, verifiers: list[str]
+    params: dict,
+    verifiers: list[str],
+    *,
+    include_context: bool = True,
+    context_verifiers: list[str] | None = None,
 ) -> dict:
+    steps = []
+    if include_context:
+        steps.append(
+            {
+                "step_id": "candidate-context",
+                "kind": "experiment",
+                "action": "gather_context",
+                "goal": "read the experiment sources",
+                "verifiers": context_verifiers or ["freshness", "citation"],
+            }
+        )
+    steps.append(
+        {
+            "step_id": "candidate-run",
+            "kind": "experiment",
+            "action": "run_experiment",
+            "goal": "run",
+            "verifiers": verifiers,
+            "params": params,
+        }
+    )
     return {
         "summary": "candidate",
-        "steps": [
-            {
-                "step_id": "candidate-run",
-                "kind": "experiment",
-                "action": "run_experiment",
-                "goal": "run",
-                "verifiers": verifiers,
-                "params": params,
-            }
-        ],
+        "steps": steps,
     }
 
 
@@ -339,6 +355,42 @@ def test_dynamic_experiment_plan_must_retain_runnable_template_params() -> None:
     assert [step.step_id for step in plan.steps] == ["s1-context", "s2-run"]
 
 
+def test_dynamic_experiment_plan_cannot_omit_context_gate() -> None:
+    task = TaskSpec.from_file(_EXPERIMENT_TASK)
+    template = Supervisor(Config()).plan(task)
+    params = next(
+        step.params for step in template.steps if step.action == "run_experiment"
+    )
+    payload = _dynamic_experiment_plan(
+        params,
+        ["psnr", "ssim", "reproducibility"],
+        include_context=False,
+    )
+
+    plan = Supervisor(Config(dynamic_planning=True), _PlanLLM(payload)).plan(task)
+
+    assert [step.step_id for step in plan.steps] == ["s1-context", "s2-run"]
+    assert plan.steps[0].verifiers == ["freshness", "citation"]
+
+
+def test_dynamic_experiment_plan_cannot_weaken_context_gate() -> None:
+    task = TaskSpec.from_file(_EXPERIMENT_TASK)
+    template = Supervisor(Config()).plan(task)
+    params = next(
+        step.params for step in template.steps if step.action == "run_experiment"
+    )
+    payload = _dynamic_experiment_plan(
+        params,
+        ["psnr", "ssim", "reproducibility"],
+        context_verifiers=["freshness"],
+    )
+
+    plan = Supervisor(Config(dynamic_planning=True), _PlanLLM(payload)).plan(task)
+
+    assert [step.step_id for step in plan.steps] == ["s1-context", "s2-run"]
+    assert plan.steps[0].verifiers == ["freshness", "citation"]
+
+
 def test_dynamic_experiment_plan_with_fixed_protocol_is_accepted() -> None:
     task = TaskSpec.from_file(_EXPERIMENT_TASK)
     template = Supervisor(Config()).plan(task)
@@ -351,4 +403,7 @@ def test_dynamic_experiment_plan_with_fixed_protocol_is_accepted() -> None:
 
     plan = Supervisor(Config(dynamic_planning=True), _PlanLLM(payload)).plan(task)
 
-    assert [step.step_id for step in plan.steps] == ["candidate-run"]
+    assert [step.step_id for step in plan.steps] == [
+        "candidate-context",
+        "candidate-run",
+    ]

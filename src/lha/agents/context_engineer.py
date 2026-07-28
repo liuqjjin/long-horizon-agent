@@ -103,10 +103,10 @@ class ContextEngineer:
 
     @staticmethod
     def _synthesize(bundle: ContextBundle) -> str:
-        """A simple, deterministic, citation-anchored answer for v1."""
+        """Render retrieved snippets with their source locations."""
         if not bundle.items:
             return f"No indexed context found for: {bundle.query}"
-        lines = [f"Answer for: {bundle.query}", ""]
+        lines = [f"Matches for: {bundle.query}", ""]
         for item in bundle.items[:5]:
             snippet = " ".join(item.text.split())[:200]
             lines.append(f"- {snippet} [{item.provenance.locator}]")

@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 
+import lha.verifiers.code.pytest_verifier as pytest_verifier_module
 from lha.agents.verifier_agent import _env_record, _safe_verify
 from lha.artifacts import Patch, Step
+from lha.oracle_inventory import build_pytest_oracle_inventory
 from lha.pytest_evidence import (
     MAX_NODEID_CHARS,
     MAX_NODEIDS,
@@ -52,6 +54,101 @@ def test_pytest_verifier_pass(tmp_path):
     assert check.detail["outcome"] == "PASS"
     assert len(check.detail["receipt_sha256"]) == 64
     assert check.detail["report_status"] == "not-required"
+
+
+def test_pytest_verifier_uses_persisted_baseline_without_recollection(
+    tmp_path,
+    monkeypatch,
+):
+    repo = _repo(
+        tmp_path,
+        "def f():\n    return 1\n",
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+    baseline = build_pytest_oracle_inventory(
+        repo,
+        TrustedLocalBackend(),
+    )
+
+    def collection_must_not_repeat(*_args, **_kwargs):
+        raise AssertionError("post-patch collection must not replace baseline truth")
+
+    monkeypatch.setattr(
+        pytest_verifier_module,
+        "collect_pytest_inventory_disposable",
+        collection_must_not_repeat,
+    )
+    check = PytestVerifier().verify(
+        Patch(step_id="s"),
+        VerifyContext(
+            workdir=repo,
+            step=_step("pytest"),
+            pytest_oracle_inventory=baseline,
+        ),
+    )
+
+    assert check.passed
+    assert check.detail["collected"] == len(baseline.nodeids)
+    assert check.detail["baseline_inventory_sha256"] == baseline.sha256
+
+
+def test_pytest_verifier_fails_closed_when_run_attempt_has_no_baseline(tmp_path):
+    repo = _repo(
+        tmp_path,
+        "def f():\n    return 1\n",
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+
+    check = PytestVerifier().verify(
+        Patch(step_id="s"),
+        VerifyContext(
+            workdir=repo,
+            step=_step("pytest"),
+            attempt_id="s-r0",
+        ),
+    )
+
+    assert not check.passed
+    assert check.detail["outcome"] == "INFRA_ERROR"
+    assert check.detail["summary"] == "persisted pytest oracle inventory is missing"
+
+
+def test_pytest_verifier_rejects_new_oracle_path_against_persisted_baseline(
+    tmp_path,
+    monkeypatch,
+):
+    repo = _repo(
+        tmp_path,
+        "def f():\n    return 1\n",
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+    baseline = build_pytest_oracle_inventory(
+        repo,
+        TrustedLocalBackend(),
+    )
+    (repo / "tests" / "expected.json").write_text('{"forged": true}\n')
+
+    def collection_must_not_repeat(*_args, **_kwargs):
+        raise AssertionError("post-patch collection must not replace baseline truth")
+
+    monkeypatch.setattr(
+        pytest_verifier_module,
+        "collect_pytest_inventory_disposable",
+        collection_must_not_repeat,
+    )
+    check = PytestVerifier().verify(
+        Patch(step_id="s"),
+        VerifyContext(
+            workdir=repo,
+            step=_step("pytest"),
+            pytest_oracle_inventory=baseline,
+        ),
+    )
+
+    assert not check.passed
+    assert check.detail["outcome"] == "INFRA_ERROR"
+    assert "persisted pytest oracle inventory is invalid" in check.detail["summary"]
+    assert "tests/expected.json" in check.detail["summary"]
 
 
 def test_pytest_verifier_fail(tmp_path):
@@ -111,6 +208,157 @@ def test_pytest_verifier_keeps_candidate_syntax_error_as_test_failure(tmp_path):
     assert not check.passed
     assert check.detail["outcome"] == "TEST_FAIL"
     assert len(check.detail["receipt_sha256"]) == 64
+    assert check.detail["summary"] == (
+        "pytest collection failed; test execution was not started"
+    )
+
+
+def test_pytest_verifier_rejects_collection_that_deletes_a_later_test(tmp_path):
+    repo = _repo(
+        tmp_path,
+        (
+            "from pathlib import Path\n"
+            "Path('tests/test_z_oracle.py').unlink(missing_ok=True)\n\n"
+            "def f():\n"
+            "    Path('run-phase.txt').write_text('executed\\n')\n"
+            "    return 1\n"
+        ),
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+    (repo / "tests" / "test_z_oracle.py").write_text(
+        "def test_oracle():\n    assert False\n"
+    )
+
+    check = PytestVerifier().verify(
+        Patch(step_id="s"), VerifyContext(workdir=repo, step=_step("pytest"))
+    )
+
+    assert not check.passed
+    assert check.detail["outcome"] == "INFRA_ERROR"
+    assert "collection changed protected files" in check.detail["summary"]
+    assert "tests/test_z_oracle.py" in check.detail["summary"]
+    assert not (repo / "run-phase.txt").exists()
+
+
+def test_pytest_verifier_rejects_mutation_of_custom_collected_test(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n"
+        'testpaths = ["quality"]\n'
+        'python_files = ["checks_*.py"]\n'
+        "pythonpath = ['.']\n"
+    )
+    (tmp_path / "quality").mkdir()
+    oracle = tmp_path / "quality" / "checks_behavior.py"
+    oracle.write_text(
+        "from m import f\n\n"
+        "def test_behavior():\n"
+        "    assert f() == 1\n"
+    )
+    (tmp_path / "m.py").write_text(
+        "from pathlib import Path\n"
+        "Path('quality/checks_behavior.py').write_text("
+        "'def test_behavior(): pass\\n')\n\n"
+        "def f():\n"
+        "    return 1\n"
+    )
+
+    check = PytestVerifier().verify(
+        Patch(step_id="s"),
+        VerifyContext(workdir=tmp_path, step=_step("pytest")),
+    )
+
+    assert not check.passed
+    assert check.detail["outcome"] == "INFRA_ERROR"
+    assert "collection changed protected files" in check.detail["summary"]
+    assert "quality/checks_behavior.py" in check.detail["summary"]
+
+
+def test_pytest_verifier_detects_delete_and_restore_during_collection(tmp_path):
+    repo = _repo(
+        tmp_path,
+        (
+            "import atexit\n"
+            "from pathlib import Path\n"
+            "_oracle = Path('tests/test_z_oracle.py')\n"
+            "_saved = _oracle.read_bytes()\n"
+            "_oracle.unlink()\n"
+            "atexit.register(_oracle.write_bytes, _saved)\n\n"
+            "def f():\n"
+            "    return 1\n"
+        ),
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+    oracle = repo / "tests" / "test_z_oracle.py"
+    oracle.write_text("def test_oracle():\n    assert False\n")
+
+    check = PytestVerifier().verify(
+        Patch(step_id="s"), VerifyContext(workdir=repo, step=_step("pytest"))
+    )
+
+    assert oracle.read_text() == "def test_oracle():\n    assert False\n"
+    assert not check.passed
+    assert check.detail["outcome"] == "INFRA_ERROR"
+    assert "collection changed protected files" in check.detail["summary"]
+    assert "tests/test_z_oracle.py" in check.detail["summary"]
+
+
+@pytest.mark.parametrize("attack", ["add", "rewrite"])
+def test_pytest_verifier_rejects_collection_that_changes_oracle_files(
+    tmp_path, attack
+):
+    action = {
+        "add": "Path('tests/test_added.py').write_text('def test_added(): pass\\n')",
+        "rewrite": "Path('tests/test_m.py').write_text('def test_f(): pass\\n')",
+    }[attack]
+    repo = _repo(
+        tmp_path,
+        f"from pathlib import Path\n{action}\n\ndef f():\n    return 1\n",
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+
+    check = PytestVerifier().verify(
+        Patch(step_id="s"), VerifyContext(workdir=repo, step=_step("pytest"))
+    )
+
+    assert not check.passed
+    assert check.detail["outcome"] == "INFRA_ERROR"
+    assert "collection changed protected files" in check.detail["summary"]
+
+
+def test_pytest_verifier_rejects_symbolic_linked_oracle(tmp_path):
+    repo = _repo(
+        tmp_path,
+        "def f():\n    return 1\n",
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+    outside = tmp_path / "outside.py"
+    outside.write_text("def test_outside():\n    assert True\n")
+    (repo / "tests" / "test_link.py").symlink_to(outside)
+
+    check = PytestVerifier().verify(
+        Patch(step_id="s"), VerifyContext(workdir=repo, step=_step("pytest"))
+    )
+
+    assert not check.passed
+    assert check.detail["outcome"] == "INFRA_ERROR"
+    assert "symbolic link" in check.detail["summary"]
+
+
+def test_pytest_verifier_rejects_hard_linked_oracle(tmp_path):
+    repo = _repo(
+        tmp_path,
+        "def f():\n    return 1\n",
+        "from m import f\n\n\ndef test_f():\n    assert f() == 1\n",
+    )
+    (repo / "tests" / "test_alias.py").hardlink_to(repo / "tests" / "test_m.py")
+
+    check = PytestVerifier().verify(
+        Patch(step_id="s"), VerifyContext(workdir=repo, step=_step("pytest"))
+    )
+
+    assert not check.passed
+    assert check.detail["outcome"] == "INFRA_ERROR"
+    assert "hard-link alias" in check.detail["summary"]
 
 
 @pytest.mark.parametrize(

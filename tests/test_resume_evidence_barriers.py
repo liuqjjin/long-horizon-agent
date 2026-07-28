@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import os
 import threading
@@ -14,14 +15,18 @@ from typing import Any, Iterator
 import pytest
 from conftest import hermetic_task
 
+import lha.harness.state as state_module
 from lha.clock import now
 from lha.config import Config
 from lha.harness import Harness
 from lha.harness.checkpoint import load_state, save_state
 from lha.harness.errors import CheckpointCorrupt, TransactionCorrupt
-from lha.harness.state import RunState
+from lha.harness.state import CLIIdentity, RunRuntimeContract, RunState
 from lha.harness.transaction import list_transactions
+from lha.operation_lease import OperationLeaseStore, OperationRecoveryResult
+from lha.process_result import ProcResult
 from lha.reporting import ReportingError, collect_run, prune_runs
+from lha.verifiers.code import PytestVerifier
 from lha.verifiers.verdict import Verdict
 
 
@@ -41,6 +46,7 @@ def _suspended_state(
     run_id: str,
     *,
     config: Config | None = None,
+    runtime: str = "loop",
 ) -> RunState:
     run_dir = tmp_path / "runs" / run_id
     workdir = run_dir / "workdir"
@@ -52,6 +58,7 @@ def _suspended_state(
         str(run_dir),
         str(workdir),
         config=config,
+        runtime=runtime,  # type: ignore[arg-type]
     )
     state.status = "PAUSED"
     save_state(state)
@@ -67,6 +74,70 @@ def _runtime(runtime: str, config: Config):
             "lha.runtime.langgraph_runner"
         )
     return Harness(config), importlib.import_module("lha.harness.loop")
+
+
+class _FakeCodexCLI:
+    def _resolved_cli_identity(
+        self,
+    ) -> tuple[str, int, int, int, int, str]:
+        return (
+            "/test/bin/codex",
+            1,
+            1,
+            1,
+            1,
+            "a" * 64,
+        )
+
+    def _cli_version(self) -> str:
+        return "codex-cli test"
+
+
+def test_docker_runtime_capture_binds_path_and_digest_around_image_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = CLIIdentity(
+        path="/fixed/docker",
+        sha256="d" * 64,
+        version="Docker version test",
+    )
+    binds: list[bool] = []
+
+    class Backend:
+        docker = "docker"
+        image = "lha:test"
+
+        @staticmethod
+        def bind_control_plane(*, verify_digest: bool):
+            binds.append(verify_digest)
+            return {"path": cli.path, "sha256": cli.sha256}
+
+    monkeypatch.setattr(
+        state_module,
+        "_capture_cli_identity",
+        lambda _value: cli,
+    )
+    monkeypatch.setattr(
+        "lha.tools.shell.run",
+        lambda *_args, **_kwargs: ProcResult(
+            0,
+            f"sha256:{'a' * 64}\n",
+            "",
+            0.01,
+        ),
+    )
+    contract = RunRuntimeContract.capture(
+        _config(tmp_path, exec_backend="docker", exec_image="lha:test"),
+        runtime="loop",
+        exec_backend=Backend(),
+        code_root=tmp_path,
+    )
+
+    assert contract.docker_cli == cli
+    assert contract.exec_image == "lha:test"
+    assert contract.exec_image_id == f"sha256:{'a' * 64}"
+    assert binds == [True, True]
 
 
 @pytest.mark.parametrize("runtime", ["loop", "langgraph"])
@@ -184,7 +255,9 @@ def test_orphan_immutable_verdict_is_adopted_without_reexecution(
 def test_stale_resumer_reloads_terminal_state_after_lock_barrier(
     runtime: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    state = _suspended_state(tmp_path, f"{runtime}-stale-resumer")
+    state = _suspended_state(
+        tmp_path, f"{runtime}-stale-resumer", runtime=runtime
+    )
     config = _config(tmp_path)
     runner, runtime_module = _runtime(runtime, config)
     entered_lock = threading.Event()
@@ -255,6 +328,7 @@ def test_interrupted_active_window_exhausts_deadline_before_planning(
         tmp_path,
         f"{runtime}-interrupted-deadline",
         config=config,
+        runtime=runtime,
     )
     state.status = "RUNNING"
     state.active_since = now() - timedelta(seconds=5)
@@ -284,6 +358,7 @@ def test_future_active_since_fails_closed_without_resetting_budget(
         tmp_path,
         f"{runtime}-future-active",
         config=config,
+        runtime=runtime,
     )
     state.status = "RUNNING"
     state.active_since = now() + timedelta(hours=1)
@@ -320,6 +395,7 @@ def test_resume_rejects_any_budget_limit_drift(
         tmp_path,
         f"{runtime}-changed-{field}",
         config=recorded,
+        runtime=runtime,
     )
     changed = recorded.model_copy(update={field: value})
     runner, _runtime_module = _runtime(runtime, changed)
@@ -333,6 +409,451 @@ def test_resume_rejects_any_budget_limit_drift(
     unchanged = load_state(state.run_dir)
     assert unchanged.status == "PAUSED"
     assert unchanged.budget_limits == state.budget_limits
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("parallel_verify", False),
+        ("dynamic_planning", True),
+        ("use_skill_memory", False),
+        ("freshness_max_age_s", 99.0),
+        ("code_backend", "ccc"),
+        ("embedder_model", "different-embedder"),
+        ("data_dir", Path("different-data")),
+    ],
+)
+def test_resume_rejects_runtime_configuration_drift(
+    runtime: str,
+    field: str,
+    value: object,
+    tmp_path: Path,
+) -> None:
+    recorded = _config(tmp_path)
+    state = _suspended_state(
+        tmp_path,
+        f"{runtime}-runtime-{field}",
+        config=recorded,
+        runtime=runtime,
+    )
+    changed = recorded.model_copy(update={field: value})
+    runner, _runtime_module = _runtime(runtime, changed)
+
+    with pytest.raises(
+        CheckpointCorrupt,
+        match=rf"runtime contract changed.*{field}",
+    ):
+        runner.resume(state.run_id)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("codex_max_retries", 4),
+        ("codex_retry_backoff_s", 0.25),
+    ],
+)
+def test_resume_contract_tracks_codex_retry_controls(
+    field: str,
+    value: int | float,
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        tmp_path,
+        llm_backend="codex_cli",
+        codex_model="gpt-test-pinned",
+        codex_cli_path="unused-in-test",
+    )
+    run_dir = tmp_path / "runs" / f"codex-{field}"
+    workdir = run_dir / "workdir"
+    workdir.mkdir(parents=True)
+    client = _FakeCodexCLI()
+    state = RunState.new(
+        hermetic_task("data/tasks/fix_average.yaml"),
+        f"codex-{field}",
+        str(run_dir),
+        str(workdir),
+        config=config,
+        runtime="loop",
+        llm=client,
+    )
+    assert state.runtime_contract is not None
+    assert state.runtime_contract.codex_max_retries == 2
+    assert state.runtime_contract.codex_retry_backoff_s == 1.0
+
+    changed = config.model_copy(update={field: value})
+    with pytest.raises(
+        CheckpointCorrupt,
+        match=rf"runtime contract changed.*{field}",
+    ):
+        state.require_matching_runtime_contract(
+            changed,
+            runtime="loop",
+            llm=client,
+        )
+
+
+def test_cli_run_without_explicit_model_cannot_resume(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        llm_backend="codex_cli",
+        codex_model="",
+        codex_cli_path="unused-in-test",
+    )
+    run_dir = tmp_path / "runs" / "codex-unpinned"
+    workdir = run_dir / "workdir"
+    workdir.mkdir(parents=True)
+    client = _FakeCodexCLI()
+    state = RunState.new(
+        hermetic_task("data/tasks/fix_average.yaml"),
+        "codex-unpinned",
+        str(run_dir),
+        str(workdir),
+        config=config,
+        runtime="loop",
+        llm=client,
+    )
+    assert state.runtime_contract is not None
+    assert state.runtime_contract.llm_model == "cli-default"
+    assert state.runtime_contract.llm_model_pinned is False
+
+    with pytest.raises(
+        CheckpointCorrupt,
+        match="did not record an explicitly pinned codex_cli model",
+    ):
+        state.require_matching_runtime_contract(
+            config,
+            runtime="loop",
+            llm=client,
+        )
+
+
+def test_resume_contract_tracks_resolved_auto_code_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "lha.live_context.resolve_code_backend_name",
+        lambda **_kwargs: "null",
+    )
+    config = _config(tmp_path, code_backend="auto")
+    state = _suspended_state(
+        tmp_path,
+        "resolved-code-backend",
+        config=config,
+    )
+    assert state.runtime_contract is not None
+    assert state.runtime_contract.code_backend == "auto"
+    assert state.runtime_contract.resolved_code_backend == "null"
+
+    monkeypatch.setattr(
+        "lha.live_context.resolve_code_backend_name",
+        lambda **_kwargs: "ccc",
+    )
+    with pytest.raises(
+        CheckpointCorrupt,
+        match=r"runtime contract changed.*resolved_code_backend",
+    ):
+        state.require_matching_runtime_contract(
+            config,
+            runtime="loop",
+        )
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_legacy_docker_contract_without_cli_identity_cannot_resume(
+    runtime: str,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    state = _suspended_state(
+        tmp_path,
+        f"{runtime}-docker-to-local",
+        config=config,
+        runtime=runtime,
+    )
+    assert state.runtime_contract is not None
+    state.runtime_contract = RunRuntimeContract.model_validate(
+        {
+            **state.runtime_contract.model_dump(mode="json"),
+            "exec_backend": "docker",
+            "exec_image": "lha:test",
+            "exec_image_id": f"sha256:{'a' * 64}",
+        }
+    )
+    save_state(state)
+
+    runner, _runtime_module = _runtime(runtime, config)
+    result = runner.resume(state.run_id)
+
+    assert result.status == "PAUSED"
+    assert result.state.quarantine is not None
+    assert (
+        result.state.quarantine.kind
+        == "active_operation_recovery_unconfirmed"
+    )
+    assert "no recorded client identity" in result.state.quarantine.detail
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_resume_verifies_recorded_docker_bytes_before_operation_recovery(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    state = _suspended_state(
+        tmp_path,
+        f"{runtime}-changed-docker-cli",
+        config=config,
+        runtime=runtime,
+    )
+    fake_docker = tmp_path / "docker"
+    original = b"#!/bin/sh\nexit 0\n"
+    fake_docker.write_bytes(original)
+    fake_docker.chmod(0o755)
+    assert state.runtime_contract is not None
+    state.runtime_contract = RunRuntimeContract.model_validate(
+        {
+            **state.runtime_contract.model_dump(mode="json"),
+            "exec_backend": "docker",
+            "exec_image": "lha:test",
+            "exec_image_id": f"sha256:{'a' * 64}",
+            "docker_cli": CLIIdentity(
+                path=str(fake_docker.resolve()),
+                sha256=hashlib.sha256(original).hexdigest(),
+                version="Docker version test",
+            ).model_dump(mode="json"),
+        }
+    )
+    save_state(state)
+    fake_docker.write_bytes(b"#!/bin/sh\nexit 1\n")
+
+    def recovery_must_not_run(*_args: Any, **_kwargs: Any):
+        raise AssertionError("operation recovery ran with changed Docker bytes")
+
+    monkeypatch.setattr(
+        "lha.sandbox.docker.DockerBackend.recover_active_operations",
+        recovery_must_not_run,
+    )
+    runner, _runtime_module = _runtime(runtime, config)
+    result = runner.resume(state.run_id)
+
+    assert result.status == "PAUSED"
+    assert result.state.quarantine is not None
+    assert "Docker executable bytes changed" in result.state.quarantine.detail
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_legacy_state_without_runtime_contract_is_inspectable_but_not_resumable(
+    runtime: str,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    state = _suspended_state(
+        tmp_path,
+        f"{runtime}-legacy-contract",
+        config=config,
+        runtime=runtime,
+    )
+    state.runtime_contract = None
+    save_state(state)
+    assert load_state(state.run_dir).runtime_contract is None
+
+    runner, _runtime_module = _runtime(runtime, config)
+    with pytest.raises(CheckpointCorrupt, match="no persisted runtime contract"):
+        runner.resume(state.run_id)
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_resume_quarantines_before_transaction_recovery_when_operation_survives(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    state = _suspended_state(
+        tmp_path,
+        f"{runtime}-active-operation",
+        config=config,
+        runtime=runtime,
+    )
+    worktree_file = Path(state.workdir) / "sentinel.txt"
+    worktree_file.write_bytes(b"unchanged-worktree")
+    transaction_file = Path(state.run_dir) / "transactions" / "sentinel.bin"
+    transaction_file.parent.mkdir()
+    transaction_file.write_bytes(b"unchanged-transaction")
+    runner, runtime_module = _runtime(runtime, config)
+    order: list[str] = []
+
+    def unconfirmed(_run_dir: str | Path) -> OperationRecoveryResult:
+        order.append("operation")
+        return OperationRecoveryResult(
+            False,
+            quarantined_operation_ids=("a" * 32,),
+            detail="simulated surviving operation",
+        )
+
+    backend = getattr(getattr(runner, "_h", runner), "exec")
+    monkeypatch.setattr(backend, "recover_active_operations", unconfirmed)
+
+    def transaction_recovery_must_not_run(*args: Any, **kwargs: Any) -> None:
+        order.append("transaction")
+        raise AssertionError("transaction recovery ran after unconfirmed cleanup")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "recover_transaction_journals",
+        transaction_recovery_must_not_run,
+    )
+    result = runner.resume(state.run_id)
+
+    assert result.status == "PAUSED"
+    assert order == ["operation"]
+    assert result.state.quarantine is not None
+    assert (
+        result.state.quarantine.kind
+        == "active_operation_recovery_unconfirmed"
+    )
+    assert worktree_file.read_bytes() == b"unchanged-worktree"
+    assert transaction_file.read_bytes() == b"unchanged-transaction"
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_operation_recovery_precedes_runtime_contract_mismatch(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded = _config(tmp_path)
+    state = _suspended_state(
+        tmp_path,
+        f"{runtime}-recovery-before-contract",
+        config=recorded,
+        runtime=runtime,
+    )
+    changed = recorded.model_copy(update={"parallel_verify": False})
+    runner, _runtime_module = _runtime(runtime, changed)
+    backend = getattr(getattr(runner, "_h", runner), "exec")
+    calls: list[str] = []
+
+    def confirmed(_run_dir: str | Path) -> OperationRecoveryResult:
+        calls.append("operation")
+        return OperationRecoveryResult(True)
+
+    monkeypatch.setattr(backend, "recover_active_operations", confirmed)
+    with pytest.raises(CheckpointCorrupt, match="runtime contract changed"):
+        runner.resume(state.run_id)
+    assert calls == ["operation"]
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_runtime_passes_persisted_pytest_inventory_to_verifier(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    runner, _runtime_module = _runtime(runtime, config)
+    original_verify = PytestVerifier.verify
+    observed = []
+
+    def record_inventory(self, artifact, context):
+        if context.step.step_id == "s2-fix":
+            observed.append(context.pytest_oracle_inventory)
+        return original_verify(self, artifact, context)
+
+    monkeypatch.setattr(PytestVerifier, "verify", record_inventory)
+    completed = runner.run(
+        hermetic_task("data/tasks/fix_average.yaml"),
+        run_id=f"{runtime}-oracle-verifier-context",
+    )
+
+    assert completed.status == "DONE"
+    persisted = completed.state.pytest_oracle_inventories["s2-fix"]
+    assert observed
+    assert all(inventory is not None for inventory in observed)
+    assert all(inventory.sha256 == persisted.sha256 for inventory in observed)
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_disposable_pytest_collection_uses_the_run_owned_operation_store(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    runner, _runtime_module = _runtime(runtime, config)
+    original_prepare = OperationLeaseStore.prepare_local
+    observed: list[tuple[Path, Path]] = []
+
+    def record_prepare(self, command, *, cwd, operation_id=None):
+        lease = original_prepare(
+            self,
+            command,
+            cwd=cwd,
+            operation_id=operation_id,
+        )
+        observed.append((self.run_dir, Path(cwd).resolve()))
+        return lease
+
+    monkeypatch.setattr(
+        OperationLeaseStore,
+        "prepare_local",
+        record_prepare,
+    )
+    completed = runner.run(
+        hermetic_task("data/tasks/fix_average.yaml"),
+        run_id=f"{runtime}-disposable-operation-store",
+    )
+
+    assert completed.status == "DONE"
+    run_dir = Path(completed.state.run_dir).resolve()
+    disposable = [
+        (lease_dir, cwd)
+        for lease_dir, cwd in observed
+        if not cwd.is_relative_to(run_dir)
+    ]
+    assert disposable
+    assert all(lease_dir == run_dir for lease_dir, _cwd in disposable)
+    assert OperationLeaseStore(run_dir).list() == []
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_resume_reuses_and_validates_persisted_pytest_oracle_inventory(
+    runtime: str,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    runner, _runtime_module = _runtime(runtime, config)
+    completed = runner.run(
+        hermetic_task("data/tasks/fix_average.yaml"),
+        run_id=f"{runtime}-oracle-inventory",
+    )
+    assert completed.status == "DONE"
+    inventory = completed.state.pytest_oracle_inventories["s2-fix"]
+    inventory_path = (
+        Path(completed.state.run_dir)
+        / "oracle_inventories"
+        / "s2-fix.json"
+    )
+    inventory_bytes = inventory_path.read_bytes()
+    assert inventory.sha256
+
+    oracle = Path(completed.state.workdir) / inventory.protected_paths[0]
+    oracle.write_bytes(oracle.read_bytes() + b"\n# changed after completion\n")
+    resumed, _module = _runtime(runtime, config)
+    result = resumed.resume(completed.state.run_id)
+
+    assert result.status == "PAUSED"
+    assert result.state.quarantine is not None
+    assert result.state.quarantine.kind == "pytest_oracle_inventory_invalid"
+    assert inventory_path.read_bytes() == inventory_bytes
+    assert (
+        result.state.pytest_oracle_inventories["s2-fix"].sha256
+        == inventory.sha256
+    )
 
 
 def test_replaced_terminal_verdict_is_refused_by_reporting_and_pruning(

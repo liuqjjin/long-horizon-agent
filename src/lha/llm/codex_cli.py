@@ -6,27 +6,22 @@ the final assistant message comes back via ``--output-last-message``, and
 
 Two differences from the ``claude`` backend matter for the ablation.
 
-**Isolation.** ``--ignore-user-config`` still loads the user's plugins and
-skills, which cost ~6k input tokens here and could inject instructions into a
-run that is supposed to measure the model. So the client builds a throwaway
-``CODEX_HOME`` containing nothing but a copy of ``auth.json``: no config, no
-plugins, no skills, no MCP servers, no notify hooks. Two runs on two machines
-then see the same prompt.
+**Isolation.** The client builds a throwaway ``CODEX_HOME`` containing only a
+credential copy and a generated permission profile. The profile denies the
+filesystem root and temporary directories, reopens only Codex's minimal runtime
+paths and the empty attempt workspace, and disables network access for local
+commands. User plugins, skills, MCP servers, hooks and project rules are absent.
 
-**Leak-freedom is enforced by detection, not by a deny-list.** ``codex`` has no
-``--disallowed-tools`` equivalent, and its most restrictive sandbox
-(``-s read-only``) still permits reading the whole filesystem — so an agentic
-model could in principle go and find the canonical test files the ablation
-deliberately withheld. Instead of naming tools to forbid, the client audits every
-event stream and **fails the call if the model used any tool at all**; ``no_tools``
-also adds a prompt-only preamble to reduce the refusal rate. The audit is strictly
-stronger than a deny-list, which a renamed tool in a future CLI would silently
-defeat: here anything other than model-authored text is a failure, whatever it is
-called.
+**Tool audit.** ``codex`` has no ``--disallowed-tools`` equivalent, so every
+JSONL item is validated and a call is rejected if the model used any tool.
+``no_tools`` also adds a prompt instruction to reduce discarded answers. The
+filesystem profile prevents a tool subprocess from reading the credential copy
+or withheld files before the event audit rejects the result.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -47,6 +42,7 @@ from ..bench.codex_exec_events import (
 from ..bench.codex_exec_events import (
     CodexJsonlValidator,
 )
+from ..tools.shell import sanitized_absolute_path, trusted_executable
 from .base import LLMClient
 
 # Event items that are a model *talking*. Anything else means the model reached
@@ -115,6 +111,9 @@ _MAX_JSONL_BYTES = 16 * 1024 * 1024
 _MAX_STDERR_BYTES = 1024 * 1024
 _MAX_FINAL_MESSAGE_BYTES = 4 * 1024 * 1024
 _OUTPUT_READ_CHUNK_BYTES = 64 * 1024
+_MAX_AUTH_BYTES = 4 * 1024 * 1024
+_AUTH_READ_CHUNK_BYTES = 64 * 1024
+_PERMISSION_PROFILE_PREFIX = "lha"
 
 # Why this preamble exists, measured rather than assumed: the implementer prompt
 # lists files as "### <path>", and codex reads that as "you are in a repository".
@@ -141,7 +140,9 @@ def _minimal_subprocess_env(*, codex_home: Path, temp_dir: Path) -> dict[str, st
     particular, this intentionally does not copy OPENAI_API_KEY, AWS_*, SSH
     agent sockets, NODE_OPTIONS, or arbitrary caller variables.
     """
-    env = {"PATH": os.environ.get("PATH") or os.defpath}
+    env = {
+        "PATH": sanitized_absolute_path(require_unwritable=True) or os.defpath
+    }
     for name in _PASSTHROUGH_ENV:
         value = os.environ.get(name)
         if value:
@@ -161,6 +162,173 @@ def _minimal_subprocess_env(*, codex_home: Path, temp_dir: Path) -> dict[str, st
         }
     )
     return env
+
+
+def _write_private_probe(path: Path, token: str) -> None:
+    """Create a non-secret probe without following or replacing an existing path."""
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        payload = token.encode("ascii")
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                raise OSError("short write while creating permission probe")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _credential_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """Return the fields that must remain fixed for one credential read."""
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _copy_private_credential(source: Path, destination: Path) -> None:
+    """Copy one stable regular credential file without following either path."""
+    try:
+        path_before = os.lstat(source)
+    except FileNotFoundError:
+        raise CodexInvocationError(
+            "codex is not logged in; run `codex login` before starting LHA"
+        ) from None
+    except (OSError, ValueError):
+        raise CodexInvocationError(
+            "Codex credential source could not be validated securely"
+        ) from None
+
+    if not stat.S_ISREG(path_before.st_mode):
+        raise CodexInvocationError(
+            "Codex credential source is not a stable regular file"
+        )
+    if path_before.st_size > _MAX_AUTH_BYTES:
+        raise CodexInvocationError(
+            "Codex credential source exceeds the accepted size limit"
+        )
+
+    source_descriptor: int | None = None
+    destination_descriptor: int | None = None
+    operation_error: BaseException | None = None
+    close_error: OSError | None = None
+    try:
+        source_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        source_descriptor = os.open(source, source_flags)
+        descriptor_before = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(descriptor_before.st_mode)
+            or _credential_identity(path_before)
+            != _credential_identity(descriptor_before)
+        ):
+            raise ValueError("credential source changed before it was opened")
+
+        destination_flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        destination_descriptor = os.open(destination, destination_flags, 0o600)
+        os.fchmod(destination_descriptor, 0o600)
+
+        remaining = descriptor_before.st_size
+        while remaining:
+            chunk = os.read(
+                source_descriptor,
+                min(remaining, _AUTH_READ_CHUNK_BYTES),
+            )
+            if not chunk:
+                raise OSError("credential source ended before its recorded size")
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_descriptor, chunk[offset:])
+                if written <= 0:
+                    raise OSError("credential destination made no write progress")
+                offset += written
+            remaining -= len(chunk)
+
+        if os.read(source_descriptor, 1):
+            raise ValueError("credential source grew while it was read")
+
+        descriptor_after = os.fstat(source_descriptor)
+        path_after = os.lstat(source)
+        expected_identity = _credential_identity(path_before)
+        if (
+            not stat.S_ISREG(descriptor_after.st_mode)
+            or not stat.S_ISREG(path_after.st_mode)
+            or _credential_identity(descriptor_before) != expected_identity
+            or _credential_identity(descriptor_after) != expected_identity
+            or _credential_identity(path_after) != expected_identity
+        ):
+            raise ValueError("credential source changed while it was read")
+
+        copied = os.fstat(destination_descriptor)
+        if (
+            not stat.S_ISREG(copied.st_mode)
+            or copied.st_size != descriptor_before.st_size
+            or stat.S_IMODE(copied.st_mode) != 0o600
+        ):
+            raise OSError("credential destination does not match the secured copy")
+        os.fsync(destination_descriptor)
+    except BaseException as error:
+        operation_error = error
+    finally:
+        for descriptor in (destination_descriptor, source_descriptor):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                close_error = close_error or error
+
+    if operation_error is not None:
+        if isinstance(operation_error, (OSError, ValueError)):
+            raise CodexInvocationError(
+                "Codex credentials could not be copied securely"
+            ) from None
+        raise operation_error
+    if close_error is not None:
+        raise CodexInvocationError(
+            "Codex credentials could not be copied securely"
+        ) from None
+
+
+def _executable_identity(path: Path) -> tuple[os.stat_result, str]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not os.access(path, os.X_OK):
+            raise ValueError("Codex CLI path is not an executable regular file")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in stable):
+            raise ValueError("Codex CLI changed while its identity was read")
+        return after, digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _process_group_exists(pgid: int) -> bool:
@@ -521,28 +689,125 @@ def _run_isolated_process(
     text: bool,
     timeout: float,
     env: Mapping[str, str],
+    operation_lease_dir: str | Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one process with a single, checked process-lifecycle owner."""
     if not capture_output or not text:
         raise ValueError("isolated Codex processes require captured text output")
     input_payload = (input or "").encode("utf-8")
-    common: dict[str, Any] = {
-        "stdin": subprocess.PIPE,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "env": dict(env),
-    }
-    if os.name == "posix":
-        proc = subprocess.Popen(argv, start_new_session=True, **common)
-    else:
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        proc = subprocess.Popen(argv, creationflags=creationflags, **common)
+    command = list(argv)
+    execution_cwd = Path.cwd().resolve()
+    store = None
+    lease = None
+    operation_id: str | None = None
+    release_read: int | None = None
+    release_write: int | None = None
+    spawn_argv = command
+    try:
+        if operation_lease_dir is not None:
+            from ..operation_lease import (
+                OperationLeaseStore,
+                build_local_launcher,
+            )
+
+            store = OperationLeaseStore(operation_lease_dir)
+            # Generate the ID here rather than inside prepare_local. If the
+            # durable write reaches disk and then reports a sync error, the
+            # caller still knows exactly which record must be quarantined.
+            operation_id = os.urandom(16).hex()
+            lease = store.prepare_local(
+                command,
+                cwd=execution_cwd,
+                operation_id=operation_id,
+            )
+            release_read, release_write = os.pipe()
+            spawn_argv = build_local_launcher(
+                store,
+                lease,
+                command,
+                release_fd=release_read,
+            )
+        common: dict[str, Any] = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": dict(env),
+            "cwd": str(execution_cwd),
+        }
+        if os.name == "posix":
+            proc = subprocess.Popen(
+                spawn_argv,
+                start_new_session=True,
+                pass_fds=((release_read,) if release_read is not None else ()),
+                **common,
+            )
+        else:
+            if lease is not None:
+                raise OSError("durable Codex operations require a POSIX host")
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            proc = subprocess.Popen(
+                spawn_argv,
+                creationflags=creationflags,
+                **common,
+            )
+    except BaseException as primary_error:
+        lease_error: BaseException | None = None
+        if store is not None and operation_id is not None:
+            try:
+                store.clear(operation_id)
+            except BaseException as error:
+                lease_error = error
+        for descriptor in (release_read, release_write):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if lease_error is not None:
+            assert store is not None
+            assert operation_id is not None
+            raise CodexLeaseCleanupError(
+                "Codex CLI was not spawned, but its preparing lease "
+                "could not be cleared durably",
+                primary_error=primary_error,
+                cleanup_error=lease_error,
+                operation_id=operation_id,
+                operation_run_dir=store.run_dir,
+            ) from lease_error
+        raise
     lifecycle: _ProcessLifecycle | None = None
+
+    def clear_lease() -> BaseException | None:
+        if store is None or lease is None:
+            return None
+        try:
+            store.clear(lease.operation_id)
+        except BaseException as error:
+            return error
+        return None
+
     try:
         lifecycle = _ProcessLifecycle(proc)
+        if store is not None and lease is not None:
+            from ..operation_lease import (
+                OperationLeaseError,
+                wait_until_local_active,
+            )
+
+            assert release_write is not None
+            wait_until_local_active(
+                store,
+                lease.operation_id,
+                pid=proc.pid,
+            )
+            if os.write(release_write, b"G") != 1:
+                raise OperationLeaseError(
+                    f"could not release operation {lease.operation_id}"
+                )
         stdout, stderr = _communicate_bounded(
             proc,
-            argv=argv,
+            argv=command,
             input_payload=input_payload,
             timeout=timeout,
             lifecycle=lifecycle,
@@ -553,23 +818,37 @@ def _run_isolated_process(
             if lifecycle is not None
             else _attempt_process_group_cleanup(proc)
         )
-        if not cleaned:
+        lease_error = clear_lease() if cleaned else None
+        if not cleaned or lease_error is not None:
             raise CodexProcessCleanupError(
                 "Codex CLI process group could not be confirmed stopped",
                 process=proc,
                 primary_error=primary_error,
-                cleanup_error=cleanup_error,
-            ) from (cleanup_error or primary_error)
+                cleanup_error=cleanup_error or lease_error,
+                operation_id=lease.operation_id if lease is not None else None,
+                operation_run_dir=store.run_dir if store is not None else None,
+            ) from (cleanup_error or lease_error or primary_error)
         raise
     else:
         cleaned, cleanup_error = lifecycle.stop_once()
-        if not cleaned:
+        lease_error = clear_lease() if cleaned else None
+        if not cleaned or lease_error is not None:
             raise CodexProcessCleanupError(
                 "Codex CLI process group could not be confirmed stopped",
                 process=proc,
-                cleanup_error=cleanup_error,
-            ) from cleanup_error
-        return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+                cleanup_error=cleanup_error or lease_error,
+                operation_id=lease.operation_id if lease is not None else None,
+                operation_run_dir=store.run_dir if store is not None else None,
+            ) from (cleanup_error or lease_error)
+        return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    finally:
+        for descriptor in (release_read, release_write):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 class CodexCLIError(RuntimeError):
@@ -596,7 +875,54 @@ class CodexCleanupError(CodexCLIError):
     """Attempt-local files could not be removed and must be inspected or retried."""
 
 
-class CodexProcessCleanupError(CodexCleanupError):
+class CodexOperationCleanupError(CodexCleanupError):
+    """A durable operation record could not be reconciled safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        primary_error: BaseException | None = None,
+        cleanup_error: BaseException | None = None,
+        operation_id: str | None = None,
+        operation_run_dir: Path | None = None,
+        spawned: bool,
+    ):
+        super().__init__(message)
+        self.operation_id = operation_id
+        self.operation_run_dir = operation_run_dir
+        self.spawned = spawned
+        self.primary_error_type = (
+            type(primary_error).__name__ if primary_error is not None else None
+        )
+        self.cleanup_error_type = (
+            type(cleanup_error).__name__ if cleanup_error is not None else None
+        )
+
+
+class CodexLeaseCleanupError(CodexOperationCleanupError):
+    """A pre-spawn lease remains unconfirmed, so local state must stay."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        primary_error: BaseException | None = None,
+        cleanup_error: BaseException | None = None,
+        operation_id: str,
+        operation_run_dir: Path,
+    ):
+        super().__init__(
+            message,
+            primary_error=primary_error,
+            cleanup_error=cleanup_error,
+            operation_id=operation_id,
+            operation_run_dir=operation_run_dir,
+            spawned=False,
+        )
+
+
+class CodexProcessCleanupError(CodexOperationCleanupError):
     """A process group remains unconfirmed, so attempt-local files must stay."""
 
     def __init__(
@@ -606,15 +932,18 @@ class CodexProcessCleanupError(CodexCleanupError):
         process: subprocess.Popen[Any],
         primary_error: BaseException | None = None,
         cleanup_error: BaseException | None = None,
+        operation_id: str | None = None,
+        operation_run_dir: Path | None = None,
     ):
-        super().__init__(message)
+        super().__init__(
+            message,
+            primary_error=primary_error,
+            cleanup_error=cleanup_error,
+            operation_id=operation_id,
+            operation_run_dir=operation_run_dir,
+            spawned=True,
+        )
         self.process = process
-        self.primary_error_type = (
-            type(primary_error).__name__ if primary_error is not None else None
-        )
-        self.cleanup_error_type = (
-            type(cleanup_error).__name__ if cleanup_error is not None else None
-        )
 
 
 class CodexToolUse(CodexProtocolError):
@@ -636,6 +965,7 @@ class CodexCLIClient(LLMClient):
         externally_sandboxed: bool = False,
         max_retries: int = 2,
         retry_backoff_s: float = 1.0,
+        operation_lease_dir: str | Path | None = None,
     ):
         if (
             isinstance(timeout, bool)
@@ -677,6 +1007,11 @@ class CodexCLIClient(LLMClient):
         self.externally_sandboxed = externally_sandboxed
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
+        self.operation_lease_dir = (
+            Path(operation_lease_dir).resolve()
+            if operation_lease_dir is not None
+            else None
+        )
         # usage of the most recent call (tokens), for the run trace
         self.last_usage: dict | None = None
         # commands the most recent call ran, if any — evidence for the audit
@@ -688,32 +1023,150 @@ class CodexCLIClient(LLMClient):
         self._workspace: Path | None = None
         self._output_dirs: set[Path] = set()
         self._pending_process: subprocess.Popen[Any] | None = None
+        # The boolean records whether Popen returned a process. A PREPARING
+        # lease from a failed Popen can be cleared after validation; an ACTIVE
+        # spawned lease must go through process recovery.
+        self._pending_operation: tuple[Path, str, bool] | None = None
         self.last_cleanup_failures: tuple[str, ...] = ()
         self._attempt_reserver: Callable[[], None] | None = None
         self._version: str | None = None
+        self._verified_permission_roots: set[tuple[str, str]] = set()
+        self._cli_identity: tuple[str, int, int, int, int, str, bool] | None = None
 
     # --- isolated environment ------------------------------------------------
-    def _clean_home(self) -> Path:
-        """A CODEX_HOME carrying only credentials, scoped to one attempt.
+    def _uses_permission_profile(self) -> bool:
+        return self.sandbox_mode in {"read-only", "workspace-write"}
 
-        ``--ignore-user-config`` skips ``config.toml`` but not plugins/skills, and
-        the CLI reads auth from ``CODEX_HOME``, so the only way to get a clean
-        environment while staying logged in is to point it at a directory holding
-        just ``auth.json``.
+    def _resolved_cli_identity(self) -> tuple[str, int, int, int, int, str, bool]:
+        """Resolve the CLI once and bind every later invocation to those bytes."""
+        if self._cli_identity is None:
+            configured = Path(self.cli_path)
+            trusted = False
+            if configured.name == self.cli_path:
+                resolved_text = trusted_executable(
+                    self.cli_path,
+                    require_unwritable=False,
+                )
+                if resolved_text is None:
+                    raise CodexInvocationError(
+                        "Codex CLI was not found on a sanitized absolute PATH"
+                    )
+                resolved = Path(resolved_text)
+                trusted = (
+                    trusted_executable(
+                        self.cli_path,
+                        require_unwritable=True,
+                    )
+                    == str(resolved)
+                )
+            else:
+                if not configured.is_absolute():
+                    raise CodexInvocationError(
+                        "Codex CLI path must be a basename or an absolute path"
+                    )
+                try:
+                    resolved = configured.resolve(strict=True)
+                except (OSError, RuntimeError) as error:
+                    raise CodexInvocationError(
+                        "configured Codex CLI path is unavailable"
+                    ) from error
+                candidate = trusted_executable(
+                    resolved.name,
+                    path="",
+                    extra_dirs=(resolved.parent,),
+                    require_unwritable=True,
+                )
+                trusted = candidate == str(resolved)
+            metadata, digest = _executable_identity(resolved)
+            self._cli_identity = (
+                str(resolved),
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                digest,
+                trusted,
+            )
+        return self._cli_identity
+
+    def _resolved_cli_path(self) -> str:
+        identity = self._resolved_cli_identity()
+        path = Path(identity[0])
+        try:
+            metadata, digest = _executable_identity(path)
+        except (OSError, ValueError) as error:
+            raise CodexInvocationError(
+                "Codex CLI executable changed or became unavailable"
+            ) from error
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            digest,
+        ) != identity[1:6]:
+            raise CodexInvocationError(
+                "Codex CLI executable changed after its identity was recorded"
+            )
+        return identity[0]
+
+    @property
+    def permission_model(self) -> str:
+        return "profile" if self._uses_permission_profile() else "external"
+
+    @property
+    def permission_profile(self) -> str | None:
+        if not self._uses_permission_profile():
+            return None
+        return self._permission_profile_name()
+
+    def _permission_profile_name(self) -> str:
+        suffix = "read" if self.sandbox_mode == "read-only" else "write"
+        return f"{_PERMISSION_PROFILE_PREFIX}-{suffix}"
+
+    def _permission_profile_config(self) -> str:
+        """Return the complete config for the attempt-local Codex home."""
+        if not self._uses_permission_profile():
+            return ""
+        profile = self._permission_profile_name()
+        workspace_access = "read" if self.sandbox_mode == "read-only" else "write"
+        workspace_key = json.dumps(str(self._empty_workspace().resolve()))
+        return (
+            'approval_policy = "never"\n'
+            f'default_permissions = "{profile}"\n\n'
+            f"[permissions.{profile}.filesystem]\n"
+            '":root" = "deny"\n'
+            '":minimal" = "read"\n'
+            '":tmpdir" = "deny"\n'
+            '":slash_tmp" = "deny"\n\n'
+            f"{workspace_key} = \"{workspace_access}\"\n\n"
+            f"[permissions.{profile}.network]\n"
+            "enabled = false\n"
+        )
+
+    def _clean_home(self) -> Path:
+        """Create one attempt-local home with credentials and a fixed policy.
+
+        The generated permission profile is loaded only for the two restricted
+        modes. ``danger-full-access`` is accepted solely when an outer sandbox
+        was explicitly declared and continues to use the legacy CLI flag.
         """
         if self._home is not None:
             return self._home
         source = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "auth.json"
-        if not source.exists():
-            raise CodexInvocationError(
-                "codex is not logged in; run `codex login` before starting LHA"
-            )
         home = Path(tempfile.mkdtemp(prefix="lha_codex_home_"))
         self._home = home
         try:
             home.chmod(0o700)
-            shutil.copy2(source, home / "auth.json")
-            (home / "auth.json").chmod(0o600)
+            config = self._permission_profile_config()
+            if config:
+                (home / "config.toml").write_text(config, encoding="utf-8")
+                (home / "config.toml").chmod(0o600)
+                # Permission aliases such as :tmpdir are platform-dependent.
+                # Prove the actual directory is denied before putting a real
+                # credential in it; a misresolved /tmp profile must fail closed.
+                self._verify_permission_barrier(home)
+            _copy_private_credential(source, home / "auth.json")
         except BaseException as setup_error:
             try:
                 self.cleanup()
@@ -721,6 +1174,103 @@ class CodexCLIClient(LLMClient):
                 raise cleanup_error from setup_error
             raise
         return home
+
+    @property
+    def credential_barrier(self) -> str:
+        if not self._uses_permission_profile():
+            return "external"
+        return "verified" if self._verified_permission_roots else "pending"
+
+    def _verify_permission_barrier(self, home: Path) -> None:
+        """Prove the active profile can read the workspace but not this home.
+
+        The probe contains only random, non-secret text and runs before auth.json
+        is copied. A non-zero command by itself is not enough: a broken profile
+        or CLI would also fail, so a workspace control read must first succeed.
+        """
+        profile = self._permission_profile_name()
+        root_key = (str(home.parent.resolve()), profile)
+        if root_key in self._verified_permission_roots:
+            return
+        reader = trusted_executable("cat", require_unwritable=True)
+        if reader is None:
+            raise CodexInvocationError(
+                "cannot verify Codex credential isolation: trusted file reader missing"
+            )
+        try:
+            reader_metadata = Path(reader).stat()
+        except OSError as error:
+            raise CodexInvocationError(
+                "cannot verify Codex credential isolation: file reader unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(reader_metadata.st_mode)
+            or reader_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise CodexInvocationError(
+                "cannot verify Codex credential isolation: file reader is writable"
+            )
+
+        workspace = self._empty_workspace()
+        token = os.urandom(24).hex()
+        control = workspace / ".lha-permission-control"
+        denied = home / ".lha-credential-sentinel"
+        try:
+            _write_private_probe(control, token)
+            _write_private_probe(denied, token)
+            environment = _minimal_subprocess_env(
+                codex_home=home,
+                # ``:tmpdir`` resolves from this environment. Pointing it at
+                # the workspace would make the explicit temp deny override the
+                # project-root control we are trying to prove.
+                temp_dir=home,
+            )
+            base = [
+                self._resolved_cli_path(),
+                "sandbox",
+                "-P",
+                profile,
+                "-C",
+                str(workspace),
+                reader,
+            ]
+            control_result = self._run_process(
+                [*base, str(control)],
+                input=None,
+                timeout=30,
+                env=environment,
+            )
+            if (
+                control_result.returncode != 0
+                or control_result.stdout.strip() != token
+            ):
+                raise CodexInvocationError(
+                    "Codex permission profile failed its workspace-read control"
+                )
+            denied_result = self._run_process(
+                [*base, str(denied)],
+                input=None,
+                timeout=30,
+                env=environment,
+            )
+            combined = f"{denied_result.stdout}\n{denied_result.stderr}"
+            if denied_result.returncode == 0 or token in combined:
+                raise CodexInvocationError(
+                    "Codex permission profile can read the credential directory"
+                )
+        except CodexOperationCleanupError:
+            raise
+        except (OSError, subprocess.TimeoutExpired, _ProcessOutputError) as error:
+            raise CodexInvocationError(
+                "could not verify Codex credential isolation"
+            ) from error
+        finally:
+            for path in (control, denied):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+        self._verified_permission_roots.add(root_key)
 
     def _empty_workspace(self) -> Path:
         """An empty working root for the agent.
@@ -786,6 +1336,119 @@ class CodexCLIClient(LLMClient):
                 )
             self._pending_process = None
 
+        pending_operation = self._pending_operation
+        if pending_operation is not None:
+            from ..operation_lease import (
+                OperationLeaseError,
+                OperationLeaseStore,
+                recover_local_operation,
+            )
+
+            operation_run_dir, operation_id, spawned = pending_operation
+            try:
+                store = OperationLeaseStore(operation_run_dir)
+            except (OSError, RuntimeError) as error:
+                self.last_cleanup_failures = (
+                    "temporary Codex state: operation lease store is invalid",
+                )
+                raise CodexCleanupError(
+                    "Codex operation lease store could not be opened; "
+                    "attempt-local files remain retained"
+                ) from error
+            lease_path = store.directory / f"{operation_id}.json"
+            try:
+                lease = store.load(operation_id)
+            except OperationLeaseError as error:
+                if lease_path.exists() or lease_path.is_symlink():
+                    self.last_cleanup_failures = (
+                        "temporary Codex state: operation lease is invalid",
+                    )
+                    raise CodexCleanupError(
+                        "Codex operation lease is invalid; "
+                        "attempt-local files remain retained"
+                    ) from error
+                # clear() may have unlinked the record and then failed its
+                # directory fsync. Re-sync the containing namespace before
+                # treating an absent file as a confirmed cleanup.
+                try:
+                    if store.directory.is_symlink():
+                        raise OSError("operation lease directory is a symlink")
+                    if store.directory.exists():
+                        if not store.directory.is_dir():
+                            raise OSError(
+                                "operation lease directory is not a directory"
+                            )
+                        sync_root = store.directory
+                    else:
+                        sync_root = store.run_dir
+                    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    flags |= getattr(os, "O_DIRECTORY", 0)
+                    descriptor = os.open(sync_root, flags)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    if lease_path.exists() or lease_path.is_symlink():
+                        raise OSError("operation lease reappeared during cleanup")
+                except OSError as sync_error:
+                    self.last_cleanup_failures = (
+                        "temporary Codex state: operation lease absence "
+                        "could not be confirmed durably",
+                    )
+                    raise CodexCleanupError(
+                        "Codex operation lease absence could not be confirmed; "
+                        "attempt-local files remain retained"
+                    ) from sync_error
+                lease = None
+            if lease is not None:
+                if lease.backend != "trusted-local":
+                    self.last_cleanup_failures = (
+                        "temporary Codex state: operation lease backend is invalid",
+                    )
+                    raise CodexCleanupError(
+                        "Codex operation lease has an unexpected backend; "
+                        "attempt-local files remain retained"
+                    )
+                if not spawned or lease.phase == "PREPARING":
+                    if lease.phase != "PREPARING":
+                        self.last_cleanup_failures = (
+                            "temporary Codex state: pre-spawn lease became active",
+                        )
+                        raise CodexCleanupError(
+                            "Codex pre-spawn operation lease became active; "
+                            "attempt-local files remain retained"
+                        )
+                    try:
+                        store.clear(operation_id)
+                    except (OSError, OperationLeaseError) as error:
+                        self.last_cleanup_failures = (
+                            "temporary Codex state: operation lease clear failed",
+                        )
+                        raise CodexCleanupError(
+                            "Codex preparing operation lease could not be cleared; "
+                            "attempt-local files remain retained"
+                        ) from error
+                else:
+                    try:
+                        recovery = recover_local_operation(store, lease)
+                    except (OSError, OperationLeaseError) as error:
+                        self.last_cleanup_failures = (
+                            "temporary Codex state: operation lease recovery failed",
+                        )
+                        raise CodexCleanupError(
+                            "Codex operation lease could not be recovered; "
+                            "attempt-local files remain retained"
+                        ) from error
+                    if not recovery.confirmed:
+                        self.last_cleanup_failures = (
+                            "temporary Codex state: operation lease remains active",
+                        )
+                        raise CodexCleanupError(
+                            "Codex operation lease remains active; "
+                            "attempt-local files remain retained"
+                        )
+            self._pending_operation = None
+
         failures: list[str] = []
 
         def remove(path: Path | None, label: str) -> bool:
@@ -834,27 +1497,80 @@ class CodexCLIClient(LLMClient):
         """Install the tracer's write-ahead reservation for each CLI process attempt."""
         self._attempt_reserver = reserver
 
+    def set_operation_lease_dir(self, run_dir: str | Path) -> None:
+        """Bind future CLI processes to one durable run-owned lease store."""
+        resolved = Path(run_dir).resolve()
+        if (
+            self.operation_lease_dir is not None
+            and self.operation_lease_dir != resolved
+            and (
+                self._pending_process is not None
+                or self._pending_operation is not None
+                or self.pending_cleanup_paths
+            )
+        ):
+            raise CodexCleanupError(
+                "cannot move Codex operation leases while attempt state is pending"
+            )
+        self.operation_lease_dir = resolved
+
+    def _run_process(
+        self,
+        argv: list[str],
+        *,
+        input: str | None,
+        timeout: float,
+        env: Mapping[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        kwargs: dict[str, Any] = {}
+        if self.operation_lease_dir is not None:
+            kwargs["operation_lease_dir"] = self.operation_lease_dir
+        try:
+            return _run_isolated_process(
+                argv,
+                input=input,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                **kwargs,
+            )
+        except CodexOperationCleanupError as error:
+            if isinstance(error, CodexProcessCleanupError):
+                self._pending_process = error.process
+            if error.operation_id is not None and error.operation_run_dir is not None:
+                self._pending_operation = (
+                    error.operation_run_dir,
+                    error.operation_id,
+                    error.spawned,
+                )
+            self.last_cleanup_failures = (
+                "temporary Codex state: durable operation cleanup unconfirmed",
+            )
+            raise
+
     def _cli_version(self) -> str:
         if self._version is not None:
             return self._version
         scratch = Path(tempfile.mkdtemp(prefix="lha_codex_version_"))
         self._output_dirs.add(scratch)
-        process_cleanup_failed = False
+        operation_cleanup_failed = False
         try:
-            res = _run_isolated_process(
-                [self.cli_path, "--version"],
+            res = self._run_process(
+                [self._resolved_cli_path(), "--version"],
                 input=None,
-                capture_output=True,
-                text=True,
                 timeout=30,
                 env=_minimal_subprocess_env(codex_home=scratch, temp_dir=scratch),
             )
-        except CodexProcessCleanupError as error:
-            self._pending_process = error.process
-            process_cleanup_failed = True
+        except CodexOperationCleanupError:
+            operation_cleanup_failed = True
             self.last_cleanup_failures = (
-                "temporary Codex state: process group still present",
+                "temporary Codex state: durable operation cleanup unconfirmed",
             )
+            try:
+                self.cleanup()
+            except CodexCleanupError:
+                pass
             raise
         except (OSError, subprocess.TimeoutExpired, _ProcessOutputError):
             version = "unknown"
@@ -863,7 +1579,7 @@ class CodexCLIClient(LLMClient):
                 (res.stdout.strip() or res.stderr.strip()) if res.returncode == 0 else "unknown"
             )
         finally:
-            if not process_cleanup_failed:
+            if not operation_cleanup_failed:
                 self.cleanup()
         self._version = version or "unknown"
         return self._version
@@ -877,28 +1593,65 @@ class CodexCLIClient(LLMClient):
         Folding them in means a CLI upgrade or an effort change re-samples the
         cells instead of quietly mixing two generations of results.
         """
+        identity = self._resolved_cli_identity()
         return (
             f"{self._cli_version()} model={self.model or 'cli-default'} "
-            f"effort={self.reasoning_effort} sandbox={self.sandbox_mode}"
+            f"effort={self.reasoning_effort} sandbox={self.sandbox_mode} "
+            f"permission_model={self.permission_model} "
+            f"cli_sha256={identity[5]} cli_trusted={str(identity[6]).lower()}"
         )
+
+    def preflight(self) -> None:
+        """Validate the fixed CLI and credential boundary before a batch starts."""
+        self.cleanup()
+        try:
+            version = self._cli_version()
+        except BaseException as primary_error:
+            try:
+                self.cleanup()
+            except CodexCleanupError as cleanup_error:
+                raise cleanup_error from primary_error
+            raise
+        if version != _SUPPORTED_CLI_VERSION:
+            raise CodexProtocolError(
+                "unsupported Codex CLI protocol version: "
+                f"expected {_SUPPORTED_CLI_VERSION!r}, got {version!r}"
+            )
+        try:
+            self._clean_home()
+        finally:
+            # A preflight proves setup and teardown together. Retaining a
+            # credential-bearing path is a failed preflight, not a warning.
+            self.cleanup()
+        if self._uses_permission_profile() and self.credential_barrier != "verified":
+            raise CodexInvocationError(
+                "Codex credential isolation was not verified"
+            )
 
     # --- the call ------------------------------------------------------------
     def _argv(self, out_path: Path) -> list[str]:
         argv = [
-            self.cli_path,
+            self._cli_identity[0] if self._cli_identity is not None else self.cli_path,
             "exec",
             "--ephemeral",  # 200+ ablation cells must not leave 200+ session files
-            "--ignore-user-config",  # only the attempt-local auth file may influence the run
             "--skip-git-repo-check",  # cells run in temp dirs, not checkouts
             "--ignore-rules",  # no project/user execpolicy files
-            "--sandbox",
-            self.sandbox_mode,
             "-C",
             str(self._empty_workspace()),
             "--json",
             "-o",
             str(out_path),
         ]
+        if self._uses_permission_profile():
+            # config.toml is generated inside the otherwise-empty attempt home.
+            # Strict parsing makes an unsupported permission key a hard failure.
+            argv.insert(3, "--strict-config")
+        else:
+            argv[3:3] = [
+                "--ignore-user-config",
+                "--sandbox",
+                self.sandbox_mode,
+            ]
         if self.model:
             argv += ["-m", self.model]
         if self.reasoning_effort:
@@ -970,6 +1723,14 @@ class CodexCLIClient(LLMClient):
             try:
                 answer = self._complete_once(system, prompt)
             except Exception as exc:
+                if isinstance(exc, CodexOperationCleanupError):
+                    # A second confirmation often succeeds once the kernel has
+                    # reaped the final process-group member or a failed lease
+                    # fsync can be retried. The original call still fails.
+                    try:
+                        self.cleanup()
+                    except CodexCleanupError:
+                        pass
                 attempt_record: dict[str, Any] = {
                     "attempt": attempt + 1,
                     "status": "failed",
@@ -978,7 +1739,7 @@ class CodexCLIClient(LLMClient):
                     "retryable": bool(getattr(exc, "retryable", False)),
                     "event_summary": self.last_event_summary,
                 }
-                if isinstance(exc, CodexProcessCleanupError):
+                if isinstance(exc, CodexOperationCleanupError):
                     attempt_record["primary_error_type"] = exc.primary_error_type
                     attempt_record["cleanup_error_type"] = exc.cleanup_error_type
                 attempts.append(attempt_record)
@@ -1012,8 +1773,9 @@ class CodexCLIClient(LLMClient):
         raise AssertionError("unreachable")
 
     def _complete_once(self, system: str, prompt: str) -> str:
-        process_cleanup_failed = False
+        operation_cleanup_failed = False
         try:
+            self._resolved_cli_path()
             out_dir = Path(tempfile.mkdtemp(prefix="lha_codex_out_"))
             self._output_dirs.add(out_dir)
             out_path = out_dir / "last_message.txt"
@@ -1022,20 +1784,14 @@ class CodexCLIClient(LLMClient):
                 temp_dir=out_dir,
             )
             try:
-                proc = _run_isolated_process(
+                proc = self._run_process(
                     self._argv(out_path),
                     input=f"{system}\n\n---\n\n{prompt}",
-                    capture_output=True,
-                    text=True,
                     timeout=self.timeout,
                     env=env,
                 )
-            except CodexProcessCleanupError as error:
-                self._pending_process = error.process
-                process_cleanup_failed = True
-                self.last_cleanup_failures = (
-                    "temporary Codex state: process group still present",
-                )
+            except CodexOperationCleanupError:
+                operation_cleanup_failed = True
                 raise
             except subprocess.TimeoutExpired as e:
                 raise CodexTransientError(f"codex CLI timed out after {self.timeout}s") from e
@@ -1075,7 +1831,7 @@ class CodexCLIClient(LLMClient):
                 )
             return answer
         finally:
-            if not process_cleanup_failed:
+            if not operation_cleanup_failed:
                 self.cleanup()
 
     @staticmethod
@@ -1125,6 +1881,15 @@ class CodexCLIClient(LLMClient):
             "model": self.model or "cli-default",
             "reasoning_effort": self.reasoning_effort,
             "sandbox_mode": self.sandbox_mode,
+            "permission_model": self.permission_model,
+            "permission_profile": self.permission_profile,
+            "credential_barrier": self.credential_barrier,
+            "cli_executable_sha256": (
+                self._cli_identity[5] if self._cli_identity is not None else None
+            ),
+            "cli_executable_trusted": (
+                self._cli_identity[6] if self._cli_identity is not None else None
+            ),
             "externally_sandboxed": self.externally_sandboxed,
             "retries": max(0, len(attempts) - 1),
             "attempt_count": len(attempts),
@@ -1135,7 +1900,7 @@ class CodexCLIClient(LLMClient):
         if error is not None:
             metadata["error_type"] = type(error).__name__
             metadata["retryable"] = bool(getattr(error, "retryable", False))
-            if isinstance(error, CodexProcessCleanupError):
+            if isinstance(error, CodexOperationCleanupError):
                 metadata["primary_error_type"] = error.primary_error_type
                 metadata["cleanup_error_type"] = error.cleanup_error_type
         self.last_call = metadata

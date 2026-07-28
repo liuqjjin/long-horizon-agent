@@ -18,6 +18,8 @@ Enable with ``lha run --runtime langgraph`` (and ``lha resume --runtime langgrap
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 import time
@@ -27,7 +29,8 @@ from typing import Any, NotRequired, TypedDict
 
 from .. import live_context
 from ..agents import Supervisor, VerifierAgent
-from ..artifacts import ExperimentResult, Patch
+from ..agents.experimenter import ExperimentEvidence
+from ..artifacts import Patch
 from ..clock import now
 from ..config import Config
 from ..harness.approval import (
@@ -53,6 +56,7 @@ from ..harness.errors import (
 from ..harness.loop import (
     Harness,
     RunResult,
+    _attempt_ref,
     _claim_run_dir,
     _discard_uninitialized_run_dir,
     _gen_run_id,
@@ -66,12 +70,20 @@ from ..harness.loop import (
 from ..harness.manifest import sha256_bytes
 from ..harness.state import RUN_STATE_SCHEMA, Phase, RunState, StepRecord
 from ..harness.transaction import (
+    load_transaction,
+    recover_transaction_journals,
     validate_terminal_transaction_state,
     validate_transaction_journals,
 )
 from ..live_context.models import ContextBundle
-from ..repo_adapter import RepoIntegrityResult, RepoStageResult
+from ..repo_adapter import (
+    RepoIntegrityResult,
+    RepoStageEvidence,
+    repository_tree_sha256,
+)
+from ..sandbox import ProcessCleanupUnconfirmed
 from ..verifiers import VerifyContext
+from ..verifiers.verdict import verdict_requires_process_quarantine
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +108,7 @@ class LangGraphHarness:
         run_dir = _claim_run_dir(self.config.runs_dir, run_id)
         try:
             with run_lock(run_dir):
+                self._h._bind_execution_backend(run_dir)
                 workdir = run_dir / "workdir"
                 self._h._prepare_workdir(task, workdir)
                 state = RunState.new(
@@ -104,6 +117,9 @@ class LangGraphHarness:
                     str(run_dir),
                     str(workdir),
                     config=self.config,
+                    runtime="langgraph",
+                    exec_backend=self._h.exec,
+                    llm=self._h.llm,
                 )
                 save_state(state)
                 return self._drive(state)
@@ -123,9 +139,28 @@ class LangGraphHarness:
                     f"run {run_id} uses state schema {state.schema_version}; "
                     f"schema {RUN_STATE_SCHEMA} is required for safe resume"
                 )
+            self._h._bind_execution_backend(run_dir)
+            blocked = self._h._resume_preflight(state)
+            if blocked is not None:
+                return blocked
+            state.require_matching_runtime_contract(
+                self.config,
+                runtime="langgraph",
+                exec_backend=self._h.exec,
+                llm=self._h.llm,
+            )
             limits = state.require_matching_budget_limits(self.config)
+            if state.quarantine is not None:
+                state.status = "PAUSED"
+                save_state(state)
+                return RunResult(
+                    state,
+                    "PAUSED",
+                    state.quarantine.detail,
+                )
             records = read_ledger(state.run_dir)
             try:
+                recover_transaction_journals(Path(state.run_dir))
                 validate_transaction_journals(Path(state.run_dir))
                 if state.status in ("DONE", "FAILED"):
                     validate_terminal_transaction_state(
@@ -145,6 +180,14 @@ class LangGraphHarness:
             records = self._h._reconcile_durable_ledger(state, records)
             if records:
                 state.seq = max(state.seq, *(record.seq for record in records))
+            if state.quarantine is not None:
+                state.status = "PAUSED"
+                save_state(state)
+                return RunResult(
+                    state,
+                    "PAUSED",
+                    state.quarantine.detail,
+                )
             if state.is_terminal():
                 save_state(state)
                 return RunResult(
@@ -173,6 +216,7 @@ class LangGraphHarness:
 
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
+        self._h._bind_execution_backend(run_dir)
         # Wall-clock budget across nodes: prior_elapsed (from earlier processes) plus
         # this process's monotonic delta gives the run's total elapsed for deadline_s.
         self._t0 = time.monotonic()
@@ -240,6 +284,18 @@ class LangGraphHarness:
                 state.status = "PAUSED"
                 self._h._save(state)
                 return RunResult(state, "PAUSED", str(error))
+            except ProcessCleanupUnconfirmed as error:
+                state.elapsed_s = self._prior_elapsed + (
+                    time.monotonic() - self._t0
+                )
+                state.active_since = None
+                self._h._quarantine_cleanup_interruption(
+                    state,
+                    state.next_step(),
+                    error,
+                )
+                self._h._save(state)
+                return RunResult(state, "PAUSED", str(error))
             except Exception as error:
                 state.elapsed_s = self._prior_elapsed + (
                     time.monotonic() - self._t0
@@ -304,6 +360,20 @@ class LangGraphHarness:
                         f"invalid approval evidence: {error}",
                     )
                 if decision_evidence is None:
+                    # The graph checkpoint and state.json are durable before the
+                    # request files are published. Recreate only an undecided
+                    # request after a crash in that narrow window. Once a
+                    # decision exists, a missing request remains tamper evidence.
+                    try:
+                        self._request_approval(snap, state)
+                    except (CheckpointCorrupt, ValueError) as error:
+                        return self._fail_invalid_approval(
+                            state,
+                            current_step,
+                            f"invalid approval request: {error}",
+                        )
+                    state.status = "AWAITING_APPROVAL"
+                    self._h._save(state)
                     return RunResult(
                         load_state_by_id(self.config.runs_dir, state.run_id),
                         "AWAITING_APPROVAL",
@@ -358,6 +428,19 @@ class LangGraphHarness:
                     str(e),
                     step=final.next_step(),
                 )
+            except ProcessCleanupUnconfirmed as error:
+                final = load_state_by_id(
+                    self.config.runs_dir,
+                    state.run_id,
+                )
+                final.recover_active_elapsed()
+                self._h._quarantine_cleanup_interruption(
+                    final,
+                    final.next_step(),
+                    error,
+                )
+                self._h._save(final)
+                return RunResult(final, "PAUSED", str(error))
             except Exception as e:
                 # Same fail-closed contract as the default loop: a mid-node fault
                 # must not leave the run wedged at RUNNING with an unverified
@@ -393,8 +476,13 @@ class LangGraphHarness:
 
         final = load_state_by_id(self.config.runs_dir, state.run_id)
         final.recover_active_elapsed()
-        if final.status == "PAUSED":  # budget exhausted mid-graph
-            return RunResult(final, "PAUSED", "budget exceeded")
+        if final.status == "PAUSED":
+            message = (
+                final.quarantine.detail
+                if final.quarantine is not None
+                else "budget exceeded"
+            )
+            return RunResult(final, "PAUSED", message)
         limits = final.require_matching_budget_limits(self.config)
         if (
             not final.is_terminal()
@@ -450,6 +538,9 @@ class LangGraphHarness:
         )
 
     def _repair_or_fail(self, state: RunState, step, verdict, workdir: Path) -> None:
+        if verdict_requires_process_quarantine(verdict):
+            self._h._quarantine_process_failure(state, step, verdict)
+            return
         non_retryable = any(check.detail.get("non_retryable") for check in verdict.checks)
         limits = state.require_matching_budget_limits(self.config)
         if not non_retryable and state.repairs_for(step) < limits.max_repairs:
@@ -545,6 +636,7 @@ class LangGraphHarness:
                 step,
                 artifact_ref="patch.json",
                 attempt_id=attempt_id,
+                require_transaction=False,
             )
             verdict_json = verdict.model_dump_json(indent=2)
             verdict_sha = sha256_bytes(verdict_json.encode("utf-8"))
@@ -667,7 +759,18 @@ class LangGraphHarness:
         workdir = Path(state.workdir)
         state.active_since = now()
         self._h._save(state)
-        artifact, bundle = _load_step_artifacts(run_dir, step)
+        artifact, bundle = _load_step_artifacts(state, step)
+        if step.action == "edit_code":
+            attempt_id = state.attempt_id(step)
+            if load_transaction(run_dir, step.step_id, attempt_id) is None:
+                raise TransactionCorrupt(
+                    f"patch transaction is missing for {step.step_id}/{attempt_id}"
+                )
+            # A crash after prepare can resume directly at verify. Re-entering
+            # the shared transaction recovery path validates the immutable
+            # patch, aliases, manifest, backups and applied worktree before any
+            # verifier is allowed to grade it.
+            artifact = self._h._execute_patch(state, step, bundle)
 
         verdict = VerifierAgent(parallel=self.config.parallel_verify).verify(
             step,
@@ -678,6 +781,12 @@ class LangGraphHarness:
                 bundle=bundle,
                 exec=self._h.exec,
                 attempt_id=state.attempt_id(step),
+                pytest_oracle_inventory=state.pytest_oracle_inventories.get(
+                    step.step_id
+                ),
+                allowed_oracle_changes=tuple(
+                    state.task.allowed_protected_files
+                ),
             ),
         )
         attempt_id = state.attempt_id(step)
@@ -731,7 +840,15 @@ class LangGraphHarness:
         ):
             state.status = "PAUSED"
         self._h._save(state)
-        nxt = "done" if (state.is_terminal() or state.next_step() is None) else "continue"
+        nxt = (
+            "done"
+            if (
+                state.is_terminal()
+                or state.quarantine is not None
+                or state.next_step() is None
+            )
+            else "continue"
+        )
         return {"rs": state.model_dump(mode="json"), "next": nxt}
 
     # --- helpers -----------------------------------------------------------
@@ -836,39 +953,69 @@ def _current_artifact_sha(run_dir: Path, step_id: str | None, action: str) -> st
     return None
 
 
-def _load_step_artifacts(run_dir: Path, step) -> tuple[Any, ContextBundle | None]:
+def _load_step_artifacts(
+    state: RunState,
+    step,
+) -> tuple[Any, ContextBundle | None]:
     """Reload the artifacts ``prepare`` persisted for this step.
 
     The verify node grades exactly what was executed (and, for gated steps,
     approved) — a missing artifact fails closed rather than passing vacuously.
     """
+    run_dir = Path(state.run_dir)
     sdir = run_dir / "steps" / _safe_seg(step.step_id)
-    bundle: ContextBundle | None = None
-    bpath = sdir / "context_bundle.json"
-    if bpath.exists():
-        try:
-            bundle = ContextBundle.model_validate_json(bpath.read_text())
-        except Exception:
-            bundle = None
+    attempt_id = state.attempt_id(step)
+    context_ref = _attempt_ref(attempt_id, "context_bundle.json")
+    context_bytes = _read_ledger_bound_bytes(
+        state,
+        step,
+        phase="context",
+        expected_ref=context_ref,
+    )
+    try:
+        bundle = ContextBundle.model_validate_json(context_bytes)
+    except Exception as error:
+        raise CheckpointCorrupt(
+            f"persisted context artifact is invalid for {step.step_id}: {error}"
+        ) from error
     if step.action == "edit_code":
         ppath = sdir / "patch.json"
-        if ppath.exists():
-            try:
-                return Patch.model_validate_json(ppath.read_text()), bundle
-            except Exception:
-                pass
-        return Patch(step_id=step.step_id), bundle
+        if ppath.is_symlink() or not ppath.is_file():
+            raise TransactionCorrupt(
+                f"persisted patch is missing or unsafe for {step.step_id}"
+            )
+        try:
+            patch = Patch.model_validate_json(ppath.read_text())
+        except Exception as error:
+            raise TransactionCorrupt(
+                f"persisted patch is invalid for {step.step_id}: {error}"
+            ) from error
+        if patch.step_id != step.step_id:
+            raise TransactionCorrupt(
+                f"persisted patch step identity mismatch for {step.step_id}"
+            )
+        return patch, bundle
     if step.action == "run_experiment":
-        epath = sdir / "experiment.json"
-        if epath.exists():
-            try:
-                return ExperimentResult.model_validate_json(epath.read_text()), bundle
-            except Exception:
-                pass
-        return (
-            ExperimentResult(step_id=step.step_id, returncode=1, stdout_tail="artifact missing"),
-            bundle,
+        evidence = _read_checksumming_envelope(
+            _read_ledger_bound_bytes(
+                state,
+                step,
+                phase="execute",
+                expected_ref=_attempt_ref(
+                    attempt_id, "experiment_evidence.json"
+                ),
+            ),
+            ExperimentEvidence,
+            label=f"experiment evidence for {step.step_id}/{attempt_id}",
         )
+        if (
+            evidence.intent.step_id != step.step_id
+            or evidence.intent.attempt_id != attempt_id
+        ):
+            raise CheckpointCorrupt(
+                f"experiment evidence identity mismatch for {step.step_id}/{attempt_id}"
+            )
+        return evidence.result, bundle
     if step.action == "repo_integrity":
         ipath = sdir / "repo_integrity.json"
         if ipath.exists():
@@ -878,11 +1025,104 @@ def _load_step_artifacts(run_dir: Path, step) -> tuple[Any, ContextBundle | None
                 pass
         return None, bundle
     if step.action == "repo_stage":
-        rpath = sdir / "repo_stage.json"
-        if rpath.exists():
-            try:
-                return RepoStageResult.model_validate_json(rpath.read_text()), bundle
-            except Exception:
-                pass
-        return None, bundle
+        evidence = _read_checksumming_envelope(
+            _read_ledger_bound_bytes(
+                state,
+                step,
+                phase="execute",
+                expected_ref=_attempt_ref(
+                    attempt_id, "repo_stage_evidence.json"
+                ),
+            ),
+            RepoStageEvidence,
+            label=f"repository-stage evidence for {step.step_id}/{attempt_id}",
+        )
+        if (
+            evidence.intent.step_id != step.step_id
+            or evidence.intent.attempt_id != attempt_id
+        ):
+            raise CheckpointCorrupt(
+                f"repository-stage evidence identity mismatch for "
+                f"{step.step_id}/{attempt_id}"
+            )
+        try:
+            current_tree = repository_tree_sha256(state.workdir)
+        except (OSError, ValueError) as error:
+            raise CheckpointCorrupt(
+                f"repository worktree cannot be validated for "
+                f"{step.step_id}/{attempt_id}: {error}"
+            ) from error
+        if current_tree != evidence.worktree_sha256:
+            raise CheckpointCorrupt(
+                f"repository worktree changed after stage execution for "
+                f"{step.step_id}/{attempt_id}; refusing stale evidence"
+            )
+        return evidence.result, bundle
     return bundle, bundle  # gather_context / answer_query: the bundle IS the artifact
+
+
+def _read_ledger_bound_bytes(
+    state: RunState,
+    step,
+    *,
+    phase: Phase,
+    expected_ref: str,
+) -> bytes:
+    attempt_id = state.attempt_id(step)
+    records = [
+        record
+        for record in read_ledger(state.run_dir)
+        if record.phase == phase
+        and record.step_id == step.step_id
+        and record.attempt_id == attempt_id
+    ]
+    if len(records) != 1:
+        raise CheckpointCorrupt(
+            f"{step.step_id}/{attempt_id} has {len(records)} {phase} evidence events"
+        )
+    record = records[0]
+    if record.artifact_ref != expected_ref or record.evidence_sha256 is None:
+        raise CheckpointCorrupt(
+            f"{phase} event is not bound to immutable evidence for "
+            f"{step.step_id}/{attempt_id}"
+        )
+    path = (
+        Path(state.run_dir)
+        / "steps"
+        / _safe_seg(step.step_id)
+        / expected_ref
+    )
+    if path.is_symlink() or not path.is_file():
+        raise CheckpointCorrupt(
+            f"immutable {phase} evidence is missing or unsafe: {path}"
+        )
+    data = path.read_bytes()
+    if sha256_bytes(data) != record.evidence_sha256:
+        raise CheckpointCorrupt(
+            f"immutable {phase} evidence changed for {step.step_id}/{attempt_id}"
+        )
+    return data
+
+
+def _read_checksumming_envelope(data: bytes, model_type, *, label: str):
+    try:
+        raw = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CheckpointCorrupt(f"{label} is unreadable: {error}") from error
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"schema_version", "sha256", "payload"}
+        or raw.get("schema_version") != 1
+        or not isinstance(raw.get("payload"), dict)
+        or not isinstance(raw.get("sha256"), str)
+    ):
+        raise CheckpointCorrupt(f"{label} is not a supported checksummed envelope")
+    canonical = json.dumps(
+        raw["payload"], sort_keys=True, separators=(",", ":")
+    ).encode()
+    if hashlib.sha256(canonical).hexdigest() != raw["sha256"]:
+        raise CheckpointCorrupt(f"{label} failed its integrity check")
+    try:
+        return model_type.model_validate(raw["payload"])
+    except Exception as error:
+        raise CheckpointCorrupt(f"{label} has an invalid payload: {error}") from error

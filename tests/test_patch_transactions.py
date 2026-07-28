@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import stat
 import subprocess
 import sys
@@ -47,6 +48,7 @@ from lha.harness.transaction import (
 )
 from lha.llm.stub import DeterministicStub
 from lha.llm.trace import TracedLLM
+from lha.process_result import ProcResult
 from lha.reporting import ReportingError, collect_run
 from lha.tasks.spec import TaskSpec
 from lha.tools import policy
@@ -75,6 +77,48 @@ def _paused(tmp_path: Path):
     return Harness(_cfg(tmp_path)).run(
         hermetic_task("data/tasks/fix_average_approval.yaml")
     )
+
+
+class _WrongThenCorrectSameFile(DeterministicStub):
+    """Exercise an incremental repair that supersedes the first write."""
+
+    def propose_patch(self, step, bundle, workdir):
+        target = Path(workdir) / "mathutils.py"
+        current = target.read_text()
+        if not step.prior_failures:
+            replacement = current.replace(
+                "return sum(values) / len(values) - 1",
+                "return 0",
+            )
+        else:
+            replacement = current.replace(
+                "return 0",
+                "return sum(values) / len(values)",
+            )
+        return Patch(
+            step_id=step.step_id,
+            file_contents={"mathutils.py": replacement},
+            based_on_context=bundle.locators(),
+        )
+
+
+class _WrongThenWrongSameFile(_WrongThenCorrectSameFile):
+    def propose_patch(self, step, bundle, workdir):
+        patch = super().propose_patch(step, bundle, workdir)
+        if step.prior_failures:
+            return patch.model_copy(
+                update={
+                    "file_contents": {
+                        "mathutils.py": patch.file_contents[
+                            "mathutils.py"
+                        ].replace(
+                            "return sum(values) / len(values)",
+                            "return 1",
+                        )
+                    }
+                }
+            )
+        return patch
 
 
 def _record_terminal_transaction(
@@ -181,6 +225,80 @@ def test_resolved_diff_decodes_git_octal_utf8_and_detects_aliases():
     assert resolved.paths == ["src/é.py"]
 
 
+def test_resolved_diff_uses_git_machine_path_for_unquoted_spaces(tmp_path):
+    workdir = tmp_path / "workdir"
+    target = workdir / "src" / "file name.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("old\n")
+    diff = (
+        "diff --git a/src/file name.py b/src/file name.py\n"
+        "--- a/src/file name.py\t\n"
+        "+++ b/src/file name.py\t\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    patch = Patch(step_id="s", unified_diff=diff)
+
+    resolved = resolve_patch(patch)
+
+    assert resolved.paths == ["src/file name.py"]
+    _paths, backup = apply_patch(patch, workdir, resolved=resolved)
+    assert target.read_text() == "new\n"
+    revert_patch(backup, workdir)
+    assert target.read_text() == "old\n"
+
+
+@pytest.mark.parametrize("operation", ["rename", "copy"])
+def test_resolved_diff_uses_exact_unquoted_rename_copy_paths(tmp_path, operation):
+    workdir = tmp_path / "workdir"
+    source = workdir / "old name.py"
+    destination = workdir / "new name.py"
+    workdir.mkdir()
+    source.write_text("value = 1\n")
+    diff = (
+        "diff --git a/old name.py b/new name.py\n"
+        "similarity index 100%\n"
+        f"{operation} from old name.py\n"
+        f"{operation} to new name.py\n"
+    )
+    patch = Patch(step_id="s", unified_diff=diff)
+
+    resolved = resolve_patch(patch)
+
+    assert resolved.paths == ["new name.py", "old name.py"]
+    _paths, backup = apply_patch(patch, workdir, resolved=resolved)
+    assert destination.read_text() == "value = 1\n"
+    assert source.exists() is (operation == "copy")
+    revert_patch(backup, workdir)
+    assert source.read_text() == "value = 1\n"
+    assert not destination.exists()
+
+
+def test_resolved_diff_preserves_a_trailing_space_in_git_path(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    source = workdir / "old"
+    destination = workdir / "new "
+    source.write_text("value = 1\n")
+    diff = (
+        "diff --git a/old b/new \n"
+        "similarity index 100%\n"
+        "rename from old\n"
+        "rename to new \n"
+    )
+    patch = Patch(step_id="s", unified_diff=diff)
+
+    resolved = resolve_patch(patch)
+
+    assert resolved.paths == ["new ", "old"]
+    _paths, backup = apply_patch(patch, workdir, resolved=resolved)
+    assert destination.read_text() == "value = 1\n"
+    revert_patch(backup, workdir)
+    assert source.read_text() == "value = 1\n"
+    assert not destination.exists()
+
+
 def test_resolved_diff_matches_git_apply_p1_for_custom_prefixes(tmp_path):
     workdir = tmp_path / "workdir"
     (workdir / "src").mkdir(parents=True)
@@ -252,6 +370,202 @@ def test_unified_diff_can_rename_and_revert_a_file(tmp_path):
     revert_patch(backup, workdir)
     assert source.read_text() == "value = 1\n"
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("operation", ["rename", "copy"])
+def test_unified_diff_rejects_mismatched_extended_paths(operation):
+    diff = (
+        "diff --git a/src/app.py b/src/moved.py\n"
+        "similarity index 100%\n"
+        f"{operation} from src/app.py\n"
+        f"{operation} to tests/test_oracle.py\n"
+    )
+    with pytest.raises(ValueError, match=rf"diff --git and {operation} paths disagree"):
+        resolve_patch(Patch(step_id="s", unified_diff=diff))
+
+
+def test_unified_diff_rejects_disagreement_with_file_headers():
+    diff = (
+        "diff --git a/src/app.py b/src/moved.py\n"
+        "similarity index 90%\n"
+        "rename from src/app.py\n"
+        "rename to src/moved.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/tests/test_oracle.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    with pytest.raises(ValueError, match=r"diff --git and \+\+\+ paths disagree"):
+        resolve_patch(Patch(step_id="s", unified_diff=diff))
+
+
+@pytest.mark.parametrize("operation", ["rename", "copy"])
+def test_unified_diff_accepts_quoted_extended_paths(tmp_path, operation):
+    workdir = tmp_path / "workdir"
+    source = workdir / "src" / "old name.py"
+    destination = workdir / "src" / "new name.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("value = 1\n")
+    diff = (
+        'diff --git "a/src/old name.py" "b/src/new name.py"\n'
+        "similarity index 100%\n"
+        f'{operation} from "src/old name.py"\n'
+        f'{operation} to "src/new name.py"\n'
+    )
+    patch = Patch(step_id="s", unified_diff=diff)
+    resolved = resolve_patch(patch)
+
+    assert resolved.paths == ["src/new name.py", "src/old name.py"]
+    _paths, backup = apply_patch(patch, workdir, resolved=resolved)
+    assert destination.read_text() == "value = 1\n"
+    assert source.exists() is (operation == "copy")
+
+    revert_patch(backup, workdir)
+    assert source.read_text() == "value = 1\n"
+    assert not destination.exists()
+
+
+def test_unified_diff_protects_a_rename_destination():
+    diff = (
+        "diff --git a/src/app.py b/tests/test_oracle.py\n"
+        "similarity index 100%\n"
+        "rename from src/app.py\n"
+        "rename to tests/test_oracle.py\n"
+    )
+    resolved = resolve_patch(Patch(step_id="s", unified_diff=diff))
+    assert resolved.paths == ["src/app.py", "tests/test_oracle.py"]
+    assert policy.check_resolved(resolved) == ["tests/test_oracle.py"]
+
+
+@pytest.mark.parametrize("mode", ["contents", "diff"])
+def test_patch_rejects_a_hardlink_alias_to_a_protected_file(tmp_path, mode):
+    workdir = tmp_path / "workdir"
+    protected = workdir / "tests" / "test_oracle.py"
+    target = workdir / "src" / "app.py"
+    protected.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    protected.write_text("value = 1\n")
+    target.hardlink_to(protected)
+    if mode == "contents":
+        patch = Patch(step_id="s", file_contents={"src/app.py": "value = 2\n"})
+    else:
+        patch = Patch(
+            step_id="s",
+            unified_diff=make_unified_diff(
+                "value = 1\n",
+                "value = 2\n",
+                "src/app.py",
+            ),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=r"hard links.*same-inode path outside the write set",
+    ):
+        apply_patch(patch, workdir)
+
+    assert protected.read_text() == "value = 1\n"
+    assert target.read_text() == "value = 1\n"
+
+
+def test_diff_apply_ignores_relative_and_writable_git_paths(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\n")
+    fake_git = tmp_path / "git"
+    fake_git.write_text("#!/bin/sh\nprintf hijacked > git-ran\nexit 0\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((".", str(tmp_path))))
+    patch = Patch(
+        step_id="s",
+        unified_diff=make_unified_diff(
+            "value = 1\n",
+            "value = 2\n",
+            "module.py",
+        ),
+    )
+
+    apply_patch(patch, tmp_path)
+
+    assert target.read_text() == "value = 2\n"
+    assert not (tmp_path / "git-ran").exists()
+
+
+def test_diff_apply_rolls_back_an_unexpected_write(tmp_path, monkeypatch):
+    import lha.tools.patch as patch_module
+
+    target = tmp_path / "module.py"
+    unexpected = tmp_path / "tests" / "test_oracle.py"
+    target.write_text("value = 1\n")
+    patch = Patch(
+        step_id="s",
+        unified_diff=make_unified_diff(
+            "value = 1\n",
+            "value = 2\n",
+            "module.py",
+        ),
+    )
+
+    def fake_git_apply(_diff, workdir, *, check=False, reverse=False):
+        workdir = Path(workdir)
+        local_unexpected = workdir / "tests" / "test_oracle.py"
+        if reverse and not check:
+            (workdir / "module.py").write_text("value = 1\n")
+            local_unexpected.unlink(missing_ok=True)
+            if local_unexpected.parent.exists():
+                local_unexpected.parent.rmdir()
+        elif not check:
+            (workdir / "module.py").write_text("value = 2\n")
+            if workdir.resolve() == tmp_path.resolve():
+                local_unexpected.parent.mkdir()
+                local_unexpected.write_text("disabled = True\n")
+        return ProcResult(0, "", "", 0.0)
+
+    monkeypatch.setattr(patch_module, "_run_git_apply", fake_git_apply)
+
+    with pytest.raises(ValueError, match="outside the resolved write set"):
+        apply_patch(patch, tmp_path)
+
+    assert target.read_text() == "value = 1\n"
+    assert not unexpected.exists()
+
+
+def test_diff_apply_rolls_back_an_unexpected_result(tmp_path, monkeypatch):
+    import lha.tools.patch as patch_module
+
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\n")
+    patch = Patch(
+        step_id="s",
+        unified_diff=make_unified_diff(
+            "value = 1\n",
+            "value = 2\n",
+            "module.py",
+        ),
+    )
+
+    def fake_git_apply(_diff, workdir, *, check=False, reverse=False):
+        workdir = Path(workdir)
+        if reverse and not check:
+            (workdir / "module.py").write_text("value = 1\n")
+        elif not check:
+            result = (
+                "value = 99\n"
+                if workdir.resolve() == tmp_path.resolve()
+                else "value = 2\n"
+            )
+            (workdir / "module.py").write_text(result)
+        return ProcResult(0, "", "", 0.0)
+
+    monkeypatch.setattr(patch_module, "_run_git_apply", fake_git_apply)
+
+    with pytest.raises(ValueError, match="contents do not match"):
+        apply_patch(patch, tmp_path)
+
+    assert target.read_text() == "value = 1\n"
 
 
 def test_symlink_diff_is_removed_when_apply_fails_closed(tmp_path):
@@ -1176,6 +1490,161 @@ def test_transaction_writes_one_checksummed_event_per_phase(tmp_path):
         "PREPARED",
         "APPLIED",
     ]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("patch_sha256", "3" * 64),
+        ("resolved_paths", ["tests/test_oracle.py"]),
+        ("backup_sha256", "4" * 64),
+        ("created_at", "2099-01-01T00:00:00+00:00"),
+    ],
+)
+def test_transaction_binding_fields_are_immutable_after_prepare(
+    tmp_path,
+    field,
+    replacement,
+):
+    patch = Patch(step_id="s", file_contents={"src/app.py": "value = 1\n"})
+    transaction = build_transaction(
+        run_dir=tmp_path,
+        step_id="s",
+        attempt_id="s-r0",
+        resolved=resolve_patch(patch),
+        backup_sha256="2" * 64,
+    )
+    save_transaction(tmp_path, transaction)
+    state_path = transaction_path(tmp_path, "s", "s-r0")
+    log_path = transaction_log_path(tmp_path, "s", "s-r0")
+    state_before = state_path.read_bytes()
+    log_before = log_path.read_bytes()
+
+    with pytest.raises(TransactionCorrupt, match="transaction binding changed"):
+        save_transaction(
+            tmp_path,
+            transaction.model_copy(update={field: replacement}),
+        )
+
+    assert state_path.read_bytes() == state_before
+    assert log_path.read_bytes() == log_before
+
+
+def test_verified_transition_preserves_applied_transaction_evidence(tmp_path):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    target = workdir / "src.py"
+    target.write_text("value = 1\n")
+    patch = Patch(step_id="s", file_contents={"src.py": "value = 1\n"})
+    transaction = build_transaction(
+        run_dir=tmp_path,
+        step_id="s",
+        attempt_id="s-r0",
+        resolved=resolve_patch(patch),
+        backup_sha256="2" * 64,
+    )
+    save_transaction(tmp_path, transaction)
+    applied = transaction.transition("APPLIED", workdir=workdir)
+    save_transaction(tmp_path, applied)
+    target.write_text("value = 2\n")
+
+    verified = applied.transition("VERIFIED", workdir=workdir)
+    save_transaction(tmp_path, verified)
+
+    assert verified.applied_state == applied.applied_state
+    assert load_transaction(tmp_path, "s", "s-r0") == verified
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_same_file_repair_preserves_each_transaction_and_completes(
+    runtime: str,
+    tmp_path: Path,
+) -> None:
+    if runtime == "langgraph":
+        pytest.importorskip("langgraph")
+        from lha.runtime.langgraph_runner import LangGraphHarness
+
+        harness = LangGraphHarness(_cfg(tmp_path))
+        harness._h.llm = TracedLLM(_WrongThenCorrectSameFile())
+    else:
+        harness = Harness(_cfg(tmp_path))
+        harness.llm = TracedLLM(_WrongThenCorrectSameFile())
+
+    result = harness.run(hermetic_task("data/tasks/fix_average.yaml"))
+
+    assert result.status == "DONE", result.message
+    assert result.state.repairs == {"s2-fix": 1}
+    assert (
+        Path(result.state.workdir) / "mathutils.py"
+    ).read_text().count("return sum(values) / len(values)\n") == 1
+    transactions = list_transactions(Path(result.state.run_dir), "s2-fix")
+    assert [transaction.status for transaction in transactions] == [
+        "VERIFIED",
+        "VERIFIED",
+    ]
+    assert (
+        transactions[0].applied_state["mathutils.py"]
+        != transactions[1].applied_state["mathutils.py"]
+    )
+    validate_terminal_transaction_state(
+        Path(result.state.run_dir),
+        Path(result.state.workdir),
+        "DONE",
+    )
+
+
+def test_exhausted_same_file_repair_rolls_back_every_attempt(
+    tmp_path: Path,
+) -> None:
+    config = _cfg(tmp_path).model_copy(update={"max_repairs": 1})
+    harness = Harness(config)
+    harness.llm = TracedLLM(_WrongThenWrongSameFile())
+
+    result = harness.run(hermetic_task("data/tasks/fix_average.yaml"))
+
+    assert result.status == "FAILED"
+    assert "len(values) - 1" in (
+        Path(result.state.workdir) / "mathutils.py"
+    ).read_text()
+    assert [
+        transaction.status
+        for transaction in list_transactions(
+            Path(result.state.run_dir),
+            "s2-fix",
+        )
+    ] == ["REVERTED", "REVERTED"]
+    validate_terminal_transaction_state(
+        Path(result.state.run_dir),
+        Path(result.state.workdir),
+        "FAILED",
+    )
+
+
+def test_transaction_save_validates_current_journal_before_main_record(tmp_path):
+    patch = Patch(step_id="s", file_contents={"src.py": "value = 1\n"})
+    transaction = build_transaction(
+        run_dir=tmp_path,
+        step_id="s",
+        attempt_id="s-r0",
+        resolved=resolve_patch(patch),
+        backup_sha256="2" * 64,
+    )
+    save_transaction(tmp_path, transaction)
+    state_path = transaction_path(tmp_path, "s", "s-r0")
+    log_path = transaction_log_path(tmp_path, "s", "s-r0")
+    state_before = state_path.read_bytes()
+    log_path.write_bytes(b"")
+
+    with pytest.raises(TransactionCorrupt, match="does not end"):
+        save_transaction(
+            tmp_path,
+            transaction.model_copy(
+                update={"updated_at": "2099-01-01T00:00:00+00:00"}
+            ),
+        )
+
+    assert state_path.read_bytes() == state_before
+    assert log_path.read_bytes() == b""
 
 
 def test_single_schema_two_transaction_remains_loadable(tmp_path):
