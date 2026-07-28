@@ -1864,7 +1864,7 @@ def validate_recovery_evidence(run_dir: Path) -> None:
         raise ReportingError(str(error)) from error
     transaction_root = run_dir / "transactions"
     expected_logs: set[Path] = set()
-    latest_reviews: dict[str, tuple[str, bytes]] = {}
+    latest_reviews: dict[str, tuple[int, bytes]] = {}
     if transaction_root.exists() or transaction_root.is_symlink():
         if transaction_root.is_symlink() or not transaction_root.is_dir():
             raise ReportingError(f"transaction directory is unsafe: {transaction_root}")
@@ -1978,12 +1978,13 @@ def validate_recovery_evidence(run_dir: Path) -> None:
                     f"review diff does not match transaction: {review_path}"
                 )
             current_review = latest_reviews.get(transaction.step_id)
+            transaction_sequence = int(transaction.sequence or 0)
             if (
                 current_review is None
-                or transaction.created_at >= current_review[0]
+                or transaction_sequence > current_review[0]
             ):
                 latest_reviews[transaction.step_id] = (
-                    transaction.created_at,
+                    transaction_sequence,
                     expected_review,
                 )
             if (
@@ -2022,7 +2023,7 @@ def validate_recovery_evidence(run_dir: Path) -> None:
             raise ReportingError(
                 f"orphaned transaction log: {sorted(orphaned)[0]}"
             )
-        for step_id, (_created_at, expected_review) in latest_reviews.items():
+        for step_id, (_sequence, expected_review) in latest_reviews.items():
             alias = _regular_file(
                 run_dir / "steps" / step_id / "patch.diff",
                 required=True,

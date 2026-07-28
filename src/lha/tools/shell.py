@@ -1,26 +1,14 @@
-"""Thin, capture-everything subprocess helper used by verifiers and tools."""
+"""Bounded helper for fixed control-plane commands."""
 
 from __future__ import annotations
 
 import shutil
-import subprocess
 import sys
-import time
-from dataclasses import dataclass
 from pathlib import Path
 
+from ..process_result import ProcResult
 
-@dataclass
-class ProcResult:
-    returncode: int
-    stdout: str
-    stderr: str
-    duration_s: float
-    output_truncated: bool = False
-
-    @property
-    def ok(self) -> bool:
-        return self.returncode == 0 and not self.output_truncated
+_CONTROL_OUTPUT_BYTES = 4 * 1024 * 1024
 
 
 def run(
@@ -31,27 +19,42 @@ def run(
     env: dict[str, str] | None = None,
     input: str | None = None,
 ) -> ProcResult:
-    start = time.monotonic()
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            input=input,
+    """Run a fixed harness command without inheriting secrets or orphaning children."""
+    from ..sandbox.base import (
+        PROCESS_CLEANUP_RETURN_CODE,
+        process_group_cleanup_supported,
+        run_bounded_process,
+        scrub_env,
+        terminate_process_group,
+    )
+
+    if not process_group_cleanup_supported():
+        return ProcResult(
+            PROCESS_CLEANUP_RETURN_CODE,
+            "",
+            (
+                "control command requires POSIX process-group cleanup; "
+                "use Linux, macOS, or WSL2"
+            ),
+            0.0,
         )
-        return ProcResult(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - start)
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        return ProcResult(124, out, f"timeout after {timeout}s", time.monotonic() - start)
-    except OSError as e:
+    try:
+        return run_bounded_process(
+            cmd,
+            cwd=cwd,
+            timeout=timeout,
+            output_bytes=_CONTROL_OUTPUT_BYTES,
+            env=env if env is not None else scrub_env(),
+            input=input,
+            start_new_session=True,
+            on_exit=terminate_process_group,
+        )
+    except OSError as error:
         return ProcResult(
             127,
             "",
-            f"failed to execute {cmd[0] if cmd else '<empty>'}: {e}",
-            time.monotonic() - start,
+            f"failed to execute {cmd[0] if cmd else '<empty>'}: {error}",
+            0.0,
         )
 
 

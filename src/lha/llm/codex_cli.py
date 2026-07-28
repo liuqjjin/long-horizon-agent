@@ -28,12 +28,14 @@ called.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -110,7 +112,9 @@ _PROCESS_KILL_GRACE_S = 2.0
 _SUPPORTED_CLI_VERSION = "codex-cli 0.141.0"
 _MAX_JSONL_LINE_BYTES = 2 * 1024 * 1024
 _MAX_JSONL_BYTES = 16 * 1024 * 1024
+_MAX_STDERR_BYTES = 1024 * 1024
 _MAX_FINAL_MESSAGE_BYTES = 4 * 1024 * 1024
+_OUTPUT_READ_CHUNK_BYTES = 64 * 1024
 
 # Why this preamble exists, measured rather than assumed: the implementer prompt
 # lists files as "### <path>", and codex reads that as "you are in a repository".
@@ -172,8 +176,8 @@ def _process_group_exists(pgid: int) -> bool:
     return True
 
 
-def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
-    """Stop the leader and every descendant before temporary secrets disappear."""
+def _terminate_process_group(proc: subprocess.Popen[Any]) -> bool:
+    """Stop the process tree and confirm that its process group is absent."""
     if os.name == "posix":
         pgid = proc.pid  # start_new_session=True makes the child its group leader.
         if _process_group_exists(pgid):
@@ -208,7 +212,11 @@ def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
                 proc.wait(timeout=_PROCESS_KILL_GRACE_S)
             except (subprocess.TimeoutExpired, ChildProcessError):
                 pass
-        return
+        deadline = time.monotonic() + _PROCESS_KILL_GRACE_S
+        while _process_group_exists(pgid) and time.monotonic() < deadline:
+            proc.poll()
+            time.sleep(0.01)
+        return proc.poll() is not None and not _process_group_exists(pgid)
 
     # Windows has no killpg equivalent in the standard library. A new process
     # group still prevents signal sharing with the parent; terminate/kill is the
@@ -223,6 +231,286 @@ def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
                 proc.wait(timeout=_PROCESS_KILL_GRACE_S)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+    return proc.poll() is not None
+
+
+def _attempt_process_group_cleanup(
+    proc: subprocess.Popen[Any],
+) -> tuple[bool, BaseException | None]:
+    """Keep the process handle available even when the cleanup helper itself fails."""
+    try:
+        return _terminate_process_group(proc), None
+    except BaseException as error:
+        return False, error
+
+
+class _ProcessLifecycle:
+    """Own exactly one termination attempt for one newly spawned process."""
+
+    def __init__(self, process: subprocess.Popen[Any]):
+        self.process = process
+        self.attempted = False
+        self.cleaned = False
+        self.error: BaseException | None = None
+
+    def stop_once(self) -> tuple[bool, BaseException | None]:
+        if not self.attempted:
+            self.attempted = True
+            self.cleaned, self.error = _attempt_process_group_cleanup(self.process)
+        return self.cleaned, self.error
+
+
+def _join_started_threads(
+    threads: list[threading.Thread],
+) -> BaseException | None:
+    deadline = time.monotonic() + _PROCESS_KILL_GRACE_S
+    first_error: BaseException | None = None
+    for thread in threads:
+        if thread.ident is None:
+            continue
+        try:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        except BaseException as error:
+            first_error = first_error or error
+    try:
+        if any(thread.is_alive() for thread in threads):
+            first_error = first_error or RuntimeError("pipe thread did not stop")
+    except BaseException as error:
+        first_error = first_error or error
+    return first_error
+
+
+def _close_process_pipes(proc: subprocess.Popen[Any]) -> BaseException | None:
+    """Close parent pipe endpoints even when no worker thread took ownership."""
+
+    first_error: BaseException | None = None
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is None:
+            continue
+        try:
+            pipe.close()
+        except BaseException as error:
+            first_error = first_error or error
+    return first_error
+
+
+class _ProcessOutputError(RuntimeError):
+    """A child stream could not be captured within its registered boundary."""
+
+
+def _read_bounded_pipe(
+    pipe: Any,
+    *,
+    stream_name: str,
+    maximum_bytes: int,
+    maximum_line_bytes: int | None,
+    sink: bytearray,
+    failures: list[BaseException],
+    failure_lock: threading.Lock,
+    abort: threading.Event,
+) -> None:
+    """Drain one binary pipe without ever retaining more than its byte limit."""
+
+    current_line_bytes = 0
+    try:
+        descriptor = pipe.fileno()
+        while True:
+            # BufferedReader.read(n) may wait for all n bytes even when a smaller
+            # violating chunk is already in the pipe. os.read returns available
+            # bytes, so the process is stopped as soon as a boundary is crossed.
+            chunk = os.read(descriptor, _OUTPUT_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            if not isinstance(chunk, bytes):
+                raise _ProcessOutputError(
+                    f"codex {stream_name} pipe did not produce binary output"
+                )
+            if len(sink) + len(chunk) > maximum_bytes:
+                remaining = max(0, maximum_bytes - len(sink))
+                sink.extend(chunk[:remaining])
+                raise _ProcessOutputError(
+                    f"codex {stream_name} exceeded the {maximum_bytes}-byte limit"
+                )
+            if maximum_line_bytes is not None:
+                cursor = 0
+                while cursor < len(chunk):
+                    newline = chunk.find(b"\n", cursor)
+                    if newline < 0:
+                        current_line_bytes += len(chunk) - cursor
+                        if current_line_bytes > maximum_line_bytes:
+                            raise _ProcessOutputError(
+                                "codex stdout JSONL line exceeded the "
+                                f"{maximum_line_bytes}-byte limit"
+                            )
+                        break
+                    current_line_bytes += newline - cursor + 1
+                    if current_line_bytes > maximum_line_bytes:
+                        raise _ProcessOutputError(
+                            "codex stdout JSONL line exceeded the "
+                            f"{maximum_line_bytes}-byte limit"
+                        )
+                    current_line_bytes = 0
+                    cursor = newline + 1
+            sink.extend(chunk)
+    except BaseException as exc:
+        with failure_lock:
+            failures.append(exc)
+        abort.set()
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def _write_process_input(
+    pipe: Any,
+    payload: bytes,
+    *,
+    failures: list[BaseException],
+    failure_lock: threading.Lock,
+    abort: threading.Event,
+) -> None:
+    """Write stdin concurrently so output-first children cannot deadlock the parent."""
+
+    try:
+        if payload:
+            pipe.write(payload)
+            pipe.flush()
+    except BrokenPipeError:
+        # A process that exits before consuming stdin is accounted for by its
+        # return code and audited output.
+        pass
+    except BaseException as exc:
+        with failure_lock:
+            failures.append(exc)
+        abort.set()
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def _communicate_bounded(
+    proc: subprocess.Popen[Any],
+    *,
+    argv: list[str],
+    input_payload: bytes,
+    timeout: float,
+    lifecycle: _ProcessLifecycle,
+) -> tuple[str, str]:
+    """Capture both streams while a shared lifecycle owns process termination."""
+
+    stdout_bytes = bytearray()
+    stderr_bytes = bytearray()
+    failures: list[BaseException] = []
+    failure_lock: threading.Lock | None = None
+    abort: threading.Event | None = None
+    started_threads: list[threading.Thread] = []
+    wait_error: BaseException | None = None
+    try:
+        if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+            raise _ProcessOutputError("codex process pipes were not created")
+        failure_lock = threading.Lock()
+        abort = threading.Event()
+        threads = [
+            threading.Thread(
+                target=_read_bounded_pipe,
+                kwargs={
+                    "pipe": proc.stdout,
+                    "stream_name": "stdout",
+                    "maximum_bytes": _MAX_JSONL_BYTES,
+                    "maximum_line_bytes": _MAX_JSONL_LINE_BYTES,
+                    "sink": stdout_bytes,
+                    "failures": failures,
+                    "failure_lock": failure_lock,
+                    "abort": abort,
+                },
+                name="lha-codex-stdout",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_read_bounded_pipe,
+                kwargs={
+                    "pipe": proc.stderr,
+                    "stream_name": "stderr",
+                    "maximum_bytes": _MAX_STDERR_BYTES,
+                    "maximum_line_bytes": None,
+                    "sink": stderr_bytes,
+                    "failures": failures,
+                    "failure_lock": failure_lock,
+                    "abort": abort,
+                },
+                name="lha-codex-stderr",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_write_process_input,
+                args=(proc.stdin, input_payload),
+                kwargs={
+                    "failures": failures,
+                    "failure_lock": failure_lock,
+                    "abort": abort,
+                },
+                name="lha-codex-stdin",
+                daemon=True,
+            ),
+        ]
+        for thread in threads:
+            started_threads.append(thread)
+            thread.start()
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                wait_error = subprocess.TimeoutExpired(argv, timeout)
+                break
+            if abort.wait(min(remaining, 0.05)):
+                break
+    except BaseException as exc:
+        wait_error = exc
+    finally:
+        lifecycle.stop_once()
+        try:
+            join_error = _join_started_threads(started_threads)
+        except BaseException as error:
+            join_error = error
+        pipe_close_error = _close_process_pipes(proc)
+
+    if isinstance(wait_error, (KeyboardInterrupt, SystemExit)):
+        raise wait_error
+    if failure_lock is None:
+        captured_failures = ()
+    else:
+        with failure_lock:
+            captured_failures = tuple(failures)
+    output_failure = next(
+        (
+            failure
+            for failure in captured_failures
+            if isinstance(failure, _ProcessOutputError)
+        ),
+        None,
+    )
+    if output_failure is not None:
+        raise output_failure
+    if wait_error is not None:
+        raise wait_error
+    if captured_failures:
+        raise captured_failures[0]
+    if join_error is not None:
+        raise _ProcessOutputError(
+            "codex output pipes remained open after process-group cleanup"
+        ) from join_error
+    if pipe_close_error is not None:
+        raise _ProcessOutputError(
+            "codex process pipes could not be closed after process-group cleanup"
+        ) from pipe_close_error
+    try:
+        return bytes(stdout_bytes).decode("utf-8"), bytes(stderr_bytes).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _ProcessOutputError("codex process output is not UTF-8") from exc
 
 
 def _run_isolated_process(
@@ -234,14 +522,14 @@ def _run_isolated_process(
     timeout: float,
     env: Mapping[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    """Run one process in its own group and reap its complete process tree."""
+    """Run one process with a single, checked process-lifecycle owner."""
     if not capture_output or not text:
         raise ValueError("isolated Codex processes require captured text output")
+    input_payload = (input or "").encode("utf-8")
     common: dict[str, Any] = {
         "stdin": subprocess.PIPE,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
         "env": dict(env),
     }
     if os.name == "posix":
@@ -249,16 +537,38 @@ def _run_isolated_process(
     else:
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         proc = subprocess.Popen(argv, creationflags=creationflags, **common)
+    lifecycle: _ProcessLifecycle | None = None
     try:
-        stdout, stderr = proc.communicate(input=input, timeout=timeout)
-    except BaseException:
-        _terminate_process_group(proc)
+        lifecycle = _ProcessLifecycle(proc)
+        stdout, stderr = _communicate_bounded(
+            proc,
+            argv=argv,
+            input_payload=input_payload,
+            timeout=timeout,
+            lifecycle=lifecycle,
+        )
+    except BaseException as primary_error:
+        cleaned, cleanup_error = (
+            lifecycle.stop_once()
+            if lifecycle is not None
+            else _attempt_process_group_cleanup(proc)
+        )
+        if not cleaned:
+            raise CodexProcessCleanupError(
+                "Codex CLI process group could not be confirmed stopped",
+                process=proc,
+                primary_error=primary_error,
+                cleanup_error=cleanup_error,
+            ) from (cleanup_error or primary_error)
         raise
     else:
-        # communicate() waits for the leader, but a detached worker can still
-        # hold the process group open. Reap that worker before callers clean the
-        # temporary CODEX_HOME.
-        _terminate_process_group(proc)
+        cleaned, cleanup_error = lifecycle.stop_once()
+        if not cleaned:
+            raise CodexProcessCleanupError(
+                "Codex CLI process group could not be confirmed stopped",
+                process=proc,
+                cleanup_error=cleanup_error,
+            ) from cleanup_error
         return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
@@ -286,6 +596,27 @@ class CodexCleanupError(CodexCLIError):
     """Attempt-local files could not be removed and must be inspected or retried."""
 
 
+class CodexProcessCleanupError(CodexCleanupError):
+    """A process group remains unconfirmed, so attempt-local files must stay."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        process: subprocess.Popen[Any],
+        primary_error: BaseException | None = None,
+        cleanup_error: BaseException | None = None,
+    ):
+        super().__init__(message)
+        self.process = process
+        self.primary_error_type = (
+            type(primary_error).__name__ if primary_error is not None else None
+        )
+        self.cleanup_error_type = (
+            type(cleanup_error).__name__ if cleanup_error is not None else None
+        )
+
+
 class CodexToolUse(CodexProtocolError):
     """The model reached outside the supplied prompt, invalidating the result."""
 
@@ -306,10 +637,30 @@ class CodexCLIClient(LLMClient):
         max_retries: int = 2,
         retry_backoff_s: float = 1.0,
     ):
-        if max_retries < 0:
-            raise ValueError("max_retries must be >= 0")
-        if retry_backoff_s < 0:
-            raise ValueError("retry_backoff_s must be >= 0")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be a positive finite number")
+        if (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or max_retries < 0
+        ):
+            raise ValueError("max_retries must be a non-negative integer")
+        if (
+            isinstance(retry_backoff_s, bool)
+            or not isinstance(retry_backoff_s, (int, float))
+            or not math.isfinite(retry_backoff_s)
+            or retry_backoff_s < 0
+        ):
+            raise ValueError("retry_backoff_s must be a non-negative finite number")
+        if not cli_path or "\x00" in cli_path:
+            raise ValueError("cli_path must be a non-empty executable name")
+        if model is not None and "\x00" in model:
+            raise ValueError("model must not contain NUL bytes")
         if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
             raise ValueError(f"unsupported Codex sandbox mode: {sandbox_mode!r}")
         if sandbox_mode == "danger-full-access" and not externally_sandboxed:
@@ -336,6 +687,7 @@ class CodexCLIClient(LLMClient):
         self._home: Path | None = None
         self._workspace: Path | None = None
         self._output_dirs: set[Path] = set()
+        self._pending_process: subprocess.Popen[Any] | None = None
         self.last_cleanup_failures: tuple[str, ...] = ()
         self._attempt_reserver: Callable[[], None] | None = None
         self._version: str | None = None
@@ -383,6 +735,57 @@ class CodexCLIClient(LLMClient):
 
     def cleanup(self) -> None:
         """Remove attempt-local state; retain failed paths so cleanup can be retried."""
+        pending_process = self._pending_process
+        if pending_process is not None:
+            try:
+                leader_returncode = pending_process.poll()
+            except BaseException as error:
+                self.last_cleanup_failures = (
+                    "temporary Codex state: process group recheck failed",
+                )
+                raise CodexProcessCleanupError(
+                    "Codex CLI process group could not be rechecked; "
+                    "attempt-local files remain retained",
+                    process=pending_process,
+                    cleanup_error=error,
+                ) from error
+            if os.name == "posix" and leader_returncode is not None:
+                try:
+                    cleaned = not _process_group_exists(pending_process.pid)
+                except BaseException as error:
+                    self.last_cleanup_failures = (
+                        "temporary Codex state: process group recheck failed",
+                    )
+                    raise CodexProcessCleanupError(
+                        "Codex CLI process group could not be rechecked; "
+                        "attempt-local files remain retained",
+                        process=pending_process,
+                        cleanup_error=error,
+                    ) from error
+                cleanup_error = None
+            else:
+                cleaned, cleanup_error = _attempt_process_group_cleanup(pending_process)
+            if cleanup_error is not None:
+                self.last_cleanup_failures = (
+                    "temporary Codex state: process group recheck failed",
+                )
+                raise CodexProcessCleanupError(
+                    "Codex CLI process group could not be rechecked; "
+                    "attempt-local files remain retained",
+                    process=pending_process,
+                    cleanup_error=cleanup_error,
+                ) from cleanup_error
+            if not cleaned:
+                self.last_cleanup_failures = (
+                    "temporary Codex state: process group still present",
+                )
+                raise CodexProcessCleanupError(
+                    "Codex CLI process group is still present; "
+                    "attempt-local files remain retained",
+                    process=pending_process,
+                )
+            self._pending_process = None
+
         failures: list[str] = []
 
         def remove(path: Path | None, label: str) -> bool:
@@ -434,23 +837,34 @@ class CodexCLIClient(LLMClient):
     def _cli_version(self) -> str:
         if self._version is not None:
             return self._version
+        scratch = Path(tempfile.mkdtemp(prefix="lha_codex_version_"))
+        self._output_dirs.add(scratch)
+        process_cleanup_failed = False
         try:
-            with tempfile.TemporaryDirectory(prefix="lha_codex_version_") as scratch:
-                root = Path(scratch)
-                res = _run_isolated_process(
-                    [self.cli_path, "--version"],
-                    input=None,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    env=_minimal_subprocess_env(codex_home=root, temp_dir=root),
-                )
-        except (OSError, subprocess.TimeoutExpired):
+            res = _run_isolated_process(
+                [self.cli_path, "--version"],
+                input=None,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=_minimal_subprocess_env(codex_home=scratch, temp_dir=scratch),
+            )
+        except CodexProcessCleanupError as error:
+            self._pending_process = error.process
+            process_cleanup_failed = True
+            self.last_cleanup_failures = (
+                "temporary Codex state: process group still present",
+            )
+            raise
+        except (OSError, subprocess.TimeoutExpired, _ProcessOutputError):
             version = "unknown"
         else:
             version = (
                 (res.stdout.strip() or res.stderr.strip()) if res.returncode == 0 else "unknown"
             )
+        finally:
+            if not process_cleanup_failed:
+                self.cleanup()
         self._version = version or "unknown"
         return self._version
 
@@ -495,16 +909,37 @@ class CodexCLIClient(LLMClient):
     def complete(self, system: str, prompt: str) -> str:
         # codex exec takes a single prompt; the system instructions are prepended
         # rather than passed separately (there is no --append-system-prompt here).
-        self.cleanup()
         self.last_usage = None
         self.last_tool_use = []
         self.last_call = None
         self.last_event_summary = self._new_event_summary()
+        self.last_cleanup_failures = ()
+        call_started = time.monotonic()
+        try:
+            self.cleanup()
+        except Exception as error:
+            self._finish_call(
+                started=call_started,
+                version=self._version or "unknown",
+                attempts=[],
+                status="failed",
+                error=error,
+            )
+            raise
         if self.no_tools:
             system = f"{_NO_TOOLS_PREAMBLE}\n\n{system}"
-        call_started = time.monotonic()
-        version = self._cli_version()
         attempts: list[dict[str, Any]] = []
+        try:
+            version = self._cli_version()
+        except Exception as error:
+            self._finish_call(
+                started=call_started,
+                version=self._version or "unknown",
+                attempts=attempts,
+                status="failed",
+                error=error,
+            )
+            raise
         if version != _SUPPORTED_CLI_VERSION:
             error = CodexProtocolError(
                 "unsupported Codex CLI protocol version: "
@@ -535,16 +970,18 @@ class CodexCLIClient(LLMClient):
             try:
                 answer = self._complete_once(system, prompt)
             except Exception as exc:
-                attempts.append(
-                    {
-                        "attempt": attempt + 1,
-                        "status": "failed",
-                        "duration_s": round(time.monotonic() - attempt_started, 3),
-                        "error_type": type(exc).__name__,
-                        "retryable": bool(getattr(exc, "retryable", False)),
-                        "event_summary": self.last_event_summary,
-                    }
-                )
+                attempt_record: dict[str, Any] = {
+                    "attempt": attempt + 1,
+                    "status": "failed",
+                    "duration_s": round(time.monotonic() - attempt_started, 3),
+                    "error_type": type(exc).__name__,
+                    "retryable": bool(getattr(exc, "retryable", False)),
+                    "event_summary": self.last_event_summary,
+                }
+                if isinstance(exc, CodexProcessCleanupError):
+                    attempt_record["primary_error_type"] = exc.primary_error_type
+                    attempt_record["cleanup_error_type"] = exc.cleanup_error_type
+                attempts.append(attempt_record)
                 if not isinstance(exc, CodexTransientError) or attempt >= self.max_retries:
                     self._finish_call(
                         started=call_started,
@@ -575,6 +1012,7 @@ class CodexCLIClient(LLMClient):
         raise AssertionError("unreachable")
 
     def _complete_once(self, system: str, prompt: str) -> str:
+        process_cleanup_failed = False
         try:
             out_dir = Path(tempfile.mkdtemp(prefix="lha_codex_out_"))
             self._output_dirs.add(out_dir)
@@ -592,8 +1030,17 @@ class CodexCLIClient(LLMClient):
                     timeout=self.timeout,
                     env=env,
                 )
+            except CodexProcessCleanupError as error:
+                self._pending_process = error.process
+                process_cleanup_failed = True
+                self.last_cleanup_failures = (
+                    "temporary Codex state: process group still present",
+                )
+                raise
             except subprocess.TimeoutExpired as e:
                 raise CodexTransientError(f"codex CLI timed out after {self.timeout}s") from e
+            except _ProcessOutputError as e:
+                raise CodexProtocolError(str(e)) from e
             except OSError as e:
                 raise CodexInvocationError(
                     f"could not execute codex CLI ({type(e).__name__})"
@@ -628,7 +1075,8 @@ class CodexCLIClient(LLMClient):
                 )
             return answer
         finally:
-            self.cleanup()
+            if not process_cleanup_failed:
+                self.cleanup()
 
     @staticmethod
     def _read_final_message(path: Path) -> str:
@@ -687,6 +1135,9 @@ class CodexCLIClient(LLMClient):
         if error is not None:
             metadata["error_type"] = type(error).__name__
             metadata["retryable"] = bool(getattr(error, "retryable", False))
+            if isinstance(error, CodexProcessCleanupError):
+                metadata["primary_error_type"] = error.primary_error_type
+                metadata["cleanup_error_type"] = error.cleanup_error_type
         self.last_call = metadata
         if self.last_usage is None:
             # TracedLLM persists ``last_usage`` even on exceptions. Supplying the

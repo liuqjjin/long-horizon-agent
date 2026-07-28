@@ -16,7 +16,6 @@ import json
 import math
 import os
 import shutil
-import subprocess
 from bisect import bisect_right
 from collections.abc import Awaitable
 from datetime import datetime, timezone
@@ -24,12 +23,20 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from ...clock import now
+from ...sandbox.base import (
+    PROCESS_CLEANUP_RETURN_CODE,
+    process_group_cleanup_supported,
+    run_bounded_process,
+    terminate_process_group,
+)
+from ...tools.shell import ProcResult
 from ..freshness import content_hash, strict_file_sha256
 from ..models import CodeHit, Hit, Provenance, ReindexResult
 from .base import BackendUnavailable, SearchBackend
 
 _MCP_INITIALIZE_TIMEOUT_S = 30.0
 _MCP_SEARCH_TIMEOUT_S = 180.0
+_CCC_CONTROL_OUTPUT_BYTES = 1024 * 1024
 _T = TypeVar("_T")
 
 
@@ -72,6 +79,35 @@ def _checked_timeout(value: float, *, name: str) -> float:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError(f"{name} must be a finite positive number")
     return timeout
+
+
+def _run_ccc_control(
+    argv: list[str],
+    *,
+    root: Path,
+    env: dict[str, str],
+    timeout_s: float,
+) -> ProcResult:
+    """Run a fixed CCC control command with bounded output and tree cleanup."""
+    if not process_group_cleanup_supported():
+        return ProcResult(
+            PROCESS_CLEANUP_RETURN_CODE,
+            "",
+            (
+                "ccc control command requires POSIX process-group cleanup; "
+                "use Linux, macOS, or WSL2"
+            ),
+            0.0,
+        )
+    return run_bounded_process(
+        argv,
+        cwd=root,
+        env=env,
+        timeout=timeout_s,
+        output_bytes=_CCC_CONTROL_OUTPUT_BYTES,
+        start_new_session=True,
+        on_exit=terminate_process_group,
+    )
 
 
 async def _await_mcp(
@@ -454,28 +490,24 @@ class CccBackend(SearchBackend):
         try:
             # Auto-init a fresh project (e.g. a run sandbox) before indexing.
             if not (self.root / ".cocoindex_code" / "settings.yml").exists():
-                init = subprocess.run(
+                init = _run_ccc_control(
                     [self._ccc, "init", "-f"],
-                    cwd=str(self.root),
+                    root=self.root,
                     env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
+                    timeout_s=120,
                 )
                 if init.returncode != 0:
                     return ReindexResult(
                         kind=self.kind, ok=False, version_before=version_before,
                         detail=f"ccc init failed (exit {init.returncode}): {init.stderr[-300:]}",
                     )
-            proc = subprocess.run(
+            proc = _run_ccc_control(
                 [self._ccc, "index"],
-                cwd=str(self.root),
+                root=self.root,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=600,
+                timeout_s=600,
             )
-        except (OSError, subprocess.TimeoutExpired) as e:
+        except OSError as e:
             return ReindexResult(
                 kind=self.kind, ok=False, version_before=version_before,
                 detail=f"ccc index did not run: {type(e).__name__}: {e}",

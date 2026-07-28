@@ -22,7 +22,10 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from ..artifacts import Patch
-from .shell import run
+from .shell import ProcResult
+
+_PATCH_APPLY_TIMEOUT_S = 60.0
+_PATCH_APPLY_OUTPUT_BYTES = 1024 * 1024
 
 
 class ResolvedPatch(BaseModel):
@@ -209,6 +212,47 @@ def render_review_diff(
     return "".join(rendered) or "(no diff)\n"
 
 
+def _run_git_apply(diff: str, workdir: Path):
+    """Run the fixed control-plane command without importing sandbox eagerly."""
+    from ..sandbox.base import (
+        PROCESS_CLEANUP_RETURN_CODE,
+        process_group_cleanup_supported,
+        run_bounded_process,
+        scrub_env,
+        terminate_process_group,
+    )
+
+    if not process_group_cleanup_supported():
+        return ProcResult(
+            PROCESS_CLEANUP_RETURN_CODE,
+            "",
+            (
+                "git apply requires POSIX process-group cleanup; "
+                "use Linux, macOS, or WSL2"
+            ),
+            0.0,
+        )
+    environment = scrub_env(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+        }
+    )
+    return run_bounded_process(
+        ["git", "apply", "--whitespace=nowarn", "-p1", "-"],
+        cwd=workdir,
+        timeout=_PATCH_APPLY_TIMEOUT_S,
+        output_bytes=_PATCH_APPLY_OUTPUT_BYTES,
+        env=environment,
+        input=diff,
+        start_new_session=True,
+        on_exit=terminate_process_group,
+    )
+
+
 def apply_patch(
     patch: Patch,
     workdir: str | Path,
@@ -242,11 +286,7 @@ def apply_patch(
         # is an error: the transaction journal, not a heuristic reverse-check,
         # decides whether a persisted attempt should be replayed. A reverse
         # check can misclassify mode-only patches as already applied.
-        res = run(
-            ["git", "apply", "--whitespace=nowarn", "-p1", "-"],
-            cwd=workdir,
-            input=patch.unified_diff,
-        )
+        res = _run_git_apply(patch.unified_diff, workdir)
         if not res.ok:
             raise RuntimeError(f"git apply failed: {res.stderr or res.stdout}")
         try:

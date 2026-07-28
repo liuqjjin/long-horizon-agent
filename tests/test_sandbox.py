@@ -13,8 +13,11 @@ import time
 
 import pytest
 
+import lha.sandbox.base as sandbox_base
 import lha.sandbox.docker as docker_backend
+import lha.sandbox.local as local_backend
 from lha.sandbox import DockerBackend, ResourceLimits, TrustedLocalBackend, scrub_env
+from lha.sandbox.base import ProcessCleanupResult
 from lha.tools.shell import ProcResult
 
 
@@ -63,6 +66,34 @@ def test_output_capture_limit_must_be_positive():
         ResourceLimits(output_bytes=0)
 
 
+@pytest.mark.parametrize("timeout", [True, 0, -1, float("nan"), float("inf")])
+def test_bounded_process_timeout_must_be_positive_and_finite(
+    tmp_path,
+    timeout,
+    monkeypatch,
+):
+    def unexpected_spawn(*_args, **_kwargs):
+        raise AssertionError("invalid timeout must fail before spawning")
+
+    monkeypatch.setattr(sandbox_base.subprocess, "Popen", unexpected_spawn)
+    with pytest.raises(ValueError, match="timeout"):
+        sandbox_base.run_bounded_process(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            timeout=timeout,
+            output_bytes=1024,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("cpu_s", 0), ("memory_mb", -1), ("pids", True)],
+)
+def test_process_resource_limits_must_be_positive_integers(field, value):
+    with pytest.raises(ValueError, match=field):
+        ResourceLimits(**{field: value})
+
+
 def test_local_backend_child_env_is_scrubbed(tmp_path, monkeypatch):
     monkeypatch.setenv("LHA_SECRET_PROBE", "s3cr3t")
     res = TrustedLocalBackend().run(
@@ -96,10 +127,195 @@ def test_local_backend_stops_descendant_that_holds_output_pipe(tmp_path):
         timeout=10,
     )
 
-    assert res.returncode == 125
-    assert res.output_truncated is True
+    assert res.returncode == 0
+    assert res.output_truncated is False
     time.sleep(2.5)
     assert not marker.exists(), "descendant survived after its parent exited"
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_local_backend_stops_descendant_that_closed_output_pipe(
+    tmp_path, exit_code
+):
+    marker = tmp_path / f"closed-pipe-marker-{exit_code}"
+    res = TrustedLocalBackend().run(
+        [
+            "sh",
+            "-c",
+            f"(exec >/dev/null 2>&1; sleep 1; touch {marker}) & exit {exit_code}",
+        ],
+        cwd=tmp_path,
+        timeout=10,
+    )
+
+    assert res.returncode == exit_code
+    time.sleep(1.5)
+    assert not marker.exists(), "stdio-independent descendant survived leader exit"
+
+
+def test_local_backend_fails_when_group_cleanup_cannot_be_confirmed(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        local_backend,
+        "terminate_process_group",
+        lambda _process: ProcessCleanupResult(False, "probe denied"),
+    )
+
+    res = TrustedLocalBackend().run(
+        [sys.executable, "-c", "print('finished')"],
+        cwd=tmp_path,
+    )
+
+    assert res.returncode == 126
+    assert res.ok is False
+    assert res.stdout.strip() == "finished"
+    assert "cleanup could not be confirmed" in res.stderr
+    assert "probe denied" in res.stderr
+
+
+def test_local_backend_rejects_unsupported_process_groups_before_spawn(
+    tmp_path, monkeypatch
+):
+    def unexpected_spawn(*_args, **_kwargs):
+        raise AssertionError("unsupported hosts must fail before spawning target code")
+
+    monkeypatch.setattr(
+        local_backend,
+        "process_group_cleanup_supported",
+        lambda: False,
+    )
+    monkeypatch.setattr(local_backend, "run_bounded_process", unexpected_spawn)
+
+    res = TrustedLocalBackend().run(
+        [sys.executable, "-c", "print('must not run')"],
+        cwd=tmp_path,
+    )
+
+    assert res.returncode == 126
+    assert res.ok is False
+    assert "requires POSIX process-group cleanup" in res.stderr
+
+
+def test_local_backend_uses_exec_launcher_instead_of_preexec(
+    tmp_path, monkeypatch
+):
+    observed = []
+
+    def recording_runner(cmd, **kwargs):
+        observed.append((cmd, kwargs))
+        return ProcResult(0, "", "", 0.0)
+
+    monkeypatch.setattr(local_backend, "run_bounded_process", recording_runner)
+    backend = TrustedLocalBackend()
+    original = [sys.executable, "-c", "print('ok')"]
+
+    backend.run(original, cwd=tmp_path)
+    backend.run(
+        original,
+        cwd=tmp_path,
+        limits=ResourceLimits(cpu_s=2, memory_mb=128, pids=16),
+    )
+
+    assert observed[0][0] == original
+    assert "preexec_fn" not in observed[0][1]
+    limited = observed[1][0]
+    assert limited[:3] == [sys.executable, "-m", "lha.sandbox.limit_exec"]
+    assert limited[-len(original) :] == original
+    assert ["--cpu-s", "2"] == limited[3:5]
+    assert "preexec_fn" not in observed[1][1]
+
+
+@pytest.mark.parametrize("failed_start", [2, 3])
+def test_bounded_process_closes_pipes_when_thread_start_fails(
+    failed_start, tmp_path, monkeypatch
+):
+    if os.name != "posix":
+        pytest.skip("process-group assertion requires POSIX")
+
+    real_popen = sandbox_base.subprocess.Popen
+    real_start = sandbox_base.threading.Thread.start
+    processes = []
+    start_calls = 0
+
+    def recording_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def failing_start(thread):
+        nonlocal start_calls
+        start_calls += 1
+        if start_calls == failed_start:
+            raise RuntimeError(f"thread start {failed_start} failed")
+        return real_start(thread)
+
+    monkeypatch.setattr(sandbox_base.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(sandbox_base.threading.Thread, "start", failing_start)
+
+    with pytest.raises(RuntimeError, match=f"thread start {failed_start} failed"):
+        sandbox_base.run_bounded_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=tmp_path,
+            timeout=10,
+            output_bytes=1024,
+            input="payload",
+            start_new_session=True,
+            on_exit=sandbox_base.terminate_process_group,
+        )
+
+    assert len(processes) == 1
+    process = processes[0]
+    assert process.poll() is not None
+    assert process.stdin is not None and process.stdin.closed
+    assert process.stdout is not None and process.stdout.closed
+    assert process.stderr is not None and process.stderr.closed
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process.pid, 0)
+
+
+def test_interruption_records_unconfirmed_process_cleanup(
+    tmp_path, monkeypatch
+):
+    if os.name != "posix":
+        pytest.skip("process-group assertion requires POSIX")
+
+    real_start = sandbox_base.threading.Thread.start
+    real_cleanup = sandbox_base.terminate_process_group
+    start_calls = 0
+
+    def interrupt_first_start(thread):
+        nonlocal start_calls
+        start_calls += 1
+        if start_calls == 1:
+            raise KeyboardInterrupt("cancelled during pipe setup")
+        return real_start(thread)
+
+    def unconfirmed_cleanup(process):
+        real_cleanup(process)
+        return ProcessCleanupResult(False, "simulated cleanup uncertainty")
+
+    monkeypatch.setattr(
+        sandbox_base.threading.Thread,
+        "start",
+        interrupt_first_start,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        sandbox_base.run_bounded_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=tmp_path,
+            timeout=10,
+            output_bytes=1024,
+            input="payload",
+            start_new_session=True,
+            on_exit=unconfirmed_cleanup,
+        )
+
+    assert any(
+        "simulated cleanup uncertainty" in note
+        for note in getattr(caught.value, "__notes__", ())
+    )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX rlimits")

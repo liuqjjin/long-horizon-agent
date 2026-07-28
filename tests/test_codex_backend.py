@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -29,6 +30,7 @@ from lha.llm.codex_cli import (
     CodexCleanupError,
     CodexCLIClient,
     CodexInvocationError,
+    CodexProcessCleanupError,
     CodexProtocolError,
     CodexToolUse,
     CodexTransientError,
@@ -850,9 +852,6 @@ def test_isolated_runner_reaps_the_process_group_on_exception(error_type, tmp_pa
         pid = 424242
         returncode = None
 
-        def communicate(self, *, input, timeout):
-            raise error_type("communicate interrupted")
-
     process = ExplodingProcess()
     popen_options: dict = {}
     reaped: list[object] = []
@@ -861,11 +860,15 @@ def test_isolated_runner_reaps_the_process_group_on_exception(error_type, tmp_pa
         popen_options.update(kwargs)
         return process
 
+    def explode(*_args, **_kwargs):
+        raise error_type("bounded communication interrupted")
+
     monkeypatch.setattr(codex_backend.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(codex_backend, "_communicate_bounded", explode)
     monkeypatch.setattr(
         codex_backend,
         "_terminate_process_group",
-        lambda proc: reaped.append(proc),
+        lambda proc: not reaped.append(proc),
     )
 
     with pytest.raises(error_type):
@@ -881,6 +884,439 @@ def test_isolated_runner_reaps_the_process_group_on_exception(error_type, tmp_pa
     assert reaped == [process]
     if os.name == "posix":
         assert popen_options["start_new_session"] is True
+
+
+@pytest.mark.parametrize("timeout", [True, 0, -1, float("nan"), float("inf")])
+def test_codex_client_rejects_invalid_timeout(timeout):
+    with pytest.raises(ValueError, match="timeout"):
+        CodexCLIClient(timeout=timeout)
+
+
+@pytest.mark.parametrize("max_retries", [True, -1, 1.5])
+def test_codex_client_rejects_invalid_retry_count(max_retries):
+    with pytest.raises(ValueError, match="max_retries"):
+        CodexCLIClient(max_retries=max_retries)
+
+
+@pytest.mark.parametrize("retry_backoff_s", [True, -1, float("nan"), float("inf")])
+def test_codex_client_rejects_invalid_retry_backoff(retry_backoff_s):
+    with pytest.raises(ValueError, match="retry_backoff_s"):
+        CodexCLIClient(retry_backoff_s=retry_backoff_s)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"cli_path": ""}, "cli_path"),
+        ({"cli_path": "co\x00dex"}, "cli_path"),
+        ({"model": "gpt\x00bad"}, "model"),
+    ],
+)
+def test_codex_client_rejects_malformed_process_arguments(arguments, message):
+    with pytest.raises(ValueError, match=message):
+        CodexCLIClient(**arguments)
+
+
+def test_isolated_runner_terminates_each_process_group_once(
+    tmp_path,
+    monkeypatch,
+):
+    real_terminate = codex_backend._terminate_process_group
+    terminated: list[subprocess.Popen] = []
+
+    def record_termination(process):
+        terminated.append(process)
+        return real_terminate(process)
+
+    monkeypatch.setattr(
+        codex_backend,
+        "_terminate_process_group",
+        record_termination,
+    )
+
+    result = codex_backend._run_isolated_process(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdin.buffer.read(); sys.stdout.write('ok')",
+        ],
+        input="prompt",
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={"PATH": os.defpath},
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "ok"
+    assert len(terminated) == 1
+    assert terminated[0].poll() is not None
+
+
+@pytest.mark.parametrize(
+    "failure_site",
+    ["event", "thread_constructor", "second_thread_start", "thread_join"],
+)
+def test_post_popen_resource_failure_reaps_process_group_once(
+    failure_site,
+    tmp_path,
+    monkeypatch,
+):
+    script = tmp_path / "codex-waits"
+    sleep_seconds = "0.05" if failure_site == "thread_join" else "60"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import time\n"
+        f"time.sleep({sleep_seconds})\n"
+    )
+    script.chmod(0o755)
+    real_terminate = codex_backend._terminate_process_group
+    real_start = codex_backend.threading.Thread.start
+    terminated: list[subprocess.Popen] = []
+    starts = 0
+
+    def record_termination(process):
+        terminated.append(process)
+        return real_terminate(process)
+
+    def fail_event():
+        raise RuntimeError("event allocation failed")
+
+    def fail_thread_constructor(*_args, **_kwargs):
+        raise RuntimeError("thread construction failed")
+
+    def fail_second_start(thread):
+        nonlocal starts
+        starts += 1
+        if starts == 2:
+            raise RuntimeError("thread start failed")
+        return real_start(thread)
+
+    def fail_join(_thread, _timeout=None):
+        raise RuntimeError("thread join failed")
+
+    monkeypatch.setattr(
+        codex_backend,
+        "_terminate_process_group",
+        record_termination,
+    )
+    expected = "event allocation failed"
+    expected_error: type[BaseException] = RuntimeError
+    if failure_site == "event":
+        monkeypatch.setattr(codex_backend.threading, "Event", fail_event)
+    elif failure_site == "thread_constructor":
+        expected = "thread construction failed"
+        monkeypatch.setattr(
+            codex_backend.threading,
+            "Thread",
+            fail_thread_constructor,
+        )
+    elif failure_site == "second_thread_start":
+        expected = "thread start failed"
+        monkeypatch.setattr(
+            codex_backend.threading.Thread,
+            "start",
+            fail_second_start,
+        )
+    elif failure_site == "thread_join":
+        expected = "output pipes remained open after process-group cleanup"
+        expected_error = codex_backend._ProcessOutputError
+        monkeypatch.setattr(
+            codex_backend.threading.Thread,
+            "join",
+            fail_join,
+        )
+
+    with pytest.raises(expected_error, match=expected):
+        codex_backend._run_isolated_process(
+            [str(script)],
+            input="prompt",
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={"PATH": os.defpath},
+        )
+
+    assert len(terminated) == 1
+    assert terminated[0].poll() is not None
+    assert terminated[0].stdin is not None and terminated[0].stdin.closed
+    assert terminated[0].stdout is not None and terminated[0].stdout.closed
+    assert terminated[0].stderr is not None and terminated[0].stderr.closed
+    if os.name == "posix":
+        assert not codex_backend._process_group_exists(terminated[0].pid)
+
+
+def test_process_cleanup_failure_retains_credentials_and_error_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    source_home = tmp_path / "real_codex_home"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"token": "temporary-copy"}')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    script = tmp_path / "codex-hangs-during-cleanup"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import time\n"
+        "time.sleep(60)\n"
+    )
+    script.chmod(0o755)
+    client = CodexCLIClient(
+        cli_path=str(script),
+        timeout=0.1,
+        max_retries=0,
+    )
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+    real_terminate = codex_backend._terminate_process_group
+    cleanup_attempts = 0
+
+    def fail_termination(_process):
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        raise PermissionError(1, "termination denied")
+
+    monkeypatch.setattr(
+        codex_backend,
+        "_terminate_process_group",
+        fail_termination,
+    )
+
+    with pytest.raises(CodexProcessCleanupError) as caught:
+        client.complete("SYSTEM", "PROMPT")
+
+    assert cleanup_attempts == 1
+    assert caught.value.primary_error_type == "TimeoutExpired"
+    assert caught.value.cleanup_error_type == "PermissionError"
+    assert caught.value.process.poll() is None
+    pending = client.pending_cleanup_paths
+    assert len(pending) == 3
+    assert all(path.exists() for path in pending)
+    copied_home = next(path for path in pending if path.name.startswith("lha_codex_home_"))
+    assert (copied_home / "auth.json").read_text() == '{"token": "temporary-copy"}'
+    assert client.last_call is not None
+    assert client.last_call["error_type"] == "CodexProcessCleanupError"
+    assert client.last_call["primary_error_type"] == "TimeoutExpired"
+    assert client.last_call["cleanup_error_type"] == "PermissionError"
+    assert client.last_call["attempts"][0]["primary_error_type"] == "TimeoutExpired"
+    assert client.last_call["attempts"][0]["cleanup_error_type"] == "PermissionError"
+
+    monkeypatch.setattr(
+        codex_backend,
+        "_terminate_process_group",
+        real_terminate,
+    )
+    client.cleanup()
+
+    assert client.pending_cleanup_paths == ()
+    assert all(not path.exists() for path in pending)
+    assert (source_home / "auth.json").exists()
+
+
+def test_cleanup_retry_does_not_signal_after_process_leader_exited(
+    tmp_path,
+    monkeypatch,
+):
+    if os.name != "posix":
+        pytest.skip("PGID reuse protection requires POSIX process groups")
+
+    class ExitedProcess:
+        pid = 424_244
+
+        @staticmethod
+        def poll() -> int:
+            return 1
+
+    client = CodexCLIClient()
+    copied_home = tmp_path / "retained-codex-home"
+    workspace = tmp_path / "retained-codex-workspace"
+    output = tmp_path / "retained-codex-output"
+    for path in (copied_home, workspace, output):
+        path.mkdir()
+    (copied_home / "auth.json").write_text('{"token": "retained"}')
+    process = cast(subprocess.Popen[Any], ExitedProcess())
+    client._home = copied_home
+    client._workspace = workspace
+    client._output_dirs.add(output)
+    client._pending_process = process
+    group_present = True
+    signals = 0
+
+    def process_group_exists(pgid: int) -> bool:
+        assert pgid == process.pid
+        return group_present
+
+    def unexpected_signal(_process) -> bool:
+        nonlocal signals
+        signals += 1
+        raise AssertionError("an exited leader must not be signalled on cleanup retry")
+
+    monkeypatch.setattr(codex_backend, "_process_group_exists", process_group_exists)
+    monkeypatch.setattr(codex_backend, "_terminate_process_group", unexpected_signal)
+
+    with pytest.raises(CodexProcessCleanupError, match="still present"):
+        client.cleanup()
+
+    assert signals == 0
+    assert (copied_home / "auth.json").exists()
+    assert all(path.exists() for path in (copied_home, workspace, output))
+
+    group_present = False
+    client.cleanup()
+
+    assert signals == 0
+    assert client.pending_cleanup_paths == ()
+    assert all(not path.exists() for path in (copied_home, workspace, output))
+
+
+def _flooding_codex_client(tmp_path, monkeypatch, body):
+    source_home = tmp_path / "real_codex_home"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"token": "temporary-copy"}')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    executable = tmp_path / "codex-output-fixture"
+    executable.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import os, pathlib, signal, subprocess, sys, time",
+                *body,
+            ]
+        )
+        + "\n"
+    )
+    executable.chmod(0o755)
+    client = CodexCLIClient(
+        cli_path=str(executable),
+        timeout=5.0,
+        max_retries=0,
+    )
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+    return client, source_home
+
+
+def test_stdout_total_limit_stops_a_live_codex_process(tmp_path, monkeypatch):
+    monkeypatch.setattr(codex_backend, "_MAX_JSONL_BYTES", 4096)
+    monkeypatch.setattr(codex_backend, "_MAX_JSONL_LINE_BYTES", 1024)
+    client, source_home = _flooding_codex_client(
+        tmp_path,
+        monkeypatch,
+        [
+            "while True:",
+            "    os.write(1, b'{}\\n' * 1024)",
+            "    time.sleep(0.01)",
+        ],
+    )
+
+    started = time.monotonic()
+    with pytest.raises(CodexProtocolError, match="stdout exceeded the 4096-byte limit"):
+        client.complete("SYSTEM", "PROMPT")
+    assert time.monotonic() - started < 3
+    assert client.pending_cleanup_paths == ()
+    assert (source_home / "auth.json").exists()
+    assert client.last_call is not None
+    assert client.last_call["status"] == "failed"
+    assert client.last_call["error_type"] == "CodexProtocolError"
+    assert client.last_call["attempt_count"] == 1
+    assert client.last_call["retryable"] is False
+    assert client.last_usage is not None
+    assert client.last_usage["status"] == "failed"
+
+
+def test_stdout_long_line_stops_before_the_total_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(codex_backend, "_MAX_JSONL_BYTES", 8192)
+    monkeypatch.setattr(codex_backend, "_MAX_JSONL_LINE_BYTES", 1024)
+    client, _source_home = _flooding_codex_client(
+        tmp_path,
+        monkeypatch,
+        [
+            "os.write(1, b'x' * 2048)",
+            "time.sleep(60)",
+        ],
+    )
+
+    started = time.monotonic()
+    with pytest.raises(
+        CodexProtocolError,
+        match="stdout JSONL line exceeded the 1024-byte limit",
+    ):
+        client.complete("SYSTEM", "PROMPT")
+    assert time.monotonic() - started < 3
+    assert client.pending_cleanup_paths == ()
+
+
+def test_stderr_limit_stops_a_flood_before_process_exit(tmp_path, monkeypatch):
+    monkeypatch.setattr(codex_backend, "_MAX_STDERR_BYTES", 1024)
+    client, _source_home = _flooding_codex_client(
+        tmp_path,
+        monkeypatch,
+        [
+            "os.write(2, b'e' * 4096)",
+            "time.sleep(60)",
+        ],
+    )
+
+    started = time.monotonic()
+    with pytest.raises(CodexProtocolError, match="stderr exceeded the 1024-byte limit"):
+        client.complete("SYSTEM", "PROMPT")
+    assert time.monotonic() - started < 3
+    assert client.pending_cleanup_paths == ()
+
+
+def test_output_limit_kills_a_descendant_before_credential_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    if os.name != "posix":
+        pytest.skip("process-group lifecycle assertion requires POSIX")
+    monkeypatch.setattr(codex_backend, "_MAX_JSONL_BYTES", 4096)
+    monkeypatch.setattr(codex_backend, "_MAX_JSONL_LINE_BYTES", 1024)
+    record_path = tmp_path / "output-limit-process.json"
+    ready_path = tmp_path / "output-limit-child-ready"
+    child_code = (
+        "import pathlib,signal,time;"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        f"pathlib.Path({str(ready_path)!r}).write_text('ready');"
+        "time.sleep(60)"
+    )
+    client, source_home = _flooding_codex_client(
+        tmp_path,
+        monkeypatch,
+        [
+            f"child = subprocess.Popen([{sys.executable!r}, '-c', {child_code!r}])",
+            f"ready = pathlib.Path({str(ready_path)!r})",
+            "while not ready.exists():",
+            "    time.sleep(0.01)",
+            f"pathlib.Path({str(record_path)!r}).write_text(",
+            "    str(child.pid) + '\\n' + os.environ['CODEX_HOME'] + '\\n'",
+            "    + os.environ['TMPDIR']",
+            ")",
+            "while True:",
+            "    os.write(1, b'{}\\n' * 1024)",
+            "    time.sleep(0.01)",
+        ],
+    )
+
+    with pytest.raises(CodexProtocolError, match="stdout exceeded"):
+        client.complete("SYSTEM", "PROMPT")
+
+    child_pid_text, copied_home, copied_temp = record_path.read_text().splitlines()
+    assert not Path(copied_home).exists()
+    assert not Path(copied_temp).exists()
+    assert (source_home / "auth.json").exists()
+    assert client.pending_cleanup_paths == ()
+
+    child_pid = int(child_pid_text)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail(
+            f"descendant process {child_pid} survived the Codex output boundary"
+        )
 
 
 def test_timeout_kills_a_descendant_before_removing_credentials(tmp_path, monkeypatch):

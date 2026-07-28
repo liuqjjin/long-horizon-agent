@@ -30,6 +30,8 @@ from lha.ablation import (
 from lha.artifacts import Patch
 from lha.config import Config
 from lha.llm.base import LLMClient
+from lha.llm.claude_cli import ClaudeCLIClient
+from lha.llm.trace import TracedLLM
 from lha.sandbox import TrustedLocalBackend
 
 _PYPROJECT = (
@@ -117,6 +119,48 @@ def _by_cond(report) -> dict[str, RunRecord]:
 
 def test_programmatic_ablation_default_matches_cli_backend():
     assert run_ablation.__kwdefaults__["llm"] == "codex_cli"
+
+
+def test_experimental_claude_cli_cannot_produce_ablation_evidence(tmp_path):
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    out = tmp_path / "out"
+
+    with pytest.raises(ValueError, match="experimental"):
+        run_ablation(
+            _base(tmp_path),
+            [task],
+            llm="claude_cli",
+            reps=1,
+            out_dir=out,
+            llm_client=_FixedLLM(2),
+        )
+
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_injected_claude_client_cannot_bypass_ablation_gate(
+    wrapped: bool,
+    tmp_path,
+):
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    out = tmp_path / "out"
+    client = ClaudeCLIClient(cli_path="must-not-run")
+    injected = TracedLLM(client) if wrapped else client
+
+    with pytest.raises(ValueError, match="experimental"):
+        run_ablation(
+            _base(tmp_path),
+            [task],
+            llm="stub",
+            reps=1,
+            out_dir=out,
+            llm_client=injected,
+        )
+
+    assert not out.exists()
 
 
 # --- patch sanitization (tamper-proofing) -----------------------------------
@@ -842,6 +886,31 @@ def test_docker_image_resolution_failure_precedes_any_model_call(tmp_path, monke
     assert llm.calls == 0
 
 
+def test_docker_image_resolution_keeps_only_required_host_configuration(
+    monkeypatch,
+):
+    import lha.ablation as abl
+    from lha.tools.shell import ProcResult
+
+    image_id = "sha256:" + "b" * 64
+    observed = {}
+    monkeypatch.setenv("DOCKER_CONFIG", "/tmp/lha-test-docker-config")
+    monkeypatch.setenv("DOCKER_HOST", "unix:///tmp/lha-test-docker.sock")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-docker")
+
+    def recording_run(cmd, **kwargs):
+        observed["cmd"] = cmd
+        observed.update(kwargs)
+        return ProcResult(0, image_id + "\n", "", 0.0)
+
+    monkeypatch.setattr(abl, "run", recording_run)
+
+    assert abl._resolve_docker_image_id("lha:test") == image_id
+    assert observed["env"]["DOCKER_CONFIG"] == "/tmp/lha-test-docker-config"
+    assert observed["env"]["DOCKER_HOST"] == "unix:///tmp/lha-test-docker.sock"
+    assert "OPENAI_API_KEY" not in observed["env"]
+
+
 def test_pinned_docker_backend_argv_uses_image_id_not_mutable_tag(tmp_path):
     from lha.sandbox import DockerBackend
 
@@ -980,6 +1049,40 @@ def test_cache_fingerprint_binds_scorer_and_runtime(tmp_path):
         runtime={"scorer": {"actual": "docker", "image_id": "sha256:" + "a" * 64}},
     )
     assert docker != local
+
+
+def test_report_rejects_source_tree_drift_during_run(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    initial = abl._source_file_digests()
+    calls = 0
+
+    def source_file_digests():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return initial
+        changed = dict(initial)
+        changed["ablation.py"] = "0" * 64
+        return changed
+
+    monkeypatch.setattr(abl, "_source_file_digests", source_file_digests)
+    out = tmp_path / "out"
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+
+    with pytest.raises(RuntimeError, match="source tree changed during the ablation"):
+        run_ablation(
+            _base(tmp_path),
+            [task],
+            reps=1,
+            out_dir=out,
+            llm_client=_FixedLLM(2),
+        )
+
+    assert calls == 2
+    assert not (out / "ablation_report.json").exists()
+    assert not (out / "ablation_report.md").exists()
 
 
 def test_legacy_cache_format_is_recomputed(tmp_path):

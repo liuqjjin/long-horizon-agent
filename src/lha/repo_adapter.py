@@ -52,7 +52,7 @@ _SHELL_TOOLS = frozenset({"bash", "cmd", "powershell", "pwsh", "sh", "zsh"})
 class RepoCommand(BaseModel):
     """One fixed argv command in a repository lifecycle stage."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     tool: str = Field(pattern=r"^[a-zA-Z0-9_.+-]+$")
@@ -93,7 +93,7 @@ class RepoCommand(BaseModel):
 class RepoAdapterSpec(BaseModel):
     """The complete, immutable command surface for one repository."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal[1] = 1
     allowed_tools: frozenset[str] = Field(min_length=1)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
@@ -481,6 +482,36 @@ def test_approval_repair_and_prepared_patch_recovery_are_idempotent(tmp_path: Pa
         "s06-edit-r0",
         "s06-edit-r1",
     ]
+
+
+def test_reporting_uses_transaction_sequence_when_wall_clock_moves_backward(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import lha.harness.transaction as transaction_module
+
+    current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def reversed_now() -> datetime:
+        nonlocal current
+        current -= timedelta(seconds=1)
+        return current
+
+    monkeypatch.setattr(transaction_module, "now", reversed_now)
+    task_id = "config_parser"
+    config = _config(tmp_path)
+    result = _harness(
+        config,
+        task_id,
+        fail_first=True,
+        auto_approve=True,
+    ).run(_task(task_id), run_id="reversed-transaction-clock")
+
+    assert result.status == "DONE", result.message
+    transactions = list_transactions(Path(result.state.run_dir), "s06-edit")
+    assert [transaction.sequence for transaction in transactions] == [1, 2]
+    assert transactions[0].created_at > transactions[1].created_at
+    collect_run(config.runs_dir, result.state.run_id)
 
 
 def test_stage_journal_rejects_an_ambiguous_direct_replay(tmp_path: Path):

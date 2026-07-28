@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -34,6 +33,7 @@ from lha.live_context import (
     reject_stale,
 )
 from lha.live_context import freshness as fr
+from lha.live_context.backends import ccc_backend
 from lha.live_context.backends.ccc_backend import (
     CccBackend,
     _await_mcp,
@@ -378,7 +378,11 @@ def test_ccc_reindex_fails_on_nonzero_exit(tmp_path, monkeypatch):
     (tmp_path / ".cocoindex_code" / "settings.yml").write_text("x: 1")
     backend = CccBackend(tmp_path)
     backend._ccc = "/fake/ccc"
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Proc(2, "index blew up"))
+    monkeypatch.setattr(
+        ccc_backend,
+        "_run_ccc_control",
+        lambda *a, **k: _Proc(2, "index blew up"),
+    )
     result = backend.reindex()
     assert not result.ok
     assert "exit 2" in result.detail
@@ -396,7 +400,11 @@ def test_ccc_reindex_ok_on_zero_exit(tmp_path, monkeypatch):
     (tmp_path / ".cocoindex_code" / "settings.yml").write_text("x: 1")
     backend = CccBackend(tmp_path)
     backend._ccc = "/fake/ccc"
-    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Proc(0))
+    monkeypatch.setattr(
+        ccc_backend,
+        "_run_ccc_control",
+        lambda *a, **k: _Proc(0),
+    )
     result = backend.reindex()
     assert result.ok
 
@@ -457,6 +465,55 @@ def test_ccc_subprocess_environment_excludes_host_credentials(monkeypatch):
         "SSH_AUTH_SOCK",
         "CODEX_HOME",
     } & env.keys()
+
+
+def test_ccc_control_command_uses_bounded_process_group(tmp_path, monkeypatch):
+    observed = {}
+
+    def recording_runner(argv, **kwargs):
+        observed["argv"] = argv
+        observed.update(kwargs)
+        return _Proc(0)
+
+    monkeypatch.setattr(ccc_backend, "run_bounded_process", recording_runner)
+
+    result = ccc_backend._run_ccc_control(
+        ["/fake/ccc", "index"],
+        root=tmp_path,
+        env={"PATH": "/bin"},
+        timeout_s=600,
+    )
+
+    assert result.returncode == 0
+    assert observed["argv"] == ["/fake/ccc", "index"]
+    assert observed["cwd"] == tmp_path
+    assert observed["output_bytes"] == 1024 * 1024
+    assert observed["start_new_session"] is True
+    assert observed["on_exit"] is ccc_backend.terminate_process_group
+
+
+def test_ccc_control_rejects_unsupported_process_groups_before_spawn(
+    tmp_path, monkeypatch
+):
+    def unexpected_spawn(*_args, **_kwargs):
+        raise AssertionError("unsupported hosts must fail before spawning ccc")
+
+    monkeypatch.setattr(
+        ccc_backend,
+        "process_group_cleanup_supported",
+        lambda: False,
+    )
+    monkeypatch.setattr(ccc_backend, "run_bounded_process", unexpected_spawn)
+
+    result = ccc_backend._run_ccc_control(
+        ["/fake/ccc", "index"],
+        root=tmp_path,
+        env={"PATH": "/bin"},
+        timeout_s=600,
+    )
+
+    assert result.returncode == 126
+    assert "requires POSIX process-group cleanup" in result.stderr
 
 
 def test_ccc_mcp_operation_timeout_fails_as_backend_unavailable():

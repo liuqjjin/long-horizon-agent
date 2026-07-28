@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -11,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from ..tools.shell import ProcResult
+from ..process_result import ProcResult
 
 # Environment variables that survive into target-code execution. Everything
 # else — API keys, tokens, cloud credentials — is stripped: target code has no
@@ -19,8 +21,15 @@ from ..tools.shell import ProcResult
 _KEEP_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM")
 DEFAULT_OUTPUT_BYTES = 4 * 1024 * 1024
 OUTPUT_LIMIT_RETURN_CODE = 125
+PROCESS_CLEANUP_RETURN_CODE = 126
 _READ_CHUNK_BYTES = 64 * 1024
 _DRAIN_GRACE_S = 1.0
+_PROCESS_GROUP_CLEANUP_S = 2.0
+
+
+def process_group_cleanup_supported() -> bool:
+    """Return whether the host provides POSIX process-group cleanup."""
+    return os.name == "posix" and hasattr(os, "killpg")
 
 
 def scrub_env(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -47,8 +56,75 @@ class ResourceLimits:
     output_bytes: int = DEFAULT_OUTPUT_BYTES
 
     def __post_init__(self) -> None:
+        for name in ("cpu_s", "memory_mb", "pids"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} must be a positive integer when set")
         if type(self.output_bytes) is not int or self.output_bytes <= 0:
             raise ValueError("output_bytes must be a positive integer")
+
+    @property
+    def has_process_limits(self) -> bool:
+        return any(
+            value is not None
+            for value in (self.cpu_s, self.memory_mb, self.pids)
+        )
+
+
+@dataclass(frozen=True)
+class ProcessCleanupResult:
+    """Whether a process boundary was removed and independently confirmed."""
+
+    confirmed: bool
+    detail: str
+
+
+def terminate_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    confirmation_timeout_s: float = _PROCESS_GROUP_CLEANUP_S,
+) -> ProcessCleanupResult:
+    """Kill the session leader's original process group and confirm its absence.
+
+    Waiting only for the leader is insufficient: a descendant can close stdout
+    and stderr, keep running, and therefore leave no stalled pipe for the
+    capture code to detect. ``start_new_session=True`` makes the leader PID the
+    process-group ID, so the group remains addressable after the leader exits.
+    """
+    if not process_group_cleanup_supported():
+        return ProcessCleanupResult(
+            False,
+            "POSIX process-group cleanup is unavailable on this platform",
+        )
+
+    process_group = process.pid
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        return ProcessCleanupResult(True, "process group absent")
+    except OSError as error:
+        return ProcessCleanupResult(
+            False,
+            f"could not kill process group {process_group}: {error}",
+        )
+
+    deadline = time.monotonic() + confirmation_timeout_s
+    while True:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return ProcessCleanupResult(True, "process group killed")
+        except OSError as error:
+            return ProcessCleanupResult(
+                False,
+                f"could not confirm process group {process_group} cleanup: {error}",
+            )
+        if time.monotonic() >= deadline:
+            return ProcessCleanupResult(
+                False,
+                f"process group {process_group} still exists after cleanup",
+            )
+        time.sleep(0.01)
 
 
 class _BoundedPipe:
@@ -102,8 +178,10 @@ def run_bounded_process(
     env: dict[str, str] | None = None,
     input: str | None = None,
     start_new_session: bool = False,
-    preexec_fn: Callable[[], None] | None = None,
     on_timeout: Callable[[subprocess.Popen[bytes]], str] | None = None,
+    on_exit: (
+        Callable[[subprocess.Popen[bytes]], ProcessCleanupResult] | None
+    ) = None,
 ) -> ProcResult:
     """Run a process while continuously draining two bounded output pipes.
 
@@ -114,6 +192,15 @@ def run_bounded_process(
     """
     if type(output_bytes) is not int or output_bytes <= 0:
         raise ValueError("output_bytes must be a positive integer")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be a positive finite number")
+    if on_exit is not None and not start_new_session:
+        raise ValueError("on_exit cleanup requires start_new_session=True")
     start = time.monotonic()
     process = subprocess.Popen(
         cmd,
@@ -124,58 +211,15 @@ def run_bounded_process(
         stderr=subprocess.PIPE,
         text=False,
         start_new_session=start_new_session,
-        preexec_fn=preexec_fn,
     )
-    if process.stdout is None or process.stderr is None:  # pragma: no cover
-        process.kill()
-        process.wait()
-        raise RuntimeError("bounded process capture requires stdout and stderr pipes")
-
     stdout_capture = _BoundedPipe(output_bytes)
     stderr_capture = _BoundedPipe(output_bytes)
-    readers = [
-        threading.Thread(
-            target=stdout_capture.drain,
-            args=(process.stdout,),
-            name="lha-stdout-drain",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=stderr_capture.drain,
-            args=(process.stderr,),
-            name="lha-stderr-drain",
-            daemon=True,
-        ),
-    ]
-    for reader in readers:
-        reader.start()
-
+    readers: list[threading.Thread] = []
     writer: threading.Thread | None = None
-    if input is not None:
-        payload = input.encode()
-
-        def write_input() -> None:
-            assert process.stdin is not None
-            try:
-                process.stdin.write(payload)
-                process.stdin.flush()
-            except (BrokenPipeError, OSError):
-                pass
-            finally:
-                try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-
-        writer = threading.Thread(
-            target=write_input,
-            name="lha-stdin-writer",
-            daemon=True,
-        )
-        writer.start()
-
+    writer_started = False
     timed_out = False
     timeout_detail = ""
+    interrupted: BaseException | None = None
 
     def stop_process() -> str:
         if on_timeout is None:
@@ -195,29 +239,130 @@ def run_bounded_process(
                 pass
             return "timeout cleanup failed"
 
+    def reap_leader() -> None:
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=5.0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        except (ChildProcessError, OSError):
+            pass
+
     try:
+        if process.stdout is None or process.stderr is None:
+            raise RuntimeError(
+                "bounded process capture requires stdout and stderr pipes"
+            )
+        readers = [
+            threading.Thread(
+                target=stdout_capture.drain,
+                args=(process.stdout,),
+                name="lha-stdout-drain",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=stderr_capture.drain,
+                args=(process.stderr,),
+                name="lha-stderr-drain",
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+
+        if input is not None:
+            if process.stdin is None:
+                raise RuntimeError("bounded process input pipe was not created")
+            payload = input.encode()
+
+            def write_input() -> None:
+                assert process.stdin is not None
+                try:
+                    process.stdin.write(payload)
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+                finally:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+
+            writer = threading.Thread(
+                target=write_input,
+                name="lha-stdin-writer",
+                daemon=True,
+            )
+            writer.start()
+            writer_started = True
+
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
         timeout_detail = stop_process()
-        try:
-            process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        reap_leader()
+    except BaseException as error:
+        # KeyboardInterrupt and cancellation must not leave the process tree
+        # behind merely because no ProcResult will be returned to the caller.
+        interrupted = error
+        stop_process()
+        reap_leader()
 
-    if writer is not None:
-        writer.join(timeout=1.0)
-    writer_stalled = writer is not None and writer.is_alive()
+    cleanup = ProcessCleanupResult(
+        process.poll() is not None,
+        "process leader exited" if process.poll() is not None else "process leader remains",
+    )
+    if on_exit is not None:
+        try:
+            cleanup = on_exit(process)
+        except BaseException as error:
+            cleanup = ProcessCleanupResult(
+                False,
+                f"process cleanup raised {type(error).__name__}: {error}",
+            )
+        if not isinstance(cleanup, ProcessCleanupResult):
+            cleanup = ProcessCleanupResult(
+                False,
+                "process cleanup returned an invalid result",
+            )
+
+    join_error: BaseException | None = None
+    if writer is not None and writer_started:
+        try:
+            writer.join(timeout=1.0)
+        except BaseException as error:
+            join_error = error
+    try:
+        writer_stalled = (
+            writer is not None and writer_started and writer.is_alive()
+        )
+    except BaseException as error:
+        join_error = join_error or error
+        writer_stalled = True
     drain_deadline = time.monotonic() + _DRAIN_GRACE_S
     for reader in readers:
-        reader.join(timeout=max(0.0, drain_deadline - time.monotonic()))
-    drain_stalled = any(reader.is_alive() for reader in readers)
-    if not timed_out and (writer_stalled or drain_stalled):
-        # A child can exit after forking a descendant that keeps a standard-I/O
-        # pipe open. Stop the process group/container instead of leaving the
-        # descendant and pump threads behind.
-        stop_process()
+        if reader.ident is None:
+            continue
+        try:
+            reader.join(
+                timeout=max(0.0, drain_deadline - time.monotonic())
+            )
+        except BaseException as error:
+            join_error = join_error or error
+    try:
+        drain_stalled = any(
+            reader.ident is not None and reader.is_alive()
+            for reader in readers
+        )
+    except BaseException as error:
+        join_error = join_error or error
+        drain_stalled = True
     if process.stdin is not None:
         try:
             if writer_stalled:
@@ -227,15 +372,37 @@ def run_bounded_process(
         except OSError:
             pass
     for stream in (process.stdout, process.stderr):
+        if stream is None:
+            continue
         try:
             stream.close()
         except OSError:
             pass
     for reader in readers:
-        reader.join(timeout=1.0)
+        if reader.ident is None:
+            continue
+        try:
+            reader.join(timeout=1.0)
+        except BaseException as error:
+            join_error = join_error or error
+
+    try:
+        readers_alive = any(
+            reader.ident is not None and reader.is_alive()
+            for reader in readers
+        )
+    except BaseException as error:
+        join_error = join_error or error
+        readers_alive = True
 
     stdout = bytes(stdout_capture.data).decode(errors="replace")
     stderr = bytes(stderr_capture.data).decode(errors="replace")
+    if not cleanup.confirmed:
+        stderr = _append_diagnostic(
+            stderr,
+            f"process cleanup could not be confirmed: {cleanup.detail}",
+            output_bytes,
+        )
     limit_exceeded = stdout_capture.truncated or stderr_capture.truncated
     incomplete = (
         limit_exceeded
@@ -243,8 +410,23 @@ def run_bounded_process(
         or stderr_capture.read_failed
         or writer_stalled
         or drain_stalled
-        or any(reader.is_alive() for reader in readers)
+        or readers_alive
+        or join_error is not None
     )
+    if interrupted is not None:
+        if not cleanup.confirmed:
+            interrupted.add_note(
+                f"process cleanup could not be confirmed: {cleanup.detail}"
+            )
+        raise interrupted
+    if not cleanup.confirmed:
+        return ProcResult(
+            PROCESS_CLEANUP_RETURN_CODE,
+            stdout,
+            stderr,
+            time.monotonic() - start,
+            output_truncated=incomplete,
+        )
     if timed_out:
         detail = f"timeout after {timeout}s"
         if timeout_detail:
@@ -261,7 +443,11 @@ def run_bounded_process(
         reason = (
             f"output exceeded the {output_bytes}-byte capture limit"
             if limit_exceeded
-            else "output capture did not complete"
+            else (
+                f"output capture failed: {type(join_error).__name__}"
+                if join_error is not None
+                else "output capture did not complete"
+            )
         )
         stderr = _append_diagnostic(
             stderr,

@@ -1502,9 +1502,28 @@ def _cli_version(llm: str, client: LLMClient, cli_path: str) -> str | None:
 
 def _resolve_docker_image_id(image: str, *, docker: str = "docker") -> str:
     """Resolve a mutable Docker reference once, before any experiment cell runs."""
+    docker_env = {
+        key: value
+        for key in (
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "DOCKER_CONFIG",
+            "DOCKER_CERT_PATH",
+            "DOCKER_TLS_VERIFY",
+            "XDG_RUNTIME_DIR",
+        )
+        if (value := os.environ.get(key))
+    }
+    docker_env.setdefault("PATH", os.defpath)
     result = run(
         [docker, "image", "inspect", "--format", "{{.Id}}", image],
         timeout=30,
+        env=docker_env,
     )
     value = result.stdout.strip()
     if (
@@ -2072,6 +2091,20 @@ def run_ablation(
 ) -> AblationReport:
     if reps <= 0:
         raise ValueError("reps must be greater than zero")
+    client_probe: Any = llm_client
+    seen_clients: set[int] = set()
+    rejects_formal_evidence = False
+    while client_probe is not None and id(client_probe) not in seen_clients:
+        seen_clients.add(id(client_probe))
+        if getattr(client_probe, "formal_evidence_supported", None) is False:
+            rejects_formal_evidence = True
+            break
+        client_probe = getattr(client_probe, "inner", None)
+    if llm == "claude_cli" or rejects_formal_evidence:
+        raise ValueError(
+            "claude_cli is experimental and cannot produce ablation evidence; "
+            "use the hardened codex_cli backend"
+        )
     out = Path(out_dir) if out_dir else (Path(base.runs_dir) / "ablation")
     out.mkdir(parents=True, exist_ok=True)
     # The backend's own env vars apply here exactly as in `lha run`; an explicit
@@ -2229,6 +2262,13 @@ def run_ablation(
                     llm_calls,
                 )
             )
+
+    final_source_files = _source_file_digests()
+    if final_source_files != source_files:
+        raise RuntimeError(
+            "lha source tree changed during the ablation; "
+            "refusing to publish a mixed-implementation report"
+        )
 
     git_commit, git_dirty = _git_provenance()
     configuration: dict[str, Any] = {
