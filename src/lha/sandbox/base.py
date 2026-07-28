@@ -193,7 +193,10 @@ def read_process_group_census(process_group: int) -> ProcessGroupCensus:
             return ProcessGroupCensus(
                 error=f"process-table inspection returned a malformed row: {line[:200]!r}"
             )
-        if pid <= 0 or pgid <= 0 or uid < 0 or not state:
+        # Linux exposes kernel threads such as kthreadd with PGID 0 in an
+        # all-process scan.  They are valid rows, but can never belong to the
+        # positive process group requested by the caller.
+        if pid <= 0 or pgid < 0 or uid < 0 or not state:
             return ProcessGroupCensus(
                 error=f"process-table inspection returned a malformed row: {line[:200]!r}"
             )

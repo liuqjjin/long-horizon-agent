@@ -457,6 +457,43 @@ def test_darwin_process_group_census_uses_exact_pgid_and_bounded_capture(
     )
 
 
+def test_linux_process_group_census_ignores_valid_kernel_thread_rows(
+    monkeypatch,
+):
+    def bounded_ps(_argv, **_kwargs):
+        return ProcResult(
+            0,
+            "2 0 0 S\n4320 4320 1000 Z\n",
+            "",
+            0.01,
+        )
+
+    monkeypatch.setattr(sandbox_base.sys, "platform", "linux")
+    monkeypatch.setattr(
+        sandbox_base.Path,
+        "is_file",
+        lambda path: str(path) == "/bin/ps",
+    )
+    monkeypatch.setattr(
+        sandbox_base.os,
+        "access",
+        lambda path, _mode: str(path) == "/bin/ps",
+    )
+    monkeypatch.setattr(sandbox_base, "run_bounded_process", bounded_ps)
+
+    census = sandbox_base.read_process_group_census(4320)
+
+    assert census.error is None
+    assert census.members == (
+        sandbox_base.ProcessGroupMember(
+            pid=4320,
+            pgid=4320,
+            uid=1000,
+            state="Z",
+        ),
+    )
+
+
 def test_local_backend_uses_exec_launcher_instead_of_preexec(tmp_path, monkeypatch):
     observed = []
 
