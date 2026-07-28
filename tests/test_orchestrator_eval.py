@@ -313,6 +313,26 @@ def test_quick_eval_materializes_packaged_fixtures_outside_checkout(tmp_path, mo
     assert not list(root.rglob("__pycache__"))
 
 
+def test_quick_eval_removes_only_generated_index_state(
+    tmp_path,
+    monkeypatch,
+):
+    empty_cwd = tmp_path / "empty"
+    empty_cwd.mkdir()
+    monkeypatch.chdir(empty_cwd)
+    config = Config(runs_dir=tmp_path / "runs")
+    root = _eval_data_root(config, quick=True)
+    generated = root / "sample_repo" / ".cocoindex_code"
+    generated.mkdir()
+    (generated / "stale").write_text("old index")
+
+    refreshed = _eval_data_root(config, quick=True)
+
+    assert refreshed == root
+    assert not generated.exists()
+    assert (root / "sample_repo" / "mathutils.py").is_file()
+
+
 def test_full_eval_outside_checkout_fails_with_an_explicit_boundary(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     try:

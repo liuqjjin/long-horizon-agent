@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import lha.durable_io as durable_io
 from lha.agents import ContextEngineer
 from lha.agents.supervisor import Supervisor
 from lha.artifacts import Patch
@@ -599,6 +601,173 @@ def test_stage_evidence_rejects_tampered_or_plain_storage(
             stage="setup",
         )
     assert replay.calls == []
+
+
+@pytest.mark.parametrize("link_kind", ("symlink", "hardlink"))
+@pytest.mark.parametrize(
+    "artifact_name",
+    ("repo_stage_intent.json", "repo_stage_evidence.json"),
+)
+def test_stage_evidence_rejects_linked_storage(
+    link_kind: str,
+    artifact_name: str,
+    tmp_path: Path,
+) -> None:
+    source = LONG_TASKS / "config_parser"
+    worktree = tmp_path / "worktree"
+    run_dir = tmp_path / "run"
+    shutil.copytree(source / "repo", worktree)
+    run_dir.mkdir()
+    spec = RepoAdapterSpec.from_file(source / "adapter.yaml")
+    execute_repo_stage_once(
+        worktree=worktree,
+        run_dir=run_dir,
+        step_id="setup",
+        attempt_id="setup-r0",
+        spec=spec,
+        backend=_CountingBackend(),
+        stage="setup",
+    )
+    artifact = (
+        run_dir
+        / "steps"
+        / "setup"
+        / "attempts"
+        / "setup-r0"
+        / artifact_name
+    )
+    payload = artifact.read_bytes()
+    external = tmp_path / f"external-stage-{artifact_name}-{link_kind}"
+    external.write_bytes(payload)
+    artifact.unlink()
+    if link_kind == "symlink":
+        artifact.symlink_to(external)
+    else:
+        os.link(external, artifact)
+    replay = _CountingBackend()
+
+    with pytest.raises(RepoStageAmbiguous, match="persisted stage evidence"):
+        execute_repo_stage_once(
+            worktree=worktree,
+            run_dir=run_dir,
+            step_id="setup",
+            attempt_id="setup-r0",
+            spec=spec,
+            backend=replay,
+            stage="setup",
+        )
+
+    assert replay.calls == []
+    assert external.read_bytes() == payload
+
+
+def test_stage_evidence_read_rejects_parent_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = LONG_TASKS / "config_parser"
+    worktree = tmp_path / "worktree"
+    run_dir = tmp_path / "run"
+    shutil.copytree(source / "repo", worktree)
+    run_dir.mkdir()
+    spec = RepoAdapterSpec.from_file(source / "adapter.yaml")
+    execute_repo_stage_once(
+        worktree=worktree,
+        run_dir=run_dir,
+        step_id="setup",
+        attempt_id="setup-r0",
+        spec=spec,
+        backend=_CountingBackend(),
+        stage="setup",
+    )
+    attempts = run_dir / "steps" / "setup" / "attempts"
+    attempt_dir = attempts / "setup-r0"
+    detached = attempts / "detached-setup-r0"
+    outside = tmp_path / "outside-stage-read"
+    outside.mkdir()
+    external = outside / "repo_stage_evidence.json"
+    external.write_bytes(b"outside")
+    real_open = durable_io.os.open
+    raced = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal raced
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if path == "repo_stage_evidence.json" and not raced:
+            raced = True
+            attempt_dir.rename(detached)
+            attempt_dir.symlink_to(outside, target_is_directory=True)
+        return descriptor
+
+    monkeypatch.setattr(durable_io.os, "open", racing_open)
+    replay = _CountingBackend()
+
+    with pytest.raises(RepoStageAmbiguous, match="persisted stage evidence"):
+        execute_repo_stage_once(
+            worktree=worktree,
+            run_dir=run_dir,
+            step_id="setup",
+            attempt_id="setup-r0",
+            spec=spec,
+            backend=replay,
+            stage="setup",
+        )
+
+    assert raced
+    assert replay.calls == []
+    assert external.read_bytes() == b"outside"
+
+
+def test_stage_evidence_write_rejects_parent_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = LONG_TASKS / "config_parser"
+    worktree = tmp_path / "worktree"
+    run_dir = tmp_path / "run"
+    shutil.copytree(source / "repo", worktree)
+    run_dir.mkdir()
+    spec = RepoAdapterSpec.from_file(source / "adapter.yaml")
+    attempts = run_dir / "steps" / "setup" / "attempts"
+    attempt_dir = attempts / "setup-r0"
+    detached = attempts / "detached-setup-r0"
+    outside = tmp_path / "outside-stage-write"
+    outside.mkdir()
+    external = outside / "repo_stage_evidence.json"
+    external.write_bytes(b"outside")
+    real_open = durable_io.os.open
+    raced = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal raced
+        if (
+            isinstance(path, str)
+            and path.startswith(".repo_stage_evidence.json.")
+            and path.endswith(".tmp")
+            and not raced
+        ):
+            raced = True
+            attempt_dir.rename(detached)
+            attempt_dir.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(durable_io.os, "open", racing_open)
+    backend = _CountingBackend()
+
+    with pytest.raises(RepoStageAmbiguous, match="evidence could not be persisted"):
+        execute_repo_stage_once(
+            worktree=worktree,
+            run_dir=run_dir,
+            step_id="setup",
+            attempt_id="setup-r0",
+            spec=spec,
+            backend=backend,
+            stage="setup",
+        )
+
+    assert raced
+    assert len(backend.calls) == 1
+    assert external.read_bytes() == b"outside"
 
 
 def test_stage_intent_rejects_legacy_plain_storage(tmp_path: Path):

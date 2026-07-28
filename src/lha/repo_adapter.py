@@ -18,7 +18,11 @@ from typing import Literal, Self, TypeVar
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .durable_io import atomic_replace_text, durable_mkdir_chain
+from .durable_io import (
+    anchored_atomic_replace_bytes,
+    anchored_read_bytes,
+    durable_mkdir_chain,
+)
 from .sandbox.base import ExecutionBackend, ProcessCleanupUnconfirmed
 from .step_ids import canonical_artifact_segment
 
@@ -609,7 +613,12 @@ def execute_repo_stage_once(
     safe_step = _safe_segment(step_id)
     safe_attempt = _safe_segment(attempt_id)
     attempt_dir = run_root / "steps" / safe_step / "attempts" / safe_attempt
-    durable_mkdir_chain(attempt_dir, anchor=run_root)
+    try:
+        durable_mkdir_chain(attempt_dir, anchor=run_root)
+    except (OSError, ValueError) as error:
+        raise RepoStageAmbiguous(
+            f"stage attempt path is unsafe for {step_id}/{attempt_id}: {error}"
+        ) from error
     intent_path = attempt_dir / "repo_stage_intent.json"
     evidence_path = attempt_dir / "repo_stage_evidence.json"
     spec_payload = json.dumps(
@@ -624,10 +633,24 @@ def execute_repo_stage_once(
         spec_sha256=hashlib.sha256(spec_payload).hexdigest(),
     )
 
-    if evidence_path.exists():
+    try:
+        evidence = _read_checksummed_model(
+            evidence_path,
+            RepoStageEvidence,
+            run_dir=run_root,
+            missing_ok=True,
+        )
+    except Exception as error:
+        raise RepoStageAmbiguous(
+            f"persisted stage evidence is invalid for {step_id}/{attempt_id}: {error}"
+        ) from error
+    if evidence is not None:
         try:
-            persisted_intent = _read_checksummed_model(intent_path, RepoStageIntent)
-            evidence = _read_checksummed_model(evidence_path, RepoStageEvidence)
+            persisted_intent = _read_checksummed_model(
+                intent_path,
+                RepoStageIntent,
+                run_dir=run_root,
+            )
         except Exception as error:
             raise RepoStageAmbiguous(
                 f"persisted stage evidence is invalid for {step_id}/{attempt_id}: {error}"
@@ -644,13 +667,18 @@ def execute_repo_stage_once(
         _publish_stage_result(run_root, safe_step, evidence.result)
         return evidence.result
 
-    if intent_path.exists():
-        try:
-            persisted_intent = _read_checksummed_model(intent_path, RepoStageIntent)
-        except Exception as error:
-            raise RepoStageAmbiguous(
-                f"prepared stage intent is invalid for {step_id}/{attempt_id}: {error}"
-            ) from error
+    try:
+        persisted_intent = _read_checksummed_model(
+            intent_path,
+            RepoStageIntent,
+            run_dir=run_root,
+            missing_ok=True,
+        )
+    except Exception as error:
+        raise RepoStageAmbiguous(
+            f"prepared stage intent is invalid for {step_id}/{attempt_id}: {error}"
+        ) from error
+    if persisted_intent is not None:
         if persisted_intent != intent:
             raise RepoStageAmbiguous(
                 f"prepared stage intent changed for {step_id}/{attempt_id}"
@@ -660,7 +688,13 @@ def execute_repo_stage_once(
             "refusing to duplicate its side effects"
         )
 
-    _write_checksummed_model(intent_path, intent)
+    try:
+        _write_checksummed_model(intent_path, intent, run_dir=run_root)
+    except Exception as error:
+        raise RepoStageAmbiguous(
+            f"stage intent could not be persisted for "
+            f"{step_id}/{attempt_id}: {error}"
+        ) from error
     result = RepoAdapter(root, spec, backend).run_stage(RepoStageRequest(stage=stage))
     cleanup_failures = [
         command for command in result.commands if command.cleanup_unconfirmed
@@ -680,7 +714,13 @@ def execute_repo_stage_once(
         worktree_sha256=repository_tree_sha256(root),
         result=result,
     )
-    _write_checksummed_model(evidence_path, evidence)
+    try:
+        _write_checksummed_model(evidence_path, evidence, run_dir=run_root)
+    except Exception as error:
+        raise RepoStageAmbiguous(
+            f"stage evidence could not be persisted for "
+            f"{step_id}/{attempt_id}: {error}"
+        ) from error
     _publish_stage_result(run_root, safe_step, result)
     return result
 
@@ -699,32 +739,45 @@ def _safe_segment(value: str) -> str:
 def _publish_stage_result(run_dir: Path, safe_step: str, result: RepoStageResult) -> None:
     payload = result.model_dump_json(indent=2)
     step_path = run_dir / "steps" / safe_step / "repo_stage.json"
-    _durable_replace(step_path, payload)
-    _durable_replace(run_dir / "repo_stage.json", payload)
+    _durable_replace(step_path, payload, run_dir=run_dir)
+    _durable_replace(run_dir / "repo_stage.json", payload, run_dir=run_dir)
 
 
 def _canonical_payload(payload: dict[str, object]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 
 
-def _write_checksummed_model(path: Path, model: BaseModel) -> None:
+def _write_checksummed_model(
+    path: Path,
+    model: BaseModel,
+    *,
+    run_dir: Path,
+) -> None:
     payload = model.model_dump(mode="json")
     envelope = {
         "schema_version": 1,
         "sha256": hashlib.sha256(_canonical_payload(payload)).hexdigest(),
         "payload": payload,
     }
-    _durable_replace(path, json.dumps(envelope, indent=2))
+    _durable_replace(
+        path,
+        json.dumps(envelope, indent=2),
+        run_dir=run_dir,
+    )
 
 
 def _read_checksummed_model(
     path: Path,
     model_type: type[_EnvelopeModel],
-) -> _EnvelopeModel:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"artifact path is missing or unsafe: {path}")
+    *,
+    run_dir: Path,
+    missing_ok: bool = False,
+) -> _EnvelopeModel | None:
+    data = anchored_read_bytes(path, anchor=run_dir, missing_ok=missing_ok)
+    if data is None:
+        return None
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(data)
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"artifact is unreadable: {error}") from error
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "sha256", "payload"}:
@@ -744,10 +797,8 @@ def _read_checksummed_model(
     return model_type.model_validate(payload)
 
 
-def _durable_replace(path: Path, text: str) -> None:
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise ValueError(f"artifact path is unsafe: {path}")
-    atomic_replace_text(path, text)
+def _durable_replace(path: Path, text: str, *, run_dir: Path) -> None:
+    anchored_atomic_replace_bytes(path, text.encode("utf-8"), anchor=run_dir)
 
 
 __all__ = [

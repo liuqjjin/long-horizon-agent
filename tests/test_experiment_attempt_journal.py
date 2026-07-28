@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
+import lha.durable_io as durable_io
 from lha.agents import experimenter as experimenter_module
 from lha.agents.experimenter import (
     ExperimentAmbiguous,
@@ -104,10 +106,10 @@ def test_intent_without_result_refuses_to_repeat_command(
     _write_script(worktree)
     real_write = experimenter_module._write_checksummed_model
 
-    def crash_before_result(path, model):
+    def crash_before_result(path, model, *, run_dir):
         if isinstance(model, ExperimentEvidence):
             raise KeyboardInterrupt("after experiment command")
-        return real_write(path, model)
+        return real_write(path, model, run_dir=run_dir)
 
     monkeypatch.setattr(
         experimenter_module, "_write_checksummed_model", crash_before_result
@@ -134,6 +136,157 @@ def test_intent_without_result_refuses_to_repeat_command(
             attempt_id="exp-r0",
             backend=TrustedLocalBackend(),
         )
+    assert (worktree / "main_counter.txt").read_text() == "1"
+
+
+@pytest.mark.parametrize("link_kind", ("symlink", "hardlink"))
+@pytest.mark.parametrize(
+    "artifact_name",
+    ("experiment_intent.json", "experiment_evidence.json"),
+)
+def test_experiment_evidence_rejects_linked_storage(
+    link_kind: str,
+    artifact_name: str,
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    worktree = run_dir / "workdir"
+    worktree.mkdir(parents=True)
+    _write_script(worktree)
+    execute_experiment_once(
+        step=_step(),
+        bundle=_bundle(),
+        workdir=worktree,
+        run_dir=run_dir,
+        attempt_id="exp-r0",
+        backend=TrustedLocalBackend(),
+    )
+    artifact = (
+        run_dir
+        / "steps"
+        / "exp"
+        / "attempts"
+        / "exp-r0"
+        / artifact_name
+    )
+    payload = artifact.read_bytes()
+    external = tmp_path / f"external-{artifact_name}-{link_kind}"
+    external.write_bytes(payload)
+    artifact.unlink()
+    if link_kind == "symlink":
+        artifact.symlink_to(external)
+    else:
+        os.link(external, artifact)
+
+    with pytest.raises(ExperimentAmbiguous, match="persisted experiment evidence"):
+        execute_experiment_once(
+            step=_step(),
+            bundle=_bundle(),
+            workdir=worktree,
+            run_dir=run_dir,
+            attempt_id="exp-r0",
+            backend=TrustedLocalBackend(),
+        )
+
+    assert external.read_bytes() == payload
+
+
+def test_experiment_evidence_read_rejects_parent_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    worktree = run_dir / "workdir"
+    worktree.mkdir(parents=True)
+    _write_script(worktree)
+    execute_experiment_once(
+        step=_step(),
+        bundle=_bundle(),
+        workdir=worktree,
+        run_dir=run_dir,
+        attempt_id="exp-r0",
+        backend=TrustedLocalBackend(),
+    )
+    attempts = run_dir / "steps" / "exp" / "attempts"
+    attempt_dir = attempts / "exp-r0"
+    detached = attempts / "detached-exp-r0"
+    outside = tmp_path / "outside-read"
+    outside.mkdir()
+    external = outside / "experiment_evidence.json"
+    external.write_bytes(b"outside")
+    real_open = durable_io.os.open
+    raced = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal raced
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if path == "experiment_evidence.json" and not raced:
+            raced = True
+            attempt_dir.rename(detached)
+            attempt_dir.symlink_to(outside, target_is_directory=True)
+        return descriptor
+
+    monkeypatch.setattr(durable_io.os, "open", racing_open)
+
+    with pytest.raises(ExperimentAmbiguous, match="persisted experiment evidence"):
+        execute_experiment_once(
+            step=_step(),
+            bundle=_bundle(),
+            workdir=worktree,
+            run_dir=run_dir,
+            attempt_id="exp-r0",
+            backend=TrustedLocalBackend(),
+        )
+
+    assert raced
+    assert external.read_bytes() == b"outside"
+
+
+def test_experiment_evidence_write_rejects_parent_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    worktree = run_dir / "workdir"
+    worktree.mkdir(parents=True)
+    _write_script(worktree)
+    attempts = run_dir / "steps" / "exp" / "attempts"
+    attempt_dir = attempts / "exp-r0"
+    detached = attempts / "detached-exp-r0"
+    outside = tmp_path / "outside-write"
+    outside.mkdir()
+    external = outside / "experiment_evidence.json"
+    external.write_bytes(b"outside")
+    real_open = durable_io.os.open
+    raced = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal raced
+        if (
+            isinstance(path, str)
+            and path.startswith(".experiment_evidence.json.")
+            and path.endswith(".tmp")
+            and not raced
+        ):
+            raced = True
+            attempt_dir.rename(detached)
+            attempt_dir.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(durable_io.os, "open", racing_open)
+
+    with pytest.raises(ExperimentAmbiguous, match="evidence could not be persisted"):
+        execute_experiment_once(
+            step=_step(),
+            bundle=_bundle(),
+            workdir=worktree,
+            run_dir=run_dir,
+            attempt_id="exp-r0",
+            backend=TrustedLocalBackend(),
+        )
+
+    assert raced
+    assert external.read_bytes() == b"outside"
     assert (worktree / "main_counter.txt").read_text() == "1"
 
 
