@@ -239,8 +239,8 @@ def test_process_group_cleanup_fails_closed_on_persistent_permission_error(
     monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
     monkeypatch.setattr(
         sandbox_base,
-        "_read_process_group_census",
-        lambda _pgid: sandbox_base._ProcessGroupCensus(
+        "read_process_group_census",
+        lambda _pgid: sandbox_base.ProcessGroupCensus(
             error="process table unavailable"
         ),
     )
@@ -271,10 +271,10 @@ def test_process_group_cleanup_accepts_permission_error_for_zombies_only(
     monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
     monkeypatch.setattr(
         sandbox_base,
-        "_read_process_group_census",
-        lambda pgid: sandbox_base._ProcessGroupCensus(
+        "read_process_group_census",
+        lambda pgid: sandbox_base.ProcessGroupCensus(
             (
-                sandbox_base._ProcessGroupMember(
+                sandbox_base.ProcessGroupMember(
                     pid=pgid + 1,
                     pgid=pgid,
                     uid=os.geteuid(),
@@ -309,10 +309,10 @@ def test_process_group_cleanup_rejects_same_user_runnable_member_after_eperm(
     monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
     monkeypatch.setattr(
         sandbox_base,
-        "_read_process_group_census",
-        lambda pgid: sandbox_base._ProcessGroupCensus(
+        "read_process_group_census",
+        lambda pgid: sandbox_base.ProcessGroupCensus(
             (
-                sandbox_base._ProcessGroupMember(
+                sandbox_base.ProcessGroupMember(
                     pid=pgid + 1,
                     pgid=pgid,
                     uid=os.geteuid(),
@@ -348,10 +348,10 @@ def test_process_group_cleanup_accepts_reused_pgid_after_original_leader_exit(
     monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
     monkeypatch.setattr(
         sandbox_base,
-        "_read_process_group_census",
-        lambda pgid: sandbox_base._ProcessGroupCensus(
+        "read_process_group_census",
+        lambda pgid: sandbox_base.ProcessGroupCensus(
             (
-                sandbox_base._ProcessGroupMember(
+                sandbox_base.ProcessGroupMember(
                     pid=pgid,
                     pgid=pgid,
                     uid=os.geteuid(),
@@ -394,8 +394,8 @@ def test_process_group_cleanup_rechecks_empty_census_before_accepting_absence(
     monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
     monkeypatch.setattr(
         sandbox_base,
-        "_read_process_group_census",
-        lambda _pgid: sandbox_base._ProcessGroupCensus(),
+        "read_process_group_census",
+        lambda _pgid: sandbox_base.ProcessGroupCensus(),
     )
 
     result = sandbox_base.terminate_process_group(
@@ -435,7 +435,7 @@ def test_darwin_process_group_census_uses_exact_pgid_and_bounded_capture(
     )
     monkeypatch.setattr(sandbox_base, "run_bounded_process", bounded_ps)
 
-    census = sandbox_base._read_process_group_census(4319)
+    census = sandbox_base.read_process_group_census(4319)
 
     assert observed["argv"] == [
         "/bin/ps",
@@ -448,7 +448,7 @@ def test_darwin_process_group_census_uses_exact_pgid_and_bounded_capture(
     assert observed["kwargs"]["output_bytes"] == 4 * 1024 * 1024
     assert census.error is None
     assert census.members == (
-        sandbox_base._ProcessGroupMember(
+        sandbox_base.ProcessGroupMember(
             pid=4319,
             pgid=4319,
             uid=501,

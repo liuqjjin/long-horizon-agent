@@ -33,7 +33,10 @@ from typing import Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .clock import now
-from .sandbox.base import ProcessCleanupResult
+from .sandbox.base import (
+    ProcessCleanupResult,
+    read_process_group_census,
+)
 
 LEASE_DIRECTORY = "active-operations"
 _SCHEMA_VERSION = 1
@@ -43,6 +46,8 @@ _KERNEL_BOOT_TIME = re.compile(
 )
 _ACTIVATION_TIMEOUT_S = 5.0
 _RECOVERY_CONFIRMATION_S = 2.0
+_IDENTITY_RETRY_S = 0.5
+_IDENTITY_RETRY_INTERVAL_S = 0.01
 
 
 class OperationLeaseError(RuntimeError):
@@ -668,16 +673,6 @@ def _group_exists(pgid: int) -> bool:
     return True
 
 
-def _process_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def recover_local_operation(
     store: OperationLeaseStore,
     lease: ActiveOperationLease,
@@ -728,56 +723,145 @@ def recover_local_operation(
 
     assert lease.pid is not None
     assert lease.pgid is not None
-    if not _group_exists(lease.pgid):
-        store.clear(lease.operation_id)
-        return ProcessCleanupResult(True, "process group is absent")
-    current_snapshot = _process_snapshot(lease.pid)
-    if current_snapshot is None:
-        status = (
-            "live PID identity is unavailable"
-            if _process_exists(lease.pid)
-            else "leased process leader is absent while its group still exists"
-        )
-        return ProcessCleanupResult(
-            False,
-            f"{status} for PID {lease.pid}",
-        )
-    if current_snapshot.pgid != lease.pgid:
-        return ProcessCleanupResult(
-            False,
-            (
-                f"PID {lease.pid} now belongs to process group "
-                f"{current_snapshot.pgid}, expected {lease.pgid}"
-            ),
-        )
-    if current_snapshot.birth_identity != lease.process_identity:
-        return ProcessCleanupResult(
-            False,
-            (
-                f"PID {lease.pid} was reused while process group "
-                f"{lease.pgid} still exists"
-            ),
-        )
+    identity_deadline = time.monotonic() + min(
+        confirmation_timeout_s,
+        _IDENTITY_RETRY_S,
+    )
+    while True:
+        if not _group_exists(lease.pgid):
+            store.clear(lease.operation_id)
+            return ProcessCleanupResult(True, "process group is absent")
+        census = read_process_group_census(lease.pgid)
+        if census.error is not None:
+            unavailable_detail = (
+                f"process group {lease.pgid} could not be inspected: {census.error}"
+            )
+        elif not census.members:
+            if not _group_exists(lease.pgid):
+                store.clear(lease.operation_id)
+                return ProcessCleanupResult(
+                    True,
+                    "process leader and process group are absent",
+                )
+            unavailable_detail = (
+                f"process group {lease.pgid} is absent from the process table "
+                "but the kernel still reports it present"
+            )
+        elif not census.runnable_members:
+            store.clear(lease.operation_id)
+            return ProcessCleanupResult(
+                True,
+                f"process group {lease.pgid} has only zombie members",
+            )
+        else:
+            leader = next(
+                (member for member in census.members if member.pid == lease.pid),
+                None,
+            )
+            if leader is None:
+                runnable_pids = ", ".join(
+                    str(member.pid) for member in census.runnable_members[:10]
+                )
+                return ProcessCleanupResult(
+                    False,
+                    (
+                        f"leased process leader PID {lease.pid} is absent while "
+                        f"process group {lease.pgid} has runnable members: "
+                        f"{runnable_pids}"
+                    ),
+                )
+            current_snapshot = _process_snapshot(lease.pid)
+            if current_snapshot is not None:
+                if current_snapshot.pgid != lease.pgid:
+                    return ProcessCleanupResult(
+                        False,
+                        (
+                            f"PID {lease.pid} now belongs to process group "
+                            f"{current_snapshot.pgid}, expected {lease.pgid}"
+                        ),
+                    )
+                if current_snapshot.birth_identity != lease.process_identity:
+                    return ProcessCleanupResult(
+                        False,
+                        (
+                            f"PID {lease.pid} was reused while process group "
+                            f"{lease.pgid} still exists"
+                        ),
+                    )
+                break
+            unavailable_detail = (
+                f"PID {lease.pid} is a zombie with runnable descendants but "
+                "its birth identity is unavailable"
+                if leader.is_zombie
+                else f"live PID identity is unavailable for PID {lease.pid} after retry"
+            )
+        if time.monotonic() >= identity_deadline:
+            return ProcessCleanupResult(False, unavailable_detail)
+        time.sleep(_IDENTITY_RETRY_INTERVAL_S)
+
+    permission_error: PermissionError | None = None
     try:
         os.killpg(lease.pgid, signal.SIGKILL)
     except ProcessLookupError:
         store.clear(lease.operation_id)
         return ProcessCleanupResult(True, "process group is absent")
-    except (PermissionError, OSError) as error:
+    except PermissionError as error:
+        # Darwin can report EPERM after delivering SIGKILL to members that are
+        # now zombies. The bounded census below decides whether anything can
+        # still execute.
+        permission_error = error
+    except OSError as error:
         return ProcessCleanupResult(
             False,
             f"could not kill process group {lease.pgid}: {error}",
         )
     deadline = time.monotonic() + confirmation_timeout_s
-    while _group_exists(lease.pgid):
+    while True:
+        if not _group_exists(lease.pgid):
+            store.clear(lease.operation_id)
+            return ProcessCleanupResult(True, "process group killed and confirmed absent")
+        census = read_process_group_census(lease.pgid)
+        if census.error is not None:
+            cleanup_detail = (
+                f"process group {lease.pgid} could not be inspected after SIGKILL: "
+                f"{census.error}"
+            )
+        elif not census.members:
+            if not _group_exists(lease.pgid):
+                store.clear(lease.operation_id)
+                return ProcessCleanupResult(
+                    True,
+                    "process group killed and confirmed absent",
+                )
+            cleanup_detail = (
+                f"process group {lease.pgid} is absent from the process table "
+                "but the kernel still reports it present after SIGKILL"
+            )
+        elif not census.runnable_members:
+            store.clear(lease.operation_id)
+            return ProcessCleanupResult(
+                True,
+                f"process group {lease.pgid} has only zombie members after SIGKILL",
+            )
+        else:
+            runnable_pids = ", ".join(
+                str(member.pid) for member in census.runnable_members[:10]
+            )
+            cleanup_detail = (
+                f"process group {lease.pgid} still has runnable members after "
+                f"SIGKILL: {runnable_pids}"
+            )
         if time.monotonic() >= deadline:
+            if permission_error is not None:
+                cleanup_detail = (
+                    f"could not kill process group {lease.pgid}: "
+                    f"{permission_error}; {cleanup_detail}"
+                )
             return ProcessCleanupResult(
                 False,
-                f"process group {lease.pgid} still exists after SIGKILL",
+                cleanup_detail,
             )
-        time.sleep(0.01)
-    store.clear(lease.operation_id)
-    return ProcessCleanupResult(True, "process group killed and confirmed absent")
+        time.sleep(_IDENTITY_RETRY_INTERVAL_S)
 
 
 def recover_active_operations(

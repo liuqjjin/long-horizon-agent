@@ -93,7 +93,7 @@ class ProcessCleanupUnconfirmed(RuntimeError):
 
 
 @dataclass(frozen=True)
-class _ProcessGroupMember:
+class ProcessGroupMember:
     """One kernel process-table row used to disambiguate signal-0 results."""
 
     pid: int
@@ -107,12 +107,18 @@ class _ProcessGroupMember:
 
 
 @dataclass(frozen=True)
-class _ProcessGroupCensus:
-    members: tuple[_ProcessGroupMember, ...] = ()
+class ProcessGroupCensus:
+    """A bounded process-table snapshot for one numeric process group."""
+
+    members: tuple[ProcessGroupMember, ...] = ()
     error: str | None = None
 
+    @property
+    def runnable_members(self) -> tuple[ProcessGroupMember, ...]:
+        return tuple(member for member in self.members if not member.is_zombie)
 
-def _read_process_group_census(process_group: int) -> _ProcessGroupCensus:
+
+def read_process_group_census(process_group: int) -> ProcessGroupCensus:
     """Read fixed process-table fields without trusting the target environment."""
     ps = next(
         (
@@ -123,7 +129,7 @@ def _read_process_group_census(process_group: int) -> _ProcessGroupCensus:
         None,
     )
     if ps is None:
-        return _ProcessGroupCensus(error="a fixed system ps executable is unavailable")
+        return ProcessGroupCensus(error="a fixed system ps executable is unavailable")
     fields = "pid=,pgid=,uid=,state="
     if sys.platform == "darwin" or "bsd" in sys.platform:
         # BSD ps can select the exact process group. GNU ps gives -g different
@@ -143,15 +149,15 @@ def _read_process_group_census(process_group: int) -> _ProcessGroupCensus:
             },
         )
     except OSError as error:
-        return _ProcessGroupCensus(
+        return ProcessGroupCensus(
             error=f"process-table inspection failed: {type(error).__name__}: {error}"
         )
     if result.output_truncated:
-        return _ProcessGroupCensus(
+        return ProcessGroupCensus(
             error="process-table inspection output exceeded its capture limit"
         )
     if result.returncode == 124:
-        return _ProcessGroupCensus(error="process-table inspection timed out")
+        return ProcessGroupCensus(error="process-table inspection timed out")
     if (
         result.returncode == 1
         and not result.stdout.strip()
@@ -160,22 +166,22 @@ def _read_process_group_census(process_group: int) -> _ProcessGroupCensus:
     ):
         # BSD ps uses exit 1 with no diagnostic when the selected PGID vanished
         # between the signal-0 probe and this snapshot.
-        return _ProcessGroupCensus()
+        return ProcessGroupCensus()
     if result.returncode != 0:
         detail = result.stderr.strip()[-500:]
         suffix = f": {detail}" if detail else ""
-        return _ProcessGroupCensus(
+        return ProcessGroupCensus(
             error=f"process-table inspection exited {result.returncode}{suffix}"
         )
 
-    members: list[_ProcessGroupMember] = []
+    members: list[ProcessGroupMember] = []
     for raw_line in result.stdout.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         fields = line.split()
         if len(fields) != 4:
-            return _ProcessGroupCensus(
+            return ProcessGroupCensus(
                 error=f"process-table inspection returned a malformed row: {line[:200]!r}"
             )
         raw_pid, raw_pgid, raw_uid, state = fields
@@ -184,23 +190,23 @@ def _read_process_group_census(process_group: int) -> _ProcessGroupCensus:
             pgid = int(raw_pgid)
             uid = int(raw_uid)
         except ValueError:
-            return _ProcessGroupCensus(
+            return ProcessGroupCensus(
                 error=f"process-table inspection returned a malformed row: {line[:200]!r}"
             )
         if pid <= 0 or pgid <= 0 or uid < 0 or not state:
-            return _ProcessGroupCensus(
+            return ProcessGroupCensus(
                 error=f"process-table inspection returned a malformed row: {line[:200]!r}"
             )
         if pgid == process_group:
             members.append(
-                _ProcessGroupMember(
+                ProcessGroupMember(
                     pid=pid,
                     pgid=pgid,
                     uid=uid,
                     state=state,
                 )
             )
-    return _ProcessGroupCensus(tuple(members))
+    return ProcessGroupCensus(tuple(members))
 
 
 def _confirm_process_group_not_runnable(
@@ -208,7 +214,7 @@ def _confirm_process_group_not_runnable(
     process_group: int,
 ) -> ProcessCleanupResult:
     """Resolve Darwin's ambiguous signal-0 result through the process table."""
-    census = _read_process_group_census(process_group)
+    census = read_process_group_census(process_group)
     if census.error is not None:
         return ProcessCleanupResult(
             False,
@@ -238,7 +244,7 @@ def _confirm_process_group_not_runnable(
             ),
         )
 
-    runnable = tuple(member for member in census.members if not member.is_zombie)
+    runnable = census.runnable_members
     if not runnable:
         # Darwin may return EPERM for a group containing only killed zombies.
         # Zombies cannot execute or produce further side effects; their parent
