@@ -91,7 +91,9 @@ rejects:
 
 Each call gets a temporary home, `CODEX_HOME`, workspace, and temporary
 directory. The parent environment is reduced to an allowlist. The process group
-is stopped before temporary credentials are removed.
+is stopped before temporary credentials are removed on normal return, failure,
+timeout, or handled interruption. `SIGKILL`, a kernel crash, or power loss can
+bypass this cleanup and leave a mode-protected temporary directory.
 
 Other model backends remain available for exploratory runs, but the public
 release check accepts only evidence produced by `codex_cli` with its JSONL and
@@ -103,12 +105,48 @@ The report records model and CLI settings, event summary, usage, runtime
 versions, Git state, source and task digests, scorer backend, and container
 identity where applicable. It does not record credentials.
 
+## Formal attempt registration
+
+The formal 17-task × 12-repetition schedule is different from an exploratory
+`lha ablate` run. Before execution, `benchmarks/formal_ablation_attempts.json`
+must contain one open `REGISTERED` event that fixes:
+
+- the source commit and source-tree digest;
+- the corpus manifest;
+- the model, reasoning effort, Codex CLI version and executable digest;
+- no-tools, sandbox, permission, retry, timeout, and backoff settings;
+- the immutable Docker image ID;
+- the single-use output path and witness remote.
+
+The registration commit must directly follow the source commit and may change
+only the registry. At startup the runner creates a deterministic witness commit
+and pushes it to the attempt-specific remote ref only if that ref does not
+already exist. The witness binds the registration digest, protocol digest,
+random outcome key, and run-header digest. The run proceeds only after
+`ls-remote` confirms the exact ref. The release check later requires the same
+remote ref to remain available.
+
+The registry is an append-only state machine. `COMPLETED` binds one report to
+the registration. A preflight failure, interruption, or incomplete schedule is
+recorded as `ABANDONED`. Registering an equivalent source tree, corpus, model,
+CLI/client configuration, and image again is rejected even if a new empty Git
+commit is created.
+
+This witness records that the registered attempt started. It does not make the
+remote service, host, Docker daemon, or private Git history trustworthy.
+
 ## Errors, cache, and statistics
 
-A completed cell can be reused only if its cache-key format v8 fingerprint
-still matches and its patch artifact, scorer receipt, and LLM call receipts
-validate. The fingerprint covers the input snapshot, LHA source, model
-settings, scorer, repair and retry settings, and runtime versions.
+Exploratory runs may reuse a completed cell when its cache-key format v8
+fingerprint and all referenced artifacts and receipts validate. The fingerprint
+covers the input snapshot, LHA source, model settings, scorer, repair and retry
+settings, and runtime versions.
+
+Formal runs do not read cache and do not resume. Their output directory must be
+new and contain only the full-run lock before initialization. The runner writes
+one run header, then one start marker and one terminal seal for each of the 204
+cells. Existing markers, terminal files, or copied exploratory cache entries
+stop the run.
 
 The formal schema-4 report uses `ERROR` for one narrow case: every bounded
 first-call attempt failed before Codex produced a patch. Each failed call is
@@ -116,16 +154,10 @@ saved as a content-addressed receipt. The three conditions then share one
 cell-level `ERROR`; it remains in the scheduled total but is excluded from rate
 estimates and paired tests.
 
-That terminal `ERROR` is sealed in the cell cache. A process restart may read
-the seal, but it may not call the model again for that cell. If a patch was
-already produced and a later repair, scorer, filesystem, or cache operation
-fails, the formal run stops instead of reducing a partial result to `ERROR`.
-Exploratory runs retain the broader best-effort error handling.
-
-Before the first call, the runner writes a cell-start marker bound to the
-fingerprint and input snapshot. A marker without a valid terminal seal is an
-interrupted attempt, not permission to sample again; continuing then requires a
-new output directory and a new full run.
+If a patch has been produced and a later repair, scorer, filesystem, or
+container operation fails, the formal attempt stops instead of converting the
+partial cell to `ERROR`. Any interruption consumes the registered attempt; the
+partial directory is retained for audit and cannot be resumed.
 
 The report separates scheduled cells, usable paired cells, and cell-level
 errors. Rate denominators use usable cells. A repetition with any unavailable
@@ -149,13 +181,25 @@ readable as historical records but cannot be published as current formal
 evidence.
 
 The committed report must cover the complete registered 17-task ×
-12-repetition schedule. Values from the older schema-2 run are not carried
-forward into a schema-4 claim.
+12-repetition schedule, contain no cache hits, and match one completed
+registration and its remote start witness. Values from the older schema-2 run
+are not carried forward into a schema-4 claim.
+
+The current committed `ablation_report.json` is the historical schema-2 record.
+No final schema-4 count should be quoted until the registered attempt finishes
+and all required evidence is committed.
 
 ## Reproduce
 
+First commit the source and corpus manifest. Then append the exact
+`REGISTERED` event, including the fresh attempt ID, output path
+`runs/formal_ablation/<attempt-id>`, and witness remote, in a registration-only
+commit. Push both commits before starting. The following command is valid only
+for that clean registered checkout:
+
 ```bash
 docker build -t lha:release .
+ATTEMPT_ID=replace-with-the-registered-64-hex-id
 LHA_CODEX_MODEL=gpt-5.4-mini \
 LHA_CODEX_EFFORT=low \
 LHA_CODEX_SANDBOX=read-only \
@@ -164,7 +208,7 @@ uv run lha --llm codex_cli ablate \
   --reps 12 \
   --model gpt-5.4-mini \
   --scorer-backend docker \
-  --out runs/ablation
+  --out "runs/formal_ablation/$ATTEMPT_ID"
 ```
 
 The scorer image must contain Pytest and `pytest-json-report`.
@@ -172,7 +216,9 @@ The scorer image must contain Pytest and `pytest-json-report`.
 Output:
 
 ```text
-runs/ablation/
+runs/formal_ablation/<attempt-id>/
+  .formal-ablation.lock
+  formal_run.json
   ablation_report.json
   ablation_report.md
   input_snapshots/<sha256>/
@@ -185,10 +231,11 @@ runs/ablation/
 
 Before publishing a result, finish the registered repetitions, keep every
 `ERROR`, and commit the JSON report, generated Markdown, patch artifacts,
-scorer evidence, and LLM call receipts together. `release_claims` recomputes
-the LHA source tree plus the task and corpus digests from the checkout. It also
-checks that resumed cells form a schedule prefix and that the receipt directory
-contains no unreferenced files.
+scorer evidence, LLM call receipts, run header, terminal seals, and matching
+`COMPLETED` registry event together. `release_claims` recomputes the LHA source
+tree plus task and corpus digests, requires all 204 fresh start/terminal pairs,
+rejects cache hits and unreferenced receipts, verifies the registration history,
+and confirms the remote witness ref.
 
 The generated files for the historical schema-v2 run are
 [`benchmarks/ablation_report.json`](../benchmarks/ablation_report.json) and

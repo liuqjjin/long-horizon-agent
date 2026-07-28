@@ -53,12 +53,23 @@ Resume rejects changes to the saved step, repair, deadline, or model-call
 limits.
 
 `state.json` is stored in a checksummed envelope and replaced atomically after
-`fsync`. `ledger.jsonl` is append-only. A torn final record is treated as an
-interrupted write; corruption in an earlier durable record stops recovery.
+`fsync`. `ledger.jsonl` is logically append-only: each update validates the
+event chain and atomically replaces the complete bytes. It does not depend on
+`O_APPEND`. A torn legacy final record is treated as an interrupted write;
+corruption in a complete record stops recovery.
 
 Each run has a file lock. Attempt IDs and ledger idempotency keys prevent
 duplicate approval and completion events. Schema-v1 state can be inspected but
 is not resumed as schema v2.
+
+Atomic replacement writes a temporary file, syncs it, renames it, and syncs the
+directory. A forced stop can leave a restrictive temporary file. Transaction
+recovery removes only an exact temporary file that matches a validated journal
+transition; ambiguous residue stops recovery.
+
+Write-once evidence uses exclusive creation at its final name. A forced stop or
+storage failure during that first write can leave incomplete bytes. Loaders
+reject the mismatch; they do not infer or reconstruct the missing content.
 
 The optional LangGraph runtime uses the same execution and verification helpers.
 Its prepare, approval interrupt, and verify steps are separate nodes backed by
@@ -115,6 +126,10 @@ A stage writes intent before execution and completion evidence afterward. If a
 process exits after a stage may have run but before completion is saved, resume
 does not repeat a potentially non-idempotent side effect.
 
+These adapters define how a fixed repository is prepared and checked. They do
+not by themselves establish a benchmark result; that also requires a fixed
+protocol, raw outcomes, provenance, and a committed summary.
+
 ## Persisted artifacts
 
 Boundary data uses Pydantic models. The main files are:
@@ -159,7 +174,9 @@ import CocoIndex or start `ccc`. CI checks this boundary.
 LLM calls use one interface and a tracing wrapper. The Codex CLI backend creates
 an attempt-local home, `CODEX_HOME`, workspace, and temporary directory. It
 passes a small environment allowlist, runs the CLI in a new process group, and
-removes temporary credentials after descendants have stopped.
+removes temporary credentials after descendants have stopped on normal return,
+failure, timeout, or handled interruption. `SIGKILL`, a kernel crash, or power
+loss can bypass cleanup and leave a mode-protected directory for manual review.
 
 Malformed JSONL, unknown events, error events, incomplete turns, and unfinished
 or disallowed tool use fail the call. Successful records include CLI version,
@@ -175,7 +192,8 @@ Target- or model-influenced commands use `ExecutionBackend`.
 | `docker` | external repositories and the separate ablation scoring path |
 
 The local backend limits inherited environment and manages process groups, but
-it is not a security sandbox. The Docker backend disables network access,
+it is not a security sandbox: target code retains the current user's host
+permissions. The Docker backend disables network access,
 clears the environment, applies resource limits, and mounts source read-only
 where the task permits. Its image must contain every command declared by the
 task.
@@ -187,6 +205,13 @@ scoring path applies a frozen change to a fresh repository and runs a separate
 scorer. `lha horizon` reports paired cells, complete repetitions, and
 descriptive composition as different quantities; composition adds no
 observations.
+
+The formal ablation path fixes its source, corpus, model, CLI and client
+configuration, Docker image, output path, and witness remote in a committed
+registration. At startup it creates a new remote Git ref bound to the run
+header. Formal cells do not read cache, and an interrupted formal attempt is
+recorded as abandoned rather than resumed. These rules apply only to the formal
+17-task × 12-repetition schedule; exploratory runs may use cache.
 
 `src/lha/reporting.py` validates persisted evidence before showing or deleting a
 run. `lha runs prune` is a dry run by default and refuses active, locked,

@@ -1,10 +1,7 @@
 # Contributing
 
-The project has one rule:
-
-> **No claim without a runnable check.** Any documented behavior, benchmark
-> number, test count, or coverage value must come from a command run on the
-> commit that contains the claim.
+Any documented behavior, benchmark number, test count, or coverage value must
+come from a command run on the commit that contains the claim.
 
 ## Development setup
 
@@ -44,7 +41,11 @@ fi
 For a release candidate, also run:
 
 ```bash
-uv build
+uv run python -m lha.release_claims
+uv run python tools/verify_terminal_source_build.py \
+  --root . \
+  --evidence benchmarks/terminal_bench_2_1
+uv build --clear
 docker build -t lha:release .
 LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
   uv run pytest tests/test_sandbox.py -q
@@ -100,9 +101,11 @@ properties:
 - `PatchTransaction` transitions remain
   `PREPARED → APPLIED → VERIFIED`, with rollback to `REVERTED`;
 - a transaction has durable patch, manifest, journal, and redundant backups;
-- state and ledger corruption fail closed;
+- state corruption and an invalid ledger event chain fail closed;
 - schema-v1 state is not resumed as schema v2;
 - concurrent resume is rejected by the run lock;
+- the ledger grows logically by event; its implementation validates and
+  atomically replaces the complete file rather than using `O_APPEND`;
 - ledger attempt IDs and idempotency keys do not duplicate side effects;
 - unverified work never survives failure, rejection, or exhausted repair.
 
@@ -129,6 +132,10 @@ Do not change a repository, oracle, reference patch, or digest after reading
 model results. New cases must be authored and frozen before a scored run, and
 must demonstrate baseline failure plus reference-patch success.
 
+Repository adapters define setup and check stages. Adding an adapter does not
+create a benchmark result; a result also needs a fixed protocol, raw evidence,
+provenance, and a committed summary.
+
 ## Ablation and statistics
 
 Do not use the internal gate as truth. The final scorer must grade a fresh
@@ -151,6 +158,13 @@ Never edit `benchmarks/*.json` or copied result numbers by hand. Regenerate the
 report and update all public citations in the same change. Planned repetitions
 and unfinished public-benchmark runs are not results.
 
+Formal ablation does not use the exploratory cache and cannot resume. Before it
+starts, append and commit a `REGISTERED` event that fixes the source, corpus,
+model, CLI and client settings, Docker image, output path, and witness remote.
+The runner must create the registered remote witness ref before the first cell.
+If preflight or any cell is interrupted, record `ABANDONED`; do not delete the
+output and repeat the same outcome-affecting selection.
+
 ## Codex changes
 
 The Codex backend must:
@@ -164,6 +178,9 @@ The Codex backend must:
 - record secret-free CLI/model/event/outcome provenance.
 
 Add protocol and cleanup tests without requiring live authentication.
+Cleanup guarantees apply to normal return, failure, timeout, and handled
+interruption. `SIGKILL`, a kernel crash, or power loss can leave a
+mode-protected temporary directory and requires manual inspection.
 
 ## Documentation and pull requests
 

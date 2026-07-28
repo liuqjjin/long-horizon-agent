@@ -4,10 +4,8 @@ This file records the repository rules that matter when editing or evaluating
 LHA. Longer explanations are in `docs/ARCHITECTURE.md`, `CONTRIBUTING.md`, and
 `SECURITY.md`.
 
-The main rule is:
-
-> Do not publish a behavior, test count, coverage value, or benchmark number
-> until a command in the current checkout has produced it.
+Do not publish a behavior, test count, coverage value, or benchmark number
+until a command in the current checkout has produced it.
 
 ## Scope
 
@@ -115,9 +113,11 @@ schema-v2 `RunState`. State stores the cursor, attempts, repair counters, origin
 limits, elapsed time, and model usage. Resume rejects limit drift.
 
 `state.json` is checksummed and atomically replaced after `fsync`.
-`ledger.jsonl` is append-only. A run lock rejects concurrent resume. Stable
-attempt IDs and idempotency keys prevent duplicate completion and approval
-events. Schema-v1 runs can be inspected but not resumed as schema v2.
+`ledger.jsonl` is logically append-only: each update validates the existing
+event chain and atomically replaces the complete bytes rather than relying on
+an operating-system `O_APPEND` write. A run lock rejects concurrent resume.
+Stable attempt IDs and idempotency keys prevent duplicate completion and
+approval events. Schema-v1 runs can be inspected but not resumed as schema v2.
 
 `ResolvedPatch` derives the write set from the real diff or file contents.
 Policy, backup, apply, approval, manifest, and rollback use that set.
@@ -138,8 +138,9 @@ task, repository adapter, repository, reference patch, and digests.
 
 The ten stages are integrity, setup, baseline, reproduction, context, approved
 edit, targeted tests, full tests, lint, and build. Tests cover a rejected first
-patch, repair, approval resumes, safe interruption, and equality with an
-uninterrupted result.
+patch, repair, approval resumes, injected interruption, and equality with an
+uninterrupted result. An adapter defines how a fixture is run; it is not a
+benchmark result.
 
 Do not edit a fixture, oracle, or reference patch after model output has been
 observed.
@@ -148,8 +149,10 @@ observed.
 
 `src/lha/llm/codex_cli.py` runs `codex exec --json` in an attempt-local home and
 workspace. It copies only required authentication, starts a separate process
-group, stops descendants on timeout or interruption, and removes temporary
-credentials on every exit path.
+group, stops descendants on normal failure, timeout, or handled interruption,
+and then removes temporary credentials. `SIGKILL`, a kernel crash, or power
+loss can prevent that cleanup; any surviving directory remains protected by
+its file mode and must be inspected manually.
 
 The parser rejects malformed JSONL, unknown events, incomplete turns, error
 events, and unfinished or disallowed tool use. The no-tools ablation path
@@ -176,6 +179,15 @@ scored through a separate backend. The committed schema-v2 report is a historica
 record; a current result requires a complete schema-v4 report and its evidence.
 Read historical numbers from `benchmarks/ablation_report.json` instead of
 reconstructing them from prose.
+
+A formal 17-task × 12-repetition run requires a committed `REGISTERED` event
+that fixes the source tree, corpus manifest, model, Codex CLI identity, client
+settings, Docker image, output path, and witness remote. The registration
+commit directly follows the source commit and changes only the registry.
+Before the first cell, the runner creates a new remote witness ref bound to the
+registration and run header. Formal cells never read cache and a formal run
+cannot resume. Interruption consumes the attempt: record `ABANDONED` and do not
+repeat the same outcome-affecting selection.
 
 `lha horizon` keeps paired cells, complete-corpus repetitions, and descriptive
 composition separate. Cell and episode tests can differ. Composition adds no
@@ -215,6 +227,10 @@ present and refuses active, locked, unfinished, or corrupt runs.
 
 ```bash
 uv run ruff check .
+uv run python -m lha.release_claims
+uv run python tools/verify_terminal_source_build.py \
+  --root . \
+  --evidence benchmarks/terminal_bench_2_1
 uv run pyright src/lha
 uv run pytest -q
 LHA_RUNS_DIR=runs/_release uv run lha eval
@@ -260,10 +276,17 @@ package and container smoke checks.
 
 ## Known limits
 
-- `trusted-local` is not isolation against hostile code.
+- `trusted-local` is not isolation against hostile code; target processes run
+  with the current user's host permissions.
 - The default Docker execution image does not contain Pytest or Ruff.
 - `LHA_DEADLINE_S` is a persisted boundary check, not asynchronous preemption
   of a blocking operation; each such operation needs its own timeout.
+- A forced stop during the first write to a write-once artifact can leave an
+  incomplete final file. Atomic replacement can leave a mode-protected
+  temporary file. Recovery validates known transaction temporaries and
+  otherwise stops for manual review; it does not infer missing bytes.
+- Temporary Codex credentials are cleaned on handled exit paths, not after
+  `SIGKILL`, a kernel crash, or power loss.
 - Checks reduce, but do not eliminate, prompt injection from indexed content.
 - Source freshness and citation checks are weaker than executable oracles.
 - An adapter alone is not a benchmark result; a result requires the committed
