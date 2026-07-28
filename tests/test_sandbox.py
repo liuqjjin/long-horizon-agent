@@ -627,6 +627,9 @@ def test_docker_argv_isolation_flags(tmp_path):
     joined = " ".join(argv)
     assert "--network none" in joined
     assert "--read-only" in argv
+    assert argv[argv.index("--cap-drop") + 1] == "ALL"
+    assert argv[argv.index("--security-opt") + 1] == "no-new-privileges"
+    assert "--init" in argv
     assert argv[argv.index("--tmpfs") + 1] == "/tmp:rw,nosuid,nodev,size=256m,mode=1777"
     assert "--memory 512m" in joined
     assert "--pids-limit 64" in joined
@@ -1179,6 +1182,9 @@ def test_docker_provenance_records_image_id_and_in_container_versions(
     probe = calls[1]
     assert "--network" in probe and probe[probe.index("--network") + 1] == "none"
     assert "--read-only" in probe
+    assert probe[probe.index("--cap-drop") + 1] == "ALL"
+    assert probe[probe.index("--security-opt") + 1] == "no-new-privileges"
+    assert "--init" in probe
     assert "--entrypoint" in probe
     assert not any(":/work" in value for value in probe)
     assert f"sha256:{'a' * 64}" in probe
@@ -1250,6 +1256,38 @@ print("read-only-root tmpfs-ok")
     )
     assert res.returncode == 0, res.stderr or res.stdout
     assert "read-only-root tmpfs-ok" in res.stdout
+
+
+@pytest.mark.skipif(
+    os.environ.get("LHA_DOCKER_TESTS") != "1",
+    reason="docker integration is opt-in (LHA_DOCKER_TESTS=1)",
+)
+def test_docker_backend_drops_capabilities_and_prevents_privilege_gain(tmp_path):
+    assert DockerBackend.available(), "LHA_DOCKER_TESTS=1 requires a working Docker daemon"
+    image = os.environ.get("LHA_DOCKER_TEST_IMAGE", "python:3.12-slim")
+    script = """
+from pathlib import Path
+
+status = {}
+for line in Path("/proc/self/status").read_text().splitlines():
+    if ":" in line:
+        key, value = line.split(":", 1)
+        status[key] = value.strip()
+
+assert int(status["CapBnd"], 16) == 0, status["CapBnd"]
+assert status["NoNewPrivs"] == "1", status["NoNewPrivs"]
+Path("docker-defense-write.txt").write_text("ok")
+print("capabilities-dropped no-new-privileges workdir-writable")
+"""
+    res = DockerBackend(image=image).run(
+        ["python", "-c", script],
+        cwd=tmp_path,
+        timeout=120,
+    )
+
+    assert res.returncode == 0, res.stderr or res.stdout
+    assert "capabilities-dropped no-new-privileges workdir-writable" in res.stdout
+    assert (tmp_path / "docker-defense-write.txt").read_text() == "ok"
 
 
 @pytest.mark.skipif(

@@ -41,6 +41,13 @@ _PROVENANCE_TIMEOUT_S = 30.0
 _PROVENANCE_OUTPUT_BYTES = 64 * 1024
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _OPERATION_LABEL = "lha.operation_id"
+_SECURITY_RUN_ARGS = [
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges",
+    "--init",
+]
 _VERSION_PROBE = """
 import importlib.metadata
 import json
@@ -746,6 +753,7 @@ class DockerBackend(ExecutionBackend):
             "--network",
             "none",
             "--read-only",
+            *_SECURITY_RUN_ARGS,
             "--tmpfs",
             _TMPFS,
             "--env",
@@ -864,6 +872,7 @@ class DockerBackend(ExecutionBackend):
             "--network",
             "none",
             "--read-only",
+            *_SECURITY_RUN_ARGS,
             "--tmpfs",
             _TMPFS,
             "--env",
