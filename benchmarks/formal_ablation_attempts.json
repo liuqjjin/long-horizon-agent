@@ -122,6 +122,18 @@
       "witness_remote_name": "formal-witness",
       "witness_remote_url": "https://github.com/liuqjjin/long-horizon-agent.git",
       "registered_at": "2026-07-28T23:16:27.533896+00:00"
+    },
+    {
+      "event": "ABANDONED",
+      "attempt_id": "f35274a4eb9833cc8e949b4f29d0ef8e87dca67282ec75a65a2fc01376a42e5d",
+      "recorded_at": "2026-07-28T23:37:18.166444+00:00",
+      "progress_status": "known",
+      "started_cells": 0,
+      "terminal_cells": 0,
+      "reason_code": "witness_creation_blocked_by_ruleset",
+      "reason": "GitHub update 规则阻止首次创建一次性见证分支；未开始任何模型调用或实验单元。",
+      "report_sha256": null,
+      "report_fingerprint": null
     }
   ]
 }
