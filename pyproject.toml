@@ -22,6 +22,8 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -53,7 +55,7 @@ context = [
 ]
 # Public-benchmark harnesses. harbor needs Python >= 3.12 (lha itself runs on 3.11).
 bench = ["swebench>=4.1.0", "harbor>=0.20; python_version >= '3.12'"]
-llm = ["anthropic>=0.69"]  # needs the Opus-4.8 surface (adaptive thinking, output_config.effort)
+llm = ["anthropic>=0.69"]
 typecheck = ["pyright>=1.1"]
 
 [project.urls]

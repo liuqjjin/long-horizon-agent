@@ -1,7 +1,8 @@
 # Quickstart
 
 Run commands from the repository root. LHA requires Python 3.11 or newer and
-[`uv`](https://docs.astral.sh/uv/).
+[`uv`](https://docs.astral.sh/uv/). The current process-cleanup boundary supports
+Linux, macOS, and WSL2. Native Windows is not supported yet; use WSL2 or Docker.
 
 ## Install
 
@@ -11,9 +12,11 @@ uv run lha --version
 ```
 
 The source checkout installs development and document-index dependencies. The
-core package can also be installed with `pip install lha`.
+core package can also be installed from this checkout with `python -m pip install .`,
+or from a wheel produced by `uv build`.
 
-On Linux and Windows, this repository points PyTorch at the official CPU index.
+When dependencies are resolved on Linux or Windows, this repository points
+PyTorch at the official CPU index.
 That source setting is not stored in wheel metadata. If another project installs
 the `context` extra, it should configure the same index or use the application
 image.
@@ -30,7 +33,7 @@ The run reaches `DONE` only after its Pytest and Ruff checks pass. Keep the
 printed `run_id`, then inspect the saved evidence:
 
 ```bash
-RUN_ID=替换为实际运行编号
+RUN_ID=replace-with-the-printed-run-id
 uv run lha runs show "$RUN_ID"
 uv run lha trace "$RUN_ID"
 uv run lha trace "$RUN_ID" --html
