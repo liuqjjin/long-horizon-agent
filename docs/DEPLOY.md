@@ -4,6 +4,10 @@ LHA is distributed as a Python CLI and an application image. It is not a hosted
 service. A release candidate must be tested as source, wheel, source archive,
 container image, and Docker execution backend.
 
+Host-side execution is supported on Linux, macOS, and WSL2. Native Windows does
+not yet provide the process-tree termination and confirmation required by this
+release; use WSL2 or the Docker backend.
+
 ## Build Python packages
 
 ```bash
@@ -53,7 +57,11 @@ docker run --rm lha:release \
 ```
 
 The image runs as the unprivileged `lha` user and includes the `context` extra.
-It does not include the external `ccc` executable.
+Its Python and `uv` base images are pinned by manifest digest. It also contains
+the files needed from the pinned `all-MiniLM-L6-v2` revision used by the
+document index, so self-eval does not download model files at runtime. The
+image does not send CocoIndex usage telemetry at runtime, and does not include
+the external `ccc` executable.
 
 Check that common credential and build paths are absent:
 
@@ -66,19 +74,18 @@ Do not pass authentication as a build argument or copy it into an image layer.
 
 ## Run in the application image
 
-Use volumes for run state and the optional model cache:
+Use a volume for run state:
 
 ```bash
 docker volume create lha-runs
-docker volume create lha-hf
 
 docker run --rm \
   -v lha-runs:/app/runs \
-  -v lha-hf:/home/lha/.cache/huggingface \
   lha:release lha eval
 ```
 
-The command must exit zero. The model cache is separate from run evidence.
+The command must exit zero. The bundled embedding snapshot is read-only image
+content and remains separate from run evidence.
 
 ## Test the Docker execution backend
 

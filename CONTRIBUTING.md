@@ -49,14 +49,17 @@ docker build -t lha:release .
 LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
   uv run pytest tests/test_sandbox.py -q
 docker run --rm lha:release lha --version
+docker run --network none --rm lha:release lha eval
 ```
 
 Follow [docs/DEPLOY.md](docs/DEPLOY.md) to install both the wheel and source
 distribution from empty scratch directories and verify that packaged context
 flows are present.
 
-`lha eval` may download the configured embedding model on its first run. A
-download or Docker-daemon failure is not a successful check.
+Host-side `lha eval` may download the configured embedding model on its first
+run. The application image includes a pinned model snapshot and must complete
+the command without network access. A download or Docker-daemon failure is not
+a successful check.
 
 ## Coverage
 

@@ -137,7 +137,7 @@ jobs:
           docker run --rm lha:ci lha --version
           docker run --rm lha:ci git --version
           docker run --rm lha:ci python -c "import lha, cocoindex, sentence_transformers"
-          docker run --rm lha:ci lha eval --quick
+          docker run --network none --rm lha:ci lha eval
           docker run --rm lha:ci python -c "from pathlib import Path; assert not any((Path('/app') / p).exists() for p in ('.env', '.codex', '.claude', '.agents', '.mcp.json', 'auth.json', '.ssh', '.aws', '.config/gcloud', '.netrc', '.pypirc', 'dist'))"
       - name: Build and inspect Terminal-Bench broker image
         run: |

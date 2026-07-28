@@ -62,6 +62,36 @@ def test_docker_context_excludes_local_credentials_and_build_outputs():
     assert "!.env.example" in patterns
 
 
+def test_application_image_pins_and_bundles_the_context_model():
+    root = Path(__file__).resolve().parents[1]
+    dockerfile = (root / "Dockerfile").read_text()
+
+    assert (
+        "ghcr.io/astral-sh/uv:0.11.16"
+        "@sha256:440fd6477af86a2f1b38080c539f1672cd22acb1b1a47e321dba5158ab08864d"
+        in dockerfile
+    )
+    assert (
+        "python:3.11-slim"
+        "@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93"
+        in dockerfile
+    )
+    assert (
+        "EMBEDDER_REVISION=1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+        in dockerfile
+    )
+    assert dockerfile.count("ARG EMBEDDER_REVISION") == 2
+    assert dockerfile.count("ARG EMBEDDER_REPOSITORY") == 2
+    assert "snapshot_download" in dockerfile
+    assert "allow_patterns=" in dockerfile
+    assert dockerfile.index("snapshot_download") < dockerfile.index("COPY . .")
+    assert "COPY --from=builder --chown=lha:lha /opt/lha/models /opt/lha/models" in dockerfile
+    assert "HF_HUB_OFFLINE=1" in dockerfile
+    assert "TRANSFORMERS_OFFLINE=1" in dockerfile
+    assert "COCOINDEX_DISABLE_USAGE_TRACKING=1" in dockerfile
+    assert "LHA_EMBEDDER_MODEL=/opt/lha/models/all-MiniLM-L6-v2" in dockerfile
+
+
 def test_cli_unexpected_error_has_a_stable_nonzero_exit_without_traceback(
     monkeypatch, capsys
 ):
