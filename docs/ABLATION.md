@@ -105,14 +105,32 @@ identity where applicable. It does not record credentials.
 
 ## Errors, cache, and statistics
 
-A completed cell can be reused only if its cache-key format v7 fingerprint
-still matches and its patch artifact and scorer receipt both validate. The
-fingerprint covers the input snapshot, LHA source, model settings, scorer,
-repair and retry settings, and runtime versions.
+A completed cell can be reused only if its cache-key format v8 fingerprint
+still matches and its patch artifact, scorer receipt, and LLM call receipts
+validate. The fingerprint covers the input snapshot, LHA source, model
+settings, scorer, repair and retry settings, and runtime versions.
 
-Only errors classified as transient service or connection failures use the
-configured bounded retry path. A persistent failure is written as `ERROR`,
-remains visible, is excluded from rate estimates, and is never cached.
+The formal schema-4 report uses `ERROR` for one narrow case: every bounded
+first-call attempt failed before Codex produced a patch. Each failed call is
+saved as a content-addressed receipt. The three conditions then share one
+cell-level `ERROR`; it remains in the scheduled total but is excluded from rate
+estimates and paired tests.
+
+That terminal `ERROR` is sealed in the cell cache. A process restart may read
+the seal, but it may not call the model again for that cell. If a patch was
+already produced and a later repair, scorer, filesystem, or cache operation
+fails, the formal run stops instead of reducing a partial result to `ERROR`.
+Exploratory runs retain the broader best-effort error handling.
+
+Before the first call, the runner writes a cell-start marker bound to the
+fingerprint and input snapshot. A marker without a valid terminal seal is an
+interrupted attempt, not permission to sample again; continuing then requires a
+new output directory and a new full run.
+
+The report separates scheduled cells, usable paired cells, and cell-level
+errors. Rate denominators use usable cells. A repetition with any unavailable
+task is excluded from the complete-episode analysis; the descriptive
+composition reports the actual per-task sample counts and adds no observations.
 
 The report uses:
 
@@ -130,9 +148,9 @@ inputs, patch artifacts, and scorer receipts. Reports through schema 3 remain
 readable as historical records but cannot be published as current formal
 evidence.
 
-The 17-task × 12-repetition run must be repeated under schema 4 before this
-document or the README states a current result. Values from the older schema-2
-run are not carried forward.
+The committed report must cover the complete registered 17-task ×
+12-repetition schedule. Values from the older schema-2 run are not carried
+forward into a schema-4 claim.
 
 ## Reproduce
 
@@ -160,13 +178,17 @@ runs/ablation/
   input_snapshots/<sha256>/
   artifacts/<sha256>.json
   scorer_evidence/<sha256>.json
+  llm_call_receipts/<sha256>.json
+  results/<task>__r<rep>.started.json
   results/<task>__r<rep>.json
 ```
 
 Before publishing a result, finish the registered repetitions, keep every
-`ERROR`, and commit the JSON report, generated Markdown, patch artifacts, and
-scorer evidence together. `release_claims` recomputes the LHA source tree plus
-the task and corpus digests from the checkout.
+`ERROR`, and commit the JSON report, generated Markdown, patch artifacts,
+scorer evidence, and LLM call receipts together. `release_claims` recomputes
+the LHA source tree plus the task and corpus digests from the checkout. It also
+checks that resumed cells form a schedule prefix and that the receipt directory
+contains no unreferenced files.
 
 The generated files for the historical schema-v2 run are
 [`benchmarks/ablation_report.json`](../benchmarks/ablation_report.json) and

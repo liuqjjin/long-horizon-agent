@@ -26,9 +26,9 @@ Integrity properties:
     (``no_tools``) and sees only non-test source, so it cannot read the oracle.
   - Protected paths are excluded from the frozen patch; this is an input-policy
     guarantee, not containment against arbitrary same-UID code at runtime.
-  - Transient backend errors are retried and, if they persist, recorded as ``ERROR``
-    (never cached; excluded from rates but counted and reported, never silently
-    dropped).
+  - Transient backend errors are retried and, if they persist, recorded as ``ERROR``.
+    An ERROR backed by a complete failed-call receipt is sealed as a terminal cell;
+    it is excluded from rates but counted and reported, never silently dropped.
   - Cached cells carry a provenance fingerprint over task/corpus bytes, the complete
     ``lha`` source tree, model/CLI settings, scorer identity, runtime versions, and
     repair configuration; any change recomputes.
@@ -96,12 +96,13 @@ CONDITIONS = [
 
 _MAX_REPAIRS = 3
 _LLM_RETRIES = 3
-_CACHE_SCHEMA = 7
+_CACHE_SCHEMA = 8
 _REPORT_SCHEMA = 4
 _FROZEN_ARTIFACT_SCHEMA = 1
 _INPUT_SNAPSHOT_SCHEMA = 1
 _SCORER_EVIDENCE_SCHEMA = 2
 _LLM_CALL_RECEIPT_SCHEMA = 1
+_CELL_ATTEMPT_SCHEMA = 1
 _FORMAL_CORPUS_MANIFEST_SCHEMA = 1
 _FORMAL_TASK_COUNT = 17
 _FORMAL_REPETITIONS = 12
@@ -111,6 +112,7 @@ _READ_CHUNK_BYTES = 64 * 1024
 _MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 _MAX_SCORER_EVIDENCE_BYTES = 12 * 1024 * 1024
 _MAX_LLM_CALL_RECEIPT_BYTES = 512 * 1024
+_MAX_CELL_ATTEMPT_BYTES = 4 * 1024
 _MAX_FORMAL_MANIFEST_BYTES = 512 * 1024
 _MAX_CONTROL_EXECUTABLE_BYTES = 256 * 1024 * 1024
 _MAX_CACHE_BYTES = 8 * 1024 * 1024
@@ -360,7 +362,10 @@ class AblationReport:
         gate_lines = _gate_quality_lines(self.stats)
         if gate_lines:
             lines += ["", "Internal gate vs artifact correctness (per attempt):", *gate_lines]
-        mcnemar_lines = _paired_mcnemar_lines(self.records)
+        mcnemar_lines = _paired_mcnemar_lines(
+            self.records,
+            precise=self.schema_version >= 4,
+        )
         if mcnemar_lines:
             lines += ["", "Paired contrasts:", *mcnemar_lines]
         summary = _summary(self.stats)
@@ -2454,6 +2459,7 @@ def _validate_cell_call_sequence(
     repairs: int,
     max_outer_attempts: int,
     max_inner_attempts: int,
+    terminal_error: bool = False,
 ) -> None:
     if not receipts or max_outer_attempts <= 0 or max_inner_attempts <= 0:
         raise ValueError("cell has no bounded LLM call sequence")
@@ -2474,31 +2480,50 @@ def _validate_cell_call_sequence(
         len(receipts),
     )
     first_calls = receipts[:first_end]
+    first_ended_in_error = terminal_error and first_end == len(receipts)
+    expected_first_terminal_status = "failed" if first_ended_in_error else "succeeded"
     if (
         not first_calls
         or len(first_calls) > max_outer_attempts
         or any(receipt["binding"]["label"] != "first" for receipt in first_calls)
         or any(receipt["call"]["status"] != "failed" for receipt in first_calls[:-1])
-        or first_calls[-1]["call"]["status"] != "succeeded"
+        or first_calls[-1]["call"]["status"] != expected_first_terminal_status
     ):
         raise ValueError("cell first-call retry sequence is invalid")
+    if first_ended_in_error:
+        if repairs != 0:
+            raise ValueError("failed first-call sequence cannot contain completed repairs")
+        return
 
     repair_calls = receipts[first_end:]
     repair_successes = 0
     segment_length = 0
-    for receipt in repair_calls:
+    for index, receipt in enumerate(repair_calls):
         if receipt["binding"]["label"] != "repair":
             raise ValueError("cell returned to first-call evidence after repair")
         segment_length += 1
         if segment_length > max_outer_attempts:
             raise ValueError("cell repair exceeded its outer retry budget")
         if receipt["call"]["status"] == "succeeded":
+            if terminal_error and index == len(repair_calls) - 1:
+                raise ValueError("terminal-error sequence ended in a successful repair")
             repair_successes += 1
             segment_length = 0
-    if segment_length:
+    if terminal_error:
+        if not repair_calls or repair_calls[-1]["call"]["status"] != "failed":
+            raise ValueError("terminal-error sequence has no terminal failed call")
+    elif segment_length:
         raise ValueError("cell repair sequence ended in a failed call")
     if repair_successes != repairs:
         raise ValueError("cell repair receipt count is stale")
+
+
+def _is_schema4_formal_error_sequence(receipts: list[dict[str, Any]]) -> bool:
+    """Schema 4 can represent only a cell that failed before producing a patch."""
+    return bool(receipts) and all(
+        receipt["binding"]["label"] == "first" and receipt["call"]["status"] == "failed"
+        for receipt in receipts
+    )
 
 
 @dataclass(frozen=True)
@@ -2574,6 +2599,7 @@ def _load_cached_cell(
     receipt_dir: Path | None = None,
     max_outer_attempts: int = _LLM_RETRIES,
     max_inner_attempts: int = 1,
+    formal_evidence: bool = False,
 ) -> _CachedCell | None:
     try:
         cache_envelope = json.loads(_read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES))
@@ -2590,10 +2616,38 @@ def _load_cached_cell(
     cached_fingerprint, records = decoded
     if cached_fingerprint != fingerprint:
         return None
-    # ERROR is a missing measurement, never a durable observation. Refuse even
-    # a hand-edited or old cache that contains one.
-    if any(record.status == "ERROR" for record in records):
+    terminal_error = cache_envelope.get("terminal_error")
+    if type(terminal_error) is not bool:
         return None
+    has_error = any(record.status == "ERROR" for record in records)
+    if has_error != terminal_error:
+        return None
+    if terminal_error:
+        expected_conditions = {name for name, _ in CONDITIONS}
+        if (
+            not require_call_receipts
+            or len(records) != len(CONDITIONS)
+            or {record.condition for record in records} != expected_conditions
+            or len({record.detail for record in records}) != 1
+            or len({record.repairs for record in records}) != 1
+            or any(
+                record.status != "ERROR"
+                or record.task != expected_task
+                or record.rep != expected_rep
+                or record.scorer_outcome != ScoreOutcome.INFRA_ERROR.value
+                or record.claimed_success
+                or record.artifact_correct
+                or record.true_success
+                or record.false_success
+                or record.gate_prediction is not None
+                or record.artifact_sha256
+                or record.scorer_evidence_sha256
+                or record.scorer_expected_tests != 0
+                or record.scorer_passed_tests != 0
+                for record in records
+            )
+        ):
+            return None
     if any(
         record.true_success != (record.claimed_success and record.artifact_correct)
         or record.false_success != (record.claimed_success and not record.artifact_correct)
@@ -2607,33 +2661,34 @@ def _load_cached_cell(
         or not scorer_backend
     ):
         return None
-    artifact_dir = path.parent.parent / "artifacts"
-    if any(
-        not _artifact_file_is_valid(
-            artifact_dir / f"{record.artifact_sha256}.json",
-            record.artifact_sha256,
-        )
-        for record in records
-    ):
-        return None
-    evidence_dir = path.parent.parent / "scorer_evidence"
-    if any(
-        not _scorer_evidence_file_is_valid(
-            evidence_dir / f"{record.scorer_evidence_sha256}.json",
-            record.scorer_evidence_sha256,
-            record,
-            ScorerEvidenceBinding(
-                task=record.task,
-                rep=record.rep,
-                artifact_sha256=record.artifact_sha256,
-                input_snapshot_sha256=input_snapshot_sha256,
-                scorer_backend=scorer_backend,
-                scorer_image_id=scorer_image_id,
-            ),
-        )
-        for record in records
-    ):
-        return None
+    if not terminal_error:
+        artifact_dir = path.parent.parent / "artifacts"
+        if any(
+            not _artifact_file_is_valid(
+                artifact_dir / f"{record.artifact_sha256}.json",
+                record.artifact_sha256,
+            )
+            for record in records
+        ):
+            return None
+        evidence_dir = path.parent.parent / "scorer_evidence"
+        if any(
+            not _scorer_evidence_file_is_valid(
+                evidence_dir / f"{record.scorer_evidence_sha256}.json",
+                record.scorer_evidence_sha256,
+                record,
+                ScorerEvidenceBinding(
+                    task=record.task,
+                    rep=record.rep,
+                    artifact_sha256=record.artifact_sha256,
+                    input_snapshot_sha256=input_snapshot_sha256,
+                    scorer_backend=scorer_backend,
+                    scorer_image_id=scorer_image_id,
+                ),
+            )
+            for record in records
+        ):
+            return None
     calls = cache_envelope.get("llm_calls")
     legacy_calls = (
         [call for call in calls if isinstance(call, dict)] if isinstance(calls, list) else []
@@ -2681,7 +2736,16 @@ def _load_cached_cell(
                 repairs=verify.repairs,
                 max_outer_attempts=max_outer_attempts,
                 max_inner_attempts=max_inner_attempts,
+                terminal_error=terminal_error,
             )
+            if (
+                terminal_error
+                and formal_evidence
+                and not _is_schema4_formal_error_sequence(decoded_receipts)
+            ):
+                raise RuntimeError(
+                    "formal schema-4 ERROR cache contains a successful or repair call"
+                )
         except (OSError, StopIteration, TypeError, ValueError):
             return None
     return _CachedCell(
@@ -2725,11 +2789,16 @@ def _run_cell(
     audit_log: list[dict[str, Any]] | None = None,
     require_call_receipts: bool = False,
     max_inner_attempts: int = 1,
+    formal_evidence: bool = False,
 ) -> list[RunRecord]:
     name = task.inputs.get("_name", task.title)
     cache = out_dir / "results" / f"{name}__r{rep}.json"
+    attempt_marker = out_dir / "results" / f"{name}__r{rep}.started.json"
+    receipt_dir = out_dir / "llm_call_receipts"
+    cell_audits: list[dict[str, Any]] = []
+    cell_receipts: list[str] = []
 
-    def error_records(detail: str) -> list[RunRecord]:
+    def error_records(detail: str, *, repairs: int = 0) -> list[RunRecord]:
         return [
             RunRecord(
                 task=name,
@@ -2740,11 +2809,76 @@ def _run_cell(
                 artifact_correct=False,
                 true_success=False,
                 false_success=False,
-                repairs=0,
+                repairs=repairs,
                 detail=detail[:200],
+                scorer_outcome=ScoreOutcome.INFRA_ERROR.value,
             )
             for condition, _ in CONDITIONS
         ]
+
+    def append_call_audits(receipts: list[str], *, cache_hit: bool) -> None:
+        if audit_log is None:
+            return
+        if require_call_receipts:
+            audit_log.extend(
+                {
+                    "task": name,
+                    "rep": rep,
+                    "ordinal": ordinal,
+                    "receipt_sha256": digest,
+                    "cache_hit": cache_hit,
+                }
+                for ordinal, digest in enumerate(receipts)
+            )
+        else:
+            audit_log.extend(
+                {"task": name, "rep": rep, "cache_hit": cache_hit, **call}
+                for call in cell_audits
+            )
+
+    def persist_receipts() -> tuple[list[str], list[dict[str, Any]]]:
+        receipts = _materialize_call_receipts(
+            cell_audits,
+            task=name,
+            rep=rep,
+            cell_fingerprint=fingerprint,
+            input_snapshot_sha256=input_snapshot_sha256,
+            directory=receipt_dir,
+        )
+        decoded_receipts = [
+            _read_llm_call_receipt(
+                receipt_dir / f"{digest}.json",
+                digest,
+                expected_binding={
+                    "task": name,
+                    "rep": rep,
+                    "ordinal": ordinal,
+                    "cell_fingerprint": fingerprint,
+                    "input_snapshot_sha256": input_snapshot_sha256,
+                },
+            )
+            for ordinal, digest in enumerate(receipts)
+        ]
+        return receipts, decoded_receipts
+
+    def write_cache(records: list[RunRecord], *, terminal_error: bool) -> None:
+        _atomic_write(
+            cache,
+            json.dumps(
+                {
+                    "schema_version": _CACHE_SCHEMA,
+                    "fingerprint": fingerprint,
+                    "terminal_error": terminal_error,
+                    "records": [asdict(record) for record in records],
+                    **(
+                        {"llm_call_receipts": cell_receipts}
+                        if require_call_receipts
+                        else {"llm_calls": cell_audits}
+                    ),
+                },
+                indent=2,
+            ),
+        )
 
     def snapshot_matches() -> bool:
         try:
@@ -2752,9 +2886,35 @@ def _run_cell(
         except (OSError, RuntimeError):
             return False
 
+    marker_payload = _canonical_json_object_bytes(
+        {
+            "schema_version": _CELL_ATTEMPT_SCHEMA,
+            "task": name,
+            "rep": rep,
+            "cell_fingerprint": fingerprint,
+            "input_snapshot_sha256": input_snapshot_sha256,
+        }
+    )
+    marker_exists = attempt_marker.exists() or attempt_marker.is_symlink()
+    cache_exists = cache.exists() or cache.is_symlink()
+    if formal_evidence:
+        if marker_exists:
+            try:
+                saved_marker = _read_bounded_bytes(
+                    attempt_marker,
+                    max_bytes=_MAX_CELL_ATTEMPT_BYTES,
+                )
+            except (OSError, ValueError) as error:
+                raise RuntimeError("formal ablation cell-start marker is invalid") from error
+            if saved_marker != marker_payload:
+                raise RuntimeError("formal ablation cell-start marker is stale or corrupt")
+        if cache_exists and not marker_exists:
+            raise RuntimeError("formal ablation cell cache has no matching start marker")
+
     if not snapshot_matches():
+        if formal_evidence:
+            raise RuntimeError("formal ablation input snapshot failed validation")
         return error_records("content-addressed input snapshot failed validation")
-    receipt_dir = out_dir / "llm_call_receipts"
     cached = _load_cached_cell(
         cache,
         fingerprint,
@@ -2767,28 +2927,27 @@ def _run_cell(
         receipt_dir=receipt_dir,
         max_outer_attempts=_LLM_RETRIES,
         max_inner_attempts=max_inner_attempts,
+        formal_evidence=formal_evidence,
     )
     if cached is not None:
-        if audit_log is not None:
-            if require_call_receipts:
-                audit_log.extend(
-                    {
-                        "task": name,
-                        "rep": rep,
-                        "ordinal": ordinal,
-                        "receipt_sha256": digest,
-                        "cache_hit": True,
-                    }
-                    for ordinal, digest in enumerate(cached.call_receipts)
-                )
-            else:
-                audit_log.extend(
-                    {"task": name, "rep": rep, "cache_hit": True, **call}
-                    for call in cached.legacy_calls
-                )
+        if require_call_receipts:
+            cell_receipts = cached.call_receipts
+            append_call_audits(cell_receipts, cache_hit=True)
+        elif audit_log is not None:
+            audit_log.extend(
+                {"task": name, "rep": rep, "cache_hit": True, **call}
+                for call in cached.legacy_calls
+            )
         return cached.records
-    cell_audits: list[dict[str, Any]] = []
-    cell_receipts: list[str] = []
+    if formal_evidence:
+        if cache_exists:
+            raise RuntimeError("formal ablation cell cache is stale or corrupt")
+        if marker_exists:
+            raise RuntimeError(
+                "formal ablation found an unsealed prior cell attempt; "
+                "use a new output directory"
+            )
+        _atomic_write_bytes(attempt_marker, marker_payload)
     with tempfile.TemporaryDirectory(prefix="lha_abl_") as tmp:
         scratch = Path(tmp)
         try:
@@ -2809,28 +2968,7 @@ def _run_cell(
                 cell_audits,
             )
             if require_call_receipts:
-                cell_receipts = _materialize_call_receipts(
-                    cell_audits,
-                    task=name,
-                    rep=rep,
-                    cell_fingerprint=fingerprint,
-                    input_snapshot_sha256=input_snapshot_sha256,
-                    directory=receipt_dir,
-                )
-                decoded_receipts = [
-                    _read_llm_call_receipt(
-                        receipt_dir / f"{digest}.json",
-                        digest,
-                        expected_binding={
-                            "task": name,
-                            "rep": rep,
-                            "ordinal": ordinal,
-                            "cell_fingerprint": fingerprint,
-                            "input_snapshot_sha256": input_snapshot_sha256,
-                        },
-                    )
-                    for ordinal, digest in enumerate(cell_receipts)
-                ]
+                cell_receipts, decoded_receipts = persist_receipts()
                 verify = next(record for record in records if record.condition == "verify")
                 _validate_cell_call_sequence(
                     decoded_receipts,
@@ -2839,11 +2977,62 @@ def _run_cell(
                     max_inner_attempts=max_inner_attempts,
                 )
         except _Transient as e:
-            logger.error("transient failure on %s rep %d: %s — not caching", name, rep, e)
-            if audit_log is not None and not require_call_receipts:
-                audit_log.extend(
-                    {"task": name, "rep": rep, "cache_hit": False, **call} for call in cell_audits
-                )
+            logger.error("transient failure on %s rep %d: %s", name, rep, e)
+            if require_call_receipts:
+                if not cell_audits:
+                    if formal_evidence:
+                        raise RuntimeError(
+                            "formal ablation cell failed before an auditable LLM call"
+                        ) from e
+                else:
+                    cell_receipts, decoded_receipts = persist_receipts()
+                    repairs = sum(
+                        receipt["binding"]["label"] == "repair"
+                        and receipt["call"]["status"] == "succeeded"
+                        for receipt in decoded_receipts
+                    )
+                    _validate_cell_call_sequence(
+                        decoded_receipts,
+                        repairs=repairs,
+                        max_outer_attempts=_LLM_RETRIES,
+                        max_inner_attempts=max_inner_attempts,
+                        terminal_error=True,
+                    )
+                    if formal_evidence and not _is_schema4_formal_error_sequence(
+                        decoded_receipts
+                    ):
+                        raise RuntimeError(
+                            "formal schema-4 ERROR cannot contain a successful or repair call"
+                        ) from e
+                    records = error_records(
+                        f"transient cell failure: {type(e).__name__}",
+                        repairs=repairs,
+                    )
+                    if not snapshot_matches():
+                        if formal_evidence:
+                            raise RuntimeError(
+                                "formal ablation input changed before sealing an ERROR cell"
+                            ) from e
+                        append_call_audits(cell_receipts, cache_hit=False)
+                        return records
+                    try:
+                        write_cache(records, terminal_error=True)
+                    except Exception as cache_error:
+                        if formal_evidence:
+                            raise RuntimeError(
+                                "formal ablation could not seal an ERROR cell"
+                            ) from cache_error
+                        logger.error(
+                            "ERROR cell cache write failure on %s rep %d",
+                            name,
+                            rep,
+                            exc_info=True,
+                        )
+                        append_call_audits(cell_receipts, cache_hit=False)
+                        return records
+                    append_call_audits(cell_receipts, cache_hit=False)
+                    return records
+            append_call_audits([], cache_hit=False)
             return error_records(f"transient cell failure: {type(e).__name__}")
         except Exception as error:
             # A malformed patch, filesystem error, or corrupt evidence store is
@@ -2856,48 +3045,87 @@ def _run_cell(
                 type(error).__name__,
                 exc_info=True,
             )
-            if audit_log is not None and not require_call_receipts:
-                audit_log.extend(
-                    {"task": name, "rep": rep, "cache_hit": False, **call} for call in cell_audits
-                )
+            if require_call_receipts:
+                if not cell_audits:
+                    if formal_evidence:
+                        raise RuntimeError(
+                            "formal ablation cell failed before an auditable LLM call"
+                        ) from error
+                else:
+                    cell_receipts, decoded_receipts = persist_receipts()
+                    repairs = sum(
+                        receipt["binding"]["label"] == "repair"
+                        and receipt["call"]["status"] == "succeeded"
+                        for receipt in decoded_receipts
+                    )
+                    try:
+                        _validate_cell_call_sequence(
+                            decoded_receipts,
+                            repairs=repairs,
+                            max_outer_attempts=_LLM_RETRIES,
+                            max_inner_attempts=max_inner_attempts,
+                            terminal_error=True,
+                        )
+                    except ValueError as sequence_error:
+                        if formal_evidence:
+                            raise RuntimeError(
+                                "formal ablation failure did not end in a failed LLM call"
+                            ) from sequence_error
+                        append_call_audits(cell_receipts, cache_hit=False)
+                    else:
+                        if formal_evidence and not _is_schema4_formal_error_sequence(
+                            decoded_receipts
+                        ):
+                            raise RuntimeError(
+                                "formal schema-4 ERROR cannot contain a successful or repair call"
+                            ) from error
+                        records = error_records(
+                            f"cell infrastructure failure: {type(error).__name__}",
+                            repairs=repairs,
+                        )
+                        if snapshot_matches():
+                            try:
+                                write_cache(records, terminal_error=True)
+                            except Exception as cache_error:
+                                if formal_evidence:
+                                    raise RuntimeError(
+                                        "formal ablation could not seal an ERROR cell"
+                                    ) from cache_error
+                                logger.error(
+                                    "ERROR cell cache write failure on %s rep %d",
+                                    name,
+                                    rep,
+                                    exc_info=True,
+                                )
+                                append_call_audits(cell_receipts, cache_hit=False)
+                                return records
+                        elif formal_evidence:
+                            raise RuntimeError(
+                                "formal ablation input changed before sealing an ERROR cell"
+                            ) from error
+                        else:
+                            append_call_audits(cell_receipts, cache_hit=False)
+                            return records
+                        append_call_audits(cell_receipts, cache_hit=False)
+                        return records
+            else:
+                append_call_audits([], cache_hit=False)
             return error_records(f"cell infrastructure failure: {type(error).__name__}")
-    if audit_log is not None:
-        if require_call_receipts:
-            audit_log.extend(
-                {
-                    "task": name,
-                    "rep": rep,
-                    "ordinal": ordinal,
-                    "receipt_sha256": digest,
-                    "cache_hit": False,
-                }
-                for ordinal, digest in enumerate(cell_receipts)
-            )
-        else:
-            audit_log.extend(
-                {"task": name, "rep": rep, "cache_hit": False, **call} for call in cell_audits
-            )
     if any(record.status == "ERROR" for record in records):
+        if formal_evidence:
+            raise RuntimeError(
+                "formal ablation evaluator returned infrastructure ERROR without "
+                "a terminal failed LLM call"
+            )
+        append_call_audits(cell_receipts, cache_hit=False)
         return records
     if not snapshot_matches():
+        if formal_evidence:
+            raise RuntimeError("formal ablation input changed during the cell")
+        append_call_audits(cell_receipts, cache_hit=False)
         return error_records("content-addressed input snapshot changed during the cell")
     try:
-        _atomic_write(
-            cache,
-            json.dumps(
-                {
-                    "schema_version": _CACHE_SCHEMA,
-                    "fingerprint": fingerprint,
-                    "records": [asdict(r) for r in records],
-                    **(
-                        {"llm_call_receipts": cell_receipts}
-                        if require_call_receipts
-                        else {"llm_calls": cell_audits}
-                    ),
-                },
-                indent=2,
-            ),
-        )
+        write_cache(records, terminal_error=False)
     except Exception as error:
         logger.error(
             "cache write failure on %s rep %d: %s",
@@ -2906,7 +3134,11 @@ def _run_cell(
             type(error).__name__,
             exc_info=True,
         )
+        if formal_evidence:
+            raise RuntimeError("formal ablation could not seal a completed cell") from error
+        append_call_audits(cell_receipts, cache_hit=False)
         return error_records(f"cell cache write failure: {type(error).__name__}")
+    append_call_audits(cell_receipts, cache_hit=False)
     return records
 
 
@@ -2938,7 +3170,11 @@ def _rate_ci(
     return cluster_bootstrap_ci(by_task, n=n, seed=seed)
 
 
-def _paired_mcnemar_lines(records: list[RunRecord]) -> list[str]:
+def _paired_mcnemar_lines(
+    records: list[RunRecord],
+    *,
+    precise: bool = False,
+) -> list[str]:
     """Exact McNemar on the paired (task, rep) cells for the headline contrasts."""
     from .bench.stats import mcnemar_exact
 
@@ -2961,9 +3197,11 @@ def _paired_mcnemar_lines(records: list[RunRecord]) -> list[str]:
         only_a = sum(oa[k] and not ob[k] for k in pairs)
         only_b = sum(ob[k] and not oa[k] for k in pairs)
         p = mcnemar_exact(only_a, only_b)
+        p_text = f"{p:.4e}" if precise and 0 < p < 0.0001 else f"{p:.{4 if precise else 2}f}"
         lines.append(
             f"- `{a}` vs `{b}` on {metric.replace('_', ' ')}: "
-            f"discordant {only_a}/{only_b} of {len(pairs)} pairs · exact McNemar p = {p:.2f}"
+            f"discordant {only_a}/{only_b} of {len(pairs)} pairs · "
+            f"exact McNemar p = {p_text}"
         )
     return lines
 
@@ -3242,6 +3480,12 @@ def run_ablation(
         repetitions=reps,
     )
     out = Path(out_dir) if out_dir else (Path(base.runs_dir) / "ablation")
+    report_path = out / "ablation_report.json"
+    if formal_corpus is not None and (report_path.exists() or report_path.is_symlink()):
+        raise RuntimeError(
+            "formal ablation output already contains ablation_report.json; "
+            "reports are immutable, so use a new output directory"
+        )
     out.mkdir(parents=True, exist_ok=True)
     # The backend's own env vars apply here exactly as in `lha run`; an explicit
     # --model wins. The resolved name feeds the provenance fingerprint.
@@ -3477,6 +3721,7 @@ def run_ablation(
                     llm_calls,
                     require_call_receipts,
                     max_inner_attempts,
+                    formal_corpus is not None,
                 )
             )
 
@@ -3536,6 +3781,7 @@ def run_ablation(
         "input_snapshot_schema": _INPUT_SNAPSHOT_SCHEMA,
         "scorer_evidence_schema": _SCORER_EVIDENCE_SCHEMA,
         "llm_call_receipt_schema": _LLM_CALL_RECEIPT_SCHEMA,
+        "cell_attempt_schema": _CELL_ATTEMPT_SCHEMA,
         "codex_operation_lease_store": ("." if codex_operation_lease_bound else None),
         "docker_operation_lease_store": ("." if scorer_backend == "docker" else None),
         "docker_container_absence_filter": (

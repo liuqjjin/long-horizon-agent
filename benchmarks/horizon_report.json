@@ -22,6 +22,13 @@
   "independent_episode_count": 12,
   "model": "gpt-5.4-mini",
   "source": "benchmarks/ablation_report.json",
+  "coverage": {
+    "scheduled_paired_cells": 204,
+    "usable_paired_cells": 204,
+    "unavailable_or_error_cells": 0,
+    "scheduled_repetitions": 12,
+    "complete_paired_repetitions": 12
+  },
   "estimands": {
     "cell": {
       "unit": "task \u00d7 repetition cell",
@@ -86,6 +93,46 @@
           "bench_spans": 1.0,
           "bench_urljoin": 1.0,
           "bench_window": 1.0
+        }
+      },
+      "per_task_n": {
+        "trust-chain": {
+          "bench_basen": 12,
+          "bench_brackets": 12,
+          "bench_bsearch": 12,
+          "bench_caesar": 12,
+          "bench_csvlite": 12,
+          "bench_flatten": 12,
+          "bench_lru": 12,
+          "bench_median": 12,
+          "bench_merge_intervals": 12,
+          "bench_paginate": 12,
+          "bench_roman": 12,
+          "bench_rpn": 12,
+          "bench_runstats": 12,
+          "bench_slugify": 12,
+          "bench_spans": 12,
+          "bench_urljoin": 12,
+          "bench_window": 12
+        },
+        "verify-chain": {
+          "bench_basen": 12,
+          "bench_brackets": 12,
+          "bench_bsearch": 12,
+          "bench_caesar": 12,
+          "bench_csvlite": 12,
+          "bench_flatten": 12,
+          "bench_lru": 12,
+          "bench_median": 12,
+          "bench_merge_intervals": 12,
+          "bench_paginate": 12,
+          "bench_roman": 12,
+          "bench_rpn": 12,
+          "bench_runstats": 12,
+          "bench_slugify": 12,
+          "bench_spans": 12,
+          "bench_urljoin": 12,
+          "bench_window": 12
         }
       },
       "curves": [

@@ -46,9 +46,11 @@ class HorizonDataError(ValueError):
 
 @dataclass(frozen=True)
 class Cells:
-    """Per-cell delivered correctness, after combining decision and scorer truth."""
+    """Scheduled cells and their usable delivered-correctness measurements."""
 
     tasks: list[str]
+    # Scheduled repetitions include ERROR-only and declared-but-missing cells.
+    # Keeping them here prevents coverage loss from disappearing during load.
     reps: list[int]
     outcome: dict[tuple[str, str, int], bool]
     model: str
@@ -112,7 +114,19 @@ class CompositionEstimand:
     unit: str
     independent_samples_added: int
     per_task_p: dict[str, dict[str, float]]
+    per_task_n: dict[str, dict[str, int]]
     curves: list[Curve]
+
+
+@dataclass(frozen=True)
+class HorizonCoverage:
+    """Scheduled analysis units and the subset with usable paired evidence."""
+
+    scheduled_paired_cells: int
+    usable_paired_cells: int
+    unavailable_or_error_cells: int
+    scheduled_repetitions: int
+    complete_paired_repetitions: int
 
 
 @dataclass
@@ -122,6 +136,7 @@ class HorizonReport:
     independent_episode_count: int
     model: str
     source: str
+    coverage: HorizonCoverage
     cell_estimand: PairedEstimand
     episode_estimand: PairedEstimand
     composition_estimand: CompositionEstimand
@@ -145,6 +160,15 @@ class HorizonReport:
             f"**{self.independent_episode_count} independent observed episodes** · "
             f"per-step truth from `{self.source}`",
             "",
+            "Coverage: "
+            f"scheduled paired cells **{self.coverage.scheduled_paired_cells}** · "
+            f"usable paired cells **{self.coverage.usable_paired_cells}** · "
+            "unavailable/error cells "
+            f"**{self.coverage.unavailable_or_error_cells}** · "
+            f"scheduled repetitions **{self.coverage.scheduled_repetitions}** · "
+            "complete paired repetitions "
+            f"**{self.coverage.complete_paired_repetitions}**.",
+            "",
             "This report keeps three estimands separate. The cell and episode tests use "
             "different paired units; the composition is a descriptive model projection "
             "and adds no observations.",
@@ -156,7 +180,7 @@ class HorizonReport:
             f"`verify` true success: {cell.verify_successes}/{cell.pairs}.",
             "",
             f"Discordant cells (verify-only / trust-only): {cell_b}/{cell_c} · "
-            f"exact McNemar p = {cell.mcnemar_p:.4f}"
+            f"exact McNemar p = {_format_p(cell.mcnemar_p)}"
             + ("" if cell.mcnemar_p < self.alpha else " — **not significant**"),
             "",
             "## Estimand 2 — observed episodes",
@@ -181,7 +205,7 @@ class HorizonReport:
             "",
             f"Discordant episodes (verify-only / trust-only): {episode_b}/{episode_c} of "
             f"{episode.pairs} paired episodes · exact McNemar p = "
-            f"{episode.mcnemar_p:.4f}"
+            f"{_format_p(episode.mcnemar_p)}"
             + ("" if episode.mcnemar_p < self.alpha else " — **not significant**"),
             "",
             "The cell- and episode-level p-values may coincide for a particular dataset, "
@@ -197,6 +221,24 @@ class HorizonReport:
             "",
             f"Independent samples added by composition: "
             f"**{self.composition_estimand.independent_samples_added}**.",
+            "",
+            "Composition uses every available measurement for each task. Per-task "
+            "sample sizes may differ after ERROR or missing cells; these measurements "
+            "are reused descriptively and do not add observations.",
+            "",
+            "| task | `trust-chain` measured rate | `verify-chain` measured rate |",
+            "|---|---:|---:|",
+        ]
+        for task in self.tasks:
+            trust_p = self.composition_estimand.per_task_p["trust-chain"][task]
+            verify_p = self.composition_estimand.per_task_p["verify-chain"][task]
+            trust_n = self.composition_estimand.per_task_n["trust-chain"][task]
+            verify_n = self.composition_estimand.per_task_n["verify-chain"][task]
+            lines.append(
+                f"| `{task}` | {_pct(trust_p)} (n={trust_n}) "
+                f"| {_pct(verify_p)} (n={verify_n}) |"
+            )
+        lines += [
             "",
             "| k | `trust-chain` (95% task-bootstrap interval) "
             "| `verify-chain` (95% task-bootstrap interval) | gap |",
@@ -237,6 +279,7 @@ class HorizonReport:
                 "independent_episode_count": self.independent_episode_count,
                 "model": self.model,
                 "source": self.source,
+                "coverage": asdict(self.coverage),
                 "estimands": {
                     "cell": asdict(self.cell_estimand),
                     "episode": asdict(self.episode_estimand),
@@ -253,6 +296,13 @@ def _pct(x: float) -> str:
     return f"{100 * x:.0f}%"
 
 
+def _format_p(value: float) -> str:
+    """Keep ordinary p-values readable without rounding a non-zero tail to zero."""
+    if 0 < value < 0.0001:
+        return f"{value:.4e}"
+    return f"{value:.4f}"
+
+
 def _milestones(n: int) -> list[int]:
     """A readable subset of step indices, always including 1 and n."""
     wanted = {1, n}
@@ -264,9 +314,10 @@ def _milestones(n: int) -> list[int]:
 def load_cells(report_path: str | Path) -> Cells:
     """Read measured per-cell truth out of an ``ablation_report.json``.
 
-    ``ERROR`` cells carry no measurement and are dropped here; a repetition that
-    loses any task is excluded from the episode analysis by ``complete_reps``
-    rather than silently shortening the horizon.
+    ``ERROR`` cells carry no measurement, but their scheduled repetition remains
+    visible for coverage accounting. A repetition that loses any task is
+    excluded from the episode analysis by ``complete_reps`` rather than silently
+    shortening the horizon.
     """
     path = Path(report_path)
     try:
@@ -295,7 +346,18 @@ def load_cells(report_path: str | Path) -> Cells:
     tasks = sorted(tasks_raw)
     declared_tasks = set(tasks)
     outcome: dict[tuple[str, str, int], bool] = {}
-    reps: set[int] = set()
+    observed_reps: set[int] = set()
+    declared_reps_raw = raw.get("reps")
+    if declared_reps_raw is None:
+        declared_reps: int | None = None
+    elif (
+        not isinstance(declared_reps_raw, int)
+        or isinstance(declared_reps_raw, bool)
+        or declared_reps_raw <= 0
+    ):
+        raise HorizonDataError(f"{path} has an invalid repetition count")
+    else:
+        declared_reps = declared_reps_raw
     seen: set[tuple[str, str, int]] = set()
     for index, rec in enumerate(records):
         if not isinstance(rec, dict):
@@ -311,6 +373,10 @@ def load_cells(report_path: str | Path) -> Cells:
             raise HorizonDataError(f"{path} record {index} has invalid task {task!r}")
         if not isinstance(rep, int) or isinstance(rep, bool) or rep < 0:
             raise HorizonDataError(f"{path} record {index} has invalid repetition {rep!r}")
+        if declared_reps is not None and rep >= declared_reps:
+            raise HorizonDataError(
+                f"{path} record {index} repetition {rep} exceeds the declared schedule"
+            )
         if not isinstance(status, str) or status not in _RECORD_STATUSES:
             raise HorizonDataError(f"{path} record {index} has invalid status {status!r}")
         if not isinstance(true_success, bool):
@@ -344,18 +410,19 @@ def load_cells(report_path: str | Path) -> Cells:
         if key in seen:
             raise HorizonDataError(f"{path} contains duplicate measured cell {key!r}")
         seen.add(key)
+        observed_reps.add(rep)
         if status == "ERROR":
             continue
         outcome[key] = true_success
-        reps.add(rep)
     if not tasks or not outcome:
         raise HorizonDataError(f"{path} contains no usable measured cells")
+    reps = list(range(declared_reps)) if declared_reps is not None else sorted(observed_reps)
     model = raw.get("model", "")
     if not isinstance(model, str):
         raise HorizonDataError(f"{path} field 'model' must be a string")
     return Cells(
         tasks=tasks,
-        reps=sorted(reps),
+        reps=reps,
         outcome=outcome,
         model=model,
         source=str(path),
@@ -376,6 +443,14 @@ def per_task_p(cells: Cells, ablation_condition: str) -> dict[str, float]:
             raise HorizonDataError(f"no measured cells for {task!r} under {ablation_condition!r}")
         out[task] = sum(vals) / len(vals)
     return out
+
+
+def per_task_n(cells: Cells, ablation_condition: str) -> dict[str, int]:
+    """Number of usable measurements contributing to each per-task rate."""
+    return {
+        task: sum((ablation_condition, task, rep) in cells.outcome for rep in cells.reps)
+        for task in cells.tasks
+    }
 
 
 def compounding_curve(probabilities: list[float]) -> list[float]:
@@ -465,9 +540,11 @@ def build_report(cells: Cells, *, seed: int = 0, alpha: float = _TARGET_ALPHA) -
     curves: list[Curve] = []
     episodes: list[Episode] = []
     probabilities: dict[str, dict[str, float]] = {}
+    sample_sizes: dict[str, dict[str, int]] = {}
     for name, source, _blurb in CONDITIONS:
         probs = per_task_p(cells, source)
         probabilities[name] = probs
+        sample_sizes[name] = per_task_n(cells, source)
         rate = compounding_curve(list(probs.values()))
         lo, hi = _task_bootstrap_interval(probs, seed=seed)
         curves.append(
@@ -496,6 +573,8 @@ def build_report(cells: Cells, *, seed: int = 0, alpha: float = _TARGET_ALPHA) -
         raise HorizonDataError("no complete repetition is paired under trust and verify")
     episode_pairs = [(trust_eps[rep], verify_eps[rep]) for rep in paired]
     paired_episodes = [episode for episode in episodes if episode.rep in paired]
+    scheduled_cell_pairs = len(cells.tasks) * len(cells.reps)
+    usable_cell_pairs = len(cell_pairs)
 
     return HorizonReport(
         tasks=cells.tasks,
@@ -503,12 +582,20 @@ def build_report(cells: Cells, *, seed: int = 0, alpha: float = _TARGET_ALPHA) -
         independent_episode_count=len(paired),
         model=cells.model,
         source=cells.source,
+        coverage=HorizonCoverage(
+            scheduled_paired_cells=scheduled_cell_pairs,
+            usable_paired_cells=usable_cell_pairs,
+            unavailable_or_error_cells=scheduled_cell_pairs - usable_cell_pairs,
+            scheduled_repetitions=len(cells.reps),
+            complete_paired_repetitions=len(paired),
+        ),
         cell_estimand=_paired_estimand("task × repetition cell", cell_pairs),
         episode_estimand=_paired_estimand("complete corpus repetition", episode_pairs),
         composition_estimand=CompositionEstimand(
             unit="independent-step projection over empirical per-task rates",
             independent_samples_added=0,
             per_task_p=probabilities,
+            per_task_n=sample_sizes,
             curves=curves,
         ),
         episodes=paired_episodes,

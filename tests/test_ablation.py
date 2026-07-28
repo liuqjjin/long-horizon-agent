@@ -33,6 +33,7 @@ from lha.llm.base import LLMClient
 from lha.llm.claude_cli import ClaudeCLIClient
 from lha.llm.trace import TracedLLM
 from lha.sandbox import TrustedLocalBackend
+from lha.tasks.spec import TaskSpec
 
 _PYPROJECT = (
     '[project]\nname = "buggy"\nversion = "0.0.0"\nrequires-python = ">=3.11"\n\n'
@@ -166,6 +167,69 @@ class _AuditedCodexLLM(LLMClient):
             "model": self.model,
         }
         return "### m.py\n```python\ndef f():\n    return 2\n```"
+
+
+class _NonRetryableCallError(RuntimeError):
+    retryable = False
+
+
+class _FailingAuditedCodexLLM(_AuditedCodexLLM):
+    def complete(self, system: str, prompt: str) -> str:
+        self.calls += 1
+        summary = {
+            "total_events": 3,
+            "events": {
+                "thread.started": 1,
+                "turn.started": 1,
+                "turn.failed": 1,
+            },
+            "items": {},
+            "invalid_json_lines": 0,
+        }
+        self.last_call = {
+            "status": "failed",
+            "cli_version": self._version,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "sandbox_mode": self.sandbox_mode,
+            "permission_model": self.permission_model,
+            "permission_profile": self.permission_profile,
+            "credential_barrier": self.credential_barrier,
+            "cli_executable_sha256": "9" * 64,
+            "cli_executable_trusted": False,
+            "externally_sandboxed": False,
+            "retries": 0,
+            "attempt_count": 1,
+            "duration_s": 0.1,
+            "event_summary": summary,
+            "error_type": "_NonRetryableCallError",
+            "retryable": False,
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "status": "failed",
+                    "duration_s": 0.1,
+                    "error_type": "_NonRetryableCallError",
+                    "event_summary": summary,
+                }
+            ],
+        }
+        self.last_usage = {
+            "input_tokens": None,
+            "cached_input_tokens": None,
+            "output_tokens": None,
+            "cost_usd": None,
+            "model": self.model,
+        }
+        raise _NonRetryableCallError("protocol rejected")
+
+
+class _SuccessThenFailAuditedCodexLLM(_FailingAuditedCodexLLM):
+    def complete(self, system: str, prompt: str) -> str:
+        if self.calls == 0:
+            response = _AuditedCodexLLM.complete(self, system, prompt)
+            return response.replace("return 2", "return 3")
+        return _FailingAuditedCodexLLM.complete(self, system, prompt)
 
 
 def _base(tmp_path: Path) -> Config:
@@ -440,6 +504,443 @@ def test_transient_errors_excluded_and_not_cached(tmp_path, monkeypatch):
     assert not (out / "results" / "task__r0.json").exists()
 
 
+def test_failed_codex_receipt_is_referenced_and_error_seal_is_resumable(tmp_path):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    llm = _FailingAuditedCodexLLM()
+
+    first = run_ablation(
+        _base(tmp_path),
+        [task],
+        llm="codex_cli",
+        model=llm.model,
+        reps=1,
+        out_dir=out,
+        llm_client=llm,
+    )
+
+    assert llm.calls == 1
+    assert all(
+        record.status == "ERROR"
+        and record.scorer_outcome == "INFRA_ERROR"
+        and not record.artifact_sha256
+        and not record.scorer_evidence_sha256
+        for record in first.records
+    )
+    cache = json.loads((out / "results" / "task__r0.json").read_text())
+    assert cache["schema_version"] == abl._CACHE_SCHEMA
+    assert cache["terminal_error"] is True
+    assert len(cache["llm_call_receipts"]) == 1
+    raw = json.loads((out / "ablation_report.json").read_text())
+    assert raw["llm_call_receipt_store"]["count"] == 1
+    assert len(raw["llm_calls"]) == 1
+    reference = raw["llm_calls"][0]
+    assert reference["cache_hit"] is False
+    assert reference["receipt_sha256"] == cache["llm_call_receipts"][0]
+    receipt = json.loads(
+        (out / "llm_call_receipts" / f"{reference['receipt_sha256']}.json").read_text()
+    )
+    assert receipt["call"]["status"] == "failed"
+    assert receipt["binding"]["response_sha256"] is None
+    assert receipt["binding"]["patch_sha256"] is None
+    assert receipt["binding"]["result_artifact_sha256"] is None
+
+    second = run_ablation(
+        _base(tmp_path),
+        [task],
+        llm="codex_cli",
+        model=llm.model,
+        reps=1,
+        out_dir=out,
+        llm_client=llm,
+    )
+
+    assert llm.calls == 1
+    assert all(record.status == "ERROR" for record in second.records)
+    assert second.llm_calls == [{**reference, "cache_hit": True}]
+
+
+def test_formal_error_seal_requires_its_start_marker(tmp_path):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    src = _repo(tmp_path / "src")
+    task = TaskSpec.from_file(_task(tmp_path, src))
+    task.inputs["_name"] = "task"
+    llm = _FailingAuditedCodexLLM()
+
+    def run_cell():
+        return abl._run_cell(
+            abl._PromptAuditClient(llm),
+            src,
+            task,
+            0,
+            out,
+            "f" * 64,
+            abl._repo_digest(src),
+            "a" * 64,
+            TrustedLocalBackend(),
+            TrustedLocalBackend(),
+            "trusted-local",
+            None,
+            [],
+            True,
+            1,
+            True,
+        )
+
+    first = run_cell()
+    assert llm.calls == 1
+    assert all(record.status == "ERROR" for record in first)
+    marker = out / "results" / "task__r0.started.json"
+    cache = out / "results" / "task__r0.json"
+    assert marker.exists() and cache.exists()
+
+    second = run_cell()
+    assert llm.calls == 1
+    assert all(record.status == "ERROR" for record in second)
+
+    cache.unlink()
+    with pytest.raises(RuntimeError, match="unsealed prior cell attempt"):
+        run_cell()
+    assert llm.calls == 1
+
+
+def test_formal_cache_without_start_marker_is_not_recomputed(tmp_path):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    src = _repo(tmp_path / "src")
+    task = TaskSpec.from_file(_task(tmp_path, src))
+    task.inputs["_name"] = "task"
+    llm = _FailingAuditedCodexLLM()
+    (out / "results").mkdir(parents=True)
+    (out / "results" / "task__r0.json").write_text("{}")
+
+    with pytest.raises(RuntimeError, match="no matching start marker"):
+        abl._run_cell(
+            abl._PromptAuditClient(llm),
+            src,
+            task,
+            0,
+            out,
+            "f" * 64,
+            abl._repo_digest(src),
+            "a" * 64,
+            TrustedLocalBackend(),
+            TrustedLocalBackend(),
+            "trusted-local",
+            None,
+            [],
+            True,
+            1,
+            True,
+        )
+    assert llm.calls == 0
+
+
+def test_formal_cell_failure_before_llm_call_fails_closed(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = TaskSpec.from_file(_task(tmp_path, src))
+    task.inputs["_name"] = "task"
+
+    def fail_before_call(*args, **kwargs):
+        raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(abl, "_first_attempt", fail_before_call)
+
+    with pytest.raises(RuntimeError, match="before an auditable LLM call"):
+        abl._run_cell(
+            abl._PromptAuditClient(_AuditedCodexLLM()),
+            src,
+            task,
+            0,
+            tmp_path / "out",
+            "f" * 64,
+            abl._repo_digest(src),
+            "a" * 64,
+            TrustedLocalBackend(),
+            TrustedLocalBackend(),
+            "trusted-local",
+            None,
+            [],
+            True,
+            1,
+            True,
+        )
+
+
+def test_formal_cell_rejects_initial_snapshot_mismatch(tmp_path):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = TaskSpec.from_file(_task(tmp_path, src))
+    task.inputs["_name"] = "task"
+
+    with pytest.raises(RuntimeError, match="input snapshot failed validation"):
+        abl._run_cell(
+            abl._PromptAuditClient(_AuditedCodexLLM()),
+            src,
+            task,
+            0,
+            tmp_path / "out",
+            "f" * 64,
+            "0" * 64,
+            "a" * 64,
+            TrustedLocalBackend(),
+            TrustedLocalBackend(),
+            "trusted-local",
+            None,
+            [],
+            True,
+            1,
+            True,
+        )
+
+
+def test_formal_generic_error_after_successful_call_fails_closed(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = TaskSpec.from_file(_task(tmp_path, src))
+    task.inputs["_name"] = "task"
+
+    def fail_after_success(*args, **kwargs):
+        audits = args[-1]
+        audits[-1]["result_artifact_sha256"] = "b" * 64
+        raise RuntimeError("scorer setup failed")
+
+    monkeypatch.setattr(abl, "_evaluate", fail_after_success)
+
+    with pytest.raises(RuntimeError, match="did not end in a failed LLM call"):
+        abl._run_cell(
+            abl._PromptAuditClient(_AuditedCodexLLM()),
+            src,
+            task,
+            0,
+            tmp_path / "out",
+            "f" * 64,
+            abl._repo_digest(src),
+            "a" * 64,
+            TrustedLocalBackend(),
+            TrustedLocalBackend(),
+            "trusted-local",
+            None,
+            [],
+            True,
+            1,
+            True,
+        )
+
+
+def test_formal_schema4_rejects_terminal_repair_failure(tmp_path):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = TaskSpec.from_file(_task(tmp_path, src))
+    task.inputs["_name"] = "task"
+    llm = _SuccessThenFailAuditedCodexLLM()
+
+    with pytest.raises(
+        RuntimeError,
+        match="schema-4 ERROR cannot contain a successful or repair call",
+    ):
+        abl._run_cell(
+            abl._PromptAuditClient(llm),
+            src,
+            task,
+            0,
+            tmp_path / "out",
+            "f" * 64,
+            abl._repo_digest(src),
+            "a" * 64,
+            TrustedLocalBackend(),
+            TrustedLocalBackend(),
+            "trusted-local",
+            None,
+            [],
+            True,
+            1,
+            True,
+        )
+    assert llm.calls == 2
+    assert not (tmp_path / "out" / "results" / "task__r0.json").exists()
+
+
+def test_formal_evaluator_infra_error_fails_closed(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = TaskSpec.from_file(_task(tmp_path, src))
+    task.inputs["_name"] = "task"
+
+    def return_infra_error(*args, **kwargs):
+        audits = args[-1]
+        audits[-1]["result_artifact_sha256"] = "b" * 64
+        return [
+            RunRecord(
+                "task",
+                condition,
+                0,
+                "ERROR",
+                False,
+                False,
+                False,
+                False,
+                0,
+                scorer_outcome="INFRA_ERROR",
+            )
+            for condition, _ in CONDITIONS
+        ]
+
+    monkeypatch.setattr(abl, "_evaluate", return_infra_error)
+
+    with pytest.raises(RuntimeError, match="evaluator returned infrastructure ERROR"):
+        abl._run_cell(
+            abl._PromptAuditClient(_AuditedCodexLLM()),
+            src,
+            task,
+            0,
+            tmp_path / "out",
+            "f" * 64,
+            abl._repo_digest(src),
+            "a" * 64,
+            TrustedLocalBackend(),
+            TrustedLocalBackend(),
+            "trusted-local",
+            None,
+            [],
+            True,
+            1,
+            True,
+        )
+
+
+def test_formal_completed_cell_cache_write_failure_aborts(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = TaskSpec.from_file(_task(tmp_path, src))
+    task.inputs["_name"] = "task"
+
+    def return_success(*args, **kwargs):
+        audits = args[-1]
+        audits[-1]["result_artifact_sha256"] = "b" * 64
+        return [
+            RunRecord(
+                "task",
+                condition,
+                0,
+                "DONE",
+                True,
+                True,
+                True,
+                False,
+                0,
+                artifact_sha256="b" * 64,
+                scorer_outcome="PASS",
+                scorer_evidence_sha256="c" * 64,
+            )
+            for condition, _ in CONDITIONS
+        ]
+
+    real_atomic_write = abl._atomic_write
+
+    def fail_result_cache(path, text):
+        if path.parent.name == "results":
+            raise OSError("disk full")
+        real_atomic_write(path, text)
+
+    monkeypatch.setattr(abl, "_evaluate", return_success)
+    monkeypatch.setattr(abl, "_atomic_write", fail_result_cache)
+
+    audit_log = []
+    with pytest.raises(RuntimeError, match="could not seal a completed cell"):
+        abl._run_cell(
+            abl._PromptAuditClient(_AuditedCodexLLM()),
+            src,
+            task,
+            0,
+            tmp_path / "out",
+            "f" * 64,
+            abl._repo_digest(src),
+            "a" * 64,
+            TrustedLocalBackend(),
+            TrustedLocalBackend(),
+            "trusted-local",
+            None,
+            audit_log,
+            True,
+            1,
+            True,
+        )
+    assert audit_log == []
+
+
+def test_formal_post_cell_snapshot_drift_aborts(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = TaskSpec.from_file(_task(tmp_path, src))
+    task.inputs["_name"] = "task"
+    source_sha256 = abl._repo_digest(src)
+    digest_calls = 0
+
+    def drifting_digest(path):
+        nonlocal digest_calls
+        digest_calls += 1
+        return source_sha256 if digest_calls == 1 else "0" * 64
+
+    def return_success(*args, **kwargs):
+        audits = args[-1]
+        audits[-1]["result_artifact_sha256"] = "b" * 64
+        return [
+            RunRecord(
+                "task",
+                condition,
+                0,
+                "DONE",
+                True,
+                True,
+                True,
+                False,
+                0,
+                artifact_sha256="b" * 64,
+                scorer_outcome="PASS",
+                scorer_evidence_sha256="c" * 64,
+            )
+            for condition, _ in CONDITIONS
+        ]
+
+    monkeypatch.setattr(abl, "_repo_digest", drifting_digest)
+    monkeypatch.setattr(abl, "_evaluate", return_success)
+
+    with pytest.raises(RuntimeError, match="input changed during the cell"):
+        abl._run_cell(
+            abl._PromptAuditClient(_AuditedCodexLLM()),
+            src,
+            task,
+            0,
+            tmp_path / "out",
+            "f" * 64,
+            source_sha256,
+            "a" * 64,
+            TrustedLocalBackend(),
+            TrustedLocalBackend(),
+            "trusted-local",
+            None,
+            [],
+            True,
+            1,
+            True,
+        )
+
+
 def test_error_records_are_never_reused_from_cache(tmp_path):
     import lha.ablation as abl
 
@@ -533,6 +1034,7 @@ def test_resumable_caches_real_outcomes(tmp_path):
     llm = _FixedLLM(2)
     rep1 = run_ablation(base, [task], reps=1, out_dir=out, llm_client=llm)
     assert (out / "results" / "task__r0.json").exists()
+    assert json.loads((out / "results" / "task__r0.json").read_text())["terminal_error"] is False
     assert rep1.llm_calls[0]["cache_hit"] is False
     calls_after_first_run = llm.calls
 
@@ -774,6 +1276,32 @@ def test_aggregate_and_markdown():
     report = AblationReport("stub", "", 1, ["t1", "t2"], records, list(stats.values()))
     md = report.to_markdown()
     assert "Verification ablation" in md and "false success" in md and "false-pass" in md
+
+
+def test_formal_markdown_does_not_round_nonzero_mcnemar_p_to_zero():
+    records: list[RunRecord] = []
+    for rep in range(12):
+        records.extend(
+            [
+                RunRecord("t", "trust", rep, "DONE", True, False, False, True, 0),
+                RunRecord("t", "gate", rep, "FAILED", False, False, False, False, 0),
+                RunRecord("t", "verify", rep, "DONE", True, True, True, False, 1),
+            ]
+        )
+    report = AblationReport(
+        "codex_cli",
+        "model-x",
+        12,
+        ["t"],
+        records,
+        _aggregate(records),
+        schema_version=4,
+    )
+
+    markdown = report.to_markdown()
+
+    assert "exact McNemar p = 0.0005" in markdown
+    assert "exact McNemar p = 0.00\n" not in markdown
 
 
 def test_errored_runs_excluded_from_rates():
@@ -1434,6 +1962,77 @@ def test_report_rejects_source_tree_drift_during_run(tmp_path, monkeypatch):
     assert not (out / "ablation_report.md").exists()
 
 
+def test_completed_formal_output_directory_refuses_rerun(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    out = tmp_path / "out"
+    out.mkdir()
+    records = [
+        RunRecord(
+            task="task",
+            condition=condition,
+            rep=0,
+            status="ERROR",
+            claimed_success=False,
+            artifact_correct=False,
+            true_success=False,
+            false_success=False,
+            repairs=0,
+            scorer_outcome="INFRA_ERROR",
+        )
+        for condition, _ in CONDITIONS
+    ]
+    raw = {
+        "schema_version": 4,
+        "tasks": ["task"],
+        "reps": 1,
+        "records": [record.__dict__ for record in records],
+        "fingerprint": "",
+    }
+    raw["fingerprint"] = abl._report_fingerprint(raw)
+    (out / "ablation_report.json").write_text(json.dumps(raw))
+    monkeypatch.setattr(abl, "_prepare_formal_corpus_binding", lambda *args, **kwargs: object())
+
+    with pytest.raises(RuntimeError, match="already contains ablation_report.json"):
+        run_ablation(
+            _base(tmp_path),
+            [task],
+            llm="codex_cli",
+            model="model-x",
+            reps=1,
+            out_dir=out,
+            llm_client=_AuditedCodexLLM(),
+            scorer_backend="docker",
+        )
+
+
+def test_invalid_formal_report_file_is_not_overwritten(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    out = tmp_path / "out"
+    out.mkdir()
+    report = out / "ablation_report.json"
+    report.write_text("{incomplete")
+    monkeypatch.setattr(abl, "_prepare_formal_corpus_binding", lambda *args, **kwargs: object())
+
+    with pytest.raises(RuntimeError, match="reports are immutable"):
+        run_ablation(
+            _base(tmp_path),
+            [task],
+            llm="codex_cli",
+            model="model-x",
+            reps=1,
+            out_dir=out,
+            llm_client=_AuditedCodexLLM(),
+            scorer_backend="docker",
+        )
+    assert report.read_text() == "{incomplete"
+
+
 def test_legacy_cache_format_is_recomputed(tmp_path):
     import lha.ablation as abl
 
@@ -1490,7 +2089,7 @@ def test_new_report_records_complete_secret_free_provenance(tmp_path):
     assert raw["artifact_store"]["path"] == "artifacts"
     assert raw["scorer_evidence_store"]["path"] == "scorer_evidence"
     assert raw["scorer_evidence_store"]["schema_version"] == 2
-    assert provenance["configuration"]["cache_schema"] == 7
+    assert provenance["configuration"]["cache_schema"] == 8
     assert provenance["configuration"]["scorer_evidence_schema"] == 2
     digests = {record["artifact_sha256"] for record in raw["records"]}
     assert raw["artifact_store"]["count"] == len(digests)

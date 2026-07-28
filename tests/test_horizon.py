@@ -116,6 +116,7 @@ def test_load_cells_drops_error_records(tmp_path):
     path.write_text(json.dumps(raw))
     cells = load_cells(path)
     assert ("trust", "a", 1) not in cells.outcome  # an ERROR is not a measurement
+    assert cells.reps == [0, 1]  # but it remains in the scheduled coverage
     assert cells.complete_reps("trust") == [0]
 
 
@@ -244,6 +245,11 @@ def test_report_separates_cells_episodes_and_composition(tmp_path):
 
     assert report.n_steps == 17
     assert report.independent_episode_count == 3  # R repetitions -> exactly R episodes
+    assert report.coverage.scheduled_paired_cells == 51
+    assert report.coverage.usable_paired_cells == 51
+    assert report.coverage.unavailable_or_error_cells == 0
+    assert report.coverage.scheduled_repetitions == 3
+    assert report.coverage.complete_paired_repetitions == 3
 
     assert report.cell_estimand.pairs == 51
     assert report.cell_estimand.discordant == (2, 0)
@@ -266,6 +272,67 @@ def test_report_separates_cells_episodes_and_composition(tmp_path):
     assert "not significant" in md
     assert "adds no observations" in md
     assert "Independent samples added by composition: **0**" in md
+
+
+def test_error_cell_is_disclosed_without_becoming_an_observation(tmp_path):
+    outcomes = {f"t{i:02d}": [(False, True)] * 12 for i in range(17)}
+    path = _report(tmp_path, outcomes)
+    raw = json.loads(path.read_text())
+    raw["reps"] = 12
+    error = next(
+        record
+        for record in raw["records"]
+        if record["task"] == "t00"
+        and record["condition"] == "trust"
+        and record["rep"] == 0
+    )
+    error.update(
+        status="ERROR",
+        claimed_success=False,
+        artifact_correct=False,
+        true_success=False,
+    )
+    path.write_text(json.dumps(raw))
+
+    cells = load_cells(path)
+    assert cells.reps == list(range(12))
+
+    report = build_report(cells)
+    assert report.coverage.scheduled_paired_cells == 204
+    assert report.coverage.usable_paired_cells == 203
+    assert report.coverage.unavailable_or_error_cells == 1
+    assert report.coverage.scheduled_repetitions == 12
+    assert report.coverage.complete_paired_repetitions == 11
+    assert report.independent_episode_count == 11
+    assert report.cell_estimand.pairs == 203
+    assert report.episode_estimand.pairs == 11
+
+    composition = report.composition_estimand
+    assert composition.independent_samples_added == 0
+    assert composition.per_task_n["trust-chain"]["t00"] == 11
+    assert composition.per_task_n["verify-chain"]["t00"] == 12
+    assert composition.per_task_n["trust-chain"]["t01"] == 12
+
+    payload = json.loads(report.to_json())
+    assert payload["coverage"] == {
+        "scheduled_paired_cells": 204,
+        "usable_paired_cells": 203,
+        "unavailable_or_error_cells": 1,
+        "scheduled_repetitions": 12,
+        "complete_paired_repetitions": 11,
+    }
+    assert payload["estimands"]["composition"]["independent_samples_added"] == 0
+    assert payload["estimands"]["composition"]["per_task_n"]["trust-chain"]["t00"] == 11
+
+    markdown = report.to_markdown()
+    assert "scheduled paired cells **204**" in markdown
+    assert "usable paired cells **203**" in markdown
+    assert "unavailable/error cells **1**" in markdown
+    assert "complete paired repetitions **11**" in markdown
+    assert "`t00` | 0% (n=11) | 100% (n=12)" in markdown
+    cell_line = next(line for line in markdown.splitlines() if line.startswith("Discordant cells"))
+    assert "0.0000" not in cell_line
+    assert "e-" in cell_line
 
 
 def test_cell_and_episode_mcnemar_p_can_differ(tmp_path):
@@ -316,9 +383,20 @@ def test_run_horizon_writes_all_artifacts_and_explicit_estimands(tmp_path):
     reloaded = json.loads((tmp_path / "out" / "horizon_report.json").read_text())
     assert reloaded["n_steps"] == 2
     assert reloaded["independent_episode_count"] == 1
+    assert reloaded["coverage"] == {
+        "scheduled_paired_cells": 2,
+        "usable_paired_cells": 2,
+        "unavailable_or_error_cells": 0,
+        "scheduled_repetitions": 1,
+        "complete_paired_repetitions": 1,
+    }
     assert reloaded["estimands"]["cell"]["discordant"] == [1, 0]
     assert reloaded["estimands"]["episode"]["discordant"] == [1, 0]
     assert reloaded["estimands"]["composition"]["independent_samples_added"] == 0
+    assert reloaded["estimands"]["composition"]["per_task_n"] == {
+        "trust-chain": {"a": 1, "b": 1},
+        "verify-chain": {"a": 1, "b": 1},
+    }
     assert "mcnemar_p" not in reloaded["estimands"]["composition"]
     assert report.episode_estimand.mcnemar_p == pytest.approx(1.0)
 

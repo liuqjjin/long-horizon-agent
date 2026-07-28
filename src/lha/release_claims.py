@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any, NoReturn, cast
 
 from .ablation import (
+    _CACHE_SCHEMA,
+    _CELL_ATTEMPT_SCHEMA,
     _FORMAL_CORPUS_MANIFEST_PATH,
     _FORMAL_REPETITIONS,
     _FORMAL_TASK_COUNT,
@@ -90,6 +92,12 @@ class ReleaseClaimsSummary:
     status: str
     tasks: int
     repetitions: int
+    scheduled_cells: int
+    usable_cells: int
+    error_cells: int
+    # Compatibility alias for callers that treated ``cells`` as the number of
+    # measured rate observations. It is deliberately the usable count, not the
+    # scheduled denominator.
     cells: int
     model: str
     trust_successes: int
@@ -107,7 +115,9 @@ class _AblationFacts:
     raw: dict[str, Any]
     records: tuple[RunRecord, ...]
     status: str
-    cells: int
+    scheduled_cells: int
+    usable_cells: int
+    error_cells: int
     trust_successes: int
     trust_false_successes: int
     gate_successes: int
@@ -253,11 +263,63 @@ def _validate_record_grid(raw: dict[str, Any]) -> tuple[list[str], int, tuple[Ru
     return task_names, rep_count, tuple(records)
 
 
+def _validate_formal_error_cells(records: tuple[RunRecord, ...]) -> set[tuple[str, int]]:
+    """Return terminal ERROR cells after validating their empty measurement envelope.
+
+    A formal ERROR is a cell-level infrastructure outcome, not three unrelated
+    condition results. All conditions therefore carry the same absence of a
+    delivery, artifact, and scorer measurement. The call receipts are checked
+    separately because they are content-addressed files rather than record
+    fields.
+    """
+    by_cell: dict[tuple[str, int], list[RunRecord]] = {}
+    for record in records:
+        by_cell.setdefault((record.task, record.rep), []).append(record)
+
+    error_cells: set[tuple[str, int]] = set()
+    for cell, cell_records in by_cell.items():
+        if not any(record.status == "ERROR" for record in cell_records):
+            continue
+        if (
+            len(cell_records) != len(_CONDITION_NAMES)
+            or {record.condition for record in cell_records} != set(_CONDITION_NAMES)
+            or any(record.status != "ERROR" for record in cell_records)
+        ):
+            _fail(
+                "formal ablation ERROR must cover trust, gate, and verify "
+                f"consistently for {cell!r}"
+            )
+        if len({record.repairs for record in cell_records}) != 1 or len(
+            {record.detail for record in cell_records}
+        ) != 1:
+            _fail(f"formal ablation ERROR records disagree within cell {cell!r}")
+        for record in cell_records:
+            key = (record.task, record.condition, record.rep)
+            if (
+                record.scorer_outcome != ScoreOutcome.INFRA_ERROR.value
+                or record.claimed_success
+                or record.artifact_correct
+                or record.true_success
+                or record.false_success
+                or record.gate_prediction is not None
+                or record.artifact_sha256
+                or record.scorer_evidence_sha256
+                or record.scorer_expected_tests != 0
+                or record.scorer_passed_tests != 0
+                or record.repairs != 0
+            ):
+                _fail(f"formal ablation ERROR record is not empty and typed for {key!r}")
+        error_cells.add(cell)
+    return error_cells
+
+
 def _validate_record_artifacts(records: tuple[RunRecord, ...]) -> None:
     """Bind each formal cell to a valid artifact and preserve the paired design."""
     by_cell: dict[tuple[str, int], dict[str, str]] = {}
     evidence_by_cell: dict[tuple[str, int], dict[str, str]] = {}
     for record in records:
+        if record.status == "ERROR":
+            continue
         if not _HEX_64.fullmatch(record.artifact_sha256):
             _fail(
                 "formal ablation record has an invalid artifact_sha256 "
@@ -287,7 +349,9 @@ def _validate_artifact_store(
     report_dir: Path,
 ) -> None:
     store = raw.get("artifact_store")
-    expected_digests = {record.artifact_sha256 for record in records}
+    expected_digests = {
+        record.artifact_sha256 for record in records if record.status != "ERROR"
+    }
     expected_store = {
         "schema_version": 1,
         "path": "artifacts",
@@ -461,6 +525,12 @@ def _validate_condition_stats(raw: dict[str, Any], records: tuple[RunRecord, ...
     if set(by_name) != set(_CONDITION_NAMES):
         _fail("ablation stats do not cover trust, gate, and verify exactly once")
 
+    tasks = raw.get("tasks")
+    reps = raw.get("reps")
+    if not isinstance(tasks, list) or not isinstance(reps, int) or isinstance(reps, bool):
+        _fail("ablation schedule is invalid while validating condition stats")
+    scheduled_per_condition = len(tasks) * reps
+
     boundary_problems: list[str] = []
     for condition in _CONDITION_NAMES:
         condition_records = [record for record in records if record.condition == condition]
@@ -470,6 +540,10 @@ def _validate_condition_stats(raw: dict[str, Any], records: tuple[RunRecord, ...
         n = len(usable)
         if stat.get("n") != n or stat.get("errors") != errors:
             _fail(f"ablation stats for {condition!r} have stale n/errors")
+        if n + errors != scheduled_per_condition:
+            _fail(
+                f"ablation stats for {condition!r} do not retain the scheduled denominator"
+            )
         if not n:
             _fail(f"ablation condition {condition!r} has no usable measured cells")
 
@@ -1009,12 +1083,13 @@ def _validate_provenance(
     required_protocol = {
         "max_repairs": _MAX_REPAIRS,
         "llm_retries": _LLM_RETRIES,
-        "cache_schema": 7,
+        "cache_schema": _CACHE_SCHEMA,
         "report_schema": 4,
         "frozen_artifact_schema": 1,
         "input_snapshot_schema": 1,
         "scorer_evidence_schema": 2,
         "llm_call_receipt_schema": _LLM_CALL_RECEIPT_SCHEMA,
+        "cell_attempt_schema": _CELL_ATTEMPT_SCHEMA,
         "scorer_result_source": "nonce-bound-pytest-hook-receipt",
     }
     if any(configuration.get(field) != expected for field, expected in required_protocol.items()):
@@ -1150,18 +1225,36 @@ def _validate_llm_call_audits(
         for record in cast(list[dict[str, Any]], raw["records"])
     }
     for cell, cell_calls in calls_by_cell.items():
-        if len(cache_modes[cell]) != 1:
-            _fail(f"formal ablation cell {cell!r} mixes cache provenance")
         verify = records_by_key[(*cell, "verify")]
+        terminal_error = verify["status"] == "ERROR"
+        if terminal_error:
+            if not cell_calls:
+                _fail(f"formal ablation ERROR cell {cell!r} has no LLM call receipt")
+            if len(cache_modes[cell]) != 1:
+                _fail(f"formal ablation ERROR cell {cell!r} mixes cache provenance")
+            if any(
+                receipt["binding"]["label"] != "first"
+                or receipt["call"]["status"] != "failed"
+                for receipt in cell_calls
+            ):
+                _fail(
+                    "formal ablation ERROR cell must contain only failed first-call "
+                    f"receipts for {cell!r}"
+                )
+        elif len(cache_modes[cell]) != 1:
+            _fail(f"formal ablation cell {cell!r} mixes cache provenance")
         try:
             _validate_cell_call_sequence(
                 cell_calls,
                 repairs=verify["repairs"],
                 max_outer_attempts=configuration["llm_retries"],
                 max_inner_attempts=max_inner_retries + 1,
+                terminal_error=terminal_error,
             )
         except (KeyError, TypeError, ValueError) as error:
             _fail(f"formal ablation cell {cell!r} call sequence is invalid: {error}")
+        if terminal_error:
+            continue
         successful = [receipt for receipt in cell_calls if receipt["call"]["status"] == "succeeded"]
         first = successful[0]["binding"]["result_artifact_sha256"]
         trust = records_by_key[(*cell, "trust")]["artifact_sha256"]
@@ -1169,6 +1262,22 @@ def _validate_llm_call_audits(
         final = successful[-1]["binding"]["result_artifact_sha256"]
         if first != trust or first != gate or final != verify["artifact_sha256"]:
             _fail(f"formal ablation cell {cell!r} call outputs do not bind its artifacts")
+
+    saw_uncached = False
+    for rep in range(reps):
+        for task in tasks:
+            cache_hit = next(iter(cache_modes[(task, rep)]))
+            if cache_hit and saw_uncached:
+                _fail("formal ablation cache-hit cells are not a scheduled prefix")
+            saw_uncached = saw_uncached or not cache_hit
+
+    try:
+        stored_receipts = {path.name for path in receipt_dir.iterdir()}
+    except OSError as error:
+        _fail(f"cannot enumerate formal ablation LLM call receipts: {error}")
+    expected_receipts = {f"{digest}.json" for digest in receipt_digests}
+    if stored_receipts != expected_receipts:
+        _fail("formal ablation LLM call receipt store contains unreferenced or missing entries")
 
 
 def _expected_formal_tasks(repository_root: Path) -> list[str]:
@@ -1256,7 +1365,6 @@ def _validate_ablation(ablation_json: Path, ablation_md: Path) -> _AblationFacts
     if schema_version > 4:
         _fail(f"unsupported ablation schema_version {schema_version}")
     status = "formal" if schema_version == 4 else "legacy"
-    errors = sum(record.status == "ERROR" for record in records)
     markdown = _read_text(ablation_md)
     if status == "formal":
         if len(tasks) != _FORMAL_TASK_COUNT or reps != _FORMAL_REPETITIONS:
@@ -1270,11 +1378,10 @@ def _validate_ablation(ablation_json: Path, ablation_md: Path) -> _AblationFacts
             _fail(f"formal corpus manifest is invalid: {error}")
         if tasks != expected_tasks:
             _fail("formal ablation tasks differ from the fixed committed corpus")
+        _validate_formal_error_cells(records)
         _validate_record_artifacts(records)
         _validate_artifact_store(raw, records, ablation_json.parent)
         _validate_scorer_evidence_store(raw, records, ablation_json.parent)
-        if errors:
-            _fail(f"formal ablation report contains {errors} ERROR cells")
         _validate_provenance(raw, tasks, ablation_json.parent.parent)
         _validate_operation_lease_store(
             ablation_json.parent,
@@ -1296,12 +1403,23 @@ def _validate_ablation(ablation_json: Path, ablation_md: Path) -> _AblationFacts
     trust = [record for record in usable if record.condition == "trust"]
     gate = [record for record in usable if record.condition == "gate"]
     verify = [record for record in usable if record.condition == "verify"]
+    scheduled_cell_keys = {
+        (task, rep)
+        for task in tasks
+        for rep in range(reps)
+    }
+    error_cell_keys = {
+        (record.task, record.rep) for record in records if record.status == "ERROR"
+    }
+    usable_cell_keys = scheduled_cell_keys - error_cell_keys
     return _AblationFacts(
         report=report,
         raw=raw,
         records=records,
         status=status,
-        cells=len(trust),
+        scheduled_cells=len(scheduled_cell_keys),
+        usable_cells=len(usable_cell_keys),
+        error_cells=len(error_cell_keys),
         trust_successes=sum(record.true_success for record in trust),
         trust_false_successes=sum(record.false_success for record in trust),
         gate_successes=sum(record.true_success for record in gate),
@@ -1328,7 +1446,7 @@ def _validate_horizon(
         )
     cells = Cells(
         tasks=sorted(ablation.report.tasks),
-        reps=sorted({record.rep for record in ablation.records if record.status != "ERROR"}),
+        reps=list(range(ablation.report.reps)),
         outcome={
             (record.condition, record.task, record.rep): record.true_success
             for record in ablation.records
@@ -1492,6 +1610,70 @@ def _validate_terminal_readme(
             _fail(f"README Terminal-Bench {label} differs from the committed evidence")
 
 
+def _require_readme_count(
+    section: str,
+    patterns: tuple[str, ...],
+    *,
+    expected: int,
+    label: str,
+) -> None:
+    for pattern in patterns:
+        match = re.search(pattern, section, re.IGNORECASE)
+        if match is not None:
+            if match.group(1) == str(expected):
+                return
+            break
+    _fail(f"README {label} claim differs from the committed reports")
+
+
+def _validate_formal_readme_coverage(section: str, ablation: _AblationFacts) -> None:
+    """Require explicit schedule, availability, ERROR, and rate-denominator claims."""
+    # Terminal-Bench also reports ERROR. Restrict these patterns to the
+    # ablation subsection so one benchmark cannot accidentally satisfy another.
+    ablation_section = re.split(r"Terminal[- ]Bench", section, maxsplit=1, flags=re.IGNORECASE)[
+        0
+    ]
+    _require_readme_count(
+        ablation_section,
+        (
+            r"(?:计划(?:执行|安排)?|预定)\s*`?(\d+)`?\s*组",
+            r"(?:计划(?:执行|安排)?|预定)[^。\n]{0,32}?`?(\d+)`?\s*组",
+        ),
+        expected=ablation.scheduled_cells,
+        label="formal ablation scheduled-cell",
+    )
+    _require_readme_count(
+        ablation_section,
+        (
+            r"`?(\d+)`?\s*组(?:结果|单元|数据)?\s*可用",
+            r"可用(?:结果|单元|数据)?\s*(?:为|[:：=])?\s*`?(\d+)`?\s*组",
+        ),
+        expected=ablation.usable_cells,
+        label="formal ablation usable-cell",
+    )
+    _require_readme_count(
+        ablation_section,
+        (
+            r"ERROR\s*(?:为|[:：=])?\s*`?(\d+)`?\s*组",
+            r"`?(\d+)`?\s*组(?:结果|单元|数据)?\s*(?:为|是)?\s*ERROR",
+        ),
+        expected=ablation.error_cells,
+        label="formal ablation ERROR-cell",
+    )
+    _require_readme_count(
+        ablation_section,
+        (
+            r"(?:比例|成功率|统计率)[^。\n]{0,64}?"
+            r"(?:以|按)\s*`?(\d+)`?\s*组(?:可用(?:结果|单元|数据)?)?"
+            r"\s*(?:为|作|作为)\s*分母",
+            r"(?:统计)?分母\s*(?:为|是|[:：=])\s*`?(\d+)`?\s*组"
+            r"(?:可用(?:结果|单元|数据)?)?",
+        ),
+        expected=ablation.usable_cells,
+        label="formal ablation rate denominator",
+    )
+
+
 def _validate_readme(
     readme_path: Path,
     ablation: _AblationFacts,
@@ -1516,6 +1698,7 @@ def _validate_readme(
             _fail("README still describes the committed formal benchmark as pending/legacy")
         if ablation.report.model not in section:
             _fail("README formal result section must name the evaluated model")
+        _validate_formal_readme_coverage(section, ablation)
 
     _require_readme_match(
         section,
@@ -1523,7 +1706,7 @@ def _validate_readme(
         (
             str(len(ablation.report.tasks)),
             str(ablation.report.reps),
-            str(ablation.cells),
+            str(ablation.scheduled_cells),
         ),
         "task/repetition/cell",
     )
@@ -1543,7 +1726,7 @@ def _validate_readme(
     _require_readme_match(
         section,
         r"`verify`[^|\n]*\|[^|\n]*\|\s*(\d+)/(\d+)\s*通过独立评分",
-        (str(ablation.verify_successes), str(ablation.cells)),
+        (str(ablation.verify_successes), str(ablation.usable_cells)),
         "verify outcome",
     )
 
@@ -1588,7 +1771,10 @@ def validate_release_claims(root: str | Path = ".") -> ReleaseClaimsSummary:
         status=ablation.status,
         tasks=len(ablation.report.tasks),
         repetitions=ablation.report.reps,
-        cells=ablation.cells,
+        scheduled_cells=ablation.scheduled_cells,
+        usable_cells=ablation.usable_cells,
+        error_cells=ablation.error_cells,
+        cells=ablation.usable_cells,
         model=ablation.report.model,
         trust_successes=ablation.trust_successes,
         trust_false_successes=ablation.trust_false_successes,
@@ -1614,7 +1800,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "release claims: ok "
         f"({summary.status}; tasks={summary.tasks}; reps={summary.repetitions}; "
-        f"cells={summary.cells}; model={summary.model})"
+        f"scheduled={summary.scheduled_cells}; usable={summary.usable_cells}; "
+        f"errors={summary.error_cells}; model={summary.model})"
     )
     return 0
 

@@ -38,7 +38,9 @@ def test_committed_public_claims_validate():
     assert summary.status in {"legacy", "formal"}
     assert summary.tasks > 0
     assert summary.repetitions > 0
-    assert summary.cells == summary.tasks * summary.repetitions
+    assert summary.scheduled_cells == summary.tasks * summary.repetitions
+    assert summary.cells == summary.usable_cells
+    assert summary.scheduled_cells == summary.usable_cells + summary.error_cells
     assert summary.terminal_bench is not None
     assert summary.terminal_bench.evaluated_commit_sha is not None
     assert summary.terminal_bench.evaluated_tree_sha is not None
@@ -479,12 +481,13 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
             "conditions": ["trust", "gate", "verify"],
             "max_repairs": 3,
             "llm_retries": 3,
-            "cache_schema": 7,
+            "cache_schema": 8,
             "report_schema": 4,
             "frozen_artifact_schema": 1,
             "input_snapshot_schema": 1,
             "scorer_evidence_schema": 2,
             "llm_call_receipt_schema": 1,
+            "cell_attempt_schema": 1,
             "codex_operation_lease_store": ".",
             "docker_operation_lease_store": ".",
             "docker_container_absence_filter": "label=lha.operation_id",
@@ -689,6 +692,7 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 ## 已提交的实测结果
 
 仓库中的消融报告是正式报告，使用 2 个预设 Python 缺陷，每个任务重复 2 次，共 4 组相同首轮补丁。
+计划执行 4 组，其中 4 组结果可用，ERROR 为 0 组；下表比例以 4 组可用结果为分母。
 实测模型为 `model-x`。
 
 | 条件 | 处理方式 | 独立评分 |
@@ -766,6 +770,9 @@ def test_schema_four_reports_are_checked_as_formal_evidence(tmp_path, monkeypatc
     assert summary.status == "formal"
     assert summary.tasks == 2
     assert summary.repetitions == 2
+    assert summary.scheduled_cells == 4
+    assert summary.usable_cells == 4
+    assert summary.error_cells == 0
     assert summary.cells == 4
     assert summary.trust_false_successes == 1
     assert summary.gate_successes == 2
@@ -775,9 +782,362 @@ def test_schema_four_reports_are_checked_as_formal_evidence(tmp_path, monkeypatc
     assert summary.verify_successes == 4
 
 
+def test_formal_report_accepts_receipt_backed_terminal_error_cell(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    _write_terminal_error_cell(root)
+
+    summary = validate_release_claims(root)
+
+    assert summary.scheduled_cells == 4
+    assert summary.usable_cells == 3
+    assert summary.error_cells == 1
+    assert summary.cells == 3
+    assert summary.verify_successes == 3
+
+
+def test_formal_report_accepts_cached_terminal_error_seal(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    _write_terminal_error_cell(root, cache_hit=True)
+
+    summary = validate_release_claims(root)
+
+    assert summary.error_cells == 1
+
+
+def test_formal_report_rejects_error_cell_without_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path, raw = _write_terminal_error_cell(root)
+    raw["llm_calls"] = [
+        reference
+        for reference in raw["llm_calls"]
+        if not (reference["task"] == "task_two" and reference["rep"] == 1)
+    ]
+    raw["llm_call_receipt_store"]["count"] = len(raw["llm_calls"])
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match="has no LLM call receipt"):
+        validate_release_claims(root)
+
+
+def test_formal_report_rejects_error_cell_with_successful_terminal_call(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path, raw = _write_terminal_error_cell(root)
+    error_reference = next(
+        reference
+        for reference in raw["llm_calls"]
+        if reference["task"] == "task_two" and reference["rep"] == 1
+    )
+    success_reference = next(
+        reference
+        for reference in raw["llm_calls"]
+        if reference["task"] == "task_one" and reference["rep"] == 0
+    )
+    error_path = _receipt_path(root, error_reference)
+    error_receipt = json.loads(error_path.read_text())
+    success_receipt = json.loads(_receipt_path(root, success_reference).read_text())
+    for field in ("response_sha256", "patch_sha256", "result_artifact_sha256"):
+        error_receipt["binding"][field] = success_receipt["binding"][field]
+    error_receipt["call"] = success_receipt["call"]
+    payload = _llm_call_receipt_bytes(error_receipt)
+    digest = hashlib.sha256(payload).hexdigest()
+    error_path.unlink()
+    (root / "benchmarks" / "llm_call_receipts" / f"{digest}.json").write_bytes(payload)
+    error_reference["receipt_sha256"] = digest
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match="only failed first-call"):
+        validate_release_claims(root)
+
+
+def test_formal_report_rejects_condition_local_error(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path, raw = _write_terminal_error_cell(root)
+    donor = next(
+        record
+        for record in raw["records"]
+        if record["task"] == "task_one"
+        and record["rep"] == 1
+        and record["condition"] == "trust"
+    )
+    mixed = next(
+        record
+        for record in raw["records"]
+        if record["task"] == "task_two"
+        and record["rep"] == 1
+        and record["condition"] == "trust"
+    )
+    mixed.update(
+        {
+            **donor,
+            "task": "task_two",
+            "rep": 1,
+            "condition": "trust",
+        }
+    )
+    raw["stats"] = [
+        asdict(stat) for stat in _aggregate([RunRecord(**record) for record in raw["records"]])
+    ]
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match="cover trust, gate, and verify"):
+        validate_release_claims(root)
+
+
+@pytest.mark.parametrize("store_name", ["artifact_store", "scorer_evidence_store"])
+def test_formal_error_cell_must_be_excluded_from_measurement_stores(
+    tmp_path,
+    monkeypatch,
+    store_name,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path, raw = _write_terminal_error_cell(root)
+    raw[store_name]["count"] += 1
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match="artifact_store|scorer_evidence_store"):
+        validate_release_claims(root)
+
+
+def test_formal_readme_rates_must_use_usable_cell_denominator(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    _write_terminal_error_cell(root)
+    readme = root / "README.md"
+    readme.write_text(
+        readme.read_text().replace(
+            "下表比例以 3 组可用结果为分母",
+            "下表比例以 4 组可用结果为分母",
+        )
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="rate denominator"):
+        validate_release_claims(root)
+
+
+def test_formal_error_cell_rejects_mixed_cache_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path, raw = _write_terminal_error_cell(root, failed_calls=2)
+    references = [
+        reference
+        for reference in raw["llm_calls"]
+        if reference["task"] == "task_two" and reference["rep"] == 1
+    ]
+    references[0]["cache_hit"] = True
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match="mixes cache provenance"):
+        validate_release_claims(root)
+
+
+def test_formal_cache_hits_must_form_scheduled_prefix(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path, raw = _formal_raw(root)
+    for reference in raw["llm_calls"]:
+        if reference["task"] == "task_two" and reference["rep"] == 0:
+            reference["cache_hit"] = True
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match="scheduled prefix"):
+        validate_release_claims(root)
+
+
+def test_formal_call_receipt_store_rejects_unreferenced_json(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    _path, raw = _formal_raw(root)
+    receipt = _receipt_path(root, raw["llm_calls"][0])
+    extra = root / "benchmarks" / "llm_call_receipts" / f"{'0' * 64}.json"
+    extra.write_bytes(receipt.read_bytes())
+
+    with pytest.raises(ReleaseClaimsError, match="unreferenced or missing entries"):
+        validate_release_claims(root)
+
+
 def _formal_raw(root: Path) -> tuple[Path, dict]:
     path = root / "benchmarks/ablation_report.json"
     return path, json.loads(path.read_text())
+
+
+def _write_terminal_error_cell(
+    root: Path,
+    *,
+    task: str = "task_two",
+    rep: int = 1,
+    failed_calls: int = 1,
+    cache_hit: bool = False,
+) -> tuple[Path, dict]:
+    """Replace one measured cell with a receipt-backed terminal ERROR."""
+    path, raw = _formal_raw(root)
+    cell_records = [
+        record for record in raw["records"] if record["task"] == task and record["rep"] == rep
+    ]
+    assert len(cell_records) == 3
+    for record in cell_records:
+        record.update(
+            {
+                "status": "ERROR",
+                "claimed_success": False,
+                "artifact_correct": False,
+                "true_success": False,
+                "false_success": False,
+                "repairs": 0,
+                "detail": "terminal Codex failure",
+                "gate_prediction": None,
+                "artifact_sha256": "",
+                "scorer_outcome": "INFRA_ERROR",
+                "scorer_evidence_sha256": "",
+                "scorer_expected_tests": 0,
+                "scorer_passed_tests": 0,
+            }
+        )
+
+    original_references = [
+        reference
+        for reference in raw["llm_calls"]
+        if reference["task"] == task and reference["rep"] == rep
+    ]
+    assert original_references
+    template = json.loads(_receipt_path(root, original_references[0]).read_text())
+    for reference in original_references:
+        _receipt_path(root, reference).unlink()
+    raw["llm_calls"] = [
+        reference
+        for reference in raw["llm_calls"]
+        if not (reference["task"] == task and reference["rep"] == rep)
+    ]
+    if cache_hit:
+        for reference in raw["llm_calls"]:
+            reference["cache_hit"] = True
+    empty_summary = {
+        "total_events": 0,
+        "events": {},
+        "items": {},
+        "invalid_json_lines": 0,
+    }
+    for ordinal in range(failed_calls):
+        receipt = json.loads(json.dumps(template))
+        receipt["binding"].update(
+            {
+                "label": "first",
+                "ordinal": ordinal,
+                "prompt_sha256": hashlib.sha256(
+                    f"terminal:{task}:{rep}:{ordinal}".encode()
+                ).hexdigest(),
+                "response_sha256": None,
+                "patch_sha256": None,
+                "result_artifact_sha256": None,
+            }
+        )
+        receipt["call"].update(
+            {
+                "status": "failed",
+                "retries": 0,
+                "attempt_count": 1,
+                "duration_s": 0.1,
+                "event_summary": empty_summary,
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "status": "failed",
+                        "duration_s": 0.1,
+                        "error_type": "CodexProtocolError",
+                        "event_summary": empty_summary,
+                    }
+                ],
+                "usage": {
+                    "input_tokens": None,
+                    "cached_input_tokens": None,
+                    "output_tokens": None,
+                    "cost_usd": None,
+                    "model": "model-x",
+                },
+                "error_type": "CodexProtocolError",
+                "retryable": False,
+            }
+        )
+        payload = _llm_call_receipt_bytes(receipt)
+        digest = hashlib.sha256(payload).hexdigest()
+        (root / "benchmarks" / "llm_call_receipts" / f"{digest}.json").write_bytes(payload)
+        raw["llm_calls"].append(
+            {
+                "task": task,
+                "rep": rep,
+                "ordinal": ordinal,
+                "receipt_sha256": digest,
+                "cache_hit": cache_hit,
+            }
+        )
+
+    records = [RunRecord(**record) for record in raw["records"]]
+    raw["stats"] = [asdict(stat) for stat in _aggregate(records)]
+    raw["artifact_store"]["count"] = len(
+        {record.artifact_sha256 for record in records if record.status != "ERROR"}
+    )
+    raw["scorer_evidence_store"]["count"] = len(
+        {record.scorer_evidence_sha256 for record in records if record.status != "ERROR"}
+    )
+    raw["llm_call_receipt_store"]["count"] = len(raw["llm_calls"])
+    raw["fingerprint"] = _report_fingerprint(raw)
+    path.write_text(json.dumps(raw, indent=2))
+    (root / "benchmarks" / "ablation_report.md").write_text(
+        load_ablation_report(path).to_markdown()
+    )
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(root)
+        run_horizon("benchmarks/ablation_report.json", "benchmarks")
+    finally:
+        os.chdir(previous_cwd)
+    readme = root / "README.md"
+    readme.write_text(
+        readme.read_text()
+        .replace(
+            "计划执行 4 组，其中 4 组结果可用，ERROR 为 0 组；"
+            "下表比例以 4 组可用结果为分母。",
+            "计划执行 4 组，其中 3 组结果可用，ERROR 为 1 组；"
+            "下表比例以 3 组可用结果为分母。",
+        )
+        .replace("3 个正确，1 个错误仍被接受", "2 个正确，1 个错误仍被接受")
+        .replace("接受 2 个正确补丁，拦截 1 个错误补丁", "接受 1 个正确补丁，拦截 1 个错误补丁")
+        .replace("4/4 通过独立评分", "3/3 通过独立评分")
+    )
+    return path, raw
 
 
 def _receipt_path(root: Path, reference: dict) -> Path:

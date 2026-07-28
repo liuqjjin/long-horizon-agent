@@ -13,7 +13,8 @@ cell-level McNemar test compares those two delivered outcomes.
 
 With `T` tasks and `R` complete repetitions, there can be at most `T × R`
 paired cells. An `ERROR` cell has no truth label and is not converted to success
-or failure.
+or failure. The report states the scheduled, usable, and unavailable cell
+counts separately.
 
 ## Observed complete repetition
 
@@ -33,7 +34,9 @@ steps succeed over uniformly ordered task subsets of size `k`.
 
 `src/lha/horizon.py::compounding_curve` computes this value from the measured
 per-task rates. Its task bootstrap describes sensitivity to the observed task
-mix.
+mix. When an `ERROR` removes one task/repetition measurement, the report shows
+the actual sample count beside every per-task rate instead of implying that all
+tasks have the same denominator.
 
 The curve adds no independent samples and has no McNemar p-value. It is a
 projection, not an additional long-task experiment.
@@ -84,8 +87,8 @@ runs/horizon/horizon_report.md
 runs/horizon/horizon_curve.svg
 ```
 
-The JSON keeps cells, episodes, and composition in separate objects. Markdown
-and SVG are renderings of the same data.
+The JSON keeps coverage, cells, episodes, and composition in separate objects.
+Markdown and SVG are renderings of the same data.
 
 Before citing a result, check that model and runtime provenance match the
 intended protocol, `ERROR` cells are accounted for, the two measured units are
