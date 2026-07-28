@@ -8,12 +8,17 @@ evidence accepted by the release check.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import ipaddress
 import json
+import os
 import re
+import stat
+from contextlib import contextmanager
 from datetime import datetime
-from pathlib import PurePosixPath
-from typing import Annotated, Any, Literal
+from pathlib import Path, PurePosixPath
+from typing import Annotated, Any, Iterator, Literal
 from urllib.parse import urlsplit
 
 from pydantic import (
@@ -28,7 +33,7 @@ from pydantic import (
 FORMAL_ABLATION_ATTEMPTS_PATH = PurePosixPath(
     "benchmarks/formal_ablation_attempts.json"
 )
-FORMAL_ABLATION_ATTEMPTS_SCHEMA = 1
+FORMAL_ABLATION_ATTEMPTS_SCHEMA = 2
 FORMAL_ABLATION_PROTOCOL_SCHEMA = 1
 MAX_FORMAL_ABLATION_ATTEMPTS_BYTES = 1024 * 1024
 
@@ -36,8 +41,9 @@ _HEX_40_PATTERN = r"^[0-9a-f]{40}$"
 _HEX_64_PATTERN = r"^[0-9a-f]{64}$"
 _DOCKER_IMAGE_ID_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _WITNESS_REMOTE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
-_SCP_REMOTE_PATTERN = re.compile(
-    r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+:[A-Za-z0-9._~/-]+$"
+_PUBLIC_DNS_NAME_PATTERN = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
 )
 
 FORMAL_ATTEMPT_WITNESS_REF_PREFIX = "refs/heads/formal-attempts"
@@ -46,6 +52,225 @@ FORMAL_ATTEMPT_WITNESS_IDENTITY = (
     "liuqjjin <156533013+liuqjjin@users.noreply.github.com>"
 )
 FORMAL_ATTEMPT_WITNESS_GIT_TIME = "946684800 +0000"
+FORMAL_ATTEMPT_LOCK_NAME = "lha-formal-attempt.lock"
+
+
+def _formal_git_directory(repository_root: Path) -> Path:
+    marker = repository_root / ".git"
+    metadata = marker.lstat()
+    if stat.S_ISLNK(metadata.st_mode):
+        raise OSError("formal attempt Git metadata path is a symlink")
+    if stat.S_ISDIR(metadata.st_mode):
+        descriptor = os.open(
+            marker,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            named = marker.lstat()
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+                or (named.st_dev, named.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise OSError("formal attempt Git metadata directory changed")
+            git_directory = marker.resolve(strict=True)
+            resolved = git_directory.lstat()
+            if (resolved.st_dev, resolved.st_ino) != (
+                opened.st_dev,
+                opened.st_ino,
+            ):
+                raise OSError("formal attempt Git metadata directory changed")
+        finally:
+            os.close(descriptor)
+    elif (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == os.geteuid()
+        and not stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        if metadata.st_size <= 0 or metadata.st_size > 4096:
+            raise OSError("formal attempt Git metadata file is invalid")
+        descriptor = os.open(
+            marker,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened_before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened_before.st_mode)
+                or opened_before.st_nlink != 1
+                or opened_before.st_uid != os.geteuid()
+                or stat.S_IMODE(opened_before.st_mode) & 0o022
+                or (opened_before.st_dev, opened_before.st_ino)
+                != (metadata.st_dev, metadata.st_ino)
+            ):
+                raise OSError("formal attempt Git metadata file changed")
+            chunks: list[bytes] = []
+            remaining = 4097
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 4096))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
+            opened_after = os.fstat(descriptor)
+            named_after = marker.lstat()
+            stable_fields = (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+            if (
+                len(payload) > 4096
+                or any(
+                    getattr(opened_before, field)
+                    != getattr(opened_after, field)
+                    for field in stable_fields
+                )
+                or (named_after.st_dev, named_after.st_ino)
+                != (opened_after.st_dev, opened_after.st_ino)
+            ):
+                raise OSError("formal attempt Git metadata file changed")
+        finally:
+            os.close(descriptor)
+        try:
+            value = payload.decode("utf-8").strip()
+        except UnicodeDecodeError as error:
+            raise OSError("formal attempt Git metadata file is invalid") from error
+        if not value.startswith("gitdir: "):
+            raise OSError("formal attempt Git metadata file is invalid")
+        configured = Path(value.removeprefix("gitdir: "))
+        git_directory = (
+            configured
+            if configured.is_absolute()
+            else repository_root / configured
+        )
+    else:
+        raise OSError("formal attempt Git metadata path is unsafe")
+    git_directory = git_directory.resolve(strict=True)
+    named = git_directory.lstat()
+    if (
+        stat.S_ISLNK(named.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or named.st_uid != os.geteuid()
+        or stat.S_IMODE(named.st_mode) & 0o022
+    ):
+        raise OSError("formal attempt Git directory is unsafe")
+    return git_directory
+
+
+@contextmanager
+def formal_attempt_lock(
+    repository_root: str | Path,
+    *,
+    blocking: bool = False,
+) -> Iterator[None]:
+    """Serialize runner and lifecycle commands above any replaceable output."""
+    repository = Path(repository_root).resolve(strict=True)
+    git_directory = _formal_git_directory(repository)
+    expected_directory = git_directory.lstat()
+    directory_descriptor = os.open(
+        git_directory,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    opened_directory = os.fstat(directory_descriptor)
+    named_directory = git_directory.lstat()
+    if (
+        not stat.S_ISDIR(opened_directory.st_mode)
+        or (opened_directory.st_dev, opened_directory.st_ino)
+        != (expected_directory.st_dev, expected_directory.st_ino)
+        or (named_directory.st_dev, named_directory.st_ino)
+        != (opened_directory.st_dev, opened_directory.st_ino)
+    ):
+        os.close(directory_descriptor)
+        raise OSError("formal attempt Git directory changed before locking")
+    descriptor: int | None = None
+    locked = False
+    try:
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(
+            FORMAL_ATTEMPT_LOCK_NAME,
+            flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        named = os.stat(
+            FORMAL_ATTEMPT_LOCK_NAME,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) & 0o077
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise OSError("formal attempt lock is unsafe")
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        os.fsync(directory_descriptor)
+        operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(descriptor, operation)
+        except (BlockingIOError, OSError) as error:
+            raise RuntimeError(
+                "another formal attempt command or runner is active"
+            ) from error
+        locked = True
+        opened_after = os.fstat(descriptor)
+        named_after = os.stat(
+            FORMAL_ATTEMPT_LOCK_NAME,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        confirmed_git_directory = _formal_git_directory(repository)
+        named_directory_after = git_directory.lstat()
+        if (
+            (opened_after.st_dev, opened_after.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or (named_after.st_dev, named_after.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or (
+                named_directory_after.st_dev,
+                named_directory_after.st_ino,
+            )
+            != (opened_directory.st_dev, opened_directory.st_ino)
+            or confirmed_git_directory != git_directory
+        ):
+            raise OSError("formal attempt lock name changed during acquisition")
+        yield
+    finally:
+        if descriptor is not None:
+            if locked:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(descriptor)
+        os.close(directory_descriptor)
 
 
 def _validate_timestamp(value: str) -> str:
@@ -83,34 +308,66 @@ def _validate_plain_text(value: str) -> str:
 
 
 def _validate_witness_remote_url(value: str) -> str:
-    """Accept public, non-interactive Git URLs without embedded passwords."""
+    """Accept only canonical public HTTPS URLs suitable for anonymous reads."""
     if (
         not value
         or value.strip() != value
         or len(value.encode("utf-8")) > 2048
         or value.startswith("-")
+        or "\\" in value
         or any(character.isspace() or ord(character) < 32 for character in value)
     ):
         raise ValueError("formal ablation witness remote URL is invalid")
-    if value.startswith("/"):
-        path = PurePosixPath(value)
-        if any(part in {"", ".", ".."} for part in path.parts[1:]):
-            raise ValueError("formal ablation witness remote URL is invalid")
-        return value
-    if _SCP_REMOTE_PATTERN.fullmatch(value):
-        return value
     parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("formal ablation witness remote URL is invalid") from error
+    host = parsed.hostname
     if (
-        parsed.scheme not in {"git", "https", "ssh"}
-        or not parsed.hostname
+        parsed.scheme != "https"
+        or not host
+        or host != host.lower()
+        or parsed.netloc != host
+        or parsed.username is not None
         or parsed.password is not None
+        or port is not None
         or parsed.query
         or parsed.fragment
+        or not parsed.path
+        or parsed.path == "/"
+        or not parsed.path.startswith("/")
+        or PurePosixPath(parsed.path).as_posix() != parsed.path
+        or "%" in parsed.path
+        or any(
+            part in {"", ".", ".."}
+            for part in PurePosixPath(parsed.path).parts[1:]
+        )
     ):
         raise ValueError("formal ablation witness remote URL is invalid")
-    if parsed.scheme in {"git", "https"} and parsed.username is not None:
-        raise ValueError("formal ablation witness remote URL cannot contain credentials")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if (
+            _PUBLIC_DNS_NAME_PATTERN.fullmatch(host) is None
+            or host.endswith(
+                (".local", ".localhost", ".internal", ".invalid", ".test")
+            )
+        ):
+            raise ValueError(
+                "formal ablation witness remote URL must use a public host"
+            )
+    else:
+        if not address.is_global:
+            raise ValueError(
+                "formal ablation witness remote URL must use a public host"
+            )
     return value
+
+
+def validate_formal_witness_remote_url(value: str) -> str:
+    """Validate a witness URL at runtime as well as at model boundaries."""
+    return _validate_witness_remote_url(value)
 
 
 def formal_ablation_witness_ref(attempt_id: str) -> str:
@@ -207,6 +464,89 @@ class FormalCodexClientConfig(BaseModel):
     )
 
 
+class FormalGitCredentialHelper(BaseModel):
+    """Pinned GitHub CLI bytes used only for the authenticated witness push."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    host: str
+    executable_path: str
+    executable_sha256: str = Field(pattern=_HEX_64_PATTERN)
+    version: str
+    command: str
+
+    _version = field_validator("version")(_validate_plain_text)
+
+    @model_validator(mode="after")
+    def _binding_is_canonical(self) -> "FormalGitCredentialHelper":
+        path = Path(self.executable_path)
+        if (
+            not path.is_absolute()
+            or str(path) != self.executable_path
+            or self.executable_path.strip() != self.executable_path
+            or "\x00" in self.executable_path
+            or any(character.isspace() for character in self.executable_path)
+        ):
+            raise ValueError(
+                "formal Git credential helper executable path is invalid"
+            )
+        if (
+            self.host != self.host.lower()
+            or _PUBLIC_DNS_NAME_PATTERN.fullmatch(self.host) is None
+            or self.host.endswith(
+                (".local", ".localhost", ".internal", ".invalid", ".test")
+            )
+        ):
+            raise ValueError("formal Git credential helper host is invalid")
+        if self.command != f"!{self.executable_path} auth git-credential":
+            raise ValueError("formal Git credential helper command is invalid")
+        return self
+
+
+def make_formal_codex_client(
+    *,
+    cli_path: str,
+    model: str,
+    reasoning_effort: str,
+) -> Any:
+    """Construct the only Codex client accepted by a formal ablation."""
+    from .llm.codex_cli import CodexCLIClient
+
+    return CodexCLIClient(
+        cli_path=cli_path,
+        timeout=300.0,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        no_tools=True,
+        sandbox_mode="read-only",
+        externally_sandboxed=False,
+        max_retries=2,
+        retry_backoff_s=1.0,
+    )
+
+
+def formal_codex_client_config_from_runtime(
+    client: Any,
+) -> FormalCodexClientConfig:
+    """Resolve the exact client fields consumed by the formal runner."""
+    try:
+        return FormalCodexClientConfig(
+            no_tools=client.no_tools,
+            sandbox_mode=client.sandbox_mode,
+            permission_model=client.permission_model,
+            permission_profile=client.permission_profile,
+            credential_barrier=client.credential_barrier,
+            externally_sandboxed=client.externally_sandboxed,
+            max_retries=client.max_retries,
+            timeout_s=float(client.timeout),
+            retry_backoff_s=float(client.retry_backoff_s),
+        )
+    except (AttributeError, TypeError, ValidationError, ValueError) as error:
+        raise ValueError(
+            "formal Codex runtime does not match the fixed client protocol"
+        ) from error
+
+
 def formal_codex_client_sha256(config: FormalCodexClientConfig) -> str:
     """Hash the canonical outcome-affecting Codex client configuration."""
     payload = json.dumps(
@@ -234,6 +574,7 @@ class FormalAblationProtocol(BaseModel):
     codex_cli_executable_sha256: str = Field(pattern=_HEX_64_PATTERN)
     codex_client: FormalCodexClientConfig
     codex_client_sha256: str = Field(pattern=_HEX_64_PATTERN)
+    witness_credential_helper: FormalGitCredentialHelper | None = None
 
     _model = field_validator("model")(_validate_plain_text)
     _effort = field_validator("reasoning_effort")(_validate_plain_text)
@@ -253,7 +594,7 @@ class FormalAblationProtocol(BaseModel):
 def formal_ablation_protocol_sha256(protocol: FormalAblationProtocol) -> str:
     """Hash the canonical execution choices, excluding attempt ID and timestamp."""
     payload = json.dumps(
-        protocol.model_dump(mode="json"),
+        protocol.model_dump(mode="json", exclude_none=True),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -268,8 +609,11 @@ def formal_ablation_selection_sha256(protocol: FormalAblationProtocol) -> str:
     prevents an empty commit or a registry-only commit after ABANDONED from
     making the same code/model/corpus selection eligible for another attempt.
     """
-    payload = protocol.model_dump(mode="json")
+    payload = protocol.model_dump(mode="json", exclude_none=True)
     payload.pop("source_commit")
+    # Authentication plumbing is provenance-critical but cannot change model
+    # output, scorer truth, or the selected corpus.
+    payload.pop("witness_credential_helper", None)
     return hashlib.sha256(
         json.dumps(
             payload,
@@ -297,6 +641,7 @@ class RegisteredAttempt(BaseModel):
     codex_cli_executable_sha256: str = Field(pattern=_HEX_64_PATTERN)
     codex_client: FormalCodexClientConfig
     codex_client_sha256: str = Field(pattern=_HEX_64_PATTERN)
+    witness_credential_helper: FormalGitCredentialHelper | None = None
     witness_remote_name: str = Field(pattern=_WITNESS_REMOTE_NAME_PATTERN)
     witness_remote_url: str
     registered_at: str
@@ -326,10 +671,20 @@ class RegisteredAttempt(BaseModel):
             codex_cli_executable_sha256=self.codex_cli_executable_sha256,
             codex_client=self.codex_client,
             codex_client_sha256=self.codex_client_sha256,
+            witness_credential_helper=self.witness_credential_helper,
         )
 
     @model_validator(mode="after")
     def _protocol_digest_matches(self) -> "RegisteredAttempt":
+        if self.witness_credential_helper is None:
+            raise ValueError(
+                "REGISTERED requires a pinned witness credential helper"
+            )
+        witness_host = urlsplit(self.witness_remote_url).hostname
+        if self.witness_credential_helper.host != witness_host:
+            raise ValueError(
+                "REGISTERED witness credential helper host does not match its URL"
+            )
         expected_output = f"runs/formal_ablation/{self.attempt_id}"
         if self.output_path != expected_output:
             raise ValueError(
@@ -346,8 +701,9 @@ class AbandonedAttempt(BaseModel):
     event: Literal["ABANDONED"] = "ABANDONED"
     attempt_id: str = Field(pattern=_HEX_64_PATTERN)
     recorded_at: str
-    started_cells: int = Field(ge=0, le=204, strict=True)
-    terminal_cells: int = Field(ge=0, le=204, strict=True)
+    progress_status: Literal["known", "evidence_missing"] = "known"
+    started_cells: int | None = Field(default=None, ge=0, le=204, strict=True)
+    terminal_cells: int | None = Field(default=None, ge=0, le=204, strict=True)
     reason_code: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
     reason: str
     report_sha256: str | None = Field(default=None, pattern=_HEX_64_PATTERN)
@@ -358,8 +714,19 @@ class AbandonedAttempt(BaseModel):
 
     @model_validator(mode="after")
     def _progress_and_report_are_consistent(self) -> "AbandonedAttempt":
-        if self.terminal_cells > self.started_cells:
-            raise ValueError("ABANDONED terminal_cells cannot exceed started_cells")
+        if self.progress_status == "known":
+            if self.started_cells is None or self.terminal_cells is None:
+                raise ValueError(
+                    "ABANDONED known progress requires both cell counts"
+                )
+            if self.terminal_cells > self.started_cells:
+                raise ValueError(
+                    "ABANDONED terminal_cells cannot exceed started_cells"
+                )
+        elif self.started_cells is not None or self.terminal_cells is not None:
+            raise ValueError(
+                "ABANDONED missing evidence cannot claim cell counts"
+            )
         if (self.report_sha256 is None) != (self.report_fingerprint is None):
             raise ValueError(
                 "ABANDONED report_sha256 and report_fingerprint must appear together"
@@ -498,7 +865,7 @@ FormalAttemptEvent = Annotated[
 class FormalAblationAttemptRegistry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = FORMAL_ABLATION_ATTEMPTS_SCHEMA
+    schema_version: Literal[2] = FORMAL_ABLATION_ATTEMPTS_SCHEMA
     events: tuple[FormalAttemptEvent, ...]
 
     @model_validator(mode="after")

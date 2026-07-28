@@ -54,6 +54,7 @@ import re
 import secrets
 import shutil
 import stat
+import subprocess
 import tempfile
 import time
 from collections.abc import Callable
@@ -69,13 +70,18 @@ from .ablation_attempts import (
     MAX_FORMAL_ABLATION_ATTEMPTS_BYTES,
     FormalAblationProtocol,
     FormalCodexClientConfig,
+    FormalGitCredentialHelper,
     RegisteredAttempt,
     formal_ablation_protocol_sha256,
     formal_ablation_witness_commit_bytes,
     formal_ablation_witness_commit_oid,
     formal_ablation_witness_message,
+    formal_attempt_lock,
+    formal_codex_client_config_from_runtime,
     formal_codex_client_sha256,
+    make_formal_codex_client,
     parse_formal_ablation_attempt_registry,
+    validate_formal_witness_remote_url,
 )
 from .agents.implementer import Implementer
 from .artifacts import Patch, Step
@@ -95,6 +101,7 @@ from .pytest_evidence import (
     validate_evidence,
 )
 from .sandbox import DockerBackend, ExecutionBackend, TrustedLocalBackend, make_backend
+from .sandbox.base import process_group_cleanup_supported, terminate_process_group
 from .sandbox.docker import resolve_docker_executable
 from .tasks.spec import TaskSpec
 from .tools import policy
@@ -127,6 +134,7 @@ _FORMAL_RUN_HEADER_SCHEMA = 1
 _FORMAL_TASK_COUNT = 17
 _FORMAL_REPETITIONS = 12
 _FORMAL_CORPUS_MANIFEST_PATH = Path("benchmarks/formal_ablation_manifest.json")
+_FORMAL_CONTROL_FILES = ("pyproject.toml", "uv.lock", ".python-version")
 _BOOTSTRAP_N = 10_000
 _READ_CHUNK_BYTES = 64 * 1024
 _MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -140,6 +148,9 @@ _MAX_CACHE_BYTES = 8 * 1024 * 1024
 _MAX_REPORT_BYTES = 32 * 1024 * 1024
 _MAX_TASK_BYTES = 2 * 1024 * 1024
 _MAX_SOURCE_TEXT_BYTES = 8 * 1024 * 1024
+_MAX_FORMAL_HEAD_BYTES = 128 * 1024 * 1024
+_MAX_FORMAL_HEAD_FILES = 10_000
+_MAX_GH_CONFIG_BYTES = 1024 * 1024
 _DOCKER_IMAGE_PROBE_SCHEMA = 1
 _DOCKER_IMAGE_PROBE_MARKER = "LHA_DOCKER_IMAGE_PROBE "
 _DOCKER_IMAGE_PROBE_SCRIPT = r"""
@@ -1534,7 +1545,11 @@ class _FormalOutputLease:
     inode: int
 
 
-def _open_or_create_formal_output(path: Path) -> tuple[Path, int]:
+def _open_or_create_formal_output(
+    path: Path,
+    *,
+    require_existing: bool = False,
+) -> tuple[Path, int]:
     """Walk every lexical component with ``openat`` and reject directory links."""
     output = Path(os.path.abspath(os.fspath(path)))
     if not output.is_absolute() or not output.anchor:
@@ -1545,11 +1560,12 @@ def _open_or_create_formal_output(path: Path) -> tuple[Path, int]:
             if not part or part in {".", ".."} or "/" in part or os.sep in part:
                 raise OSError("formal ablation output path component is unsafe")
             created = False
-            try:
-                os.mkdir(part, 0o700, dir_fd=descriptor)
-                created = True
-            except FileExistsError:
-                pass
+            if not require_existing:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
             child = os.open(part, _directory_open_flags(), dir_fd=descriptor)
             try:
                 opened = os.fstat(child)
@@ -1576,14 +1592,21 @@ def _open_or_create_formal_output(path: Path) -> tuple[Path, int]:
 
 
 @contextmanager
-def _formal_ablation_lock(out_dir: Path) -> Iterator[_FormalOutputLease]:
+def _formal_ablation_lock(
+    out_dir: Path,
+    *,
+    require_existing: bool = False,
+) -> Iterator[_FormalOutputLease]:
     """Hold a fail-closed lock from preflight through report and cleanup completion."""
     try:
         # Walking from the filesystem root intentionally rejects every symbolic
         # component, including macOS aliases such as /var. Formal callers should
         # provide the canonical spelling (/private/var) rather than weakening the
         # evidence boundary for a convenience alias.
-        output, directory_descriptor = _open_or_create_formal_output(out_dir)
+        output, directory_descriptor = _open_or_create_formal_output(
+            out_dir,
+            require_existing=require_existing,
+        )
     except OSError as error:
         raise RuntimeError("formal ablation output directory is unsafe") from error
     lock_descriptor: int | None = None
@@ -1604,13 +1627,20 @@ def _formal_ablation_lock(out_dir: Path) -> Iterator[_FormalOutputLease]:
         flags = _regular_file_open_flags()
         created = False
         try:
-            lock_descriptor = os.open(
-                _FORMAL_OUTPUT_LOCK_NAME,
-                flags | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=directory_descriptor,
-            )
-            created = True
+            if require_existing:
+                lock_descriptor = os.open(
+                    _FORMAL_OUTPUT_LOCK_NAME,
+                    flags,
+                    dir_fd=directory_descriptor,
+                )
+            else:
+                lock_descriptor = os.open(
+                    _FORMAL_OUTPUT_LOCK_NAME,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                created = True
         except FileExistsError:
             try:
                 lock_descriptor = os.open(
@@ -2283,13 +2313,28 @@ def _repo_relative_evidence_path(
         or any(part in {"", ".", ".."} for part in relative.parts)
     ):
         raise ValueError(f"formal corpus {kind} path is unsafe")
-    path = repository_root.joinpath(*relative.parts)
     try:
-        path.resolve(strict=True).relative_to(repository_root.resolve())
-    except (OSError, ValueError) as error:
+        root = repository_root.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("formal corpus repository root is unavailable") from error
+    path = root
+    try:
+        for index, component in enumerate(relative.parts):
+            path = path / component
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(
+                    f"formal corpus {kind} path must not contain a symlink"
+                )
+            if index < len(relative.parts) - 1 and not stat.S_ISDIR(
+                metadata.st_mode
+            ):
+                raise ValueError(
+                    f"formal corpus {kind} parent is not a directory"
+                )
+        path.resolve(strict=True).relative_to(root)
+    except OSError as error:
         raise ValueError(f"formal corpus {kind} path is unavailable") from error
-    if path.is_symlink():
-        raise ValueError(f"formal corpus {kind} path must not be a symlink")
     return relative.as_posix(), path
 
 
@@ -2404,6 +2449,7 @@ class _FormalAttemptBinding:
     git_path: str
     witness_remote_name: str
     witness_remote_url: str
+    witness_credential_helper: FormalGitCredentialHelper
     witness_ref: str
 
 
@@ -2435,11 +2481,11 @@ def _initialize_formal_run(
     attempt: _FormalAttemptBinding,
     lease: _FormalOutputLease,
 ) -> _FormalRunBinding:
-    """Seal a fresh-attempt header before any cell can be started.
+    """Seal a fresh-attempt header and then consume its remote witness.
 
     A formal output directory is single use.  Even a header left by a failed
-    preflight proves the attempt began and therefore requires an ABANDONED
-    registry event rather than deletion and retry.
+    witness push requires an ABANDONED registry event rather than deletion and
+    retry. No model call can occur until both durable header and witness exist.
     """
     try:
         entries = set(os.listdir(lease.directory_descriptor))
@@ -2462,11 +2508,6 @@ def _initialize_formal_run(
         }
     )
     header_sha256 = hashlib.sha256(payload).hexdigest()
-    witness_commit = _create_formal_start_witness(
-        attempt,
-        outcome_key=outcome_key,
-        run_header_sha256=header_sha256,
-    )
     descriptor: int | None = None
     try:
         flags = (
@@ -2509,6 +2550,11 @@ def _initialize_formal_run(
         if descriptor is not None:
             os.close(descriptor)
 
+    witness_commit = _create_formal_start_witness(
+        attempt,
+        outcome_key=outcome_key,
+        run_header_sha256=header_sha256,
+    )
     return _FormalRunBinding(
         attempt_id=attempt.attempt_id,
         registration_registry_sha256=attempt.registry_sha256,
@@ -2547,6 +2593,278 @@ def _formal_git_output(
     return result.stdout
 
 
+def _formal_local_git_config_values(
+    git_path: str,
+    *,
+    repository_root: Path,
+    key: str,
+) -> list[str]:
+    """Read one exact repository-local key without includes or URL rewriting."""
+    if (
+        not Path(git_path).is_absolute()
+        or not key
+        or key.strip() != key
+        or any(character.isspace() or ord(character) < 32 for character in key)
+    ):
+        raise RuntimeError("formal Git local configuration request is invalid")
+    result = run(
+        [
+            git_path,
+            "config",
+            "--local",
+            "--no-includes",
+            "--null",
+            "--get-all",
+            key,
+        ],
+        cwd=repository_root,
+        timeout=30,
+        env=_git_local_config_env(),
+    )
+    if (
+        result.returncode not in {0, 1}
+        or result.output_truncated
+        or result.cleanup_unconfirmed
+        or (result.returncode == 1 and result.stdout)
+    ):
+        raise RuntimeError("formal Git local configuration could not be read")
+    if result.returncode == 1:
+        return []
+    if not result.stdout.endswith("\0"):
+        raise RuntimeError("formal Git local configuration output is truncated")
+    values = result.stdout[:-1].split("\0")
+    if not values or any(not value for value in values):
+        raise RuntimeError("formal Git local configuration contains an empty value")
+    return values
+
+
+def _formal_witness_remote_url(
+    git_path: str,
+    *,
+    repository_root: Path,
+    remote_name: str,
+) -> str:
+    """Resolve only pushurl/url from local config and require one public URL."""
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", remote_name) is None:
+        raise RuntimeError("formal witness remote name is invalid")
+    prefix = f"remote.{remote_name}"
+    push_urls = _formal_local_git_config_values(
+        git_path,
+        repository_root=repository_root,
+        key=f"{prefix}.pushurl",
+    )
+    urls = push_urls or _formal_local_git_config_values(
+        git_path,
+        repository_root=repository_root,
+        key=f"{prefix}.url",
+    )
+    if len(urls) != 1:
+        raise RuntimeError(
+            "formal witness remote must have exactly one configured URL"
+        )
+    try:
+        return validate_formal_witness_remote_url(urls[0])
+    except ValueError as error:
+        raise RuntimeError(
+            "formal witness remote must be a public HTTPS URL"
+        ) from error
+
+
+def _formal_git_credential_helper(
+    host: str,
+    *,
+    expected: FormalGitCredentialHelper | None = None,
+) -> FormalGitCredentialHelper:
+    """Resolve and remeasure the exact gh binary used by Git authentication."""
+    if expected is None:
+        resolved_text = trusted_executable("gh", require_unwritable=False)
+        if resolved_text is None:
+            raise RuntimeError("formal Git credential helper is unavailable")
+        path = Path(resolved_text)
+    else:
+        path = Path(expected.executable_path)
+    try:
+        resolved = path.resolve(strict=True)
+        before = resolved.lstat()
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError("formal Git credential helper is unavailable") from error
+    if (
+        not resolved.is_absolute()
+        or resolved != path
+        or resolved.name != "gh"
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or before.st_size > _MAX_CONTROL_EXECUTABLE_BYTES
+        or not os.access(resolved, os.X_OK)
+    ):
+        raise RuntimeError("formal Git credential helper is not a bounded executable")
+    digest = hashlib.sha256()
+    _consume_stable_regular_file(
+        resolved,
+        digest.update,
+        max_bytes=_MAX_CONTROL_EXECUTABLE_BYTES,
+        reject_hardlinks=False,
+    )
+    after = resolved.lstat()
+    if _stable_file_signature(before) != _stable_file_signature(after):
+        raise RuntimeError("formal Git credential helper changed while hashing")
+    with tempfile.TemporaryDirectory(
+        prefix="lha_formal_gh_identity_"
+    ) as temporary:
+        temporary_root = Path(temporary)
+        result = run(
+            [str(resolved), "--version"],
+            cwd=temporary_root,
+            timeout=30,
+            env={
+                "PATH": sanitized_absolute_path(
+                    extra_dirs=(resolved.parent,),
+                    require_unwritable=False,
+                ),
+                "HOME": str(temporary_root),
+                "XDG_CONFIG_HOME": str(temporary_root / "config"),
+                "XDG_STATE_HOME": str(temporary_root / "state"),
+                "GH_CONFIG_DIR": str(temporary_root / "gh"),
+                "LANG": "C",
+                "LC_ALL": "C",
+            },
+        )
+    version = result.stdout.rstrip("\n")
+    if (
+        result.returncode != 0
+        or result.output_truncated
+        or result.cleanup_unconfirmed
+        or not version
+        or len(version.encode("utf-8")) > 16 * 1024
+        or version.strip() != version
+        or "\x00" in version
+    ):
+        raise RuntimeError("formal Git credential helper version is unavailable")
+    try:
+        measured = FormalGitCredentialHelper(
+            host=host,
+            executable_path=str(resolved),
+            executable_sha256=digest.hexdigest(),
+            version=version,
+            command=f"!{resolved} auth git-credential",
+        )
+    except ValueError as error:
+        raise RuntimeError("formal Git credential helper identity is invalid") from error
+    if expected is not None and measured != expected:
+        raise RuntimeError(
+            "formal Git credential helper differs from its registration"
+        )
+    return measured
+
+
+def _preflight_formal_git_credential_helper(
+    git_path: str,
+    helper: FormalGitCredentialHelper,
+) -> dict[str, Any]:
+    """Verify helper output shape without returning or logging credential values."""
+    measured = _formal_git_credential_helper(
+        helper.host,
+        expected=helper,
+    )
+    command = [
+        git_path,
+        "-c",
+        "credential.helper=",
+        "-c",
+        (
+            f"credential.https://{measured.host}.helper="
+            f"{measured.command}"
+        ),
+        "credential",
+        "fill",
+    ]
+    with _git_authenticated_push_env(measured) as authenticated_env:
+        result = run(
+            command,
+            cwd=Path(authenticated_env["HOME"]),
+            timeout=30,
+            env=authenticated_env,
+            input=f"protocol=https\nhost={measured.host}\n\n",
+        )
+        raw = result.stdout
+        fields: dict[str, str] = {}
+        field_names: tuple[str, ...] = ()
+        try:
+            if (
+                result.returncode != 0
+                or result.output_truncated
+                or result.cleanup_unconfirmed
+                or not raw
+                or len(raw.encode("utf-8")) > 64 * 1024
+            ):
+                raise RuntimeError("formal Git credential helper preflight failed")
+            for line in raw.splitlines():
+                key, separator, value = line.partition("=")
+                if (
+                    not separator
+                    or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key) is None
+                    or key in fields
+                    or not value
+                ):
+                    raise RuntimeError(
+                        "formal Git credential helper preflight returned invalid fields"
+                    )
+                fields[key] = value
+            allowed = {
+                "protocol",
+                "host",
+                "username",
+                "password",
+                "password_expiry_utc",
+                "oauth_refresh_token",
+            }
+            if (
+                not {"protocol", "host", "username", "password"}.issubset(fields)
+                or not set(fields).issubset(allowed)
+                or fields["protocol"] != "https"
+                or fields["host"] != measured.host
+            ):
+                raise RuntimeError(
+                    "formal Git credential helper preflight returned invalid fields"
+                )
+            field_names = tuple(sorted(fields))
+        finally:
+            # Credential values exist only in this local frame and the child
+            # process environment. Never return them or attach them to errors.
+            result.stdout = ""
+            result.stderr = ""
+            raw = ""
+            fields.clear()
+            del result
+    return {
+        "host": measured.host,
+        "fields": field_names,
+    }
+
+
+def _formal_anonymous_git_output(
+    git_path: str,
+    arguments: list[str],
+    *,
+    label: str,
+) -> str:
+    """Probe a public remote without repository-local or user Git settings."""
+    with tempfile.TemporaryDirectory(prefix="lha_formal_remote_") as temporary:
+        result = run(
+            [git_path, *arguments],
+            cwd=Path(temporary),
+            timeout=30,
+            env=_git_control_env(),
+        )
+    if (
+        result.returncode != 0
+        or result.output_truncated
+        or result.cleanup_unconfirmed
+    ):
+        raise RuntimeError(f"formal ablation failed {label}")
+    return result.stdout
+
+
 def _create_formal_start_witness(
     attempt: _FormalAttemptBinding,
     *,
@@ -2554,6 +2872,10 @@ def _create_formal_start_witness(
     run_header_sha256: str,
 ) -> str:
     """Atomically consume a registration through its preregistered remote ref."""
+    helper = _formal_git_credential_helper(
+        attempt.witness_credential_helper.host,
+        expected=attempt.witness_credential_helper,
+    )
     tree = _formal_git_output(
         attempt.git_path,
         ["rev-parse", f"{attempt.registration_commit}^{{tree}}"],
@@ -2587,22 +2909,34 @@ def _create_formal_start_witness(
         raise RuntimeError("formal ablation witness object identity is inconsistent")
 
     refspec = f"{witness_commit}:{attempt.witness_ref}"
-    push = run(
-        [
-            attempt.git_path,
-            "push",
-            "--porcelain",
-            "--atomic",
-            "--no-verify",
-            "--no-follow-tags",
-            "--recurse-submodules=no",
-            f"--force-with-lease={attempt.witness_ref}:",
-            attempt.witness_remote_url,
-            refspec,
-        ],
-        cwd=attempt.repository_root,
-        timeout=60,
-        env=_git_control_env(),
+    with _git_authenticated_push_env(helper) as authenticated_env:
+        push = run(
+            [
+                attempt.git_path,
+                "-c",
+                "credential.helper=",
+                "-c",
+                (
+                    f"credential.https://{helper.host}.helper="
+                    f"{helper.command}"
+                ),
+                "push",
+                "--porcelain",
+                "--atomic",
+                "--no-verify",
+                "--no-follow-tags",
+                "--recurse-submodules=no",
+                f"--force-with-lease={attempt.witness_ref}:",
+                attempt.witness_remote_url,
+                refspec,
+            ],
+            cwd=attempt.repository_root,
+            timeout=60,
+            env=authenticated_env,
+        )
+    _formal_git_credential_helper(
+        helper.host,
+        expected=helper,
     )
     expected_statuses = {
         f"*\t{refspec}\t[new branch]",
@@ -2625,10 +2959,9 @@ def _create_formal_start_witness(
             "attempt cannot run"
         )
 
-    remote_ref = _formal_git_output(
+    remote_ref = _formal_anonymous_git_output(
         attempt.git_path,
         ["ls-remote", "--refs", attempt.witness_remote_url, attempt.witness_ref],
-        repository_root=attempt.repository_root,
         label="witness remote confirmation",
     ).strip()
     if remote_ref != f"{witness_commit}\t{attempt.witness_ref}":
@@ -2674,6 +3007,25 @@ def _bind_formal_attempt(
     ).strip()
     if head != formal_corpus.preregistration_commit:
         raise RuntimeError("formal ablation HEAD changed before attempt validation")
+    branch = _formal_git_output(
+        git_path,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        repository_root=repository_root,
+        label="branch resolution",
+    ).strip()
+    if not branch:
+        raise RuntimeError("formal ablation requires a named registration branch")
+    _formal_git_output(
+        git_path,
+        ["check-ref-format", f"refs/heads/{branch}"],
+        repository_root=repository_root,
+        label="branch validation",
+    )
+    trusted_source_files = _revalidate_formal_checkout(formal_corpus)
+    if _source_tree_digest(trusted_source_files) != source_tree_sha256:
+        raise RuntimeError(
+            "formal ablation source differs from its registered HEAD bytes"
+        )
     registry_relative = FORMAL_ABLATION_ATTEMPTS_PATH.as_posix()
     _formal_git_output(
         git_path,
@@ -2777,6 +3129,27 @@ def _bind_formal_attempt(
         raise RuntimeError(
             "formal ablation registration commit may only change the attempt registry"
         )
+    configured_witness_url = _formal_witness_remote_url(
+        git_path,
+        repository_root=repository_root,
+        remote_name=registration.witness_remote_name,
+    )
+    if configured_witness_url != registration.witness_remote_url:
+        raise RuntimeError(
+            "formal ablation witness remote differs from its registration"
+        )
+    if registration.witness_credential_helper is None:
+        raise RuntimeError(
+            "formal ablation registration has no credential helper binding"
+        )
+    witness_credential_helper = _formal_git_credential_helper(
+        registration.witness_credential_helper.host,
+        expected=registration.witness_credential_helper,
+    )
+    _preflight_formal_git_credential_helper(
+        git_path,
+        witness_credential_helper,
+    )
     protocol = FormalAblationProtocol(
         source_commit=registration.source_commit,
         source_tree_sha256=source_tree_sha256,
@@ -2788,6 +3161,7 @@ def _bind_formal_attempt(
         codex_cli_executable_sha256=codex_cli_executable_sha256,
         codex_client=codex_client,
         codex_client_sha256=formal_codex_client_sha256(codex_client),
+        witness_credential_helper=witness_credential_helper,
     )
     protocol_sha256 = formal_ablation_protocol_sha256(protocol)
     expected = {
@@ -2804,27 +3178,27 @@ def _bind_formal_attempt(
         ),
         "codex_client": protocol.codex_client,
         "codex_client_sha256": protocol.codex_client_sha256,
+        "witness_credential_helper": protocol.witness_credential_helper,
         "protocol_sha256": protocol_sha256,
     }
     if any(getattr(registration, field) != value for field, value in expected.items()):
         raise RuntimeError(
             "open formal ablation registration does not match this run"
         )
-    configured_push_urls = _formal_git_output(
+    remote_branch = _formal_anonymous_git_output(
         git_path,
         [
-            "remote",
-            "get-url",
-            "--push",
-            "--all",
-            registration.witness_remote_name,
+            "ls-remote",
+            "--heads",
+            registration.witness_remote_url,
+            f"refs/heads/{branch}",
         ],
-        repository_root=repository_root,
-        label="witness remote resolution",
-    ).splitlines()
-    if configured_push_urls != [registration.witness_remote_url]:
+        label="registration branch confirmation",
+    ).strip()
+    if remote_branch.split() != [head, f"refs/heads/{branch}"]:
         raise RuntimeError(
-            "formal ablation witness remote differs from its registration"
+            "formal ablation registration commit is not published on "
+            "the current remote branch"
         )
     return _FormalAttemptBinding(
         attempt_id=registration.attempt_id,
@@ -2836,6 +3210,7 @@ def _bind_formal_attempt(
         git_path=git_path,
         witness_remote_name=registration.witness_remote_name,
         witness_remote_url=registration.witness_remote_url,
+        witness_credential_helper=witness_credential_helper,
         witness_ref=registration.witness_ref,
     )
 
@@ -2867,52 +3242,15 @@ def _prepare_formal_corpus_binding(
     commit, dirty = _git_provenance(git_path)
     if commit is None or _HEX_40.fullmatch(commit) is None or dirty is not False:
         raise RuntimeError("formal ablation must start from a clean committed Git checkout")
-    manifest_relative = _FORMAL_CORPUS_MANIFEST_PATH.as_posix()
-    tracked = run(
-        [git_path, "cat-file", "-e", f"{commit}:{manifest_relative}"],
-        cwd=repository_root,
-        timeout=10,
-        env=_git_control_env(),
+    _validate_formal_head_checkout(
+        repository_root,
+        git_path=git_path,
+        head=commit,
+        manifest=manifest,
+        manifest_sha256=manifest_sha256,
     )
-    ancestor = run(
-        [
-            git_path,
-            "merge-base",
-            "--is-ancestor",
-            manifest["corpus_commit"],
-            commit,
-        ],
-        cwd=repository_root,
-        timeout=10,
-        env=_git_control_env(),
-    )
-    registered_inputs = [
-        value for entry in manifest["tasks"] for value in (entry["task_path"], entry["corpus_path"])
-    ]
-    unchanged = run(
-        [
-            git_path,
-            "diff",
-            "--quiet",
-            "--no-ext-diff",
-            "--no-textconv",
-            manifest["corpus_commit"],
-            commit,
-            "--",
-            *registered_inputs,
-        ],
-        cwd=repository_root,
-        timeout=30,
-        env=_git_control_env(),
-    )
-    controls = (tracked, ancestor, unchanged)
-    if any(
-        result.returncode != 0 or result.output_truncated or result.cleanup_unconfirmed
-        for result in controls
-    ):
-        raise RuntimeError("formal corpus manifest or registered inputs are not anchored in Git")
     return _FormalCorpusBinding(
-        path=manifest_relative,
+        path=_FORMAL_CORPUS_MANIFEST_PATH.as_posix(),
         sha256=manifest_sha256,
         preregistration_commit=commit,
         git_executable=git_executable,
@@ -2939,6 +3277,597 @@ def _source_file_digests(root: Path | None = None) -> dict[str, str]:
 
 def _source_tree_digest(source_files: dict[str, str]) -> str:
     return _canonical_digest(source_files)
+
+
+def _git_head_tree_entries(
+    repository_root: Path,
+    *,
+    git_path: str,
+    commit: str,
+    paths: list[str],
+) -> dict[str, tuple[str, int, str]]:
+    """List regular blobs below fixed paths without consulting the index."""
+    if (
+        not Path(git_path).is_absolute()
+        or _HEX_40.fullmatch(commit) is None
+        or not paths
+    ):
+        raise RuntimeError("formal Git tree request is invalid")
+    requested: list[str] = []
+    for value in paths:
+        parsed = PurePosixPath(value)
+        if (
+            parsed.is_absolute()
+            or parsed.as_posix() != value
+            or any(part in {"", ".", ".."} for part in parsed.parts)
+        ):
+            raise RuntimeError("formal Git tree path is unsafe")
+        if value not in requested:
+            requested.append(value)
+    output = _formal_git_output(
+        git_path,
+        [
+            "ls-tree",
+            "-r",
+            "-l",
+            "-z",
+            "--full-tree",
+            commit,
+            "--",
+            *requested,
+        ],
+        repository_root=repository_root,
+        label="trusted HEAD tree read",
+    )
+    if "\ufffd" in output:
+        raise RuntimeError("formal Git tree contains a non-UTF-8 path")
+    entries: dict[str, tuple[str, int, str]] = {}
+    total_bytes = 0
+    for record in output.split("\0"):
+        if not record:
+            continue
+        metadata, separator, name = record.partition("\t")
+        fields = metadata.split()
+        if (
+            not separator
+            or len(fields) != 4
+            or fields[0] not in {"100644", "100755"}
+            or fields[1] != "blob"
+            or re.fullmatch(r"[0-9a-f]{40,64}", fields[2]) is None
+        ):
+            raise RuntimeError("formal Git tree contains a non-regular entry")
+        try:
+            size = int(fields[3])
+        except ValueError as error:
+            raise RuntimeError("formal Git tree contains an invalid blob size") from error
+        relative = PurePosixPath(name)
+        if (
+            size < 0
+            or relative.is_absolute()
+            or relative.as_posix() != name
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or not any(
+                name == prefix or name.startswith(f"{prefix}/")
+                for prefix in requested
+            )
+            or name in entries
+        ):
+            raise RuntimeError("formal Git tree returned an unexpected entry")
+        total_bytes += size
+        if (
+            len(entries) >= _MAX_FORMAL_HEAD_FILES
+            or total_bytes > _MAX_FORMAL_HEAD_BYTES
+        ):
+            raise RuntimeError("formal Git tree exceeds the trusted byte bound")
+        entries[name] = (fields[2], size, fields[0])
+    return entries
+
+
+def _validate_formal_git_tree_modes(
+    repository_root: Path,
+    entries: dict[str, tuple[str, int, str]],
+) -> None:
+    """Match Git's executable-bit model against the current worktree."""
+    try:
+        root = repository_root.resolve(strict=True)
+        root_metadata = root.lstat()
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError("formal worktree is unavailable") from error
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise RuntimeError("formal worktree root is unsafe")
+    for name, (_oid, _size, git_mode) in entries.items():
+        candidate = root
+        parts = PurePosixPath(name).parts
+        try:
+            for component in parts[:-1]:
+                candidate /= component
+                parent_metadata = candidate.lstat()
+                if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(
+                    parent_metadata.st_mode
+                ):
+                    raise RuntimeError("formal worktree file path is unsafe")
+            candidate /= parts[-1]
+            metadata = candidate.lstat()
+        except OSError as error:
+            raise RuntimeError("formal worktree file is unavailable") from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("formal worktree file is not regular")
+        expected_executable = git_mode == "100755"
+        actual_executable = bool(stat.S_IMODE(metadata.st_mode) & 0o111)
+        if actual_executable != expected_executable:
+            raise RuntimeError(
+                "formal worktree file mode differs from the trusted Git tree"
+            )
+
+
+def _git_blob_batch(
+    repository_root: Path,
+    *,
+    git_path: str,
+    entries: dict[str, tuple[str, int, str]],
+) -> dict[str, bytes]:
+    """Read exact committed blob bytes through one bounded, isolated Git process."""
+    if not process_group_cleanup_supported():
+        raise RuntimeError("formal Git blob reads require POSIX process cleanup")
+    ordered_oids = list(
+        dict.fromkeys(oid for oid, _size, _mode in entries.values())
+    )
+    if not ordered_oids:
+        return {}
+    expected_sizes: dict[str, int] = {}
+    for oid, size, _mode in entries.values():
+        previous = expected_sizes.setdefault(oid, size)
+        if previous != size:
+            raise RuntimeError("formal Git blob size is inconsistent")
+    request = b"".join(f"{oid}\n".encode("ascii") for oid in ordered_oids)
+    try:
+        process: subprocess.Popen[bytes] = subprocess.Popen(
+            [git_path, "cat-file", "--batch"],
+            cwd=repository_root,
+            env=_git_control_env(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as error:
+        raise RuntimeError("formal Git blob reader could not start") from error
+    timed_out = False
+    interrupted: BaseException | None = None
+    stdout = b""
+    stderr = b""
+    try:
+        stdout, stderr = process.communicate(input=request, timeout=30)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    except BaseException as error:
+        interrupted = error
+    cleanup = terminate_process_group(process)
+    if timed_out:
+        try:
+            stdout, stderr = process.communicate(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if interrupted is not None:
+        if not cleanup.confirmed:
+            raise RuntimeError(
+                "formal Git blob reader cleanup could not be confirmed"
+            ) from interrupted
+        raise interrupted
+    if (
+        timed_out
+        or process.returncode != 0
+        or not cleanup.confirmed
+        or len(stderr) > 1024 * 1024
+        or len(stdout)
+        > _MAX_FORMAL_HEAD_BYTES + len(ordered_oids) * 160
+    ):
+        raise RuntimeError("formal Git blob reader failed closed")
+
+    blobs_by_oid: dict[str, bytes] = {}
+    offset = 0
+    for expected_oid in ordered_oids:
+        newline = stdout.find(b"\n", offset)
+        if newline < 0:
+            raise RuntimeError("formal Git blob stream is truncated")
+        try:
+            header = stdout[offset:newline].decode("ascii").split()
+        except UnicodeDecodeError as error:
+            raise RuntimeError("formal Git blob header is invalid") from error
+        expected_size = expected_sizes[expected_oid]
+        if (
+            len(header) != 3
+            or header[0] != expected_oid
+            or header[1] != "blob"
+            or header[2] != str(expected_size)
+        ):
+            raise RuntimeError("formal Git blob header disagrees with the tree")
+        start = newline + 1
+        end = start + expected_size
+        if end >= len(stdout) or stdout[end : end + 1] != b"\n":
+            raise RuntimeError("formal Git blob payload is truncated")
+        blobs_by_oid[expected_oid] = stdout[start:end]
+        offset = end + 1
+    if offset != len(stdout):
+        raise RuntimeError("formal Git blob stream contains trailing bytes")
+    return {
+        name: blobs_by_oid[oid]
+        for name, (oid, _size, _mode) in entries.items()
+    }
+
+
+def _trusted_git_blobs(
+    repository_root: Path,
+    *,
+    git_path: str,
+    commit: str,
+    paths: list[str],
+) -> dict[str, bytes]:
+    entries = _git_head_tree_entries(
+        repository_root,
+        git_path=git_path,
+        commit=commit,
+        paths=paths,
+    )
+    _validate_formal_git_tree_modes(repository_root, entries)
+    blobs = _git_blob_batch(
+        repository_root,
+        git_path=git_path,
+        entries=entries,
+    )
+    _validate_formal_git_tree_modes(repository_root, entries)
+    return blobs
+
+
+def _formal_tree_file_digests(root: Path) -> dict[str, str]:
+    _validate_formal_tree_nodes(root, label="formal corpus")
+    files: dict[str, str] = {}
+    for relative, path in sorted(_iter_files(root)):
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("formal corpus contains a non-regular file")
+        files[relative] = _sha256_regular_file(path)
+    _validate_formal_tree_nodes(root, label="formal corpus")
+    return files
+
+
+def _validate_formal_tree_nodes(root: Path, *, label: str) -> None:
+    """Reject links and special nodes that ``copytree`` could follow or copy."""
+    try:
+        root_metadata = root.lstat()
+    except OSError as error:
+        raise RuntimeError(f"{label} tree is unavailable") from error
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(
+        root_metadata.st_mode
+    ):
+        raise RuntimeError(f"{label} root is not a real directory")
+    count = 0
+    try:
+        for path in root.rglob("*"):
+            count += 1
+            if count > _MAX_FORMAL_HEAD_FILES:
+                raise RuntimeError(f"{label} tree exceeds the trusted file bound")
+            metadata = path.lstat()
+            if not (
+                stat.S_ISDIR(metadata.st_mode)
+                or (
+                    stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_nlink == 1
+                )
+            ):
+                raise RuntimeError(
+                    f"{label} tree contains a link or special node"
+                )
+    except OSError as error:
+        raise RuntimeError(f"{label} tree could not be inspected") from error
+
+
+def _formal_input_snapshot_is_valid(
+    path: Path,
+    *,
+    task: str,
+    task_sha256: str,
+    corpus_sha256: str,
+    snapshot_sha256: str,
+) -> bool:
+    """Recompute every byte binding referenced by a formal cell marker."""
+    expected_metadata = {
+        "schema_version": _INPUT_SNAPSHOT_SCHEMA,
+        "task": task,
+        "task_sha256": task_sha256,
+        "corpus_sha256": corpus_sha256,
+        "snapshot_sha256": snapshot_sha256,
+    }
+    if snapshot_sha256 != _input_snapshot_digest(task_sha256, corpus_sha256):
+        return False
+    try:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            return False
+        entries = {entry.name: entry for entry in path.iterdir()}
+        if set(entries) != {"task.yaml", "repo", "snapshot.json"}:
+            return False
+        task_payload = _read_bounded_bytes(
+            entries["task.yaml"],
+            max_bytes=_MAX_TASK_BYTES,
+        )
+        metadata_payload = _read_bounded_bytes(
+            entries["snapshot.json"],
+            max_bytes=_MAX_TASK_BYTES,
+        )
+        if (
+            _sha256_bytes(task_payload) != task_sha256
+            or metadata_payload
+            != _canonical_json_object_bytes(expected_metadata)
+            or json.loads(metadata_payload) != expected_metadata
+        ):
+            return False
+        repository = entries["repo"]
+        _validate_formal_tree_nodes(
+            repository,
+            label="formal input snapshot",
+        )
+        if _repo_digest(repository) != corpus_sha256:
+            return False
+        _validate_formal_tree_nodes(
+            repository,
+            label="formal input snapshot",
+        )
+    except (
+        OSError,
+        RuntimeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    return True
+
+
+def _head_repo_digest(blobs: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for relative, payload in sorted(blobs.items()):
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(payload)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _validate_formal_head_checkout(
+    repository_root: Path,
+    *,
+    git_path: str,
+    head: str,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+) -> dict[str, str]:
+    """Bind source, manifest, tasks, and corpora to exact committed blobs."""
+    manifest_relative = _FORMAL_CORPUS_MANIFEST_PATH.as_posix()
+    source_relative = "src/lha"
+    registered_inputs = [
+        value
+        for entry in manifest["tasks"]
+        for value in (entry["task_path"], entry["corpus_path"])
+    ]
+    requested = [
+        source_relative,
+        manifest_relative,
+        *_FORMAL_CONTROL_FILES,
+        *registered_inputs,
+    ]
+    head_blobs = _trusted_git_blobs(
+        repository_root,
+        git_path=git_path,
+        commit=head,
+        paths=requested,
+    )
+    manifest_path = _repo_relative_evidence_path(
+        repository_root,
+        manifest_relative,
+        kind="manifest",
+    )[1]
+    current_manifest = _read_bounded_bytes(
+        manifest_path,
+        max_bytes=_MAX_FORMAL_MANIFEST_BYTES,
+    )
+    if (
+        head_blobs.get(manifest_relative) != current_manifest
+        or _sha256_bytes(current_manifest) != manifest_sha256
+    ):
+        raise RuntimeError(
+            "formal corpus manifest differs from the trusted HEAD blob"
+        )
+
+    for control_relative in _FORMAL_CONTROL_FILES:
+        expected_control = head_blobs.get(control_relative)
+        candidate = repository_root / control_relative
+        present = candidate.exists() or candidate.is_symlink()
+        if expected_control is None:
+            if present:
+                raise RuntimeError(
+                    f"formal control file {control_relative!r} is not in HEAD"
+                )
+            continue
+        if not present:
+            raise RuntimeError(
+                f"formal control file {control_relative!r} is missing"
+            )
+        control_path = _repo_relative_evidence_path(
+            repository_root,
+            control_relative,
+            kind="control",
+        )[1]
+        current_control = _read_bounded_bytes(
+            control_path,
+            max_bytes=_MAX_FORMAL_HEAD_BYTES,
+        )
+        if current_control != expected_control:
+            raise RuntimeError(
+                f"formal control file {control_relative!r} differs from HEAD"
+            )
+
+    source_root = _repo_relative_evidence_path(
+        repository_root,
+        source_relative,
+        kind="source",
+    )[1]
+    if not source_root.is_dir():
+        raise RuntimeError("formal source tree is unavailable")
+    _validate_formal_tree_nodes(source_root, label="formal source")
+    prefix = f"{source_relative}/"
+    head_source_files = {
+        name.removeprefix(prefix): _sha256_bytes(payload)
+        for name, payload in head_blobs.items()
+        if name.startswith(prefix)
+        and "__pycache__" not in PurePosixPath(name).parts
+        and PurePosixPath(name).suffix not in {".pyc", ".pyo"}
+    }
+    if (
+        not head_source_files
+        or _source_file_digests(source_root) != head_source_files
+    ):
+        raise RuntimeError(
+            "formal source bytes differ from the trusted HEAD blobs"
+        )
+    _validate_formal_tree_nodes(source_root, label="formal source")
+
+    for entry in manifest["tasks"]:
+        task_relative = entry["task_path"]
+        corpus_relative = entry["corpus_path"]
+        task_path = _repo_relative_evidence_path(
+            repository_root,
+            task_relative,
+            kind="task",
+        )[1]
+        current_task = _read_bounded_bytes(
+            task_path,
+            max_bytes=_MAX_TASK_BYTES,
+        )
+        if (
+            head_blobs.get(task_relative) != current_task
+            or _sha256_bytes(current_task) != entry["task_sha256"]
+        ):
+            raise RuntimeError(
+                f"formal task {entry['name']!r} differs from the trusted HEAD blob"
+            )
+        corpus_root = _repo_relative_evidence_path(
+            repository_root,
+            corpus_relative,
+            kind="corpus",
+        )[1]
+        corpus_prefix = f"{corpus_relative}/"
+        head_corpus_bytes = {
+            name.removeprefix(corpus_prefix): payload
+            for name, payload in head_blobs.items()
+            if name.startswith(corpus_prefix)
+            and not any(
+                part in _DIFF_IGNORE
+                for part in PurePosixPath(name.removeprefix(corpus_prefix)).parts
+            )
+        }
+        head_corpus_files = {
+            name: _sha256_bytes(payload)
+            for name, payload in head_corpus_bytes.items()
+        }
+        if (
+            not head_corpus_files
+            or _formal_tree_file_digests(corpus_root) != head_corpus_files
+            or _head_repo_digest(head_corpus_bytes) != entry["corpus_sha256"]
+        ):
+            raise RuntimeError(
+                f"formal corpus {entry['name']!r} differs from trusted HEAD blobs"
+            )
+
+    _formal_git_output(
+        git_path,
+        [
+            "merge-base",
+            "--is-ancestor",
+            manifest["corpus_commit"],
+            head,
+        ],
+        repository_root=repository_root,
+        label="formal corpus commit ancestry",
+    )
+    corpus_commit_blobs = _trusted_git_blobs(
+        repository_root,
+        git_path=git_path,
+        commit=manifest["corpus_commit"],
+        paths=registered_inputs,
+    )
+    head_inputs = {
+        name: payload
+        for name, payload in head_blobs.items()
+        if any(
+            name == value or name.startswith(f"{value}/")
+            for value in registered_inputs
+        )
+    }
+    if corpus_commit_blobs != head_inputs:
+        raise RuntimeError(
+            "formal task or corpus bytes changed after the fixed corpus commit"
+        )
+    return head_source_files
+
+
+def _revalidate_formal_checkout(
+    formal_corpus: _FormalCorpusBinding,
+) -> dict[str, str]:
+    repository_root = _project_root()
+    if repository_root is None:
+        raise RuntimeError("formal ablation requires a Git project checkout")
+    repository_root = repository_root.resolve(strict=True)
+    git_path = str(formal_corpus.git_executable.get("path", ""))
+    manifest, manifest_sha256 = _load_formal_corpus_manifest(
+        repository_root / _FORMAL_CORPUS_MANIFEST_PATH,
+        repository_root,
+    )
+    if manifest_sha256 != formal_corpus.sha256:
+        raise RuntimeError("formal corpus manifest changed after preregistration")
+    return _validate_formal_head_checkout(
+        repository_root,
+        git_path=git_path,
+        head=formal_corpus.preregistration_commit,
+        manifest=manifest,
+        manifest_sha256=manifest_sha256,
+    )
+
+
+def _write_ablation_reports(
+    out: Path,
+    *,
+    report_json: str,
+    report_markdown: str,
+    formal_corpus: _FormalCorpusBinding | None,
+    source_files: dict[str, str],
+) -> None:
+    if formal_corpus is None:
+        _atomic_write(out / "ablation_report.json", report_json)
+        _atomic_write(out / "ablation_report.md", report_markdown)
+        return
+    before_publish = _revalidate_formal_checkout(formal_corpus)
+    if before_publish != source_files:
+        raise RuntimeError("formal checkout changed before report publication")
+    # JSON is the formal completion marker. A stop after the derived Markdown
+    # write leaves no JSON and can therefore be closed as ABANDONED rather than
+    # mistaken for a complete result.
+    _atomic_write(
+        out / "ablation_report.md",
+        report_markdown,
+        anchor=out,
+    )
+    after_markdown = _revalidate_formal_checkout(formal_corpus)
+    if after_markdown != source_files:
+        raise RuntimeError(
+            "formal checkout changed before the report commit marker"
+        )
+    _atomic_write(
+        out / "ablation_report.json",
+        report_json,
+        anchor=out,
+    )
 
 
 def _project_root() -> Path | None:
@@ -3009,12 +3938,181 @@ def _git_control_env() -> dict[str, str]:
         "PATH": sanitized_absolute_path(require_unwritable=True),
         "LANG": "C",
         "LC_ALL": "C",
+        "GIT_CONFIG": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_PAGER": "cat",
     }
     return {key: value for key, value in env.items() if value}
+
+
+def _git_local_config_env() -> dict[str, str]:
+    """Permit only an explicit ``git config --local --no-includes`` read."""
+    env = _git_control_env()
+    env.pop("GIT_CONFIG", None)
+    return env
+
+
+def _gh_config_source_directory() -> Path:
+    """Resolve the official gh config directory without following aliases."""
+    configured = os.environ.get("GH_CONFIG_DIR")
+    if configured:
+        candidate = Path(configured)
+    else:
+        xdg_config = os.environ.get("XDG_CONFIG_HOME")
+        candidate = (
+            Path(xdg_config) / "gh"
+            if xdg_config
+            else Path.home() / ".config" / "gh"
+        )
+    if not candidate.is_absolute():
+        raise RuntimeError("formal Git credential configuration is unavailable")
+    try:
+        resolved = candidate.resolve(strict=True)
+        metadata = resolved.lstat()
+    except (OSError, RuntimeError) as error:
+        raise RuntimeError(
+            "formal Git credential configuration is unavailable"
+        ) from error
+    if (
+        resolved != candidate
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise RuntimeError("formal Git credential configuration is unsafe")
+    return resolved
+
+
+def _gh_config_signatures(source: Path) -> dict[str, tuple[int, ...]]:
+    """Bind the files gh may read without copying or decoding their contents."""
+    signatures: dict[str, tuple[int, ...]] = {}
+    for name in ("hosts.yml", "config.yml"):
+        candidate = source / name
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            if name == "hosts.yml":
+                raise RuntimeError(
+                    "formal Git credential configuration is incomplete"
+                ) from None
+            continue
+        except OSError as error:
+            raise RuntimeError(
+                "formal Git credential configuration is unsafe"
+            ) from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or metadata.st_size <= 0
+            or metadata.st_size > _MAX_GH_CONFIG_BYTES
+        ):
+            raise RuntimeError("formal Git credential configuration is unsafe")
+        signatures[name] = _stable_file_signature(metadata)
+    return signatures
+
+
+@contextmanager
+def _git_authenticated_push_env(
+    helper: FormalGitCredentialHelper,
+) -> Iterator[dict[str, str]]:
+    """Use a memory-only token with disposable writable gh directories."""
+    source = _gh_config_source_directory()
+    before = _gh_config_signatures(source)
+    helper_path = helper.executable_path
+    with tempfile.TemporaryDirectory(
+        prefix="lha_formal_git_auth_"
+    ) as temporary:
+        root = Path(temporary)
+        root.chmod(0o700)
+        directories = {
+            "home": root / "home",
+            "config": root / "config",
+            "state": root / "state",
+            "cache": root / "cache",
+            "data": root / "data",
+            "runtime": root / "runtime",
+            "tmp": root / "tmp",
+            "gh": root / "gh",
+        }
+        for directory in directories.values():
+            directory.mkdir(mode=0o700)
+            directory.chmod(0o700)
+        token_env = _git_control_env()
+        token_env.update(
+            {
+                # On macOS, gh's keychain lookup is bound to the account home.
+                # All gh write locations remain redirected below the disposable
+                # root; only this read-only token lookup sees the real HOME.
+                "HOME": str(Path.home().resolve()),
+                "GH_CONFIG_DIR": str(source),
+                "XDG_CONFIG_HOME": str(directories["config"]),
+                "XDG_STATE_HOME": str(directories["state"]),
+                "XDG_CACHE_HOME": str(directories["cache"]),
+                "XDG_DATA_HOME": str(directories["data"]),
+                "XDG_RUNTIME_DIR": str(directories["runtime"]),
+                "TMPDIR": str(directories["tmp"]),
+                "GH_HOST": helper.host,
+                "GH_PROMPT_DISABLED": "1",
+                "GH_NO_UPDATE_NOTIFIER": "1",
+            }
+        )
+        token_result = run(
+            [helper_path, "auth", "token", "--hostname", helper.host],
+            cwd=directories["home"],
+            timeout=30,
+            env=token_env,
+        )
+        token = ""
+        try:
+            token = token_result.stdout.strip()
+            invalid_token = (
+                token_result.returncode != 0
+                or token_result.output_truncated
+                or token_result.cleanup_unconfirmed
+                or not token
+                or len(token.encode("utf-8")) > 16 * 1024
+                or any(
+                    character.isspace() or ord(character) < 32
+                    for character in token
+                )
+            )
+            config_changed = _gh_config_signatures(source) != before
+        finally:
+            token_result.stdout = ""
+            token_result.stderr = ""
+            del token_result
+        if invalid_token or config_changed:
+            token = ""
+            raise RuntimeError("formal Git credential token preflight failed")
+        env = _git_control_env()
+        env.update(
+            {
+                "HOME": str(directories["home"]),
+                "GH_CONFIG_DIR": str(directories["gh"]),
+                "GH_TOKEN": token,
+                "GH_HOST": helper.host,
+                "XDG_CONFIG_HOME": str(directories["config"]),
+                "XDG_STATE_HOME": str(directories["state"]),
+                "XDG_CACHE_HOME": str(directories["cache"]),
+                "XDG_DATA_HOME": str(directories["data"]),
+                "XDG_RUNTIME_DIR": str(directories["runtime"]),
+                "TMPDIR": str(directories["tmp"]),
+                "GH_PROMPT_DISABLED": "1",
+                "GH_NO_UPDATE_NOTIFIER": "1",
+            }
+        )
+        try:
+            yield env
+        finally:
+            env.pop("GH_TOKEN", None)
+            token = ""
 
 
 def _provenance_path(path: str | Path) -> str:
@@ -3456,6 +4554,7 @@ def _load_cached_cell(
     max_outer_attempts: int = _LLM_RETRIES,
     max_inner_attempts: int = 1,
     formal_evidence: bool = False,
+    expected_formal_binding: dict[str, str] | None = None,
 ) -> _CachedCell | None:
     try:
         cache_envelope = json.loads(_read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES))
@@ -3465,6 +4564,26 @@ def _load_cached_cell(
         not isinstance(cache_envelope, dict)
         or cache_envelope.get("schema_version") != _CACHE_SCHEMA
     ):
+        return None
+    formal_fields = (
+        "formal_attempt_id",
+        "formal_registration_registry_sha256",
+        "formal_protocol_sha256",
+        "formal_outcome_key",
+    )
+    if formal_evidence:
+        if (
+            not isinstance(expected_formal_binding, dict)
+            or set(expected_formal_binding) != set(formal_fields)
+            or any(
+                not isinstance(expected_formal_binding[field], str)
+                or _HEX_64.fullmatch(expected_formal_binding[field]) is None
+                or cache_envelope.get(field) != expected_formal_binding[field]
+                for field in formal_fields
+            )
+        ):
+            return None
+    elif expected_formal_binding is not None:
         return None
     decoded = _decode_cache(cache_envelope)
     if decoded is None:
@@ -3583,10 +4702,14 @@ def _load_cached_cell(
                             "ordinal": ordinal,
                             "cell_fingerprint": fingerprint,
                             "input_snapshot_sha256": input_snapshot_sha256,
-                            "formal_attempt_id": None,
-                            "formal_registration_registry_sha256": None,
-                            "formal_protocol_sha256": None,
-                            "formal_outcome_key": None,
+                            **{
+                                field: (
+                                    expected_formal_binding[field]
+                                    if expected_formal_binding is not None
+                                    else None
+                                )
+                                for field in formal_fields
+                            },
                         },
                     )
                 )
@@ -4352,28 +5475,39 @@ def run_ablation(
 ) -> AblationReport:
     if reps <= 0:
         raise ValueError("reps must be greater than zero")
+    out = Path(out_dir) if out_dir else (Path(base.runs_dir) / "ablation")
     formal_corpus = _prepare_formal_corpus_binding(
         task_paths,
         repetitions=reps,
     )
-    out = Path(out_dir) if out_dir else (Path(base.runs_dir) / "ablation")
     if formal_corpus is not None:
+        repository_root = _project_root()
+        if repository_root is None:
+            raise RuntimeError("formal ablation requires a Git project checkout")
         # Corpus binding is read-only preregistration work. The output lifecycle
-        # begins here: every Docker/Codex preflight, snapshot, model call, cell,
-        # final cleanup check, and report write remains inside this lease.
-        with _formal_ablation_lock(out) as formal_output_lease:
-            return _run_ablation_with_binding(
-                base,
+        # begins under a repository lock that cannot be replaced with runs/.
+        # The output lock is always second, giving terminal commands the same
+        # global -> output ordering.
+        with formal_attempt_lock(repository_root):
+            formal_corpus = _prepare_formal_corpus_binding(
                 task_paths,
-                llm=llm,
-                model=model,
-                reps=reps,
-                out_dir=out,
-                llm_client=llm_client,
-                scorer_backend=scorer_backend,
-                formal_corpus=formal_corpus,
-                formal_output_lease=formal_output_lease,
+                repetitions=reps,
             )
+            if formal_corpus is None:
+                raise RuntimeError("formal ablation corpus binding is unavailable")
+            with _formal_ablation_lock(out) as formal_output_lease:
+                return _run_ablation_with_binding(
+                    base,
+                    task_paths,
+                    llm=llm,
+                    model=model,
+                    reps=reps,
+                    out_dir=out,
+                    llm_client=llm_client,
+                    scorer_backend=scorer_backend,
+                    formal_corpus=formal_corpus,
+                    formal_output_lease=formal_output_lease,
+                )
     return _run_ablation_with_binding(
         base,
         task_paths,
@@ -4466,7 +5600,18 @@ def _run_ablation_with_binding(
             requested_docker_image,
             docker=docker_identity.path,
         )
-    client = llm_client or _make_llm(llm, model, cli_path=cli_path, effort=effort)
+    client = llm_client or (
+        make_formal_codex_client(
+            cli_path=cli_path,
+            model=model,
+            reasoning_effort=effort,
+        )
+        if formal_corpus is not None
+        and llm == "codex_cli"
+        and isinstance(model, str)
+        and model
+        else _make_llm(llm, model, cli_path=cli_path, effort=effort)
+    )
     if formal_corpus is not None:
         from .llm.codex_cli import CodexCLIClient
 
@@ -4516,19 +5661,9 @@ def _run_ablation_with_binding(
                 "permission boundary"
             )
         formal_cli_executable_sha256 = identity[5]
-        formal_codex_client = FormalCodexClientConfig(
-            no_tools=True,
-            sandbox_mode="read-only",
-            permission_model="profile",
-            permission_profile="lha-read",
-            credential_barrier="verified",
-            externally_sandboxed=False,
-            max_retries=client.max_retries,
-            timeout_s=float(client.timeout),
-            retry_backoff_s=float(client.retry_backoff_s),
-        )
+        formal_codex_client = formal_codex_client_config_from_runtime(client)
         registered_source_tree_sha256 = _source_tree_digest(
-            _source_file_digests()
+            _revalidate_formal_checkout(formal_corpus)
         )
         formal_attempt_binding = _bind_formal_attempt(
             formal_corpus=formal_corpus,
@@ -4639,7 +5774,11 @@ def _run_ablation_with_binding(
             backend_version = str(client_provenance())
         except Exception:  # a probe failure must not stop the experiment
             logger.warning("could not read the backend provenance", exc_info=True)
-    source_files = _source_file_digests()
+    source_files = (
+        _revalidate_formal_checkout(formal_corpus)
+        if formal_corpus is not None
+        else _source_file_digests()
+    )
     source_tree_sha256 = _source_tree_digest(source_files)
     if (
         registered_source_tree_sha256 is not None
@@ -4766,7 +5905,11 @@ def _run_ablation_with_binding(
                 )
             )
 
-    final_source_files = _source_file_digests()
+    final_source_files = (
+        _revalidate_formal_checkout(formal_corpus)
+        if formal_corpus is not None
+        else _source_file_digests()
+    )
     if final_source_files != source_files:
         raise RuntimeError(
             "lha source tree changed during the ablation; "
@@ -5038,14 +6181,13 @@ def _run_ablation_with_binding(
         }
     report.fingerprint = _report_fingerprint(report_raw)
     report_raw["fingerprint"] = report.fingerprint
-    _atomic_write(
-        out / "ablation_report.json",
-        json.dumps(report_raw, indent=2),
-        anchor=out if formal_corpus is not None else None,
-    )
-    _atomic_write(
-        out / "ablation_report.md",
-        report.to_markdown(),
-        anchor=out if formal_corpus is not None else None,
+    report_json = json.dumps(report_raw, indent=2)
+    report_markdown = report.to_markdown()
+    _write_ablation_reports(
+        out,
+        report_json=report_json,
+        report_markdown=report_markdown,
+        formal_corpus=formal_corpus,
+        source_files=source_files,
     )
     return report

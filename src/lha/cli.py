@@ -4,6 +4,7 @@ lha run <task.yaml>      run a task and its configured checks
 lha resume <run_id>      resume a paused/awaiting run
 lha eval [--quick]       run the six repository regression workflows
 lha ablate [tasks...]    compare direct acceptance, checks, and repair
+lha ablation-attempt ... register or close a one-shot formal ablation
 lha horizon              compose measured task outcomes across task counts
 lha batch <task>...      run multiple tasks in parallel (process-isolated)
 lha trace <run_id>       render a run's ledger timeline
@@ -136,6 +137,61 @@ def _cmd_ablate(args) -> int:
     print(report.to_markdown())
     print(f"report: {out / 'ablation_report.md'}")
     return 1 if any(record.status == "ERROR" for record in report.records) else 0
+
+
+def _emit_attempt_result(result: dict, *, as_json: bool) -> int:
+    import json
+
+    if as_json:
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+        return 0
+    for key, value in result.items():
+        if value is not None:
+            print(f"{key}: {value}")
+    return 0
+
+
+def _cmd_ablation_attempt_register(args) -> int:
+    from .formal_attempt_cli import register_formal_attempt
+
+    result = register_formal_attempt(
+        repo_root=Path.cwd(),
+        config=_config(args),
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        docker_image_id=args.docker_image_id,
+        witness_remote_name=args.witness_remote,
+    )
+    return _emit_attempt_result(result, as_json=args.json)
+
+
+def _cmd_ablation_attempt_status(args) -> int:
+    from .formal_attempt_cli import formal_attempt_status
+
+    return _emit_attempt_result(
+        formal_attempt_status(repo_root=Path.cwd()),
+        as_json=args.json,
+    )
+
+
+def _cmd_ablation_attempt_complete(args) -> int:
+    from .formal_attempt_cli import complete_formal_attempt
+
+    return _emit_attempt_result(
+        complete_formal_attempt(repo_root=Path.cwd()),
+        as_json=args.json,
+    )
+
+
+def _cmd_ablation_attempt_abandon(args) -> int:
+    from .formal_attempt_cli import abandon_formal_attempt
+
+    result = abandon_formal_attempt(
+        repo_root=Path.cwd(),
+        reason_code=args.reason_code,
+        reason=args.reason,
+    )
+    return _emit_attempt_result(result, as_json=args.json)
 
 
 def _cmd_horizon(args) -> int:
@@ -569,6 +625,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="where the independent final scorer runs (docker for untrusted repos)",
     )
     pab.set_defaults(func=_cmd_ablate)
+
+    pat = sub.add_parser(
+        "ablation-attempt",
+        help="register, inspect, complete, or abandon a one-shot formal ablation",
+    )
+    attempt_sub = pat.add_subparsers(dest="attempt_cmd", required=True)
+    patr = attempt_sub.add_parser(
+        "register",
+        help="write a REGISTERED event after resolving every formal input",
+    )
+    patr.add_argument("--model", required=True, help="exact Codex model")
+    patr.add_argument(
+        "--reasoning-effort",
+        required=True,
+        help="exact Codex reasoning effort",
+    )
+    patr.add_argument(
+        "--docker-image-id",
+        required=True,
+        help="immutable Docker image ID (sha256:..., tags are rejected)",
+    )
+    patr.add_argument(
+        "--witness-remote",
+        default="formal-witness",
+        help="repository-local public HTTPS witness remote",
+    )
+    patr.add_argument("--json", action="store_true")
+    patr.set_defaults(func=_cmd_ablation_attempt_register)
+
+    pats = attempt_sub.add_parser("status", help="read the current attempt state")
+    pats.add_argument("--json", action="store_true")
+    pats.set_defaults(func=_cmd_ablation_attempt_status)
+
+    patc = attempt_sub.add_parser(
+        "complete",
+        help="validate all formal evidence and write a COMPLETED event",
+    )
+    patc.add_argument("--json", action="store_true")
+    patc.set_defaults(func=_cmd_ablation_attempt_complete)
+
+    pata = attempt_sub.add_parser(
+        "abandon",
+        help="write an explicit ABANDONED event for the open attempt",
+    )
+    pata.add_argument("--reason-code", required=True)
+    pata.add_argument("--reason", required=True)
+    pata.add_argument("--json", action="store_true")
+    pata.set_defaults(func=_cmd_ablation_attempt_abandon)
 
     ph = sub.add_parser("horizon", help="compose measured outcomes across task counts")
     ph.add_argument(

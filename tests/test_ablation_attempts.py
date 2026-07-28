@@ -11,6 +11,7 @@ from lha.ablation_attempts import (
     FormalAblationAttemptRegistry,
     FormalAblationProtocol,
     FormalCodexClientConfig,
+    FormalGitCredentialHelper,
     RegisteredAttempt,
     UnregisteredRunRecorded,
     formal_ablation_protocol_sha256,
@@ -23,7 +24,18 @@ from lha.ablation_attempts import (
 _TIME = "2026-07-28T12:00:00+08:00"
 
 
-def _protocol() -> FormalAblationProtocol:
+def _credential_helper() -> FormalGitCredentialHelper:
+    path = "/opt/homebrew/bin/gh"
+    return FormalGitCredentialHelper(
+        host="github.com",
+        executable_path=path,
+        executable_sha256="8" * 64,
+        version="gh version 2.92.0",
+        command=f"!{path} auth git-credential",
+    )
+
+
+def _protocol(*, legacy: bool = False) -> FormalAblationProtocol:
     client = FormalCodexClientConfig(
         max_retries=2,
         timeout_s=300.0,
@@ -40,6 +52,9 @@ def _protocol() -> FormalAblationProtocol:
         codex_cli_executable_sha256="9" * 64,
         codex_client=client,
         codex_client_sha256=formal_codex_client_sha256(client),
+        witness_credential_helper=(
+            None if legacy else _credential_helper()
+        ),
     )
 
 
@@ -49,6 +64,10 @@ def _registered(
     protocol: FormalAblationProtocol | None = None,
 ) -> RegisteredAttempt:
     selected = protocol or _protocol()
+    if selected.witness_credential_helper is None:
+        selected = selected.model_copy(
+            update={"witness_credential_helper": _credential_helper()}
+        )
     return RegisteredAttempt(
         attempt_id=attempt_id,
         protocol_sha256=formal_ablation_protocol_sha256(selected),
@@ -63,8 +82,9 @@ def _registered(
         codex_cli_executable_sha256=selected.codex_cli_executable_sha256,
         codex_client=selected.codex_client,
         codex_client_sha256=selected.codex_client_sha256,
+        witness_credential_helper=selected.witness_credential_helper,
         witness_remote_name="formal-witness",
-        witness_remote_url="git@github.com:example/lha-formal-witness.git",
+        witness_remote_url="https://github.com/example/lha-formal-witness.git",
         registered_at=_TIME,
     )
 
@@ -171,7 +191,7 @@ def test_terminal_attempt_cannot_change_state():
 
 
 def test_unregistered_disclosure_never_opens_an_attempt():
-    protocol = _protocol()
+    protocol = _protocol(legacy=True)
     disclosure = UnregisteredRunRecorded(
         attempt_id="1" * 64,
         protocol_sha256=formal_ablation_protocol_sha256(protocol),
@@ -214,7 +234,7 @@ def test_unregistered_disclosure_never_opens_an_attempt():
 
 
 def test_unregistered_disclosure_consumes_the_same_selection():
-    protocol = _protocol()
+    protocol = _protocol(legacy=True)
     disclosure = UnregisteredRunRecorded(
         attempt_id="1" * 64,
         protocol_sha256=formal_ablation_protocol_sha256(protocol),
@@ -298,8 +318,9 @@ def test_protocol_digest_cannot_be_replaced():
             codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
             codex_client=protocol.codex_client,
             codex_client_sha256=protocol.codex_client_sha256,
+            witness_credential_helper=protocol.witness_credential_helper,
             witness_remote_name="formal-witness",
-            witness_remote_url="git@github.com:example/lha-formal-witness.git",
+            witness_remote_url="https://github.com/example/lha-formal-witness.git",
             registered_at=_TIME,
         )
 
@@ -339,6 +360,26 @@ def test_codex_retry_configuration_changes_the_selection():
     )
 
 
+def test_witness_helper_changes_provenance_but_not_experiment_selection():
+    first = _protocol()
+    helper = first.witness_credential_helper
+    assert helper is not None
+    second = first.model_copy(
+        update={
+            "witness_credential_helper": helper.model_copy(
+                update={"executable_sha256": "7" * 64}
+            )
+        }
+    )
+
+    assert formal_ablation_protocol_sha256(first) != formal_ablation_protocol_sha256(
+        second
+    )
+    assert formal_ablation_selection_sha256(first) == formal_ablation_selection_sha256(
+        second
+    )
+
+
 def test_registered_output_is_derived_from_attempt_id():
     protocol = _protocol()
 
@@ -357,14 +398,52 @@ def test_registered_output_is_derived_from_attempt_id():
             codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
             codex_client=protocol.codex_client,
             codex_client_sha256=protocol.codex_client_sha256,
+            witness_credential_helper=protocol.witness_credential_helper,
             witness_remote_name="formal-witness",
-            witness_remote_url="git@github.com:example/lha-formal-witness.git",
+            witness_remote_url="https://github.com/example/lha-formal-witness.git",
             registered_at=_TIME,
         )
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "/tmp/witness.git",
+        "git@github.com:example/lha.git",
+        "ssh://git@github.com/example/lha.git",
+        "https://user@github.com/example/lha.git",
+        "https://github.com:443/example/lha.git",
+        "https://github.com/example/lha.git?ref=main",
+        "https://localhost/example/lha.git",
+        "https://github.com/",
+        "https://github.com/example//lha.git",
+        "https://github.com/example/%2e%2e/lha.git",
+    ],
+)
+def test_registered_witness_requires_canonical_public_https(url: str):
+    registration = _registered("1" * 64)
+    fields = registration.model_dump(mode="python")
+    fields["witness_remote_url"] = url
+
+    with pytest.raises(ValidationError, match="witness remote URL"):
+        RegisteredAttempt(**fields)
+
+
+def test_registered_witness_helper_must_match_remote_host():
+    registration = _registered("1" * 64)
+    fields = registration.model_dump(mode="python")
+    helper = registration.witness_credential_helper
+    assert helper is not None
+    fields["witness_credential_helper"] = helper.model_copy(
+        update={"host": "gitlab.com"}
+    )
+
+    with pytest.raises(ValidationError, match="host does not match"):
+        RegisteredAttempt(**fields)
+
+
 def test_unregistered_disclosure_requires_complete_condition_counts():
-    protocol = _protocol()
+    protocol = _protocol(legacy=True)
     fields = {
         "attempt_id": "1" * 64,
         "protocol_sha256": formal_ablation_protocol_sha256(protocol),
@@ -408,7 +487,7 @@ def test_unregistered_disclosure_requires_complete_condition_counts():
 def test_registry_rejects_unknown_fields():
     registration = _registered("1" * 64)
     raw = {
-        "schema_version": 1,
+        "schema_version": 2,
         "events": [
             {
                 **registration.model_dump(mode="json"),

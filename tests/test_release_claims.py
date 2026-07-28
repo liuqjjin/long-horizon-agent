@@ -35,6 +35,7 @@ from lha.ablation_attempts import (
     FormalAblationAttemptRegistry,
     FormalAblationProtocol,
     FormalCodexClientConfig,
+    FormalGitCredentialHelper,
     RegisteredAttempt,
     UnregisteredRunRecorded,
     formal_ablation_attempt_registry_bytes,
@@ -51,6 +52,17 @@ from lha.horizon import run_horizon
 from lha.release_claims import ReleaseClaimsError, validate_release_claims
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _formal_git_credential_helper() -> FormalGitCredentialHelper:
+    path = "/opt/homebrew/bin/gh"
+    return FormalGitCredentialHelper(
+        host="github.com",
+        executable_path=path,
+        executable_sha256="8" * 64,
+        version="gh version 2.92.0",
+        command=f"!{path} auth git-credential",
+    )
 
 
 def test_committed_public_claims_validate():
@@ -2019,8 +2031,19 @@ def _formal_attempt_release_fixture(
     _git(root, "config", "user.name", "Test")
     _git(root, "config", "user.email", "test@example.com")
     witness_remote = (root.parent / f"{root.name}-formal-witness.git").resolve()
+    witness_url = f"https://github.com/example/{root.name}-formal-witness.git"
     _git(root, "init", "--bare", "-q", str(witness_remote))
-    _git(root, "remote", "add", "formal-witness", str(witness_remote))
+    _git(root, "remote", "add", "formal-witness", witness_url)
+    original_git_success = claims._git_success
+
+    def mapped_git_success(repo_root, arguments, **kwargs):
+        mapped = [
+            str(witness_remote) if value == witness_url else value
+            for value in arguments
+        ]
+        return original_git_success(repo_root, mapped, **kwargs)
+
+    monkeypatch.setattr(claims, "_git_success", mapped_git_success)
     _git(root, "add", ".")
     _git(root, "commit", "-qm", "source for formal attempt")
     source_commit = _git(root, "rev-parse", "HEAD")
@@ -2045,6 +2068,7 @@ def _formal_attempt_release_fixture(
         ],
         codex_client=codex_client,
         codex_client_sha256=formal_codex_client_sha256(codex_client),
+        witness_credential_helper=_formal_git_credential_helper(),
     )
     protocol_sha256 = formal_ablation_protocol_sha256(protocol)
     registration = RegisteredAttempt(
@@ -2061,8 +2085,9 @@ def _formal_attempt_release_fixture(
         codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
         codex_client=protocol.codex_client,
         codex_client_sha256=protocol.codex_client_sha256,
+        witness_credential_helper=protocol.witness_credential_helper,
         witness_remote_name="formal-witness",
-        witness_remote_url=str(witness_remote),
+        witness_remote_url=witness_url,
         registered_at="2026-07-28T12:00:00+08:00",
     )
     registration_registry = FormalAblationAttemptRegistry(events=(registration,))
@@ -2122,7 +2147,7 @@ def _formal_attempt_release_fixture(
             "formal_attempt_protocol_sha256": protocol_sha256,
             "formal_attempt_registration_commit": registration_commit,
             "formal_attempt_witness_remote_name": "formal-witness",
-            "formal_attempt_witness_remote_url": str(witness_remote),
+            "formal_attempt_witness_remote_url": witness_url,
             "formal_attempt_witness_ref": witness_ref,
             "formal_attempt_witness_commit": witness_commit,
         }
@@ -2430,6 +2455,7 @@ def test_formal_attempt_release_rejects_a_second_completed_protocol(
         codex_cli_executable_sha256=first.codex_cli_executable_sha256,
         codex_client=first.codex_client,
         codex_client_sha256=first.codex_client_sha256,
+        witness_credential_helper=first.witness_credential_helper,
         witness_remote_name=first.witness_remote_name,
         witness_remote_url=first.witness_remote_url,
         registered_at="2026-07-28T14:00:00+08:00",

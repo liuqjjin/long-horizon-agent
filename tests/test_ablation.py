@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,82 @@ _PYPROJECT = (
     '[tool.pytest.ini_options]\npythonpath = ["."]\n'
 )
 _TEST = "from m import f\n\n\ndef test_f():\n    assert f() == 2\n"
+_FORMAL_TEST_REMOTES: dict[str, str] = {}
+
+
+@pytest.fixture(autouse=True)
+def _translate_formal_test_remotes(monkeypatch, request, tmp_path):
+    """Keep production URLs public while using local bare remotes in tests."""
+    import lha.ablation as abl
+
+    original_anonymous = abl._formal_anonymous_git_output
+    original_run = abl.run
+    original_helper = abl._formal_git_credential_helper
+
+    def translated(values):
+        return [
+            _FORMAL_TEST_REMOTES.get(value, value)
+            for value in values
+        ]
+
+    def anonymous(git_path, arguments, **kwargs):
+        return original_anonymous(
+            git_path,
+            translated(arguments),
+            **kwargs,
+        )
+
+    def run(command, **kwargs):
+        return original_run(translated(command), **kwargs)
+
+    def credential_helper(host, *, expected=None):
+        if expected is not None:
+            return expected
+        return original_helper(host)
+
+    @contextmanager
+    def authenticated_env(helper):
+        home = tmp_path / "formal-auth-home"
+        home.mkdir(exist_ok=True)
+        env = abl._git_control_env()
+        env.update(
+            {
+                "HOME": str(home),
+                "GH_CONFIG_DIR": str(home),
+                "GH_HOST": helper.host,
+                "GH_TOKEN": "test-token",
+            }
+        )
+        try:
+            yield env
+        finally:
+            env.pop("GH_TOKEN", None)
+
+    monkeypatch.setattr(abl, "_formal_anonymous_git_output", anonymous)
+    monkeypatch.setattr(abl, "run", run)
+    if request.node.name != "test_formal_authenticated_git_env_is_disposable":
+        monkeypatch.setattr(
+            abl,
+            "_git_authenticated_push_env",
+            authenticated_env,
+        )
+    if not request.node.name.startswith(
+        "test_formal_git_credential_preflight_"
+    ):
+        monkeypatch.setattr(
+            abl,
+            "_preflight_formal_git_credential_helper",
+            lambda *_args, **_kwargs: {
+                "host": "github.com",
+                "fields": ("host", "password", "protocol", "username"),
+            },
+        )
+    if request.node.name != "test_formal_git_helper_identity_uses_disposable_home":
+        monkeypatch.setattr(
+            abl,
+            "_formal_git_credential_helper",
+            credential_helper,
+        )
 
 
 def _hold_formal_output_lock(path: str, ready, release) -> None:
@@ -88,6 +165,7 @@ def _formal_attempt_repository(
         FormalAblationAttemptRegistry,
         FormalAblationProtocol,
         FormalCodexClientConfig,
+        FormalGitCredentialHelper,
         RegisteredAttempt,
         UnregisteredRunRecorded,
         formal_ablation_attempt_registry_bytes,
@@ -100,11 +178,76 @@ def _formal_attempt_repository(
     _git(root, "config", "user.name", "LHA Test")
     _git(root, "config", "user.email", "lha@example.invalid")
     witness_remote = (root.parent / f"{root.name}-formal-witness.git").resolve()
+    witness_url = f"https://github.com/example/{root.name}-formal-witness.git"
+    _FORMAL_TEST_REMOTES[witness_url] = str(witness_remote)
     _git(root, "init", "--bare", "-q", str(witness_remote))
-    _git(root, "remote", "add", "formal-witness", str(witness_remote))
+    _git(root, "remote", "add", "formal-witness", witness_url)
     (root / ".gitignore").write_text("runs/\n")
-    (root / "source.py").write_text("VALUE = 1\n")
-    _git(root, "add", ".gitignore", "source.py")
+    (root / "src" / "lha").mkdir(parents=True)
+    (root / "src" / "lha" / "runtime.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    (root / "pyproject.toml").write_text(
+        "[project]\nname = \"formal-test\"\nversion = \"0.0.0\"\n",
+        encoding="utf-8",
+    )
+    (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    (root / ".python-version").write_text("3.11\n", encoding="utf-8")
+    manifest_entries = []
+    for index in range(17):
+        name = f"task_{index:02d}"
+        corpus_relative = f"data/bench/{name}"
+        task_relative = f"data/tasks/{name}.yaml"
+        corpus = root / corpus_relative
+        corpus.mkdir(parents=True)
+        (corpus / "module.py").write_text(
+            f"VALUE = {index}\n",
+            encoding="utf-8",
+        )
+        task = root / task_relative
+        task.parent.mkdir(parents=True, exist_ok=True)
+        task.write_text(
+            "\n".join(
+                (
+                    "kind: issue_to_pr",
+                    f"title: fix {name}",
+                    f"description: repair {name}",
+                    f"target_repo: {corpus_relative}",
+                    "inputs: {}",
+                    "success:",
+                    '  - "pytest passes"',
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        manifest_entries.append(
+            {
+                "name": name,
+                "task_path": task_relative,
+                "task_sha256": hashlib.sha256(task.read_bytes()).hexdigest(),
+                "corpus_path": corpus_relative,
+                "corpus_sha256": abl._repo_digest(corpus),
+            }
+        )
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "corpus")
+    corpus_commit = _git(root, "rev-parse", "HEAD")
+    manifest = {
+        "schema_version": 1,
+        "benchmark": "lha-verification-ablation",
+        "repetitions": 12,
+        "corpus_commit": corpus_commit,
+        "tasks": manifest_entries,
+    }
+    manifest_path = root / "benchmarks" / "formal_ablation_manifest.json"
+    manifest_path.parent.mkdir()
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", "benchmarks/formal_ablation_manifest.json")
     _git(root, "commit", "-qm", "source")
     source_commit = _git(root, "rev-parse", "HEAD")
 
@@ -113,10 +256,20 @@ def _formal_attempt_repository(
         timeout_s=300.0,
         retry_backoff_s=1.0,
     )
+    helper_path = "/opt/homebrew/bin/gh"
+    credential_helper = FormalGitCredentialHelper(
+        host="github.com",
+        executable_path=helper_path,
+        executable_sha256="8" * 64,
+        version="gh version 2.92.0",
+        command=f"!{helper_path} auth git-credential",
+    )
     protocol = FormalAblationProtocol(
         source_commit=source_commit,
-        source_tree_sha256=abl._source_tree_digest(abl._source_file_digests()),
-        manifest_sha256="b" * 64,
+        source_tree_sha256=abl._source_tree_digest(
+            abl._source_file_digests(root / "src" / "lha")
+        ),
+        manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         model="model-x",
         reasoning_effort="medium",
         docker_image_id="sha256:" + "c" * 64,
@@ -124,6 +277,9 @@ def _formal_attempt_repository(
         codex_cli_executable_sha256="9" * 64,
         codex_client=client_config,
         codex_client_sha256=formal_codex_client_sha256(client_config),
+        witness_credential_helper=(
+            credential_helper if event == "REGISTERED" else None
+        ),
     )
     event_type = {
         "REGISTERED": RegisteredAttempt,
@@ -147,8 +303,9 @@ def _formal_attempt_repository(
     if event == "REGISTERED":
         attempt_event = event_type(
             **common,
+            witness_credential_helper=credential_helper,
             witness_remote_name="formal-witness",
-            witness_remote_url=str(witness_remote),
+            witness_remote_url=witness_url,
             registered_at="2026-07-28T12:00:00+08:00",
         )
     else:
@@ -177,12 +334,20 @@ def _formal_attempt_repository(
         )
     registry = FormalAblationAttemptRegistry(events=(attempt_event,))
     registry_path = root / "benchmarks" / "formal_ablation_attempts.json"
-    registry_path.parent.mkdir()
+    registry_path.parent.mkdir(exist_ok=True)
     registry_path.write_bytes(formal_ablation_attempt_registry_bytes(registry))
     if tracked:
         _git(root, "add", "benchmarks/formal_ablation_attempts.json")
         _git(root, "commit", "-qm", "register formal attempt")
     head = _git(root, "rev-parse", "HEAD")
+    branch = _git(root, "symbolic-ref", "--short", "HEAD")
+    _git(
+        root,
+        "push",
+        "-q",
+        str(witness_remote),
+        f"HEAD:refs/heads/{branch}",
+    )
     binding = abl._FormalCorpusBinding(
         path="benchmarks/formal_ablation_manifest.json",
         sha256=protocol.manifest_sha256,
@@ -252,7 +417,11 @@ def _run_formal_until_registration(
         lambda *args, **kwargs: "sha256:" + "c" * 64,
     )
     monkeypatch.setattr(client, "preflight", preflight)
-    monkeypatch.setattr(abl, "_make_llm", lambda *args, **kwargs: client)
+    monkeypatch.setattr(
+        abl,
+        "make_formal_codex_client",
+        lambda *args, **kwargs: client,
+    )
     return run_ablation(
         _base(repo),
         [],
@@ -965,6 +1134,24 @@ def test_formal_output_path_rejects_symbolic_link_parent(tmp_path):
             raise AssertionError("symbolic parent directory was accepted")
 
 
+def test_formal_evidence_path_rejects_intermediate_symlink(tmp_path):
+    import lha.ablation as abl
+
+    root = tmp_path / "repo"
+    real = root / "real"
+    real.mkdir(parents=True)
+    (real / "task.yaml").write_text("kind: issue_to_pr\n", encoding="utf-8")
+    (root / "data").mkdir()
+    (root / "data" / "alias").symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must not contain a symlink"):
+        abl._repo_relative_evidence_path(
+            root,
+            "data/alias/task.yaml",
+            kind="task",
+        )
+
+
 def test_formal_attempt_binding_accepts_committed_matching_registration(
     tmp_path,
     monkeypatch,
@@ -1000,6 +1187,677 @@ def test_formal_attempt_binding_accepts_committed_matching_registration(
     assert attempt_binding.protocol_sha256 == formal_ablation_protocol_sha256(
         protocol
     )
+
+
+@pytest.mark.parametrize(
+    "index_flag",
+    ["--assume-unchanged", "--skip-worktree"],
+)
+def test_formal_head_binding_rejects_hidden_source_drift(
+    tmp_path,
+    monkeypatch,
+    index_flag,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    source = repo / "src" / "lha" / "runtime.py"
+    _git(repo, "update-index", index_flag, "--", "src/lha/runtime.py")
+    source.write_text("VALUE = 99\n", encoding="utf-8")
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="source bytes differ"):
+        abl._revalidate_formal_checkout(binding)
+
+
+def test_formal_head_binding_rejects_hidden_executable_bit_drift(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    relative = "src/lha/runtime.py"
+    source = repo / relative
+    _git(repo, "update-index", "--assume-unchanged", "--", relative)
+    source.chmod(source.stat().st_mode | 0o111)
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="file mode differs"):
+        abl._revalidate_formal_checkout(binding)
+
+
+def test_formal_completion_rejects_hidden_source_drift(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+    import lha.formal_attempt_cli as commands
+    from lha.ablation_attempts import parse_formal_ablation_attempt_registry
+
+    repo = tmp_path / "repo"
+    binding, _protocol, registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    registry = parse_formal_ablation_attempt_registry(registry_path.read_bytes())
+    registration = registry.open_registration()
+    assert registration is not None
+    source = repo / "src" / "lha" / "runtime.py"
+    _git(
+        repo,
+        "update-index",
+        "--skip-worktree",
+        "--",
+        "src/lha/runtime.py",
+    )
+    source.write_text("VALUE = 99\n", encoding="utf-8")
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with pytest.raises(
+        commands.FormalAttemptCommandError,
+        match="changed before completion",
+    ):
+        commands._validate_registration_checkout(
+            repo,
+            registration_head=binding.preregistration_commit,
+            registration=registration,
+        )
+
+
+def test_formal_head_binding_rejects_excluded_untracked_source(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.write_text("src/lha/hidden.py\n", encoding="utf-8")
+    (repo / "src" / "lha" / "hidden.py").write_text(
+        "HIDDEN = True\n",
+        encoding="utf-8",
+    )
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="source bytes differ"):
+        abl._revalidate_formal_checkout(binding)
+
+
+def test_formal_head_binding_rejects_excluded_untracked_manifest(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    manifest = repo / "benchmarks" / "formal_ablation_manifest.json"
+    payload = manifest.read_bytes()
+    _git(repo, "rm", "-q", "benchmarks/formal_ablation_manifest.json")
+    _git(repo, "commit", "-qm", "remove manifest from head")
+    (repo / ".git" / "info" / "exclude").write_text(
+        "benchmarks/formal_ablation_manifest.json\n",
+        encoding="utf-8",
+    )
+    manifest.write_bytes(payload)
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    hidden_binding = abl._FormalCorpusBinding(
+        path=binding.path,
+        sha256=binding.sha256,
+        preregistration_commit=_git(repo, "rev-parse", "HEAD"),
+        git_executable=binding.git_executable,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="trusted HEAD blob"):
+        abl._revalidate_formal_checkout(hidden_binding)
+
+
+@pytest.mark.parametrize(
+    ("relative", "replacement", "message"),
+    [
+        (
+            "benchmarks/formal_ablation_manifest.json",
+            lambda current: current + "\n",
+            "manifest changed",
+        ),
+        (
+            "data/tasks/task_00.yaml",
+            lambda current: current + "# hidden task drift\n",
+            "formal corpus bytes disagree",
+        ),
+        (
+            "pyproject.toml",
+            lambda current: current + "\n# hidden control drift\n",
+            "control file",
+        ),
+    ],
+)
+def test_formal_head_binding_rejects_hidden_tracked_input_drift(
+    tmp_path,
+    monkeypatch,
+    relative,
+    replacement,
+    message,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    target = repo / relative
+    _git(repo, "update-index", "--assume-unchanged", "--", relative)
+    target.write_text(
+        replacement(target.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        abl._revalidate_formal_checkout(binding)
+
+
+def test_formal_head_binding_rejects_excluded_untracked_corpus_file(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.write_text(
+        "data/bench/task_00/hidden.py\n",
+        encoding="utf-8",
+    )
+    (repo / "data" / "bench" / "task_00" / "hidden.py").write_text(
+        "HIDDEN = True\n",
+        encoding="utf-8",
+    )
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with pytest.raises(ValueError, match="formal corpus bytes disagree"):
+        abl._revalidate_formal_checkout(binding)
+
+
+def test_formal_head_binding_rejects_excluded_corpus_directory_symlink(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    external = tmp_path / "external-corpus"
+    external.mkdir()
+    (external / "payload.py").write_text("COPIED = True\n", encoding="utf-8")
+    relative = "data/bench/task_00/hidden_dir"
+    (repo / ".git" / "info" / "exclude").write_text(
+        f"{relative}\n",
+        encoding="utf-8",
+    )
+    (repo / relative).symlink_to(external, target_is_directory=True)
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="link or special node"):
+        abl._revalidate_formal_checkout(binding)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "src/lha/runtime.py",
+        "data/bench/task_00/module.py",
+    ],
+)
+def test_formal_head_binding_rejects_hidden_hardlink(
+    tmp_path,
+    monkeypatch,
+    relative,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    target = repo / relative
+    payload = target.read_bytes()
+    external = tmp_path / f"external-{target.name}"
+    external.write_bytes(payload)
+    _git(repo, "update-index", "--assume-unchanged", "--", relative)
+    target.unlink()
+    os.link(external, target)
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with pytest.raises(RuntimeError, match="link or special node"):
+        abl._revalidate_formal_checkout(binding)
+
+
+def test_formal_git_plumbing_ignores_local_replace_objects(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    manifest = json.loads(
+        (repo / "benchmarks" / "formal_ablation_manifest.json").read_text()
+    )
+    _git(
+        repo,
+        "replace",
+        binding.preregistration_commit,
+        manifest["corpus_commit"],
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    assert abl._git_control_env()["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert abl._revalidate_formal_checkout(binding)
+
+
+def test_formal_git_remote_resolution_ignores_includes_and_rewrites(
+    tmp_path,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    included = tmp_path / "included.gitconfig"
+    included.write_text(
+        '[remote "formal-witness"]\n'
+        "    pushurl = https://github.com/attacker/other.git\n",
+        encoding="utf-8",
+    )
+    expected_url = _git(repo, "remote", "get-url", "formal-witness")
+    _git(repo, "config", "--local", "include.path", str(included))
+    _git(
+        repo,
+        "config",
+        "--local",
+        "url.file:///tmp/attacker.insteadOf",
+        "https://github.com/",
+    )
+    git_path = str(binding.git_executable["path"])
+
+    assert abl._git_control_env()["GIT_CONFIG"] == os.devnull
+    assert (
+        abl._formal_witness_remote_url(
+            git_path,
+            repository_root=repo,
+            remote_name="formal-witness",
+        )
+        == expected_url
+    )
+    _git(
+        repo,
+        "config",
+        "--local",
+        "--add",
+        "remote.formal-witness.pushurl",
+        "https://github.com/example/one.git",
+    )
+    _git(
+        repo,
+        "config",
+        "--local",
+        "--add",
+        "remote.formal-witness.pushurl",
+        "https://github.com/example/two.git",
+    )
+    with pytest.raises(RuntimeError, match="exactly one"):
+        abl._formal_witness_remote_url(
+            git_path,
+            repository_root=repo,
+            remote_name="formal-witness",
+        )
+
+
+def test_formal_git_helper_identity_uses_disposable_home(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    executable = tmp_path / "bin" / "gh"
+    executable.parent.mkdir()
+    executable.write_text(
+        "#!/bin/sh\n"
+        'mkdir -p "$XDG_STATE_HOME/gh"\n'
+        'printf "device" > "$XDG_STATE_HOME/gh/device-id"\n'
+        'printf "gh version test\\n"\n',
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(
+        abl,
+        "trusted_executable",
+        lambda *_args, **_kwargs: str(executable),
+    )
+
+    helper = abl._formal_git_credential_helper("github.com")
+
+    assert helper.executable_path == str(executable)
+    assert helper.version == "gh version test"
+    assert not (workspace / ".local").exists()
+    assert not (workspace / "state").exists()
+    executable.write_text(
+        "#!/bin/sh\nprintf 'gh version changed\\n'\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    with pytest.raises(RuntimeError, match="differs from its registration"):
+        abl._formal_git_credential_helper(
+            "github.com",
+            expected=helper,
+        )
+    assert not (workspace / ".local").exists()
+
+
+def test_formal_authenticated_git_env_is_disposable(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+    from lha.ablation_attempts import FormalGitCredentialHelper
+
+    config = (tmp_path / "gh-config").resolve()
+    config.mkdir(mode=0o700)
+    hosts = config / "hosts.yml"
+    hosts.write_text("github.com:\n  user: test\n", encoding="utf-8")
+    hosts.chmod(0o600)
+    executable = (tmp_path / "bin" / "gh").resolve()
+    executable.parent.mkdir()
+    executable.write_text(
+        "#!/bin/sh\n"
+        'mkdir -p "$XDG_STATE_HOME/gh" '
+        '"$XDG_CACHE_HOME/gh" "$XDG_DATA_HOME/gh"\n'
+        'printf "device" > "$XDG_STATE_HOME/gh/device-id"\n'
+        'printf "test-token\\n"\n',
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    helper = FormalGitCredentialHelper(
+        host="github.com",
+        executable_path=str(executable),
+        executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+        version="gh version test",
+        command=f"!{executable} auth git-credential",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("GH_CONFIG_DIR", str(config))
+
+    with abl._git_authenticated_push_env(helper) as environment:
+        home = Path(environment["HOME"])
+        temporary_root = home.parent
+        assert environment["GH_TOKEN"] == "test-token"
+        for key in (
+            "HOME",
+            "GH_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ):
+            assert Path(environment[key]).is_relative_to(temporary_root)
+        (home / "probe").mkdir()
+        assert (Path(environment["XDG_STATE_HOME"]) / "gh" / "device-id").is_file()
+
+    assert not temporary_root.exists()
+    assert hosts.read_text(encoding="utf-8") == "github.com:\n  user: test\n"
+    assert not (workspace / ".local").exists()
+
+
+def test_formal_git_credential_preflight_returns_only_field_names(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+    from lha.ablation_attempts import FormalGitCredentialHelper
+    from lha.tools.shell import ProcResult
+
+    helper = FormalGitCredentialHelper(
+        host="github.com",
+        executable_path="/opt/homebrew/bin/gh",
+        executable_sha256="8" * 64,
+        version="gh version test",
+        command="!/opt/homebrew/bin/gh auth git-credential",
+    )
+    observed: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = list(command)
+        observed["input"] = kwargs["input"]
+        return ProcResult(
+            0,
+            (
+                "protocol=https\n"
+                "host=github.com\n"
+                "username=x-access-token\n"
+                "password=test-secret\n"
+            ),
+            "",
+            0.01,
+        )
+
+    monkeypatch.setattr(abl, "run", fake_run)
+    summary = abl._preflight_formal_git_credential_helper(
+        str((tmp_path / "git").resolve()),
+        helper,
+    )
+
+    assert summary == {
+        "host": "github.com",
+        "fields": ("host", "password", "protocol", "username"),
+    }
+    assert "test-secret" not in json.dumps(summary)
+    assert "push" not in observed["command"]
+    assert "refs/" not in str(observed["input"])
+
+
+def test_formal_git_credential_preflight_rejects_unknown_fields_without_values(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+    from lha.ablation_attempts import FormalGitCredentialHelper
+    from lha.tools.shell import ProcResult
+
+    helper = FormalGitCredentialHelper(
+        host="github.com",
+        executable_path="/opt/homebrew/bin/gh",
+        executable_sha256="8" * 64,
+        version="gh version test",
+        command="!/opt/homebrew/bin/gh auth git-credential",
+    )
+    monkeypatch.setattr(
+        abl,
+        "run",
+        lambda *_args, **_kwargs: ProcResult(
+            0,
+            (
+                "protocol=https\n"
+                "host=github.com\n"
+                "username=x-access-token\n"
+                "password=test-secret\n"
+                "unexpected=test-secret\n"
+            ),
+            "",
+            0.01,
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as captured:
+        abl._preflight_formal_git_credential_helper(
+            str((tmp_path / "git").resolve()),
+            helper,
+        )
+    assert "test-secret" not in str(captured.value)
+
+
+def test_formal_runner_rejects_source_only_remote_branch(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    output_path = f"runs/formal_ablation/{'a' * 64}"
+    binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    branch = _git(repo, "symbolic-ref", "--short", "HEAD")
+    witness_url = _git(repo, "remote", "get-url", "formal-witness")
+    _git(
+        repo,
+        "push",
+        "-q",
+        "--force",
+        _FORMAL_TEST_REMOTES[witness_url],
+        f"{protocol.source_commit}:refs/heads/{branch}",
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        with pytest.raises(RuntimeError, match="not published"):
+            abl._bind_formal_attempt(
+                formal_corpus=binding,
+                formal_output_lease=output_lease,
+                model=protocol.model,
+                reasoning_effort=protocol.reasoning_effort,
+                docker_image_id=protocol.docker_image_id,
+                source_tree_sha256=protocol.source_tree_sha256,
+                codex_cli_version=protocol.codex_cli_version,
+                codex_cli_executable_sha256=(
+                    protocol.codex_cli_executable_sha256
+                ),
+                codex_client=protocol.codex_client,
+            )
+
+
+def test_registration_rejects_hidden_source_before_external_preflights(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.formal_attempt_cli as commands
+    from lha.ablation_attempts import (
+        FormalAblationAttemptRegistry,
+        formal_ablation_attempt_registry_bytes,
+    )
+
+    repo = tmp_path / "repo"
+    _binding, protocol, registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+    )
+    registry_path.write_bytes(
+        formal_ablation_attempt_registry_bytes(
+            FormalAblationAttemptRegistry(events=())
+        )
+    )
+    _git(repo, "add", "benchmarks/formal_ablation_attempts.json")
+    _git(repo, "commit", "-qm", "close test registry")
+    _git(
+        repo,
+        "update-index",
+        "--assume-unchanged",
+        "--",
+        "src/lha/runtime.py",
+    )
+    (repo / "src" / "lha" / "runtime.py").write_text(
+        "VALUE = 99\n",
+        encoding="utf-8",
+    )
+    assert _git(repo, "status", "--porcelain=v1") == ""
+    external_calls: list[str] = []
+
+    def forbidden(name):
+        def fail(*_args, **_kwargs):
+            external_calls.append(name)
+            raise AssertionError(f"{name} ran before trusted HEAD validation")
+
+        return fail
+
+    monkeypatch.setattr(commands, "_https_witness_remote", forbidden("remote"))
+    monkeypatch.setattr(commands, "_resolve_docker_image_id", forbidden("docker"))
+    monkeypatch.setattr(commands, "_probe_docker_image", forbidden("probe"))
+    monkeypatch.setattr(commands, "_codex_protocol", forbidden("codex"))
+
+    with pytest.raises(
+        commands.FormalAttemptCommandError,
+        match="trusted HEAD",
+    ):
+        commands.register_formal_attempt(
+            repo_root=repo,
+            config=Config(),
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            witness_remote_name="formal-witness",
+        )
+
+    assert external_calls == []
 
 
 def test_formal_run_rejects_an_injected_llm_before_writing_header(
@@ -1072,11 +1930,12 @@ def test_formal_run_rejects_witness_network_failure_before_model_call(
         event="REGISTERED",
         output_path=output_path,
     )
-    remote_path = Path(_git(repo, "remote", "get-url", "formal-witness"))
+    witness_url = _git(repo, "remote", "get-url", "formal-witness")
+    remote_path = Path(_FORMAL_TEST_REMOTES[witness_url])
     shutil.rmtree(remote_path)
     llm = _AuditedCodexLLM()
 
-    with pytest.raises(RuntimeError, match="start witness was not created"):
+    with pytest.raises(RuntimeError, match="registration branch confirmation"):
         _run_formal_until_registration(
             repo,
             binding,
@@ -1087,6 +1946,156 @@ def test_formal_run_rejects_witness_network_failure_before_model_call(
 
     assert llm.calls == 0
     assert not (repo / output_path / "formal_run.json").exists()
+
+
+def test_formal_header_is_durable_before_witness_push(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    output_path = f"runs/formal_ablation/{'a' * 64}"
+    binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+    original = abl._create_formal_start_witness
+    observed_header: list[bytes] = []
+
+    def create_witness(attempt, *, outcome_key, run_header_sha256):
+        header = (repo / output_path / "formal_run.json").read_bytes()
+        assert hashlib.sha256(header).hexdigest() == run_header_sha256
+        observed_header.append(header)
+        return original(
+            attempt,
+            outcome_key=outcome_key,
+            run_header_sha256=run_header_sha256,
+        )
+
+    monkeypatch.setattr(abl, "_create_formal_start_witness", create_witness)
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt = abl._bind_formal_attempt(
+            formal_corpus=binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=(
+                protocol.codex_cli_executable_sha256
+            ),
+            codex_client=protocol.codex_client,
+        )
+        run_binding = abl._initialize_formal_run(attempt, output_lease)
+
+    assert observed_header
+    assert run_binding.header_sha256 == hashlib.sha256(
+        observed_header[0]
+    ).hexdigest()
+
+
+def test_formal_witness_push_uses_only_the_registered_helper(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    output_path = f"runs/formal_ablation/{'a' * 64}"
+    binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+    original_run = abl.run
+    observed: list[tuple[list[str], dict[str, str]]] = []
+
+    def inspect_run(command, **kwargs):
+        if "push" in command:
+            observed.append((list(command), dict(kwargs["env"])))
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(abl, "run", inspect_run)
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt = abl._bind_formal_attempt(
+            formal_corpus=binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=(
+                protocol.codex_cli_executable_sha256
+            ),
+            codex_client=protocol.codex_client,
+        )
+        abl._initialize_formal_run(attempt, output_lease)
+
+    assert len(observed) == 1
+    command, environment = observed[0]
+    helper = protocol.witness_credential_helper
+    assert helper is not None
+    assert command[1:5] == [
+        "-c",
+        "credential.helper=",
+        "-c",
+        f"credential.https://github.com.helper={helper.command}",
+    ]
+    assert attempt.witness_remote_url in command
+    assert attempt.witness_remote_name not in command
+    assert environment["GIT_CONFIG"] == os.devnull
+    assert Path(environment["HOME"]).is_absolute()
+
+
+def test_witness_push_failure_leaves_complete_header_for_abandonment(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    output_path = f"runs/formal_ablation/{'a' * 64}"
+    binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    def fail_push(_attempt, *, outcome_key, run_header_sha256):
+        header = (repo / output_path / "formal_run.json").read_bytes()
+        parsed = json.loads(header)
+        assert parsed["outcome_key"] == outcome_key
+        assert hashlib.sha256(header).hexdigest() == run_header_sha256
+        raise RuntimeError("injected witness push failure")
+
+    monkeypatch.setattr(abl, "_create_formal_start_witness", fail_push)
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt = abl._bind_formal_attempt(
+            formal_corpus=binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=(
+                protocol.codex_cli_executable_sha256
+            ),
+            codex_client=protocol.codex_client,
+        )
+        with pytest.raises(RuntimeError, match="push failure"):
+            abl._initialize_formal_run(attempt, output_lease)
+
+    header = repo / output_path / "formal_run.json"
+    assert header.exists()
+    assert json.loads(header.read_bytes())["formal_attempt_id"] == "a" * 64
 
 
 def test_formal_run_header_prevents_retry_after_cell_files_are_deleted(
@@ -1185,7 +2194,7 @@ def test_formal_witness_prevents_retry_after_output_directory_is_deleted(
         repo,
         "ls-remote",
         "--refs",
-        first.witness_remote_url,
+        _FORMAL_TEST_REMOTES[first.witness_remote_url],
         first.witness_ref,
     )
     assert remote_ref == f"{first.witness_commit}\t{first.witness_ref}"
@@ -1281,7 +2290,7 @@ def test_concurrent_formal_witness_creation_has_one_winner(
     assert outcomes.count("rejected") == 1
 
 
-def test_header_failure_after_witness_push_consumes_the_attempt(
+def test_header_failure_happens_before_witness_creation(
     tmp_path,
     monkeypatch,
 ):
@@ -1328,21 +2337,17 @@ def test_header_failure_after_witness_push_consumes_the_attempt(
                 original_safety_check,
             )
 
-    shutil.rmtree(repo / output_path)
-    with abl._formal_ablation_lock(repo / output_path) as output_lease:
-        attempt = abl._bind_formal_attempt(
-            formal_corpus=corpus_binding,
-            formal_output_lease=output_lease,
-            model=protocol.model,
-            reasoning_effort=protocol.reasoning_effort,
-            docker_image_id=protocol.docker_image_id,
-            source_tree_sha256=protocol.source_tree_sha256,
-            codex_cli_version=protocol.codex_cli_version,
-            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
-            codex_client=protocol.codex_client,
+    assert (repo / output_path / "formal_run.json").exists()
+    assert (
+        _git(
+                repo,
+                "ls-remote",
+                "--refs",
+                _FORMAL_TEST_REMOTES[attempt.witness_remote_url],
+            attempt.witness_ref,
         )
-        with pytest.raises(RuntimeError, match="start witness was not created"):
-            abl._initialize_formal_run(attempt, output_lease)
+        == ""
+    )
 
 
 def test_unregistered_run_record_cannot_authorize_a_formal_run(
@@ -2932,6 +3937,55 @@ def test_report_rejects_source_tree_drift_during_run(tmp_path, monkeypatch):
     assert calls == 2
     assert not (out / "ablation_report.json").exists()
     assert not (out / "ablation_report.md").exists()
+
+
+def test_formal_report_json_is_last_commit_marker(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    out.mkdir()
+    source_files = {"runtime.py": "1" * 64}
+    binding = abl._FormalCorpusBinding(
+        path="benchmarks/formal_ablation_manifest.json",
+        sha256="2" * 64,
+        preregistration_commit="3" * 40,
+        git_executable={"path": "/usr/bin/git"},
+    )
+    revalidations = 0
+
+    def revalidate(_binding):
+        nonlocal revalidations
+        revalidations += 1
+        return source_files
+
+    original_write = abl._atomic_write
+    writes: list[str] = []
+
+    def fail_json(path, text, *, anchor=None):
+        writes.append(path.name)
+        if path.name == "ablation_report.json":
+            raise RuntimeError("injected report commit failure")
+        original_write(path, text, anchor=anchor)
+
+    monkeypatch.setattr(abl, "_revalidate_formal_checkout", revalidate)
+    monkeypatch.setattr(abl, "_atomic_write", fail_json)
+
+    with pytest.raises(RuntimeError, match="commit failure"):
+        abl._write_ablation_reports(
+            out,
+            report_json='{"schema_version":4}',
+            report_markdown="# report\n",
+            formal_corpus=binding,
+            source_files=source_files,
+        )
+
+    assert writes == ["ablation_report.md", "ablation_report.json"]
+    assert revalidations == 2
+    assert (out / "ablation_report.md").read_text() == "# report\n"
+    assert not (out / "ablation_report.json").exists()
 
 
 def test_completed_formal_output_directory_refuses_rerun(tmp_path, monkeypatch):

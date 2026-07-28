@@ -1132,6 +1132,7 @@ def _validate_formal_attempt_provenance(
     *,
     git_executable: str,
     head: str,
+    require_completion: bool = True,
 ) -> None:
     provenance = cast(dict[str, Any], raw["provenance"])
     attempt_id = cast(str, provenance["formal_attempt_id"])
@@ -1228,6 +1229,7 @@ def _validate_formal_attempt_provenance(
             ),
             codex_client=codex_client,
             codex_client_sha256=formal_codex_client_sha256(codex_client),
+            witness_credential_helper=registration.witness_credential_helper,
         )
     except ValueError as error:
         _fail(f"formal ablation attempt protocol is invalid: {error}")
@@ -1289,6 +1291,16 @@ def _validate_formal_attempt_provenance(
         _fail(f"formal ablation current attempt registry is invalid: {error}")
     if not registry_has_prefix(current_registry, registration_registry):
         _fail("formal ablation current attempt registry rewrites historical events")
+    if not require_completion:
+        if (
+            current_bytes != registration_bytes
+            or current_registry.open_registration() != registration
+        ):
+            _fail(
+                "formal ablation output does not match the still-open "
+                "registration at HEAD"
+            )
+        return
     if current_registry.open_registration() is not None:
         _fail("formal ablation release has an open attempt")
 
@@ -1532,6 +1544,8 @@ def _validate_formal_manifest_provenance(
     raw: dict[str, Any],
     tasks: list[str],
     repo_root: Path,
+    *,
+    require_completion: bool = True,
 ) -> None:
     provenance = cast(dict[str, Any], raw["provenance"])
     git_executable = _validate_git_executable_provenance(provenance)
@@ -1623,6 +1637,7 @@ def _validate_formal_manifest_provenance(
         repo_root,
         git_executable=git_executable,
         head=head,
+        require_completion=require_completion,
     )
 
     manifest_bytes = _git_success(
@@ -1689,6 +1704,8 @@ def _validate_provenance(
     raw: dict[str, Any],
     tasks: list[str],
     repo_root: Path,
+    *,
+    require_completion: bool = True,
 ) -> None:
     provenance_raw = raw.get("provenance")
     if not isinstance(provenance_raw, dict):
@@ -1889,7 +1906,15 @@ def _validate_provenance(
         for task in tasks
     ):
         _fail("formal ablation provenance has an invalid cell fingerprint")
-    _validate_formal_manifest_provenance(raw, tasks, repo_root)
+    if require_completion:
+        _validate_formal_manifest_provenance(raw, tasks, repo_root)
+    else:
+        _validate_formal_manifest_provenance(
+            raw,
+            tasks,
+            repo_root,
+            require_completion=False,
+        )
 
 
 def _validate_llm_call_audits(
@@ -2301,6 +2326,98 @@ def _validate_legacy_ablation_markdown(
     for expected in expected_p_values:
         if f"exact McNemar p = {expected:.2f}" not in markdown:
             _fail("legacy ablation Markdown has a stale McNemar p-value")
+
+
+def validate_formal_ablation_output(
+    report_dir: str | Path,
+    *,
+    repo_root: str | Path = ".",
+) -> dict[str, Any]:
+    """Validate a finished formal run before its ``COMPLETED`` event exists.
+
+    This is deliberately the same evidence gate used for a published schema-4
+    report, except that the attempt registry must still contain the matching
+    open registration.  A formal command may return non-zero because one or
+    more cells ended in ``ERROR``; complete cell seals and failed-call receipts
+    are still a valid, denominator-preserving formal result.
+    """
+    repository = Path(repo_root).resolve()
+    directory = Path(report_dir)
+    if not directory.is_absolute():
+        directory = repository / directory
+    try:
+        resolved_directory = directory.resolve(strict=True)
+        resolved_directory.relative_to(repository)
+    except (OSError, ValueError) as error:
+        _fail(f"formal ablation output directory is unsafe: {error}")
+    if directory.is_symlink() or not resolved_directory.is_dir():
+        _fail("formal ablation output directory must be a real directory")
+
+    ablation_json = resolved_directory / "ablation_report.json"
+    ablation_md = resolved_directory / "ablation_report.md"
+    raw = _load_json(ablation_json)
+    tasks, reps, records = _validate_record_grid(raw)
+    boundary_problems = _validate_condition_stats(raw, records)
+    report = _ablation_report_from_raw(raw)
+    if (
+        raw.get("schema_version") != 4
+        or len(tasks) != _FORMAL_TASK_COUNT
+        or reps != _FORMAL_REPETITIONS
+        or report.tasks != tasks
+        or report.reps != reps
+        or not report.model
+    ):
+        _fail(
+            "completed formal ablation output must contain the fixed "
+            f"{_FORMAL_TASK_COUNT}-task x {_FORMAL_REPETITIONS}-repetition grid"
+        )
+    try:
+        expected_tasks = _expected_formal_tasks(repository)
+    except (OSError, TypeError, ValueError) as error:
+        _fail(f"formal corpus manifest is invalid: {error}")
+    if tasks != expected_tasks:
+        _fail("formal ablation tasks differ from the fixed committed corpus")
+
+    provenance = raw.get("provenance")
+    if not isinstance(provenance, dict):
+        _fail("formal ablation report is missing provenance")
+    attempt_id = provenance.get("formal_attempt_id")
+    if (
+        not isinstance(attempt_id, str)
+        or resolved_directory
+        != repository / "runs" / "formal_ablation" / attempt_id
+    ):
+        _fail("formal ablation report is not in its registered output directory")
+
+    _validate_formal_error_cells(records)
+    _validate_record_artifacts(records)
+    _validate_artifact_store(raw, records, resolved_directory)
+    _validate_scorer_evidence_store(raw, records, resolved_directory)
+    _validate_provenance(
+        raw,
+        tasks,
+        repository,
+        require_completion=False,
+    )
+    _validate_operation_lease_store(
+        resolved_directory,
+        cast(dict[str, Any], provenance["configuration"]),
+    )
+    _validate_llm_call_audits(raw, tasks, reps, resolved_directory)
+    _validate_formal_fresh_cells(raw, tasks, reps, resolved_directory)
+    if boundary_problems:
+        _fail(
+            "formal ablation report violates the Wilson contract: "
+            + boundary_problems[0]
+        )
+    if raw.get("fingerprint") != _report_fingerprint(raw):
+        _fail("formal ablation report fingerprint does not match its contents")
+    markdown = _read_text(ablation_md)
+    if _LEGACY_ABLATION_MARKER in markdown.lower():
+        _fail("formal ablation Markdown is still labelled as a legacy snapshot")
+    if markdown.strip() != report.to_markdown().strip():
+        _fail("formal ablation Markdown was not generated from its JSON report")
+    return raw
 
 
 def _validate_ablation(ablation_json: Path, ablation_md: Path) -> _AblationFacts:

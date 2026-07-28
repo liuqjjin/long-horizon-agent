@@ -27,6 +27,7 @@ from pathlib import Path
 from random import Random
 
 from .bench.stats import mcnemar_exact, wilson_interval
+from .durable_io import atomic_replace_text, durable_mkdir_chain
 
 # horizon condition -> the ablation condition whose truth it reads
 CONDITIONS: list[tuple[str, str, str]] = [
@@ -311,7 +312,11 @@ def _milestones(n: int) -> list[int]:
 
 
 # --- loading -----------------------------------------------------------------
-def load_cells(report_path: str | Path) -> Cells:
+def load_cells(
+    report_path: str | Path,
+    *,
+    source_label: str | None = None,
+) -> Cells:
     """Read measured per-cell truth out of an ``ablation_report.json``.
 
     ``ERROR`` cells carry no measurement, but their scheduled repetition remains
@@ -425,7 +430,7 @@ def load_cells(report_path: str | Path) -> Cells:
         reps=reps,
         outcome=outcome,
         model=model,
-        source=str(path),
+        source=source_label or str(path),
     )
 
 
@@ -706,9 +711,8 @@ def _svg(report: HorizonReport) -> str:
 def run_horizon(report_path: str | Path, out_dir: str | Path, *, seed: int = 0) -> HorizonReport:
     """Compose the horizon analysis from a measured ablation report and write it out."""
     report = build_report(load_cells(report_path), seed=seed)
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "horizon_report.json").write_text(report.to_json())
-    (out / "horizon_report.md").write_text(report.to_markdown())
-    (out / "horizon_curve.svg").write_text(_svg(report))
+    out = durable_mkdir_chain(Path(out_dir))
+    atomic_replace_text(out / "horizon_report.json", report.to_json(), anchor=out)
+    atomic_replace_text(out / "horizon_report.md", report.to_markdown(), anchor=out)
+    atomic_replace_text(out / "horizon_curve.svg", _svg(report), anchor=out)
     return report

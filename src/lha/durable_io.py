@@ -507,6 +507,73 @@ def anchored_unlink_file(
         return True
 
 
+def anchored_unlink_file_if_bytes(
+    path: str | Path,
+    *,
+    anchor: str | Path,
+    expected_current: tuple[bytes, ...],
+    missing_ok: bool = False,
+) -> bool:
+    """Unlink only when the current complete bytes match an allowed value.
+
+    The content read, file-version comparison, and unlink all use one anchored
+    parent-directory descriptor. This closes the gap between a caller's
+    earlier validation and the destructive operation: a file replaced or
+    edited after that validation is preserved and reported as an error.
+    """
+    with _anchored_parent_descriptor(path, anchor=anchor, create=False) as (
+        directory_fd,
+        name,
+        target,
+    ):
+        current, expected = _read_regular_at(
+            directory_fd,
+            name,
+            target,
+            missing_ok=True,
+        )
+        if current is None:
+            if missing_ok:
+                return False
+            raise FileNotFoundError(target)
+        if not any(current == allowed for allowed in expected_current):
+            raise OSError(f"durable file content changed before unlink: {target}")
+        assert expected is not None
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            _require_regular_identity(expected, opened, target)
+            if not _same_file_version(expected, opened):
+                raise OSError(
+                    f"durable file version changed before content-CAS unlink: {target}"
+                )
+            named_after = _validate_named_regular(directory_fd, name, target)
+            if named_after is None or not _same_file_version(named_after, expected):
+                raise OSError(
+                    f"durable file identity changed before content-CAS unlink: {target}"
+                )
+            os.unlink(name, dir_fd=directory_fd)
+            unlinked = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(unlinked.st_mode)
+                or unlinked.st_nlink != 0
+                or not _same_inode(unlinked, opened)
+            ):
+                raise OSError(f"durable file unlink was not isolated: {target}")
+            os.fsync(directory_fd)
+            if _named_stat(directory_fd, name) is not None:
+                raise OSError(f"durable file name survived unlink: {target}")
+        finally:
+            os.close(descriptor)
+        return True
+
+
 def atomic_replace_temp_target_name(name: str) -> str | None:
     """Return the bound target for an exact atomic-replace temporary name."""
     match = _ATOMIC_REPLACE_TEMP.fullmatch(name)
@@ -732,6 +799,53 @@ def anchored_atomic_replace_bytes(
         target,
     ):
         expected = _validate_named_regular(directory_fd, name, target)
+        _replace_at(
+            directory_fd,
+            name,
+            target,
+            data,
+            expected=expected,
+            mode=mode,
+        )
+
+
+def anchored_replace_bytes_if_current(
+    path: str | Path,
+    data: bytes,
+    *,
+    anchor: str | Path,
+    expected_current: tuple[bytes, ...],
+    expected_missing: bool = False,
+    mode: int | None = None,
+) -> None:
+    """Replace only when current bytes, or permitted absence, match.
+
+    ``_read_regular_at`` returns the exact file version associated with the
+    accepted bytes. ``_replace_at`` then compares that version again in the
+    same parent-directory descriptor immediately before ``os.replace``. When
+    absence is accepted, exclusive parent traversal plus the same version check
+    prevents a file raced into the missing name from being overwritten.
+    """
+    with _anchored_parent_descriptor(
+        path,
+        anchor=anchor,
+        create=expected_missing,
+    ) as (
+        directory_fd,
+        name,
+        target,
+    ):
+        current, expected = _read_regular_at(
+            directory_fd,
+            name,
+            target,
+            missing_ok=expected_missing,
+        )
+        if current is None:
+            if not expected_missing:
+                raise FileNotFoundError(target)
+        elif not any(current == allowed for allowed in expected_current):
+            raise OSError(f"durable file content changed before replace: {target}")
         _replace_at(
             directory_fd,
             name,
