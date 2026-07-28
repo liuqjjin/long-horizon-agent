@@ -2,13 +2,16 @@
 
 The live adapter validates considerably more evidence than is suitable for a
 public repository: control records, Codex JSONL, broker receipts, and Harbor
-logs stay in the private run directory.  This module exports only the exact
-protocol and manifests, the scored records and summary, and each official
-Harbor trial ``result.json``.  A small index binds every exported byte.
+logs stay in the private run directory.  For the committed fixed-20 run, the
+16 PASS/FAIL files retain the official Harbor ``result.json`` bytes.  The four
+ERROR files are deterministic redacted projections bound to the official
+source SHA-256 values.  Those commitments detect substitution; the public
+package alone cannot reproduce or disclose the private tracebacks.
 
 The offline validator does not replace live validation.  It checks that the
 published files are the output of that validation, re-derives every scored row
-from the official trial result, and recomputes the fixed-20 summary.
+from the public trial evidence, and recomputes the fixed-20 summary.  Schema 4
+also binds the evaluated Git commit, Git tree, package version, and wheel hash.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypeVar
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
@@ -54,6 +58,7 @@ _SCORED_MANIFEST_FILE = "scored_manifest.json"
 _RECORDS_FILE = "records.json"
 _SUMMARY_FILE = "summary.json"
 _SUMMARY_MARKDOWN_FILE = "summary.md"
+_SOURCE_ATTESTATION_FILE = "source_attestation.json"
 _FIXED_FILES = frozenset(
     {
         _INDEX_FILE,
@@ -66,7 +71,14 @@ _FIXED_FILES = frozenset(
         _SUMMARY_MARKDOWN_FILE,
     }
 )
+_SCHEMA4_FIXED_FILES = _FIXED_FILES | {_SOURCE_ATTESTATION_FILE}
 _TRIAL_PATH_RE = re.compile(r"^trials/[0-9]{2}-[0-9a-f]{12}\.json$")
+_EXCEPTION_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,127}$")
+_PACKAGE_VERSION_RE = re.compile(r"^[0-9A-Za-z](?:[0-9A-Za-z.!+_-]{0,126})$")
+_WHEEL_FILENAME_RE = re.compile(
+    r"^lha-[0-9A-Za-z.!+_]+-(?:[0-9][0-9A-Za-z.]*-)?"
+    r"[0-9A-Za-z_.]+-[0-9A-Za-z_.]+-[0-9A-Za-z_.]+\.whl$"
+)
 _MAX_INDEX_BYTES = 256 * 1024
 _MAX_PROTOCOL_BYTES = 256 * 1024
 _MAX_MANIFEST_BYTES = 1024 * 1024
@@ -131,10 +143,13 @@ class PublicHarborTrial(BaseModel):
 
     instance_id: str
     path: str
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payload_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payload_kind: Literal["official", "redacted_error"]
     raw_status: Literal["PASS", "FAIL", "ERROR"]
     raw_correct: bool | None
     raw_protocol_error: str | None
+    exception_type: str | None
     duration_s: FiniteFloat | None = Field(default=None, ge=0)
     infrastructure_retries: Literal[0] | None = None
 
@@ -148,10 +163,129 @@ class PublicHarborTrial(BaseModel):
         if self.raw_status == "ERROR":
             if self.raw_protocol_error is None or not self.raw_protocol_error.strip():
                 raise ValueError("raw ERROR evidence requires a stable explanation")
+            if self.payload_kind != "redacted_error":
+                raise ValueError("raw ERROR evidence must use the redacted projection")
         elif self.raw_protocol_error is not None:
             raise ValueError("raw PASS and FAIL evidence may not claim a protocol error")
+        elif self.payload_kind != "official":
+            raise ValueError("raw PASS and FAIL evidence must keep the official payload")
+        if self.payload_kind == "official" and self.payload_sha256 != self.source_sha256:
+            raise ValueError("an official public payload must equal its source bytes")
+        if self.exception_type is not None:
+            if (
+                self.raw_status != "ERROR"
+                or _EXCEPTION_TYPE_RE.fullmatch(self.exception_type) is None
+                or self.raw_protocol_error
+                != f"Harbor trial exception: {self.exception_type}"
+            ):
+                raise ValueError("public exception type is inconsistent with the raw outcome")
+        elif self.raw_protocol_error is not None and self.raw_protocol_error.startswith(
+            "Harbor trial exception:"
+        ):
+            raise ValueError("public exception evidence omitted its exception type")
         if _TRIAL_PATH_RE.fullmatch(self.path) is None:
             raise ValueError("trial evidence path is not a fixed safe relative path")
+        return self
+
+
+class PublicHarborErrorProjection(BaseModel):
+    """Minimal deterministic projection of an official Harbor ERROR result."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    kind: Literal["terminal-bench-error-redaction"] = "terminal-bench-error-redaction"
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_name: str = Field(min_length=1)
+    task_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    raw_status: Literal["ERROR"] = "ERROR"
+    raw_correct: None = None
+    raw_protocol_error: str = Field(min_length=1)
+    exception_type: str | None = None
+    duration_s: FiniteFloat | None = Field(default=None, ge=0)
+    infrastructure_retries: Literal[0] | None = None
+
+    @model_validator(mode="after")
+    def _error_fields_are_safe_and_consistent(
+        self,
+    ) -> "PublicHarborErrorProjection":
+        if self.exception_type is not None:
+            if (
+                _EXCEPTION_TYPE_RE.fullmatch(self.exception_type) is None
+                or self.raw_protocol_error
+                != f"Harbor trial exception: {self.exception_type}"
+            ):
+                raise ValueError("redacted exception type is unsafe or inconsistent")
+        elif self.raw_protocol_error not in {
+            "Harbor trial omitted verifier_result",
+            "Harbor verifier omitted rewards",
+            "Harbor verifier omitted the official reward",
+        }:
+            raise ValueError("redacted ERROR reason is not an official stable outcome")
+        _assert_public_string(self.task_name, label="redacted ERROR task name")
+        _assert_public_string(
+            self.raw_protocol_error,
+            label="redacted ERROR explanation",
+        )
+        return self
+
+
+class SourceAttestation(BaseModel):
+    """Public identity of the source tree and wheel used by Harbor."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    repository_url: str = Field(min_length=1, max_length=512)
+    commit_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    tree_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    package_version: str = Field(min_length=1, max_length=127)
+    wheel_filename: str = Field(min_length=1, max_length=255)
+    wheel_size_bytes: int = Field(gt=0, le=_MAX_PACKAGE_BYTES)
+    wheel_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reproducible_build_command: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def _public_source_identity_is_safe(self) -> "SourceAttestation":
+        parsed = urlsplit(self.repository_url)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("source repository URL has an invalid port") from exc
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in (None, 443)
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path.strip("/")
+            or self.repository_url != self.repository_url.strip()
+        ):
+            raise ValueError("source repository URL must be a public HTTPS repository")
+        if _PACKAGE_VERSION_RE.fullmatch(self.package_version) is None:
+            raise ValueError("source package version is malformed")
+        if (
+            _WHEEL_FILENAME_RE.fullmatch(self.wheel_filename) is None
+            or not self.wheel_filename.startswith(f"lha-{self.package_version}-")
+        ):
+            raise ValueError("source wheel filename does not match the LHA package version")
+        if (
+            self.reproducible_build_command != self.reproducible_build_command.strip()
+            or any(
+                character in self.reproducible_build_command
+                for character in ("\0", "\r", "\n")
+            )
+        ):
+            raise ValueError("reproducible build command must be one non-empty line")
+        for label, value in (
+            ("source repository URL", self.repository_url),
+            ("source package version", self.package_version),
+            ("source wheel filename", self.wheel_filename),
+            ("reproducible build command", self.reproducible_build_command),
+        ):
+            _assert_public_string(value, label=label)
         return self
 
 
@@ -160,7 +294,7 @@ class TerminalBenchPublicEvidenceIndex(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3, 4] = 3
     dataset: Literal["terminal-bench/terminal-bench-2-1"] = DATASET
     evaluation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     public_path_root: str
@@ -171,6 +305,11 @@ class TerminalBenchPublicEvidenceIndex(BaseModel):
     records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     summary_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     summary_markdown_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_attestation_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
     trials: tuple[PublicHarborTrial, ...]
 
     @model_validator(mode="after")
@@ -181,6 +320,8 @@ class TerminalBenchPublicEvidenceIndex(BaseModel):
             raise ValueError("public trial evidence contains duplicate instance ids")
         if len(paths) != len(set(paths)):
             raise ValueError("public trial evidence contains duplicate paths")
+        if (self.schema_version == 4) is (self.source_attestation_sha256 is None):
+            raise ValueError("schema 4 requires exactly one source attestation digest")
         _normalized_public_root(self.public_path_root)
         return self
 
@@ -195,6 +336,28 @@ class TerminalBenchPublicEvidenceValidation(BaseModel):
     protocol_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     scored_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     records_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evaluated_commit_sha: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+    )
+    evaluated_tree_sha: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+    )
+    evaluated_wheel_filename: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+    )
+    evaluated_wheel_size_bytes: int | None = Field(
+        default=None,
+        gt=0,
+        le=_MAX_PACKAGE_BYTES,
+    )
+    evaluated_wheel_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     model: str = Field(min_length=1)
     reasoning_effort: str = Field(min_length=1)
     harbor_version: str = Field(min_length=1)
@@ -209,6 +372,19 @@ class TerminalBenchPublicEvidenceValidation(BaseModel):
     ) -> "TerminalBenchPublicEvidenceValidation":
         if self.passed + self.failed + self.errors != 20:
             raise ValueError("public evidence must account for exactly 20 tasks")
+        source_identity = (
+            self.evaluated_commit_sha,
+            self.evaluated_tree_sha,
+            self.evaluated_wheel_filename,
+            self.evaluated_wheel_size_bytes,
+            self.evaluated_wheel_sha256,
+        )
+        if any(value is None for value in source_identity) and not all(
+            value is None for value in source_identity
+        ):
+            raise ValueError(
+                "evaluated commit, tree, and wheel identity must be reported together"
+            )
         return self
 
 
@@ -321,7 +497,7 @@ def export_terminal_bench_public_evidence(
 
     records_bytes = _canonical_model_bytes(records)
     summary_bytes = _canonical_model_bytes(summary)
-    summary_markdown_bytes = (summary.to_markdown() + "\n").encode()
+    summary_markdown_bytes = _summary_markdown_bytes(summary, schema_version=3)
     command_by_id = {command.instance_id: command for command in scored_commands}
     if (
         len(command_by_id) != len(scored_commands)
@@ -349,23 +525,52 @@ def export_terminal_bench_public_evidence(
             raise ValueError(f"official Harbor result bytes changed for {instance_id}")
         if trial_path.parent.parent != Path(command.job_dir):
             raise ValueError("official Harbor result moved outside its registered job")
-        _assert_public_payload(trial_result, label=f"trial {instance_id}")
         raw_status, raw_correct, raw_error = _official_trial_outcome(trial_result)
         duration = _official_trial_duration(trial_result)
         retries = _official_infrastructure_retries(trial_result)
+        exception_type = _official_exception_type(trial_result)
+        if raw_status == "ERROR":
+            if raw_error is None:
+                raise ValueError("official Harbor ERROR omitted its stable explanation")
+            _validate_raw_trial_binding(
+                trial_result,
+                protocol=protocol,
+                protocol_sha256=protocol_digest,
+                instance_id=instance_id,
+                smoke_seal_sha256=smoke_seal_digest,
+                public_path_root=public_root,
+            )
+            projection = PublicHarborErrorProjection(
+                source_sha256=expected_digest,
+                task_name=instance_id,
+                task_checksum=protocol.task_checksums[instance_id],
+                raw_protocol_error=raw_error,
+                exception_type=exception_type,
+                duration_s=duration,
+                infrastructure_retries=retries,
+            )
+            public_trial_bytes = _canonical_model_bytes(projection)
+            payload_kind: Literal["official", "redacted_error"] = "redacted_error"
+        else:
+            _assert_public_payload(trial_result, label=f"trial {instance_id}")
+            public_trial_bytes = raw
+            payload_kind = "official"
         relative_path = (
             f"trials/{number:02d}-"
             f"{hashlib.sha256(instance_id.encode()).hexdigest()[:12]}.json"
         )
-        trial_payloads[relative_path] = raw
+        trial_payloads[relative_path] = public_trial_bytes
         trial_index.append(
             PublicHarborTrial(
                 instance_id=instance_id,
                 path=relative_path,
-                sha256=expected_digest,
+                source_sha256=expected_digest,
+                payload_sha256=hashlib.sha256(public_trial_bytes).hexdigest(),
+                payload_kind=payload_kind,
                 raw_status=raw_status,
                 raw_correct=raw_correct,
                 raw_protocol_error=raw_error,
+                exception_type=exception_type,
                 duration_s=duration,
                 infrastructure_retries=retries,
             )
@@ -419,10 +624,149 @@ def export_terminal_bench_public_evidence(
     return validation
 
 
+def upgrade_terminal_bench_public_evidence(
+    source_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    source_attestation: SourceAttestation,
+) -> TerminalBenchPublicEvidenceValidation:
+    """Copy a validated schema-3 package into an attested schema-4 package.
+
+    The source is never changed.  Files are copied through bounded, no-follow
+    reads into a sibling temporary directory, the new package is validated
+    offline, and only then is the complete directory published.  The upgrade
+    also regenerates ``summary.md`` with the current wording while preserving
+    the measured JSON summary.
+    """
+    validate_terminal_bench_public_evidence(source_dir)
+    supplied_source = Path(source_dir)
+    if supplied_source.is_symlink():
+        raise ValueError("schema-3 evidence root may not be a symlink")
+    source_root = supplied_source.resolve()
+
+    index_bytes = _read_regular_file(
+        source_root / _INDEX_FILE,
+        maximum_bytes=_MAX_INDEX_BYTES,
+        label="schema-3 evidence index",
+    )
+    source_index = _load_model_bytes(
+        index_bytes,
+        TerminalBenchPublicEvidenceIndex,
+        label="schema-3 evidence index",
+    )
+    if source_index.schema_version != 3:
+        raise ValueError("only a validated schema-3 package can be upgraded")
+    source_files = {
+        *_FIXED_FILES,
+        *(trial.path for trial in source_index.trials),
+    }
+    if _list_package_files(source_root) != source_files:
+        raise ValueError("schema-3 evidence changed after validation")
+
+    protocol_bytes = _read_regular_file(
+        source_root / _PROTOCOL_FILE,
+        maximum_bytes=_MAX_PROTOCOL_BYTES,
+        label="schema-3 protocol",
+    )
+    protocol = _load_model_bytes(
+        protocol_bytes,
+        TerminalBenchProtocol,
+        label="schema-3 protocol",
+    )
+    if source_attestation.wheel_sha256 != protocol.wheel_sha256:
+        raise ValueError("source attestation wheel does not match the frozen protocol")
+
+    payloads = {
+        relative: _read_regular_file(
+            source_root / relative,
+            maximum_bytes=_maximum_for_relative_path(relative),
+            label=f"schema-3 {relative}",
+        )
+        for relative in source_files
+        if relative != _INDEX_FILE
+    }
+    summary = _load_model_bytes(
+        payloads[_SUMMARY_FILE],
+        TerminalBenchSummary,
+        label="schema-3 summary",
+    )
+    summary_markdown_bytes = _summary_markdown_bytes(summary, schema_version=4)
+    attestation_bytes = _canonical_model_bytes(source_attestation)
+    upgraded_index = TerminalBenchPublicEvidenceIndex.model_validate(
+        {
+            **source_index.model_dump(mode="json"),
+            "schema_version": 4,
+            "summary_markdown_sha256": hashlib.sha256(
+                summary_markdown_bytes
+            ).hexdigest(),
+            "source_attestation_sha256": hashlib.sha256(
+                attestation_bytes
+            ).hexdigest(),
+        }
+    )
+    payloads[_SUMMARY_MARKDOWN_FILE] = summary_markdown_bytes
+    payloads[_SOURCE_ATTESTATION_FILE] = attestation_bytes
+    payloads[_INDEX_FILE] = _canonical_model_bytes(upgraded_index)
+    _assert_public_package_payloads(payloads)
+
+    supplied_target = Path(output_dir)
+    if supplied_target.is_symlink() or supplied_target.exists():
+        raise FileExistsError(
+            f"attested public evidence directory already exists: {supplied_target}"
+        )
+    target = supplied_target.resolve()
+    if (
+        target == source_root
+        or target.is_relative_to(source_root)
+        or source_root.is_relative_to(target)
+    ):
+        raise ValueError("source and attested evidence directories may not overlap")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.parent / f".{target.name}.attestation.lock"
+    lock_descriptor = _open_upgrade_lock(lock_path)
+    temporary: Path | None = None
+    try:
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(
+                f"attested public evidence directory already exists: {target}"
+            )
+        temporary = Path(
+            tempfile.mkdtemp(
+                prefix=f".{target.name}.",
+                dir=target.parent,
+            )
+        )
+        for relative_path, payload in payloads.items():
+            _write_new_file(temporary / relative_path, payload)
+        validation = validate_terminal_bench_public_evidence(temporary)
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(
+                f"attested public evidence directory already exists: {target}"
+            )
+        os.replace(temporary, target)
+        temporary = None
+        _fsync_directory(target.parent)
+        return validation
+    finally:
+        if temporary is not None:
+            shutil.rmtree(temporary, ignore_errors=True)
+        os.close(lock_descriptor)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        _fsync_directory(target.parent)
+
+
 def validate_terminal_bench_public_evidence(
     package_dir: str | Path,
 ) -> TerminalBenchPublicEvidenceValidation:
-    """Recompute a public result using only files inside ``package_dir``."""
+    """Recompute a public result using only files inside ``package_dir``.
+
+    Schema 3 remains readable for historical evidence.  A schema-3 result has
+    no evaluated commit in the return value because its index did not bind a
+    source attestation.
+    """
     supplied_root = Path(package_dir)
     if supplied_root.is_symlink():
         raise ValueError("public evidence root may not be a symlink")
@@ -443,8 +787,11 @@ def validate_terminal_bench_public_evidence(
     if index_bytes != _canonical_model_bytes(index):
         raise ValueError("evidence index is not in canonical exported form")
 
+    fixed_files = (
+        _SCHEMA4_FIXED_FILES if index.schema_version == 4 else _FIXED_FILES
+    )
     expected_files = {
-        *_FIXED_FILES,
+        *fixed_files,
         *(trial.path for trial in index.trials),
     }
     observed_files = _list_package_files(root)
@@ -477,6 +824,27 @@ def validate_terminal_bench_public_evidence(
     public_path_root = _normalized_public_root(index.public_path_root)
     if not _path_is_within(protocol.output_root, public_path_root):
         raise ValueError("public protocol output root is outside its neutral path root")
+
+    source_attestation: SourceAttestation | None = None
+    if index.schema_version == 4:
+        attestation_bytes = _read_regular_file(
+            root / _SOURCE_ATTESTATION_FILE,
+            maximum_bytes=_MAX_SUMMARY_BYTES,
+            label="source attestation",
+        )
+        source_attestation = _load_model_bytes(
+            attestation_bytes,
+            SourceAttestation,
+            label="source attestation",
+        )
+        if (
+            attestation_bytes != _canonical_model_bytes(source_attestation)
+            or hashlib.sha256(attestation_bytes).hexdigest()
+            != index.source_attestation_sha256
+        ):
+            raise ValueError("public source attestation changed")
+        if source_attestation.wheel_sha256 != protocol.wheel_sha256:
+            raise ValueError("evaluated source wheel does not match the frozen protocol")
 
     smoke_bytes = _read_regular_file(
         root / _SMOKE_MANIFEST_FILE,
@@ -552,40 +920,69 @@ def validate_terminal_bench_public_evidence(
     derived_records: list[TerminalBenchTaskRecord] = []
     for instance_id in protocol.subset.scored_instance_ids:
         trial_digest = scored_manifest.trial_result_sha256[instance_id]
-        raw_trial: Mapping[str, Any] | None = None
+        has_public_trial = False
         raw_duration: float | None = None
         raw_retries: Literal[0] | None = None
         raw_status: Literal["PASS", "FAIL", "ERROR"] | None = None
         raw_correct: bool | None = None
         raw_error: str | None = None
+        exception_type: str | None = None
         if trial_digest is not None:
             trial_index = indexed_trials.get(instance_id)
-            if trial_index is None or trial_index.sha256 != trial_digest:
+            if trial_index is None or trial_index.source_sha256 != trial_digest:
                 raise ValueError(f"public trial digest is missing for {instance_id}")
             raw_bytes = _read_indexed_trial(root, trial_index)
-            raw_trial = _load_json_object(
-                raw_bytes,
-                label=f"trial {instance_id}",
-            )
-            _assert_public_payload(raw_trial, label=f"trial {instance_id}")
-            _validate_raw_trial_binding(
-                raw_trial,
-                protocol=protocol,
-                protocol_sha256=protocol_digest,
-                instance_id=instance_id,
-                smoke_seal_sha256=smoke_seal_digest,
-                public_path_root=public_path_root,
-            )
-            raw_status, raw_correct, raw_error = _official_trial_outcome(raw_trial)
-            raw_duration = _official_trial_duration(raw_trial)
-            raw_retries = _official_infrastructure_retries(raw_trial)
+            if trial_index.payload_kind == "official":
+                raw_trial = _load_json_object(
+                    raw_bytes,
+                    label=f"trial {instance_id}",
+                )
+                _assert_public_payload(raw_trial, label=f"trial {instance_id}")
+                _validate_raw_trial_binding(
+                    raw_trial,
+                    protocol=protocol,
+                    protocol_sha256=protocol_digest,
+                    instance_id=instance_id,
+                    smoke_seal_sha256=smoke_seal_digest,
+                    public_path_root=public_path_root,
+                )
+                raw_status, raw_correct, raw_error = _official_trial_outcome(raw_trial)
+                raw_duration = _official_trial_duration(raw_trial)
+                raw_retries = _official_infrastructure_retries(raw_trial)
+                exception_type = _official_exception_type(raw_trial)
+            else:
+                projection = _load_model_bytes(
+                    raw_bytes,
+                    PublicHarborErrorProjection,
+                    label=f"trial {instance_id}",
+                )
+                if raw_bytes != _canonical_model_bytes(projection):
+                    raise ValueError(
+                        f"redacted ERROR projection is not canonical for {instance_id}"
+                    )
+                _validate_error_projection_binding(
+                    projection,
+                    protocol=protocol,
+                    instance_id=instance_id,
+                    source_sha256=trial_digest,
+                )
+                raw_status = projection.raw_status
+                raw_correct = projection.raw_correct
+                raw_error = projection.raw_protocol_error
+                raw_duration = projection.duration_s
+                raw_retries = projection.infrastructure_retries
+                exception_type = projection.exception_type
+            has_public_trial = True
             observed_trial = PublicHarborTrial(
                 instance_id=instance_id,
                 path=trial_index.path,
-                sha256=trial_digest,
+                source_sha256=trial_digest,
+                payload_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+                payload_kind=trial_index.payload_kind,
                 raw_status=raw_status,
                 raw_correct=raw_correct,
                 raw_protocol_error=raw_error,
+                exception_type=exception_type,
                 duration_s=raw_duration,
                 infrastructure_retries=raw_retries,
             )
@@ -596,7 +993,7 @@ def validate_terminal_bench_public_evidence(
         manifest_error = scored_manifest.protocol_errors[instance_id]
         if manifest_status != "ERROR":
             if (
-                raw_trial is None
+                not has_public_trial
                 or raw_status != manifest_status
                 or raw_correct is not (manifest_status == "PASS")
                 or raw_error is not None
@@ -675,7 +1072,10 @@ def validate_terminal_bench_public_evidence(
         maximum_bytes=_MAX_SUMMARY_BYTES,
         label="summary markdown",
     )
-    expected_markdown = (derived_summary.to_markdown() + "\n").encode()
+    expected_markdown = _summary_markdown_bytes(
+        derived_summary,
+        schema_version=index.schema_version,
+    )
     if (
         hashlib.sha256(markdown_bytes).hexdigest()
         != index.summary_markdown_sha256
@@ -699,6 +1099,31 @@ def validate_terminal_bench_public_evidence(
         protocol_sha256=protocol_digest,
         scored_manifest_sha256=scored_digest,
         records_sha256=hashlib.sha256(records_bytes).hexdigest(),
+        evaluated_commit_sha=(
+            source_attestation.commit_sha
+            if source_attestation is not None
+            else None
+        ),
+        evaluated_tree_sha=(
+            source_attestation.tree_sha
+            if source_attestation is not None
+            else None
+        ),
+        evaluated_wheel_filename=(
+            source_attestation.wheel_filename
+            if source_attestation is not None
+            else None
+        ),
+        evaluated_wheel_size_bytes=(
+            source_attestation.wheel_size_bytes
+            if source_attestation is not None
+            else None
+        ),
+        evaluated_wheel_sha256=(
+            source_attestation.wheel_sha256
+            if source_attestation is not None
+            else None
+        ),
         model=protocol.model,
         reasoning_effort=protocol.reasoning_effort,
         harbor_version=protocol.harbor_version,
@@ -900,6 +1325,37 @@ def _validate_raw_trial_binding(
         raise ValueError("completed official raw trial omitted its agent metadata")
 
 
+def _official_exception_type(trial: Mapping[str, Any]) -> str | None:
+    exception = trial.get("exception_info")
+    if exception is None:
+        return None
+    if not isinstance(exception, Mapping):
+        raise ValueError("official Harbor exception_info must be an object")
+    value = exception.get("exception_type")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("official Harbor exception_info omitted exception_type")
+    normalized = value.strip()
+    if _EXCEPTION_TYPE_RE.fullmatch(normalized) is None:
+        raise ValueError("official Harbor exception_type is unsafe for public evidence")
+    _assert_public_string(normalized, label="official Harbor exception_type")
+    return normalized
+
+
+def _validate_error_projection_binding(
+    projection: PublicHarborErrorProjection,
+    *,
+    protocol: TerminalBenchProtocol,
+    instance_id: str,
+    source_sha256: str,
+) -> None:
+    if (
+        projection.source_sha256 != source_sha256
+        or projection.task_name != instance_id
+        or projection.task_checksum != protocol.task_checksums[instance_id]
+    ):
+        raise ValueError("redacted ERROR projection changed its official source binding")
+
+
 def _summarize_offline(batch: TerminalBenchRecordBatch) -> TerminalBenchSummary:
     values = list(batch.records)
     if len(values) != 20:
@@ -1059,7 +1515,7 @@ def _read_indexed_trial(root: Path, trial: PublicHarborTrial) -> bytes:
         maximum_bytes=_MAX_TRIAL_BYTES,
         label=f"trial {trial.instance_id}",
     )
-    if hashlib.sha256(payload).hexdigest() != trial.sha256:
+    if hashlib.sha256(payload).hexdigest() != trial.payload_sha256:
         raise ValueError(f"public trial bytes changed for {trial.instance_id}")
     return payload
 
@@ -1183,6 +1639,62 @@ def _canonical_model_bytes(model: BaseModel) -> bytes:
     return (model.model_dump_json(indent=2) + "\n").encode()
 
 
+def _summary_markdown_bytes(
+    summary: TerminalBenchSummary,
+    *,
+    schema_version: Literal[3, 4],
+) -> bytes:
+    if schema_version == 3:
+        rendered = "\n".join(
+            [
+                "# Terminal-Bench 2.1 固定 20 题子集",
+                "",
+                f"- 通过：{summary.passed}/20（{summary.success_rate:.1%}）",
+                f"- 失败：{summary.failed}/20",
+                f"- ERROR：{summary.errors}/20（保留在分母中）",
+                f"- P50 / P95 耗时（秒）："
+                f"{summary.p50_duration_s} / {summary.p95_duration_s}",
+                f"- 协议错误：{summary.protocol_errors}",
+                "- 错误交付 / 拦截 / 错误拒绝：未测"
+                "（当前 Harbor agent 未经过 LHA gate）",
+                "- 修复成功率：不适用"
+                "（当前协议只有一次 Codex 执行，没有 LHA repair 循环）",
+                "",
+                "该结果仅代表预注册的固定 20 题子集，不是完整排行榜成绩。",
+            ]
+        )
+    else:
+        rendered = summary.to_markdown()
+    return (rendered + "\n").encode()
+
+
+def _open_upgrade_lock(path: Path) -> int:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"another source-attestation upgrade is active: {path}"
+        ) from exc
+    try:
+        os.fsync(descriptor)
+        _fsync_directory(path.parent)
+    except BaseException:
+        os.close(descriptor)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return descriptor
+
+
 def _write_new_file(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(
@@ -1227,6 +1739,7 @@ def _maximum_for_relative_path(relative_path: str) -> int:
         _SMOKE_SEAL_FILE,
         _SUMMARY_FILE,
         _SUMMARY_MARKDOWN_FILE,
+        _SOURCE_ATTESTATION_FILE,
     }:
         return _MAX_SUMMARY_BYTES
     if _TRIAL_PATH_RE.fullmatch(relative_path):

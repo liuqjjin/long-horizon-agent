@@ -1,0 +1,172 @@
+{
+    "id": "4f6c2d73-f7ec-41fe-843e-a352ddebadd1",
+    "task_name": "terminal-bench/modernize-scientific-stack",
+    "trial_name": "modernize-scientific-stack__gRA6VKK",
+    "trial_uri": "file:///private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-17-28cb54406d/modernize-scientific-stack__gRA6VKK",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "modernize-scientific-stack",
+        "ref": "sha256:67a9952aca67df9c70510acf62faea336644a0e9d379f3aaf9df79f14c8fcb12"
+    },
+    "source": "terminal-bench/terminal-bench-2-1",
+    "task_checksum": "8b7ed959204af91e65a1c364773fce48530405fa42083e2e77037ecf028cddf7",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/modernize-scientific-stack",
+            "ref": "sha256:67a9952aca67df9c70510acf62faea336644a0e9d379f3aaf9df79f14c8fcb12",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2-1"
+        },
+        "trial_name": "modernize-scientific-stack__gRA6VKK",
+        "trials_dir": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-17-28cb54406d",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": 4.0,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "lha.bench.terminal_bench:LhaAgent",
+            "import_path": null,
+            "model_name": "gpt-5.5",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {
+                "wheel_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/lha-0.4.2.dev0-py3-none-any.whl",
+                "codex_binary_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/codex-x86_64-unknown-linux-musl",
+                "protocol_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/protocol.json",
+                "reasoning_effort": "xhigh",
+                "instance_id": "terminal-bench/modernize-scientific-stack",
+                "run_kind": "scored",
+                "attempt_id": "2136c4322fac355c0bbe421a31505e1acdb3864d4f22aad1a6f596c0029aada3"
+            },
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "6d3a44ee-d69e-4969-8ebf-e639027598b4"
+    },
+    "agent_info": {
+        "name": "lha",
+        "version": "0.4.2.dev0",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": null
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 47756,
+        "n_cache_tokens": 40448,
+        "n_output_tokens": 1930,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": {
+            "dataset": "terminal-bench/terminal-bench-2-1",
+            "evaluation_id": "d88c314c61adf99a4315983a55287924",
+            "attempt_id": "2136c4322fac355c0bbe421a31505e1acdb3864d4f22aad1a6f596c0029aada3",
+            "dataset_version": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+            "agent_import_path": "lha.bench.terminal_bench:LhaAgent",
+            "instance_id": "terminal-bench/modernize-scientific-stack",
+            "run_kind": "scored",
+            "model": "gpt-5.5",
+            "reasoning_effort": "xhigh",
+            "harbor_version": "0.20.0",
+            "codex_cli_version": "codex-cli 0.141.0",
+            "codex_binary_sha256": "1f37cb63f6c8c3e5e9dddb247a822706f153c00e553efe8c0b05f62d0e4f1cab",
+            "wheel_sha256": "d34e0569943102c73b8ac4d6209bf5a3a061fada285f7e00c6f70c107f10fac0",
+            "protocol_sha256": "02e63fe754d3254a761153220325e33a88809ec9e3e8a03459abc6c8926893a2",
+            "task_content_digest": "sha256:67a9952aca67df9c70510acf62faea336644a0e9d379f3aaf9df79f14c8fcb12",
+            "task_image_digest": "sha256:64e69cee13bf6b0b9016e735b51891bce996a60f1e2d1a005bf12c949e221d71",
+            "container_id": "7b63f45eccb37b67c25e793da038e73147f8bf39358e7dffa20025faa78952d2",
+            "container_image_id": "sha256:64e69cee13bf6b0b9016e735b51891bce996a60f1e2d1a005bf12c949e221d71",
+            "container_configured_image": "alexgshaw/modernize-scientific-stack:20251031",
+            "container_repo_digests": [
+                "alexgshaw/modernize-scientific-stack@sha256:64e69cee13bf6b0b9016e735b51891bce996a60f1e2d1a005bf12c949e221d71"
+            ],
+            "container_compose_project": "modernize-scientific-stack__gra6vkk__env",
+            "container_network_name": "modernize-scientific-stack__gra6vkk__env_default",
+            "post_quiescence_container_id": "7b63f45eccb37b67c25e793da038e73147f8bf39358e7dffa20025faa78952d2",
+            "broker_image_id": "sha256:82dbd69b53aec0323878ff4eaf4d0dff59b044aa0a8c77a53e94b9cdd113c603",
+            "broker_receipt_sha256": "e3c7a2cd00424286beb4784f210c32b1640f5b26454dbae01202038da9d522a4",
+            "broker_accepted_requests": 4,
+            "broker_revoked": true,
+            "terminal_record_sha256": "584d058893087db175e28d978b5425620f89ba594718ff4165c8787bca30a10f",
+            "codex_events_sha256": "b81117e11755d3e12f5a0eb201e140dd42c3918145b10d120d4d5f5fe3dd17be",
+            "codex_event_counts": {
+                "item.completed": 12,
+                "item.started": 8,
+                "thread.started": 1,
+                "turn.completed": 1,
+                "turn.started": 1
+            },
+            "codex_item_counts": {
+                "agent_message": 4,
+                "command_execution": 14,
+                "file_change": 2
+            },
+            "codex_tool_calls": 8,
+            "codex_reconnect_notices": 0,
+            "codex_reasoning_output_tokens": 866,
+            "infrastructure_retries_used": 0,
+            "smoke_seal_sha256": "9640b0c413c65c6267407d46c0c1790f2d3aad8d68a138f445d10d21198d2bab"
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-07-27T22:35:22.348168Z",
+    "finished_at": "2026-07-27T22:37:23.768933Z",
+    "environment_setup": {
+        "started_at": "2026-07-27T22:35:22.367230Z",
+        "finished_at": "2026-07-27T22:35:23.261249Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-07-27T22:35:23.261316Z",
+        "finished_at": "2026-07-27T22:35:27.308656Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-07-27T22:35:27.308877Z",
+        "finished_at": "2026-07-27T22:36:21.277129Z"
+    },
+    "verifier": {
+        "started_at": "2026-07-27T22:36:21.639933Z",
+        "finished_at": "2026-07-27T22:37:13.089317Z"
+    },
+    "step_results": null
+}

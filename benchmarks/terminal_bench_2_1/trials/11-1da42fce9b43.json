@@ -1,0 +1,172 @@
+{
+    "id": "2b78e0b3-b69d-4107-b4c5-6c0044781738",
+    "task_name": "terminal-bench/path-tracing",
+    "trial_name": "path-tracing__VpGDidb",
+    "trial_uri": "file:///private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-11-1da42fce9b/path-tracing__VpGDidb",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "path-tracing",
+        "ref": "sha256:cf56094c881a488b27e9f204a638a7e78ed7d55e12dc3064108c93357190314c"
+    },
+    "source": "terminal-bench/terminal-bench-2-1",
+    "task_checksum": "549aa348dde50ec3824205f402d9686da5d1dedf65ae2bd2ae8806513839fe93",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/path-tracing",
+            "ref": "sha256:cf56094c881a488b27e9f204a638a7e78ed7d55e12dc3064108c93357190314c",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2-1"
+        },
+        "trial_name": "path-tracing__VpGDidb",
+        "trials_dir": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-11-1da42fce9b",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": 4.0,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "lha.bench.terminal_bench:LhaAgent",
+            "import_path": null,
+            "model_name": "gpt-5.5",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {
+                "wheel_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/lha-0.4.2.dev0-py3-none-any.whl",
+                "codex_binary_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/codex-x86_64-unknown-linux-musl",
+                "protocol_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/protocol.json",
+                "reasoning_effort": "xhigh",
+                "instance_id": "terminal-bench/path-tracing",
+                "run_kind": "scored",
+                "attempt_id": "df5023964429bf61b88a7c498a33377b66de715a06c2554ea773c3290bbd52a6"
+            },
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "c478205b-4398-4160-85aa-b8b842c85540"
+    },
+    "agent_info": {
+        "name": "lha",
+        "version": "0.4.2.dev0",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": null
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 1335472,
+        "n_cache_tokens": 1243776,
+        "n_output_tokens": 12761,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": {
+            "dataset": "terminal-bench/terminal-bench-2-1",
+            "evaluation_id": "d88c314c61adf99a4315983a55287924",
+            "attempt_id": "df5023964429bf61b88a7c498a33377b66de715a06c2554ea773c3290bbd52a6",
+            "dataset_version": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+            "agent_import_path": "lha.bench.terminal_bench:LhaAgent",
+            "instance_id": "terminal-bench/path-tracing",
+            "run_kind": "scored",
+            "model": "gpt-5.5",
+            "reasoning_effort": "xhigh",
+            "harbor_version": "0.20.0",
+            "codex_cli_version": "codex-cli 0.141.0",
+            "codex_binary_sha256": "1f37cb63f6c8c3e5e9dddb247a822706f153c00e553efe8c0b05f62d0e4f1cab",
+            "wheel_sha256": "d34e0569943102c73b8ac4d6209bf5a3a061fada285f7e00c6f70c107f10fac0",
+            "protocol_sha256": "02e63fe754d3254a761153220325e33a88809ec9e3e8a03459abc6c8926893a2",
+            "task_content_digest": "sha256:cf56094c881a488b27e9f204a638a7e78ed7d55e12dc3064108c93357190314c",
+            "task_image_digest": "sha256:4b44725102cd627dfa895191a5a30d16dae3c5623bb43da6459f79135db6b482",
+            "container_id": "f223bb809d78234c8cbd9e7fa823cfca435a8f087693ff56ab6c9cf87f232399",
+            "container_image_id": "sha256:4b44725102cd627dfa895191a5a30d16dae3c5623bb43da6459f79135db6b482",
+            "container_configured_image": "alexgshaw/path-tracing:20251031",
+            "container_repo_digests": [
+                "alexgshaw/path-tracing@sha256:4b44725102cd627dfa895191a5a30d16dae3c5623bb43da6459f79135db6b482"
+            ],
+            "container_compose_project": "path-tracing__vpgdidb__env",
+            "container_network_name": "path-tracing__vpgdidb__env_default",
+            "post_quiescence_container_id": "f223bb809d78234c8cbd9e7fa823cfca435a8f087693ff56ab6c9cf87f232399",
+            "broker_image_id": "sha256:82dbd69b53aec0323878ff4eaf4d0dff59b044aa0a8c77a53e94b9cdd113c603",
+            "broker_receipt_sha256": "37fb44bd5e449b111d18586be225a44c743723b3655a428cb7c5cf477b12c6d9",
+            "broker_accepted_requests": 23,
+            "broker_revoked": true,
+            "terminal_record_sha256": "69473ef223a3a32fcc7e73b76dea9b2e20454ab5c6a9c456d0ef12afb6bc95db",
+            "codex_events_sha256": "2aa9d31001389f7f88c8b5013d99028cb365608bdb0e03f0da4ff6f490e36a63",
+            "codex_event_counts": {
+                "item.completed": 59,
+                "item.started": 46,
+                "thread.started": 1,
+                "turn.completed": 1,
+                "turn.started": 1
+            },
+            "codex_item_counts": {
+                "agent_message": 13,
+                "command_execution": 88,
+                "file_change": 4
+            },
+            "codex_tool_calls": 46,
+            "codex_reconnect_notices": 0,
+            "codex_reasoning_output_tokens": 8281,
+            "infrastructure_retries_used": 0,
+            "smoke_seal_sha256": "9640b0c413c65c6267407d46c0c1790f2d3aad8d68a138f445d10d21198d2bab"
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-07-27T21:20:08.412906Z",
+    "finished_at": "2026-07-27T21:27:45.691374Z",
+    "environment_setup": {
+        "started_at": "2026-07-27T21:20:08.431821Z",
+        "finished_at": "2026-07-27T21:20:09.337813Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-07-27T21:20:09.337885Z",
+        "finished_at": "2026-07-27T21:20:13.077340Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-07-27T21:20:13.077559Z",
+        "finished_at": "2026-07-27T21:26:19.139042Z"
+    },
+    "verifier": {
+        "started_at": "2026-07-27T21:26:19.503311Z",
+        "finished_at": "2026-07-27T21:27:35.039584Z"
+    },
+    "step_results": null
+}

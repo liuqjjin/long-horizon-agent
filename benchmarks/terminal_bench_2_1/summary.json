@@ -1,0 +1,19 @@
+{
+  "dataset": "terminal-bench/terminal-bench-2-1",
+  "denominator": 20,
+  "passed": 7,
+  "failed": 9,
+  "errors": 4,
+  "success_rate": 0.35,
+  "mechanism_metrics": "unavailable",
+  "incorrect_deliveries": null,
+  "intercepted_incorrect": null,
+  "false_rejections": null,
+  "repair_successes": null,
+  "repair_attempts": null,
+  "repair_success_rate": null,
+  "p50_duration_s": 433.918,
+  "p95_duration_s": 1284.19,
+  "protocol_errors": 4,
+  "missing_instance_ids": []
+}

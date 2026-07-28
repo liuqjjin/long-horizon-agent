@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import signal
 import stat
@@ -28,9 +29,10 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Iterator, Literal, TypeVar, cast
 
 from pydantic import (
     BaseModel,
@@ -63,8 +65,9 @@ from .terminal_control import (
     evaluation_lock,
     initialize_control_store,
     open_attempt_store,
+    open_control_store,
     terminal_attempt_id,
-    terminal_control_root,
+    terminal_control_root,  # noqa: F401 - kept as the adapter's public helper
     write_command_started,
     write_model_started,
 )
@@ -112,6 +115,11 @@ _COMMAND_ENVELOPE = "command.json"
 _COMMAND_STARTED = "COMMAND_STARTED.json"
 _SMOKE_MANIFEST = "smoke_manifest.json"
 _SMOKE_SEAL = "smoke_seal.json"
+_LEGACY_MAX_JSONL_LINE_BYTES = 60 * 1024
+_MAX_JSONL_LINE_BYTES = 2 * 1024 * 1024
+_HARBOR_STREAM_LINE_HEADROOM_BYTES = 64 * 1024
+_HOST_PROCESS_TERM_GRACE_S = 0.25
+_HOST_PROCESS_KILL_GRACE_S = 5.0
 _BROKER_RECEIPT_KEYS = frozenset(
     {
         "schema_version",
@@ -259,7 +267,10 @@ class TerminalBenchBudgets(BaseModel):
     stream_max_retries: Literal[0] = 0
     broker_stream_max_retries: Literal[12] = 12
     broker_stream_max_retries_per_request: Literal[4] = 4
-    max_jsonl_line_bytes: Literal[61440] = 61440
+    # Schema 13 used 60 KiB to stay below asyncio's default line reader. A real
+    # Codex 0.141 event exceeded that transport limit. Schema 14 raises the
+    # protocol boundary and explicitly configures Harbor's pinned stream reader.
+    max_jsonl_line_bytes: Literal[61440, 2097152] = _MAX_JSONL_LINE_BYTES
     max_jsonl_bytes: Literal[16777216] = 16777216
     broker_ttl_s: Literal[2100] = 2100
     codex_exec_runs: Literal[1] = 1
@@ -418,7 +429,7 @@ class TerminalBenchProtocol(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[13] = 13
+    schema_version: Literal[13, 14] = 14
     dataset: Literal["terminal-bench/terminal-bench-2-1"] = DATASET
     evaluation_id: str
     output_root: str
@@ -526,6 +537,15 @@ class TerminalBenchProtocol(BaseModel):
     @model_validator(mode="after")
     def _digests_cover_the_registered_tasks(self) -> "TerminalBenchProtocol":
         corpus = load_terminal_bench_corpus()
+        expected_line_limit = (
+            _LEGACY_MAX_JSONL_LINE_BYTES
+            if self.schema_version == 13
+            else _MAX_JSONL_LINE_BYTES
+        )
+        if self.budgets.max_jsonl_line_bytes != expected_line_limit:
+            raise ValueError(
+                "Terminal-Bench protocol schema does not match its JSONL line limit"
+            )
         if self.harbor_version != HARBOR_VERSION:
             raise ValueError(f"formal runs require Harbor {HARBOR_VERSION}")
         if (
@@ -914,10 +934,10 @@ class TerminalBenchAgentProvenance(BaseModel):
                 and not (
                     1
                     <= self.broker_accepted_requests
-                    <= (
-                        self.codex_audit.tool_calls
-                        + 1
-                        + self.budgets.request_max_retries
+                    <= min(
+                        self.budgets.max_model_requests,
+                        (self.codex_audit.tool_calls + 1)
+                        * (self.budgets.request_max_retries + 1),
                     )
                 )
             ):
@@ -1229,7 +1249,7 @@ class TerminalBenchSummary(BaseModel):
                 f"- 失败：{self.failed}/20",
                 f"- ERROR：{self.errors}/20（保留在分母中）",
                 f"- P50 / P95 耗时（秒）：{self.p50_duration_s} / {self.p95_duration_s}",
-                f"- 协议错误：{self.protocol_errors}",
+                f"- 不可评分 ERROR：{self.protocol_errors}",
                 "- 错误交付 / 拦截 / 错误拒绝：未测"
                 "（当前 Harbor agent 未经过 LHA gate）",
                 "- 修复成功率：不适用"
@@ -1286,6 +1306,110 @@ def _atomic_write_text(path: Path, payload: str) -> None:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_stable_regular_bytes(path: Path, *, maximum_bytes: int) -> bytes:
+    """Read one existing evidence file without following a replacement link."""
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError("the existing Harbor execution manifest is unreadable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size < 0
+            or before.st_size > maximum_bytes
+        ):
+            raise ValueError("the existing Harbor execution manifest is not a regular file")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError(
+                    "the existing Harbor execution manifest ended before its stated size"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValueError("the existing Harbor execution manifest grew while it was read")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ValueError("the existing Harbor execution manifest changed while read")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _write_execution_manifest_once(
+    path: Path,
+    manifest: HarborExecutionManifest,
+) -> None:
+    """Publish a canonical manifest once, or prove an identical one already exists."""
+    payload = (manifest.model_dump_json(indent=2) + "\n").encode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("manifest write made no progress")
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            existing = _read_stable_regular_bytes(
+                path,
+                maximum_bytes=max(len(payload), 1),
+            )
+            try:
+                recorded = HarborExecutionManifest.model_validate_json(existing)
+            except ValueError as exc:
+                raise ValueError(
+                    "the existing Harbor execution manifest is invalid"
+                ) from exc
+            if recorded != manifest or existing != payload:
+                raise ValueError(
+                    "the existing Harbor execution manifest conflicts with "
+                    "current evidence"
+                )
+            return
+        try:
+            parent_descriptor = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError as exc:
+            raise ValueError(
+                "the Harbor execution manifest directory could not be synchronized"
+            ) from exc
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    except OSError as exc:
+        raise ValueError("the Harbor execution manifest could not be published") from exc
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1586,8 +1710,7 @@ def _control_registration(
     *,
     protocol_sha256: str,
 ) -> EvaluationRegistration:
-    root = terminal_control_root(protocol.output_root, protocol.evaluation_id)
-    with SecureDirectory(root) as store:
+    with open_control_store(protocol.output_root, protocol.evaluation_id) as store:
         registration = cast(
             EvaluationRegistration,
             store.read_json("registration.json", EvaluationRegistration),
@@ -1630,8 +1753,7 @@ def _validated_smoke_seal(
     *,
     protocol_sha256: str,
 ) -> str:
-    root = terminal_control_root(protocol.output_root, protocol.evaluation_id)
-    with SecureDirectory(root) as store:
+    with open_control_store(protocol.output_root, protocol.evaluation_id) as store:
         try:
             payload = store.read(_SMOKE_SEAL)
         except ControlStoreError as exc:
@@ -2652,21 +2774,77 @@ def _formal_harbor_environment(auth_path: Path) -> dict[str, str]:
     return environment
 
 
-def _stop_host_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
+def _host_process_group_exists(process_group: int) -> bool:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group, 0)
     except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        raise RuntimeError("could not inspect the Harbor process group") from exc
+    return True
+
+
+def _wait_for_host_process_group(
+    process: subprocess.Popen[bytes],
+    process_group: int,
+    *,
+    timeout_s: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        process.poll()
+        if not _host_process_group_exists(process_group):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _stop_host_process(process: subprocess.Popen[bytes]) -> None:
+    """Stop Harbor and every child before publishing its command envelope."""
+    process_group = getattr(process, "pid", None)
+    if not isinstance(process_group, int) or isinstance(process_group, bool):
+        if process.poll() is not None:
+            return
+        raise RuntimeError("the Harbor process has no valid process-group identity")
+
+    if not _host_process_group_exists(process_group):
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=_HOST_PROCESS_KILL_GRACE_S)
+        except (ChildProcessError, OSError, subprocess.TimeoutExpired) as exc:
+            if process.poll() is None:
+                raise RuntimeError("the Harbor process leader could not be reaped") from exc
+        return
+
+    try:
+        os.killpg(process_group, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    if not _wait_for_host_process_group(
+        process,
+        process_group,
+        timeout_s=_HOST_PROCESS_TERM_GRACE_S,
+    ):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        process.wait(timeout=5)
+    try:
+        process.wait(timeout=_HOST_PROCESS_KILL_GRACE_S)
+    except (ChildProcessError, OSError, subprocess.TimeoutExpired) as exc:
+        if process.poll() is None:
+            raise RuntimeError("the Harbor process leader could not be reaped") from exc
+    if not _wait_for_host_process_group(
+        process,
+        process_group,
+        timeout_s=_HOST_PROCESS_KILL_GRACE_S,
+    ):
+        raise RuntimeError(
+            "the Harbor process group is still present; "
+            "refusing to publish mutable command evidence"
+        )
 
 
 def _command_failure_stage(
@@ -2810,9 +2988,8 @@ def run_harbor_command_once(
         caught = exc
         outcome = "error"
     finally:
-        if process is not None and process.poll() is None:
-            _stop_host_process(process)
         if process is not None:
+            _stop_host_process(process)
             return_code = process.returncode
         with open_attempt_store(
             protocol.output_root,
@@ -3508,7 +3685,7 @@ def validate_harbor_results(
     )
     if manifest_path is not None:
         target = Path(manifest_path)
-        _atomic_write_text(target, manifest.model_dump_json(indent=2) + "\n")
+        _write_execution_manifest_once(target, manifest)
     return manifest
 
 
@@ -3520,6 +3697,22 @@ def seal_smoke_phase(
     manifest_path: str | Path | None = None,
 ) -> tuple[SmokeSeal, HarborExecutionManifest]:
     """Seal three infrastructure-valid smoke runs before any scored command."""
+    with evaluation_lock(protocol.output_root, protocol.evaluation_id):
+        return _seal_smoke_phase_locked(
+            protocol,
+            commands,
+            protocol_path=protocol_path,
+            manifest_path=manifest_path,
+        )
+
+
+def _seal_smoke_phase_locked(
+    protocol: TerminalBenchProtocol,
+    commands: Sequence[HarborRunCommand],
+    *,
+    protocol_path: str | Path,
+    manifest_path: str | Path | None,
+) -> tuple[SmokeSeal, HarborExecutionManifest]:
     manifest = validate_harbor_results(
         protocol,
         "smoke",
@@ -3535,18 +3728,50 @@ def seal_smoke_phase(
     smoke_ids = protocol.subset.smoke_instance_ids
     if len(smoke_ids) != 3:
         raise ValueError("the smoke phase must contain exactly three registered tasks")
-    root = terminal_control_root(protocol.output_root, protocol.evaluation_id)
-    with SecureDirectory(root) as store:
-        manifest_sha256 = store.write_json_once(_SMOKE_MANIFEST, manifest)
+    terminal_records = {
+        instance_id: cast(str, terminal_digests[instance_id])
+        for instance_id in smoke_ids
+    }
+    with open_control_store(protocol.output_root, protocol.evaluation_id) as store:
+        if store.has(_SMOKE_MANIFEST):
+            manifest_payload = store.read(_SMOKE_MANIFEST)
+            try:
+                recorded_manifest = HarborExecutionManifest.model_validate_json(
+                    manifest_payload
+                )
+            except ValueError as exc:
+                raise ControlStoreError("the smoke manifest is invalid") from exc
+            if recorded_manifest != manifest:
+                raise ControlStoreError(
+                    "the existing smoke manifest differs from current evidence"
+                )
+            manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()
+        else:
+            manifest_sha256 = store.write_json_once(_SMOKE_MANIFEST, manifest)
+
+        if store.has(_SMOKE_SEAL):
+            try:
+                recorded_seal = SmokeSeal.model_validate_json(store.read(_SMOKE_SEAL))
+            except ValueError as exc:
+                raise ControlStoreError("the smoke seal is invalid") from exc
+            if (
+                recorded_seal.evaluation_id != protocol.evaluation_id
+                or recorded_seal.protocol_sha256 != manifest.protocol_sha256
+                or recorded_seal.manifest_sha256 != manifest_sha256
+                or recorded_seal.smoke_instance_ids != smoke_ids
+                or recorded_seal.terminal_record_sha256 != terminal_records
+            ):
+                raise ControlStoreError(
+                    "the existing smoke seal differs from current evidence"
+                )
+            return recorded_seal, manifest
+
         seal = SmokeSeal(
             evaluation_id=protocol.evaluation_id,
             protocol_sha256=manifest.protocol_sha256,
             manifest_sha256=manifest_sha256,
             smoke_instance_ids=(smoke_ids[0], smoke_ids[1], smoke_ids[2]),
-            terminal_record_sha256={
-                instance_id: cast(str, terminal_digests[instance_id])
-                for instance_id in protocol.subset.smoke_instance_ids
-            },
+            terminal_record_sha256=terminal_records,
             sealed_at=now().isoformat(),
         )
         store.write_json_once(_SMOKE_SEAL, seal)
@@ -4314,14 +4539,83 @@ def _require_harbor_docker_environment(environment) -> None:
         raise RuntimeError("formal Terminal-Bench runs require Harbor's Docker environment")
 
 
-def _contains_exception(error: BaseException, expected: type[BaseException]) -> bool:
+def _contains_exception(
+    error: BaseException,
+    expected: type[BaseException],
+    *,
+    _seen: set[int] | None = None,
+) -> bool:
+    seen = _seen if _seen is not None else set()
+    if id(error) in seen:
+        return False
+    seen.add(id(error))
     if isinstance(error, expected):
         return True
     nested = getattr(error, "exceptions", ())
-    return isinstance(nested, tuple) and any(
-        isinstance(item, BaseException) and _contains_exception(item, expected)
+    if isinstance(nested, tuple) and any(
+        isinstance(item, BaseException)
+        and _contains_exception(item, expected, _seen=seen)
         for item in nested
+    ):
+        return True
+    return any(
+        isinstance(item, BaseException)
+        and _contains_exception(item, expected, _seen=seen)
+        for item in (error.__cause__, error.__context__)
     )
+
+
+@contextmanager
+def _harbor_stream_line_limit(
+    environment: Any,
+    *,
+    maximum_line_bytes: int,
+) -> Iterator[None]:
+    """Raise Harbor 0.20's private asyncio line limit within one Codex exec.
+
+    Harbor streams Docker output with ``StreamReader.readline()`` but leaves
+    asyncio's 64 KiB default in place. Codex JSONL has its own checked line and
+    total byte limits, so the transport must allow one registered line to reach
+    that validator. The wrapper is scoped to one environment instance and is
+    restored before any cleanup command runs.
+    """
+    collector = getattr(environment, "_collect_streamed_output", None)
+    if collector is None or not callable(collector):
+        # Lightweight test doubles do not implement Harbor's private collector.
+        yield
+        return
+    async_collector = cast(Callable[..., Awaitable[Any]], collector)
+    instance_values = getattr(environment, "__dict__", None)
+    if not isinstance(instance_values, dict):
+        raise RuntimeError("Harbor environment cannot scope its stream reader limit")
+    had_instance_value = "_collect_streamed_output" in instance_values
+    previous_instance_value = instance_values.get("_collect_streamed_output")
+    transport_limit = maximum_line_bytes + _HARBOR_STREAM_LINE_HEADROOM_BYTES
+
+    async def collect_with_registered_limit(process, **kwargs):
+        reader = getattr(process, "stdout", None)
+        if not isinstance(reader, asyncio.StreamReader):
+            raise RuntimeError("Harbor streaming process omitted its asyncio reader")
+        reader_state = cast(Any, reader)
+        previous_limit = reader_state._limit
+        reader_state._limit = transport_limit
+        try:
+            return await async_collector(process, **kwargs)
+        finally:
+            reader_state._limit = previous_limit
+
+    setattr(environment, "_collect_streamed_output", collect_with_registered_limit)
+    try:
+        yield
+    finally:
+        if had_instance_value:
+            setattr(
+                environment,
+                "_collect_streamed_output",
+                previous_instance_value,
+            )
+        else:
+            delattr(environment, "_collect_streamed_output")
 
 
 def build_agent():  # -> type[BaseInstalledAgent]
@@ -4952,7 +5246,13 @@ def build_agent():  # -> type[BaseInstalledAgent]
                         certificate_file.unlink(missing_ok=True)
                 finally:
                     capability_file.unlink(missing_ok=True)
-                with environment.scoped_output_callback(on_output):
+                with (
+                    _harbor_stream_line_limit(
+                        environment,
+                        maximum_line_bytes=protocol.budgets.max_jsonl_line_bytes,
+                    ),
+                    environment.scoped_output_callback(on_output),
+                ):
                     result = await environment.exec(
                         command=codex_exec_command(
                             self._model,
@@ -5039,6 +5339,14 @@ def build_agent():  # -> type[BaseInstalledAgent]
                         if _contains_exception(exc, CodexReportedError)
                         else "codex_jsonl_invalid"
                     )
+                elif _contains_exception(exc, asyncio.LimitOverrunError):
+                    outcome = "protocol_error"
+                    failure_kind = "codex_jsonl_invalid"
+                    line_error = CodexEventError(
+                        "Codex JSONL line exceeded the registered transport limit"
+                    )
+                    line_error.__cause__ = exc
+                    run_error = line_error
             finally:
                 try:
                     _, cleanup_cancellation = await _finish_cleanup(

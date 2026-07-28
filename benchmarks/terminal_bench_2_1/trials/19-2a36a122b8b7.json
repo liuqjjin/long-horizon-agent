@@ -1,0 +1,172 @@
+{
+    "id": "d7ee0da2-3648-451b-8f58-620c9b2919da",
+    "task_name": "terminal-bench/polyglot-rust-c",
+    "trial_name": "polyglot-rust-c__iz4d8hf",
+    "trial_uri": "file:///private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-19-2a36a122b8/polyglot-rust-c__iz4d8hf",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "polyglot-rust-c",
+        "ref": "sha256:a33dc72e2278d225513c0724abe2e4539653d5ee7e4c2a90ba2d676586ba9f3d"
+    },
+    "source": "terminal-bench/terminal-bench-2-1",
+    "task_checksum": "aabe829791a3d41a79deb775717a64fab08f286349cb07640e50dcfff6f497be",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/polyglot-rust-c",
+            "ref": "sha256:a33dc72e2278d225513c0724abe2e4539653d5ee7e4c2a90ba2d676586ba9f3d",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2-1"
+        },
+        "trial_name": "polyglot-rust-c__iz4d8hf",
+        "trials_dir": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-19-2a36a122b8",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": 4.0,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "lha.bench.terminal_bench:LhaAgent",
+            "import_path": null,
+            "model_name": "gpt-5.5",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {
+                "wheel_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/lha-0.4.2.dev0-py3-none-any.whl",
+                "codex_binary_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/codex-x86_64-unknown-linux-musl",
+                "protocol_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/protocol.json",
+                "reasoning_effort": "xhigh",
+                "instance_id": "terminal-bench/polyglot-rust-c",
+                "run_kind": "scored",
+                "attempt_id": "8398fb84b36b331f24338ffe07c068a47ce342c33e6e571452aca147a4cb604e"
+            },
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "438def16-7982-4ea4-bf94-bdd9ef43755e"
+    },
+    "agent_info": {
+        "name": "lha",
+        "version": "0.4.2.dev0",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": null
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 483725,
+        "n_cache_tokens": 439296,
+        "n_output_tokens": 14983,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": {
+            "dataset": "terminal-bench/terminal-bench-2-1",
+            "evaluation_id": "d88c314c61adf99a4315983a55287924",
+            "attempt_id": "8398fb84b36b331f24338ffe07c068a47ce342c33e6e571452aca147a4cb604e",
+            "dataset_version": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+            "agent_import_path": "lha.bench.terminal_bench:LhaAgent",
+            "instance_id": "terminal-bench/polyglot-rust-c",
+            "run_kind": "scored",
+            "model": "gpt-5.5",
+            "reasoning_effort": "xhigh",
+            "harbor_version": "0.20.0",
+            "codex_cli_version": "codex-cli 0.141.0",
+            "codex_binary_sha256": "1f37cb63f6c8c3e5e9dddb247a822706f153c00e553efe8c0b05f62d0e4f1cab",
+            "wheel_sha256": "d34e0569943102c73b8ac4d6209bf5a3a061fada285f7e00c6f70c107f10fac0",
+            "protocol_sha256": "02e63fe754d3254a761153220325e33a88809ec9e3e8a03459abc6c8926893a2",
+            "task_content_digest": "sha256:a33dc72e2278d225513c0724abe2e4539653d5ee7e4c2a90ba2d676586ba9f3d",
+            "task_image_digest": "sha256:3ba84f0e138a4b65e58c53f920a0fc852571e6402901c3bdbb876e9dab6e6c5e",
+            "container_id": "8c68d8b851e84aa1ff61ca15693d215d15b57ec171bfe810db1e1162762515b2",
+            "container_image_id": "sha256:3ba84f0e138a4b65e58c53f920a0fc852571e6402901c3bdbb876e9dab6e6c5e",
+            "container_configured_image": "alexgshaw/polyglot-rust-c:20251031",
+            "container_repo_digests": [
+                "alexgshaw/polyglot-rust-c@sha256:3ba84f0e138a4b65e58c53f920a0fc852571e6402901c3bdbb876e9dab6e6c5e"
+            ],
+            "container_compose_project": "polyglot-rust-c__iz4d8hf__env",
+            "container_network_name": "polyglot-rust-c__iz4d8hf__env_default",
+            "post_quiescence_container_id": "8c68d8b851e84aa1ff61ca15693d215d15b57ec171bfe810db1e1162762515b2",
+            "broker_image_id": "sha256:82dbd69b53aec0323878ff4eaf4d0dff59b044aa0a8c77a53e94b9cdd113c603",
+            "broker_receipt_sha256": "b1ad19681302703dcc8db4dbb8fdddf7e0a640a1c0251ca7a6837d3fb9248f3b",
+            "broker_accepted_requests": 25,
+            "broker_revoked": true,
+            "terminal_record_sha256": "da6f81c2d01a2d734e5dfcbf9be356ddf70455233f62bd490edc3164e8569c45",
+            "codex_events_sha256": "d1af8621b65ff8db55d5879cf612d8b9bcc2d579841be1eae3e0bcf923bd388f",
+            "codex_event_counts": {
+                "item.completed": 43,
+                "item.started": 32,
+                "thread.started": 1,
+                "turn.completed": 1,
+                "turn.started": 1
+            },
+            "codex_item_counts": {
+                "agent_message": 11,
+                "command_execution": 60,
+                "file_change": 4
+            },
+            "codex_tool_calls": 32,
+            "codex_reconnect_notices": 0,
+            "codex_reasoning_output_tokens": 11403,
+            "infrastructure_retries_used": 0,
+            "smoke_seal_sha256": "9640b0c413c65c6267407d46c0c1790f2d3aad8d68a138f445d10d21198d2bab"
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 1.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-07-27T22:46:52.350016Z",
+    "finished_at": "2026-07-27T22:54:06.267971Z",
+    "environment_setup": {
+        "started_at": "2026-07-27T22:46:52.368759Z",
+        "finished_at": "2026-07-27T22:46:53.276313Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-07-27T22:46:53.276381Z",
+        "finished_at": "2026-07-27T22:46:56.903017Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-07-27T22:46:56.903246Z",
+        "finished_at": "2026-07-27T22:53:05.034111Z"
+    },
+    "verifier": {
+        "started_at": "2026-07-27T22:53:05.393939Z",
+        "finished_at": "2026-07-27T22:53:55.533771Z"
+    },
+    "step_results": null
+}

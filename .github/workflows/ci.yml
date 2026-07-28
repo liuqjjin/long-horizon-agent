@@ -13,6 +13,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up uv (+ Python 3.11 from .python-version)
         uses: astral-sh/setup-uv@v5
@@ -27,6 +29,14 @@ jobs:
 
       - name: Published benchmark claims match committed evidence
         run: uv run python -m lha.release_claims
+
+      # This also requires the evaluated commit to be an ancestor of HEAD.
+      # A squash merge that drops that commit therefore fails closed.
+      - name: Reproduce Terminal-Bench evaluated source wheel
+        run: |
+          uv run python tools/verify_terminal_source_build.py \
+            --root . \
+            --evidence benchmarks/terminal_bench_2_1
 
       - name: Facade isolation (CocoIndex must not leak out of live_context)
         run: |
@@ -85,6 +95,26 @@ jobs:
       - name: Self-eval (lha eval, expects 6/6)
         run: uv run lha eval
 
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up uv (+ Python 3.11 from .python-version)
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync
+      - name: Static checks
+        run: |
+          uv run ruff check .
+          uv run pyright src/lha
+      - name: Tests
+        run: uv run pytest -q
+      - name: Self-eval
+        run: LHA_RUNS_DIR=runs/_macos uv run lha eval
+
   docker:
     # Proves the container actually builds. Build only — no push.
     runs-on: ubuntu-latest
@@ -108,7 +138,16 @@ jobs:
           docker run --rm lha:ci git --version
           docker run --rm lha:ci python -c "import lha, cocoindex, sentence_transformers"
           docker run --rm lha:ci lha eval --quick
-          docker run --rm lha:ci python -c "from pathlib import Path; assert not any((Path('/app') / p).exists() for p in ('.env', '.codex', '.claude', '.mcp.json', 'auth.json', '.ssh', '.aws', '.config/gcloud', '.netrc', '.pypirc', 'dist'))"
+          docker run --rm lha:ci python -c "from pathlib import Path; assert not any((Path('/app') / p).exists() for p in ('.env', '.codex', '.claude', '.agents', '.mcp.json', 'auth.json', '.ssh', '.aws', '.config/gcloud', '.netrc', '.pypirc', 'dist'))"
+      - name: Build and inspect Terminal-Bench broker image
+        run: |
+          docker build \
+            --file docker/terminal-bench-proxy.Dockerfile \
+            --tag lha-terminal-proxy:ci \
+            .
+          test "$(docker image inspect --format '{{.Config.User}}' lha-terminal-proxy:ci)" = "65532:65532"
+          docker run --rm --entrypoint python lha-terminal-proxy:ci \
+            -c "from lha.bench import terminal_proxy_server"
       - name: Set up uv (+ Python 3.11 from .python-version)
         uses: astral-sh/setup-uv@v5
         with:

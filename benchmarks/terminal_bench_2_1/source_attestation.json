@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "repository_url": "https://github.com/liuqjjin/long-horizon-agent",
+  "commit_sha": "e63f94620ce8ddd322b19ccb159381183fc31933",
+  "tree_sha": "c5b410a98ebec58d482a8ebc889758bc67662985",
+  "package_version": "0.4.2.dev0",
+  "wheel_filename": "lha-0.4.2.dev0-py3-none-any.whl",
+  "wheel_size_bytes": 365480,
+  "wheel_sha256": "d34e0569943102c73b8ac4d6209bf5a3a061fada285f7e00c6f70c107f10fac0",
+  "reproducible_build_command": "uv build --clear"
+}

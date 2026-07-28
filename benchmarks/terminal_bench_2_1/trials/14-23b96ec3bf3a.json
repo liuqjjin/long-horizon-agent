@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "terminal-bench-error-redaction",
+  "source_sha256": "767ac45d6a055a2802517ac8d65b756c3f1863b8d30de2c90e3c5633eb080ff4",
+  "task_name": "terminal-bench/video-processing",
+  "task_checksum": "1b34c811ec16da1fb7a40d07b8a8256ea79a83e33fbbe07ce361cd53383850cf",
+  "raw_status": "ERROR",
+  "raw_correct": null,
+  "raw_protocol_error": "Harbor trial exception: ValidationError",
+  "exception_type": "ValidationError",
+  "duration_s": 715.729145,
+  "infrastructure_retries": null
+}

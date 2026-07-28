@@ -7,12 +7,15 @@ import base64
 import hashlib
 import json
 import os
+import signal
 import stat
 import sys
 import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -379,13 +382,14 @@ def test_protocol_records_exact_provenance_and_contains_no_secret(tmp_path):
         broker_image_id="sha256:" + "f" * 64,
         wheel_path=wheel,
     )
-    assert protocol.schema_version == 13
+    assert protocol.schema_version == 14
     assert protocol.budgets.codex_timeout_s == 1800
     assert protocol.budgets.max_tool_calls == 128
     assert protocol.budgets.max_model_requests == 60
     assert protocol.budgets.stream_max_retries == 0
     assert protocol.budgets.broker_stream_max_retries == 12
     assert protocol.budgets.broker_stream_max_retries_per_request == 4
+    assert protocol.budgets.max_jsonl_line_bytes == 2 * 1024 * 1024
     assert protocol.budgets.codex_exec_runs == 1
     assert protocol.budgets.scored_runs_per_task == 1
     assert protocol.budgets.infrastructure_retries == 0
@@ -402,6 +406,14 @@ def test_protocol_records_exact_provenance_and_contains_no_secret(tmp_path):
         b"codex linux binary"
     ).hexdigest()
     assert protocol.wheel_sha256 == hashlib.sha256(b"wheel bytes").hexdigest()
+
+    legacy = protocol.model_dump(mode="json")
+    legacy["schema_version"] = 13
+    legacy["budgets"]["max_jsonl_line_bytes"] = 60 * 1024
+    assert tb.TerminalBenchProtocol.model_validate(legacy).schema_version == 13
+    legacy["budgets"]["max_jsonl_line_bytes"] = 2 * 1024 * 1024
+    with pytest.raises(ValueError, match="schema does not match"):
+        tb.TerminalBenchProtocol.model_validate(legacy)
 
     path = tb.write_protocol(protocol, tmp_path / "protocol.json")
     raw = path.read_text()
@@ -809,6 +821,91 @@ def test_harbor_result_manifest_rejects_set_drift(tmp_path):
         )
 
 
+def test_harbor_result_manifest_recovers_only_identical_evidence(tmp_path):
+    protocol, protocol_path, commands = _prepared_smoke_results(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+
+    first = tb.validate_harbor_results(
+        protocol,
+        "smoke",
+        commands,
+        protocol_path=protocol_path,
+        manifest_path=manifest_path,
+    )
+    original = manifest_path.read_bytes()
+    second = tb.validate_harbor_results(
+        protocol,
+        "smoke",
+        commands,
+        protocol_path=protocol_path,
+        manifest_path=manifest_path,
+    )
+
+    assert second == first
+    assert manifest_path.read_bytes() == original
+    assert not list(tmp_path.glob(".manifest.json.*.tmp"))
+
+
+def test_harbor_result_manifest_rejects_noncanonical_existing_bytes(tmp_path):
+    protocol, protocol_path, commands = _prepared_smoke_results(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    tb.validate_harbor_results(
+        protocol,
+        "smoke",
+        commands,
+        protocol_path=protocol_path,
+        manifest_path=manifest_path,
+    )
+    same_model_different_bytes = json.dumps(json.loads(manifest_path.read_text())).encode()
+    manifest_path.write_bytes(same_model_different_bytes)
+
+    with pytest.raises(ValueError, match="conflicts with current evidence"):
+        tb.validate_harbor_results(
+            protocol,
+            "smoke",
+            commands,
+            protocol_path=protocol_path,
+            manifest_path=manifest_path,
+        )
+
+    assert manifest_path.read_bytes() == same_model_different_bytes
+
+
+def test_harbor_result_manifest_rejects_conflicting_evidence_without_overwrite(
+    tmp_path,
+):
+    protocol, protocol_path, commands = _prepared_smoke_results(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    tb.validate_harbor_results(
+        protocol,
+        "smoke",
+        commands,
+        protocol_path=protocol_path,
+        manifest_path=manifest_path,
+    )
+    original = manifest_path.read_bytes()
+    result_path = Path(commands[0].job_dir) / "trial" / "result.json"
+    changed = json.loads(result_path.read_text())
+    changed["finished_at"] = "2026-07-27T10:00:11+00:00"
+    result_path.write_text(json.dumps(changed))
+    job_result_path = Path(commands[0].job_dir) / "result.json"
+    job_result = json.loads(job_result_path.read_text())
+    job_result["trial_results"][0] = changed
+    job_result_path.write_text(json.dumps(job_result))
+
+    with pytest.raises(ValueError, match="conflicts with current evidence"):
+        tb.validate_harbor_results(
+            protocol,
+            "smoke",
+            commands,
+            protocol_path=protocol_path,
+            manifest_path=manifest_path,
+        )
+
+    assert manifest_path.read_bytes() == original
+    assert not list(tmp_path.glob(".manifest.json.*.tmp"))
+
+
 def _prepared_results(tmp_path, run_kind):
     inputs = _agent_inputs(tmp_path)
     protocol_path = Path(inputs["protocol_path"])
@@ -1083,6 +1180,104 @@ def test_successful_codex_allows_only_registered_bounded_in_process_recovery():
     assert not tb._broker_receipt_proves_clean_success(receipt, 4, 0)
 
 
+def test_successful_provenance_counts_request_retries_per_logical_request():
+    budgets = tb.TerminalBenchBudgets()
+    audit = tb.CodexRunAudit(
+        event_counts={
+            "thread.started": 1,
+            "turn.started": 1,
+            "item.completed": 49,
+            "turn.completed": 1,
+        },
+        item_counts={"command_execution": 24, "agent_message": 25},
+        tool_calls=24,
+        reconnect_notices=0,
+        input_tokens=100,
+        cached_input_tokens=0,
+        output_tokens=50,
+        reasoning_output_tokens=10,
+    )
+    protocol = tb.create_protocol(
+        evaluation_id="a" * 32,
+        output_root=Path("/tmp/lha-terminal-request-count-test/jobs"),
+        model="gpt-5.5",
+        reasoning_effort="xhigh",
+        codex_cli_version="codex-cli 0.141.0",
+        codex_target="x86_64-unknown-linux-musl",
+        codex_binary_path=Path(__file__),
+        broker_image_id="sha256:" + "b" * 64,
+        wheel_path=Path(__file__),
+    )
+    instance_id = protocol.subset.smoke_instance_ids[0]
+    attempt_id = tb.terminal_attempt_id(
+        protocol.evaluation_id,
+        "smoke",
+        instance_id,
+    )
+    image = tb.DockerImageAttestation(
+        container_id="1" * 64,
+        image_id="sha256:" + "d" * 64,
+        configured_image=(
+            f"registry.example/task@{protocol.task_image_digests[instance_id]}"
+        ),
+        repo_digests=(
+            f"registry.example/task@{protocol.task_image_digests[instance_id]}",
+        ),
+        compose_project="lha-test",
+        network_name="lha-test_default",
+        container_ip="172.28.0.2",
+    )
+    base = {
+        "evaluation_id": protocol.evaluation_id,
+        "attempt_id": attempt_id,
+        "lha_version": lha.__version__,
+        "run_kind": "smoke",
+        "instance_id": instance_id,
+        "dataset_version": protocol.dataset_version,
+        "model": protocol.model,
+        "reasoning_effort": protocol.reasoning_effort,
+        "harbor_version": protocol.harbor_version,
+        "codex_cli_version": protocol.codex_cli_version,
+        "observed_codex_cli_version": protocol.codex_cli_version,
+        "codex_target": protocol.codex_target,
+        "observed_codex_target": protocol.codex_target,
+        "codex_binary_sha256": protocol.codex_binary_sha256,
+        "observed_codex_binary_sha256": protocol.codex_binary_sha256,
+        "broker_image_id": protocol.broker_image_id,
+        "task_content_digest": protocol.task_content_digests[instance_id],
+        "task_image_digest": protocol.task_image_digests[instance_id],
+        "image_attestation": image,
+        "post_quiescence_attestation": image,
+        "wheel_sha256": protocol.wheel_sha256,
+        "protocol_sha256": "c" * 64,
+        "subset": protocol.subset,
+        "budgets": budgets,
+        "model_started": True,
+        "infrastructure_retries_used": 0,
+        "codex_outcome": "success",
+        "codex_return_code": 0,
+        "broker_cleanup_state": "succeeded",
+        "container_quiescence": "restarted",
+        "codex_events_sha256": "e" * 64,
+        "broker_receipt_sha256": "f" * 64,
+        "broker_tls_certificate_sha256": "9" * 64,
+        "broker_revoked": True,
+        "codex_audit": audit,
+    }
+
+    record = tb.TerminalBenchAgentProvenance(
+        **base,
+        broker_accepted_requests=36,
+    )
+    assert record.broker_accepted_requests == 36
+
+    with pytest.raises(ValueError, match="inconsistent broker request counts"):
+        tb.TerminalBenchAgentProvenance(
+            **base,
+            broker_accepted_requests=51,
+        )
+
+
 def test_successful_codex_requires_stream_notice_and_receipt_to_agree():
     receipt = _successful_broker_receipt()
     receipt["upstream_attempts"] = 3
@@ -1241,6 +1436,8 @@ def test_terminal_summary_requires_bound_official_harbor_records(tmp_path):
     assert "不是完整排行榜成绩" in markdown
     assert "错误交付 / 拦截 / 错误拒绝：未测" in markdown
     assert "修复成功率：不适用" in markdown
+    assert "不可评分 ERROR：0" in markdown
+    assert "协议错误" not in markdown
     assert "0 / 0 / 0" not in markdown
     assert "0/0" not in markdown
 
@@ -1307,6 +1504,7 @@ def test_terminal_summary_keeps_error_in_denominator_with_mechanism_metrics_unav
     assert summary.false_rejections is None
     assert summary.repair_success_rate is None
     assert "- ERROR：1/20（保留在分母中）" in summary.to_markdown()
+    assert "- 不可评分 ERROR：1" in summary.to_markdown()
 
 
 def test_codex_protocol_error_remains_in_twenty_task_denominator(tmp_path):
@@ -1590,8 +1788,23 @@ def test_terminal_records_reject_inconsistent_official_harbor_fields(tmp_path):
     assert first.protocol_error == "Harbor trial omitted verifier_result"
 
 
-def _exported_terminal_public_evidence(tmp_path):
+def _exported_terminal_public_evidence(
+    tmp_path,
+    *,
+    first_exception_info=None,
+):
     protocol, protocol_path, commands = _prepared_scored_results(tmp_path)
+    if first_exception_info is not None:
+        first_job = Path(commands[0].job_dir)
+        trial_path = first_job / "trial" / "result.json"
+        job_result_path = first_job / "result.json"
+        trial = json.loads(trial_path.read_text())
+        trial["verifier_result"] = None
+        trial["exception_info"] = first_exception_info
+        trial_path.write_text(json.dumps(trial))
+        job_result = json.loads(job_result_path.read_text())
+        job_result["trial_results"] = [trial]
+        job_result_path.write_text(json.dumps(job_result))
     smoke_manifest_path = (
         tb.terminal_control_root(protocol.output_root, protocol.evaluation_id)
         / "smoke_manifest.json"
@@ -1800,6 +2013,120 @@ def test_terminal_public_evidence_recomputes_fail_and_keeps_twenty_denominator(
     assert validated.denominator == 20
 
 
+def test_terminal_public_evidence_redacts_error_traceback_secret_and_path(tmp_path):
+    protocol, _commands, package, exported = _exported_terminal_public_evidence(
+        tmp_path,
+        first_exception_info={
+            "exception_type": "ValidationError",
+            "exception_message": "Bearer private-token-12345678",
+            "exception_traceback": (
+                "Traceback: /Users/example/.codex/auth.json "
+                "sk-proj-privatecredential123"
+            ),
+            "occurred_at": "2026-07-27T10:00:10+00:00",
+        },
+    )
+
+    assert (exported.passed, exported.failed, exported.errors) == (19, 0, 1)
+    index = tpe.TerminalBenchPublicEvidenceIndex.model_validate_json(
+        (package / "evidence.json").read_bytes()
+    )
+    first = index.trials[0]
+    trial_path = package / first.path
+    projection = tpe.PublicHarborErrorProjection.model_validate_json(
+        trial_path.read_bytes()
+    )
+    scored_manifest = tb.HarborExecutionManifest.model_validate_json(
+        (package / "scored_manifest.json").read_bytes()
+    )
+
+    assert first.payload_kind == "redacted_error"
+    assert first.raw_status == "ERROR"
+    assert first.exception_type == "ValidationError"
+    assert first.source_sha256 == scored_manifest.trial_result_sha256[first.instance_id]
+    assert first.payload_sha256 == tb.sha256_file(trial_path)
+    assert first.payload_sha256 != first.source_sha256
+    assert projection.source_sha256 == first.source_sha256
+    assert projection.task_name == protocol.subset.scored_instance_ids[0]
+    assert projection.exception_type == "ValidationError"
+    assert set(json.loads(trial_path.read_text())) == {
+        "schema_version",
+        "kind",
+        "source_sha256",
+        "task_name",
+        "task_checksum",
+        "raw_status",
+        "raw_correct",
+        "raw_protocol_error",
+        "exception_type",
+        "duration_s",
+        "infrastructure_retries",
+    }
+    public_text = "\n".join(
+        path.read_text()
+        for path in sorted(package.rglob("*"))
+        if path.is_file()
+    )
+    assert "exception_traceback" not in public_text
+    assert "private-token" not in public_text
+    assert "privatecredential" not in public_text
+    assert "/Users/example" not in public_text
+    validated = tpe.validate_terminal_bench_public_evidence(package)
+    assert validated == exported
+
+
+@pytest.mark.parametrize(
+    "exception_type",
+    [
+        "/Users/example/.codex/auth.json",
+        "sk-proj-privatecredential123",
+    ],
+)
+def test_terminal_public_evidence_rejects_unsafe_exception_type(exception_type):
+    with pytest.raises(ValueError, match="unsafe for public evidence"):
+        tpe._official_exception_type(
+            {"exception_info": {"exception_type": exception_type}}
+        )
+
+
+def test_terminal_public_evidence_detects_redacted_error_tampering(tmp_path):
+    _protocol, _commands, package, _exported = _exported_terminal_public_evidence(
+        tmp_path,
+        first_exception_info={"exception_type": "ValidationError"},
+    )
+    index_path = package / "evidence.json"
+    index = tpe.TerminalBenchPublicEvidenceIndex.model_validate_json(
+        index_path.read_bytes()
+    )
+    first = index.trials[0]
+    trial_path = package / first.path
+    projection = tpe.PublicHarborErrorProjection.model_validate_json(
+        trial_path.read_bytes()
+    ).model_copy(
+        update={
+            "exception_type": "RuntimeError",
+            "raw_protocol_error": "Harbor trial exception: RuntimeError",
+        }
+    )
+    trial_path.write_text(projection.model_dump_json(indent=2) + "\n")
+    forged_first = first.model_copy(
+        update={
+            "payload_sha256": tb.sha256_file(trial_path),
+            "exception_type": "RuntimeError",
+            "raw_protocol_error": "Harbor trial exception: RuntimeError",
+        }
+    )
+    index_path.write_text(
+        index.model_copy(
+            update={"trials": (forged_first, *index.trials[1:])}
+        ).model_dump_json(indent=2)
+        + "\n"
+    )
+
+    with pytest.raises(ValueError, match="raw ERROR explanation changed"):
+        tpe.validate_terminal_bench_public_evidence(package)
+
+
 def test_terminal_public_evidence_refuses_credentials_and_full_logs(tmp_path):
     protocol, protocol_path, commands = _prepared_scored_results(tmp_path)
     first_job = Path(commands[0].job_dir)
@@ -1898,6 +2225,40 @@ class _FailedHarborProcess:
 
     def poll(self):
         return self.returncode
+
+
+def test_host_cleanup_kills_group_after_leader_has_already_exited(monkeypatch):
+    class ExitedLeader:
+        pid = 424242
+        returncode = -signal.SIGTERM
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            assert timeout > 0
+            return self.returncode
+
+    group_exists = True
+    delivered: list[signal.Signals] = []
+
+    def fake_killpg(process_group, requested_signal):
+        nonlocal group_exists
+        assert process_group == ExitedLeader.pid
+        if requested_signal == 0:
+            if not group_exists:
+                raise ProcessLookupError
+            return
+        delivered.append(requested_signal)
+        if requested_signal == signal.SIGKILL:
+            group_exists = False
+
+    monkeypatch.setattr(tb.os, "killpg", fake_killpg)
+
+    tb._stop_host_process(ExitedLeader())
+
+    assert delivered == [signal.SIGTERM, signal.SIGKILL]
+    assert group_exists is False
 
 
 def test_host_command_slot_is_consumed_exactly_once(monkeypatch, tmp_path):
@@ -2462,7 +2823,7 @@ def test_unstarted_scored_commands_remain_twenty_error_rows(tmp_path):
     )
 
 
-def test_smoke_seal_is_immutable_and_binds_terminal_records(tmp_path):
+def test_smoke_seal_is_idempotent_immutable_and_binds_terminal_records(tmp_path):
     protocol, protocol_path, commands = _prepared_smoke_results(tmp_path)
     seal, manifest = tb.seal_smoke_phase(
         protocol,
@@ -2475,12 +2836,13 @@ def test_smoke_seal_is_immutable_and_binds_terminal_records(tmp_path):
         instance_id: manifest.terminal_record_sha256[instance_id]
         for instance_id in protocol.subset.smoke_instance_ids
     }
-    with pytest.raises(tb.ControlRecordExists, match="already exists"):
-        tb.seal_smoke_phase(
-            protocol,
-            commands,
-            protocol_path=protocol_path,
-        )
+    repeated_seal, repeated_manifest = tb.seal_smoke_phase(
+        protocol,
+        commands,
+        protocol_path=protocol_path,
+    )
+    assert repeated_seal == seal
+    assert repeated_manifest == manifest
 
     command = commands[0]
     terminal_path = (
@@ -2495,6 +2857,119 @@ def test_smoke_seal_is_immutable_and_binds_terminal_records(tmp_path):
             protocol,
             protocol_sha256=tb.sha256_file(protocol_path),
         )
+
+
+def test_smoke_seal_recovers_after_manifest_was_published(tmp_path):
+    protocol, protocol_path, commands = _prepared_smoke_results(tmp_path)
+    manifest = tb.validate_harbor_results(
+        protocol,
+        "smoke",
+        commands,
+        protocol_path=protocol_path,
+    )
+    with tb.open_control_store(protocol.output_root, protocol.evaluation_id) as store:
+        store.write_json_once("smoke_manifest.json", manifest)
+
+    protocol_sha256 = tb.sha256_file(protocol_path)
+    registration = tb._control_registration(
+        protocol,
+        protocol_sha256=protocol_sha256,
+    )
+    tb.initialize_control_store(
+        evaluation_id=protocol.evaluation_id,
+        protocol_sha256=protocol_sha256,
+        output_root=protocol.output_root,
+        attempts=registration.attempts,
+    )
+    seal, resumed_manifest = tb.seal_smoke_phase(
+        protocol,
+        commands,
+        protocol_path=protocol_path,
+    )
+
+    assert resumed_manifest == manifest
+    assert seal.manifest_sha256 == hashlib.sha256(
+        (
+            tb.terminal_control_root(protocol.output_root, protocol.evaluation_id)
+            / "smoke_manifest.json"
+        ).read_bytes()
+    ).hexdigest()
+
+
+def test_smoke_seal_recovers_an_interrupted_manifest_write(tmp_path):
+    protocol, protocol_path, commands = _prepared_smoke_results(tmp_path)
+    with tb.open_control_store(protocol.output_root, protocol.evaluation_id) as store:
+        pending = store._pending_name("smoke_manifest.json")
+        descriptor = os.open(
+            pending,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=store._fd,
+        )
+        try:
+            os.write(descriptor, b"{")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    protocol_sha256 = tb.sha256_file(protocol_path)
+    registration = tb._control_registration(
+        protocol,
+        protocol_sha256=protocol_sha256,
+    )
+    tb.initialize_control_store(
+        evaluation_id=protocol.evaluation_id,
+        protocol_sha256=protocol_sha256,
+        output_root=protocol.output_root,
+        attempts=registration.attempts,
+    )
+    seal, manifest = tb.seal_smoke_phase(
+        protocol,
+        commands,
+        protocol_path=protocol_path,
+    )
+
+    assert seal.manifest_sha256
+    assert manifest.run_kind == "smoke"
+
+
+def test_smoke_seal_is_serialized_across_controllers(tmp_path, monkeypatch):
+    protocol, protocol_path, commands = _prepared_smoke_results(tmp_path)
+    original_validate = tb.validate_harbor_results
+    first_entered = Event()
+    release_first = Event()
+    blocked = False
+
+    def block_first(*args, **kwargs):
+        nonlocal blocked
+        if not blocked:
+            blocked = True
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(tb, "validate_harbor_results", block_first)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            tb.seal_smoke_phase,
+            protocol,
+            commands,
+            protocol_path=protocol_path,
+        )
+        assert first_entered.wait(timeout=5)
+        second = pool.submit(
+            tb.seal_smoke_phase,
+            protocol,
+            commands,
+            protocol_path=protocol_path,
+        )
+        with pytest.raises(tb.ControlStoreError, match="already active"):
+            second.result(timeout=5)
+        release_first.set()
+        seal, manifest = first.result(timeout=5)
+
+    assert seal.manifest_sha256
+    assert manifest.run_kind == "smoke"
 
 
 def test_smoke_seal_detects_every_bound_evidence_file_change(tmp_path):
@@ -2579,6 +3054,40 @@ def _stub_harbor(monkeypatch) -> None:
         "DockerEnvironment",
         _FakeEnv,
     )
+
+
+def test_harbor_stream_reader_uses_the_registered_codex_line_boundary():
+    class StreamEnvironment:
+        def __init__(self):
+            self.observed_limit = None
+
+        async def _collect_streamed_output(self, process, **_kwargs):
+            self.observed_limit = process.stdout._limit
+            return "finished"
+
+    async def exercise():
+        environment = StreamEnvironment()
+        reader = asyncio.StreamReader(limit=64 * 1024)
+        process = types.SimpleNamespace(stdout=reader)
+        original_limit = reader._limit
+        with tb._harbor_stream_line_limit(
+            environment,
+            maximum_line_bytes=2 * 1024 * 1024,
+        ):
+            assert await environment._collect_streamed_output(process) == "finished"
+        assert reader._limit == original_limit
+        assert "_collect_streamed_output" not in environment.__dict__
+        return environment.observed_limit
+
+    assert asyncio.run(exercise()) == (2 * 1024 * 1024) + (64 * 1024)
+
+
+def test_nested_asyncio_line_overrun_is_classified_from_exception_context():
+    overrun = asyncio.LimitOverrunError("line too long", consumed=70_000)
+    wrapped = ValueError("Separator is not found, and chunk exceeds the limit")
+    wrapped.__context__ = overrun
+
+    assert tb._contains_exception(wrapped, asyncio.LimitOverrunError)
 
 
 class _FakeEnv:

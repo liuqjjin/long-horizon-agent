@@ -1,0 +1,92 @@
+{
+  "codex_events_sha256": {
+    "terminal-bench/password-recovery": "3fdb42a43d2e2542ddf65364486cc6c2a888814ab423ffb7e68f54f6284f99bd",
+    "terminal-bench/sam-cell-seg": "4c9a0918a9f4ebcf0261fb6704b4593cdb58570aaa220ef6f46213e361106a58",
+    "terminal-bench/sqlite-with-gcov": "54be0921e4d36729d3cf6d2bb4f26974b0cf3d0feade3c12f5561301e11c9cca"
+  },
+  "command_envelope_sha256": {
+    "terminal-bench/password-recovery": "c5a71d1b2f122ddfbfb255e97daa40b922279920f5df76de1a2e6b2a807b9d9a",
+    "terminal-bench/sam-cell-seg": "d43179f4163edfb0d48cbbf48350873229f46e1095016cbb39efe944792a766b",
+    "terminal-bench/sqlite-with-gcov": "da331c0d64f09358a8a6bfa1e7448b22fa7641426ce3a29e3d58fd40673902e2"
+  },
+  "command_started_sha256": {
+    "terminal-bench/password-recovery": "41608c29039fe76166b43a44681287519c3f263cc327da47974efd598aeee6c9",
+    "terminal-bench/sam-cell-seg": "8e2eb3bec93662701d0d339b74a085ca81dad651f97dbeaba1999c052a03ec3e",
+    "terminal-bench/sqlite-with-gcov": "83af4769101b74ce900f12ab42ab7af45c9ae1e63d75e45baee3346658ee1580"
+  },
+  "container_image_ids": {
+    "terminal-bench/password-recovery": "sha256:15fcd84bf3b06270ee148211cc6da6599b13ec2f41ac1d0894cf75c2225872ee",
+    "terminal-bench/sam-cell-seg": "sha256:d76bdeef19d8113f4094013249c982eca93e62e46130484846269b2d378879d0",
+    "terminal-bench/sqlite-with-gcov": "sha256:f986820b00c74ce75db7288719d364df313fde7c7917bea6eb6352a08431a89f"
+  },
+  "dataset": "terminal-bench/terminal-bench-2-1",
+  "dataset_version": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+  "expected_instance_ids": [
+    "terminal-bench/sam-cell-seg",
+    "terminal-bench/sqlite-with-gcov",
+    "terminal-bench/password-recovery"
+  ],
+  "job_config_sha256": {
+    "terminal-bench/password-recovery": "ad6276f730aa0c8d46261ad9d7cfb96cb7f9cec5740adebdf4637af31e4193f0",
+    "terminal-bench/sam-cell-seg": "6222131fe2fd2a18ad981c06a9d194ad183f8c8b11585fd6b4c6b902c2861bbb",
+    "terminal-bench/sqlite-with-gcov": "d961d1a641616618fa4f0c2c5e381969130700cafba967ab4cc4bcdc7a304787"
+  },
+  "job_dirs": [
+    "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-smoke-01-30332942d4",
+    "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-smoke-02-35e663d4fe",
+    "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-smoke-03-3662a0eba0"
+  ],
+  "job_lock_sha256": {
+    "terminal-bench/password-recovery": "7fa95d9ff777f157817c77aabf54ea3fa28fa0758fc421adf5a3c834199841fe",
+    "terminal-bench/sam-cell-seg": "41a272bbe37a7633a7bb3ff8f625dbe37d1c68544c4b0c5acaa0273107c48a95",
+    "terminal-bench/sqlite-with-gcov": "04120d1d61e4abed68f110a11dd18eacad3ef0b4d656bc340758db590bb72cd9"
+  },
+  "job_result_sha256": {
+    "terminal-bench/password-recovery": "407d2d661b3cfc25eaf0a122c844efbb13b468a55fe615b81bb8cfea1c26f224",
+    "terminal-bench/sam-cell-seg": "1a66dec3b9c4c039fa163635a4b864bf4f31d2085a417138befcfc47829f53dc",
+    "terminal-bench/sqlite-with-gcov": "5cf98011009cc52997947c3d41b55d39ddfcc0cab5e116a6f4f586583721ccbc"
+  },
+  "observed_instance_ids": [
+    "terminal-bench/sam-cell-seg",
+    "terminal-bench/sqlite-with-gcov",
+    "terminal-bench/password-recovery"
+  ],
+  "official_status": {
+    "terminal-bench/password-recovery": "PASS",
+    "terminal-bench/sam-cell-seg": "PASS",
+    "terminal-bench/sqlite-with-gcov": "PASS"
+  },
+  "protocol_errors": {
+    "terminal-bench/password-recovery": null,
+    "terminal-bench/sam-cell-seg": null,
+    "terminal-bench/sqlite-with-gcov": null
+  },
+  "protocol_sha256": "02e63fe754d3254a761153220325e33a88809ec9e3e8a03459abc6c8926893a2",
+  "run_kind": "smoke",
+  "schema_version": 5,
+  "task_checksums": {
+    "terminal-bench/password-recovery": "a8b12d116b3a8e03e946f0db92b77e789cfa26ecb49a56be5723ff47a03a532d",
+    "terminal-bench/sam-cell-seg": "7ec5aad46e3ecdb169a65cf38392d4a87eb37ce0bf4acef3398dbd60af59b2f4",
+    "terminal-bench/sqlite-with-gcov": "243352f9b742b39a4a21fe51a1d88c04cc45ede977e83cc968c9becfaf3f1de2"
+  },
+  "task_content_digests": {
+    "terminal-bench/password-recovery": "sha256:9b5c6bdce0cf03f075b21f6a7af5030b825ce07d7b16b37610f3964217ab84a4",
+    "terminal-bench/sam-cell-seg": "sha256:37c182b91df18b9c2ea2dceda47430bbd585e7880c56fca2f1975907ce0df8ce",
+    "terminal-bench/sqlite-with-gcov": "sha256:9f9bd57fbf9f4831e9031755e83aea6b9d60d2b2d54e8a12d48cff4dca3c231d"
+  },
+  "task_image_digests": {
+    "terminal-bench/password-recovery": "sha256:15fcd84bf3b06270ee148211cc6da6599b13ec2f41ac1d0894cf75c2225872ee",
+    "terminal-bench/sam-cell-seg": "sha256:d76bdeef19d8113f4094013249c982eca93e62e46130484846269b2d378879d0",
+    "terminal-bench/sqlite-with-gcov": "sha256:f986820b00c74ce75db7288719d364df313fde7c7917bea6eb6352a08431a89f"
+  },
+  "terminal_record_sha256": {
+    "terminal-bench/password-recovery": "e03212930057273dd79acd6d98ead3d28df6ce9418989ba184962aaf39a1cfd6",
+    "terminal-bench/sam-cell-seg": "96bb93e33da498862aa3f0eaedc31ba2915b966b6304777ff0a93daf604efae7",
+    "terminal-bench/sqlite-with-gcov": "61e38e2ded85c87555b252f5cf0efbaca4c98e881401a51e424586cfbd293512"
+  },
+  "trial_result_sha256": {
+    "terminal-bench/password-recovery": "1902e364e8ac329a210e55e08c01c5e68e707fd2ff61694bf6fe0e9c7808d449",
+    "terminal-bench/sam-cell-seg": "b2d124a3f02bc6d9735305c02764d73bcd18b454972c4525b96f30cd3e8d2e89",
+    "terminal-bench/sqlite-with-gcov": "8a0890cc99ab09576c1b1295bbbccf927bfc98d802c7dd8ba210693d634dc6d4"
+  }
+}

@@ -51,8 +51,8 @@ from .bench.terminal_public_evidence import (
 from .horizon import Cells, build_report
 
 _CONDITION_NAMES = tuple(name for name, _blurb in CONDITIONS)
-_LEGACY_README_MARKER = "历史快照（legacy）"
-_FORMAL_README_MARKER = "正式报告（formal）"
+_LEGACY_README_MARKER = "历史报告"
+_FORMAL_README_MARKER = "正式报告"
 _LEGACY_ABLATION_MARKER = "legacy snapshot"
 _LEGACY_HORIZON_MARKER = "legacy snapshot"
 _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
@@ -904,9 +904,22 @@ def _validate_terminal_evidence(
     if not evidence_dir.exists() and not evidence_dir.is_symlink():
         return None
     try:
-        return validate_terminal_bench_public_evidence(evidence_dir)
+        validation = validate_terminal_bench_public_evidence(evidence_dir)
     except (OSError, ValueError) as exc:
         _fail(f"cannot validate committed Terminal-Bench evidence: {exc}")
+    source_identity = (
+        validation.evaluated_commit_sha,
+        validation.evaluated_tree_sha,
+        validation.evaluated_wheel_filename,
+        validation.evaluated_wheel_size_bytes,
+        validation.evaluated_wheel_sha256,
+    )
+    if any(value is None for value in source_identity):
+        _fail(
+            "committed Terminal-Bench evidence must use schema 4 with a complete "
+            "source attestation"
+        )
+    return validation
 
 
 def _terminal_claim_value(
@@ -1013,14 +1026,14 @@ def _validate_readme(
     )
     if ablation.status == "legacy":
         if _LEGACY_README_MARKER not in section:
-            _fail("README must label historical evidence as '历史快照（legacy）'")
+            _fail("README must label historical evidence as '历史报告'")
         if not pending:
             _fail("README must state that the formal 204-cell rerun is still pending")
         if _FORMAL_README_MARKER in section:
             _fail("README cannot label a legacy benchmark as formal")
     else:
         if _FORMAL_README_MARKER not in section:
-            _fail("README must label schema-4 evidence as '正式报告（formal）'")
+            _fail("README must label schema-4 evidence as '正式报告'")
         if _LEGACY_README_MARKER in section or pending:
             _fail("README still describes the committed formal benchmark as pending/legacy")
         if ablation.report.model not in section:

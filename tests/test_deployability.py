@@ -132,7 +132,7 @@ def test_orchestrator_survives_spawn_failure(monkeypatch):
     def boom(*a, **k):
         raise OSError("EMFILE: too many open files")
 
-    monkeypatch.setattr(orchestrator.subprocess, "run", boom)
+    monkeypatch.setattr(orchestrator, "run_bounded_process", boom)
     outs = orchestrator.run_tasks(["a.yaml", "b.yaml"], max_workers=2)
     assert len(outs) == 2  # one bad spawn did not discard the whole batch
     assert all(o.status == "ERROR" for o in outs)

@@ -36,7 +36,12 @@ def test_committed_public_claims_validate():
     assert summary.tasks > 0
     assert summary.repetitions > 0
     assert summary.cells == summary.tasks * summary.repetitions
-    assert summary.terminal_bench is None
+    assert summary.terminal_bench is not None
+    assert summary.terminal_bench.evaluated_commit_sha is not None
+    assert summary.terminal_bench.evaluated_tree_sha is not None
+    assert summary.terminal_bench.evaluated_wheel_filename is not None
+    assert summary.terminal_bench.evaluated_wheel_size_bytes is not None
+    assert summary.terminal_bench.evaluated_wheel_sha256 is not None
 
 
 def _terminal_validation() -> TerminalBenchPublicEvidenceValidation:
@@ -46,6 +51,11 @@ def _terminal_validation() -> TerminalBenchPublicEvidenceValidation:
         protocol_sha256="c" * 64,
         scored_manifest_sha256="d" * 64,
         records_sha256="e" * 64,
+        evaluated_commit_sha="f" * 40,
+        evaluated_tree_sha="1" * 40,
+        evaluated_wheel_filename="lha-0.4.2.dev0-py3-none-any.whl",
+        evaluated_wheel_size_bytes=365_480,
+        evaluated_wheel_sha256="2" * 64,
         model="gpt-5.5",
         reasoning_effort="xhigh",
         harbor_version="0.20.0",
@@ -98,6 +108,34 @@ def test_terminal_public_evidence_is_validated_and_bound_to_readme(
 
     assert calls == [evidence_dir]
     assert summary.terminal_bench == terminal
+
+
+def test_terminal_schema_three_evidence_cannot_support_a_public_claim(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    (root / "benchmarks/terminal_bench_2_1").mkdir()
+    legacy = _terminal_validation().model_copy(
+        update={
+            "evaluated_commit_sha": None,
+            "evaluated_tree_sha": None,
+            "evaluated_wheel_filename": None,
+            "evaluated_wheel_size_bytes": None,
+            "evaluated_wheel_sha256": None,
+        }
+    )
+    monkeypatch.setattr(
+        claims,
+        "validate_terminal_bench_public_evidence",
+        lambda _path: legacy,
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="schema 4"):
+        validate_release_claims(root)
 
 
 @pytest.mark.parametrize(
@@ -156,9 +194,9 @@ def test_legacy_snapshot_requires_an_explicit_readme_marker(tmp_path, monkeypatc
     root = tmp_path / "repo"
     _write_legacy_report(root, monkeypatch)
     readme = root / "README.md"
-    readme.write_text(readme.read_text().replace("历史快照（legacy）", "消融报告"))
+    readme.write_text(readme.read_text().replace("历史报告", "消融报告"))
 
-    with pytest.raises(ReleaseClaimsError, match="历史快照"):
+    with pytest.raises(ReleaseClaimsError, match="历史报告"):
         validate_release_claims(root)
 
 
@@ -482,7 +520,7 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 ## 已提交的实测结果
 
-仓库中的消融报告是正式报告（formal），使用 2 个预设 Python 缺陷，每个任务重复 2 次，共 4 组相同首轮补丁。
+仓库中的消融报告是正式报告，使用 2 个预设 Python 缺陷，每个任务重复 2 次，共 4 组相同首轮补丁。
 实测模型为 `model-x`。
 
 | 条件 | 处理方式 | 独立评分 |
@@ -544,7 +582,7 @@ def _write_legacy_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     readme = root / "README.md"
     readme.write_text(
         readme.read_text()
-        .replace("正式报告（formal）", "历史快照（legacy）")
+        .replace("正式报告", "历史报告")
         .replace(
             "## 其他",
             "204 次正式复测只有在运行并提交原始记录后才会更新。\n\n## 其他",
@@ -817,8 +855,8 @@ def test_schema_three_cannot_be_published_as_current_formal_evidence(
     )
     readme = root / "README.md"
     readme.write_text(
-        readme.read_text().replace("历史快照（legacy）", "正式报告（formal）")
+        readme.read_text().replace("历史报告", "正式报告")
     )
 
-    with pytest.raises(ReleaseClaimsError, match="历史快照"):
+    with pytest.raises(ReleaseClaimsError, match="历史报告"):
         validate_release_claims(root)
