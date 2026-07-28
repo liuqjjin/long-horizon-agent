@@ -83,7 +83,9 @@ def test_planning_cannot_omit_the_edit_or_pytest_gate():
 
 
 def test_planning_cannot_weaken_approval_or_required_context():
-    task = TaskSpec.from_file("data/tasks/fix_average_approval.yaml")
+    task = TaskSpec.from_file("data/tasks/fix_average_approval.yaml").model_copy(
+        update={"context_requirement": "required"}
+    )
     response = (
         '{"summary":"x","steps":['
         '{"step_id":"s1","kind":"code","action":"gather_context",'

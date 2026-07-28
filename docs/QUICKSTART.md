@@ -23,7 +23,8 @@ image.
 
 ## Run an offline code task
 
-The default model backend is deterministic and requires no credentials:
+The default model backend is deterministic and requires no credentials or
+`ccc`:
 
 ```bash
 uv run lha run data/tasks/fix_average.yaml
@@ -31,6 +32,11 @@ uv run lha run data/tasks/fix_average.yaml
 
 The run reaches `DONE` only after its Pytest and Ruff checks pass. Keep the
 printed `run_id`, then inspect the saved evidence:
+
+This bundled task explicitly makes indexed code context optional. It still runs
+the real checks when `ccc` is not installed. `ccc` is an optional code-indexing
+feature, not a quickstart prerequisite; tasks that require indexed context still
+fail closed when the backend is unavailable.
 
 ```bash
 RUN_ID=replace-with-the-printed-run-id

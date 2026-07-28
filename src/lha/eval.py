@@ -147,7 +147,9 @@ def _case_context_fail_closed(base: Config) -> EvalResult:
     be a failure of some other kind.
     """
     cfg = _cfg(base, "context_fail_closed", code_backend="null", max_repairs=0)
-    task = _task(base, "fix_average.yaml")  # context_requirement: required
+    task = _task(base, "fix_average.yaml").model_copy(
+        update={"context_requirement": "required"}
+    )
     r = Harness(cfg).run(task)
 
     named_the_reason = False

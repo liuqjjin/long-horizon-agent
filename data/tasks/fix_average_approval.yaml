@@ -9,6 +9,7 @@ description: >
   average() in mathutils.py is off by one; fix it. The edit requires human
   approval before it is verified and accepted.
 target_repo: data/sample_repo
+context_requirement: optional
 inputs:
   context_query: "average function arithmetic mean"
   require_approval: true

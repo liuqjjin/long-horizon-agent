@@ -28,12 +28,16 @@ git clone https://github.com/liuqjjin/long-horizon-agent.git
 cd long-horizon-agent
 uv sync
 
-# 默认使用确定性测试后端，不需要模型凭据
+# 默认使用确定性测试后端，不需要模型凭据或 ccc
 uv run lha run data/tasks/fix_average.yaml
 
 # 运行仓库自测
 LHA_RUNS_DIR=runs/_quickstart uv run lha eval
 ```
+
+这个入门任务把代码索引明确设为可选，因此没有安装 `ccc` 也会运行 Pytest 和 Ruff，
+并保存完整校验证据。`ccc` 只是可选的代码索引功能；需要检索仓库上下文时再安装和启用。
+其他任务若声明上下文为必需，索引不可用时仍会按失败处理。
 
 本机已经登录 Codex CLI 时，可以使用真实模型：
 
