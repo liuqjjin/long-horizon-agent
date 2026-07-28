@@ -101,6 +101,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Set up uv (+ Python 3.11 from .python-version)
         uses: astral-sh/setup-uv@v5
         with:

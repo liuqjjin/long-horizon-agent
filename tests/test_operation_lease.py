@@ -787,7 +787,11 @@ def test_unresolved_preparing_lease_returns_typed_quarantine(tmp_path):
     assert "remained PREPARING" in recovered.detail
 
 
-def test_docker_recovery_validates_label_before_removal(tmp_path, monkeypatch):
+def test_docker_recovery_validates_label_before_removal(
+    tmp_path,
+    monkeypatch,
+    fake_docker_executable,
+):
     store = OperationLeaseStore(tmp_path)
     lease = store.activate_docker(["python", "-V"], cwd=tmp_path)
     removed: list[str] = []
@@ -829,6 +833,7 @@ def test_docker_recovery_validates_label_before_removal(tmp_path, monkeypatch):
 
     recovered = DockerBackend(
         image="image:id",
+        docker=fake_docker_executable,
         operation_lease_dir=tmp_path,
     ).recover_active_operations(tmp_path)
 
@@ -837,7 +842,11 @@ def test_docker_recovery_validates_label_before_removal(tmp_path, monkeypatch):
     assert store.list() == []
 
 
-def test_docker_run_persists_identity_before_client_spawn(tmp_path, monkeypatch):
+def test_docker_run_persists_identity_before_client_spawn(
+    tmp_path,
+    monkeypatch,
+    fake_docker_executable,
+):
     workdir = tmp_path / "workdir"
     workdir.mkdir()
     observed: list[tuple[list[str], object]] = []
@@ -868,6 +877,7 @@ def test_docker_run_persists_identity_before_client_spawn(tmp_path, monkeypatch)
 
     result = DockerBackend(
         image="image:id",
+        docker=fake_docker_executable,
         operation_lease_dir=tmp_path,
     ).run(["python", "-V"], cwd=workdir)
 
@@ -881,7 +891,11 @@ def test_docker_run_persists_identity_before_client_spawn(tmp_path, monkeypatch)
     assert OperationLeaseStore(tmp_path).list() == []
 
 
-def test_docker_recovery_quarantines_identity_mismatch(tmp_path, monkeypatch):
+def test_docker_recovery_quarantines_identity_mismatch(
+    tmp_path,
+    monkeypatch,
+    fake_docker_executable,
+):
     store = OperationLeaseStore(tmp_path)
     lease = store.activate_docker(["python", "-V"], cwd=tmp_path)
     monkeypatch.setattr(
@@ -909,9 +923,10 @@ def test_docker_recovery_quarantines_identity_mismatch(tmp_path, monkeypatch):
         ),
     )
 
-    recovered = DockerBackend(image="image:id").recover_active_operations(
-        tmp_path
-    )
+    recovered = DockerBackend(
+        image="image:id",
+        docker=fake_docker_executable,
+    ).recover_active_operations(tmp_path)
 
     assert recovered.confirmed is False
     assert recovered.quarantined_operation_ids == (lease.operation_id,)

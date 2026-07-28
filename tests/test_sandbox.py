@@ -679,7 +679,11 @@ def test_docker_argv_isolation_flags(tmp_path):
     assert joined.count("--env") == 1
 
 
-def test_docker_timeout_preserves_nonzero_cleanup_failure(tmp_path, monkeypatch):
+def test_docker_timeout_preserves_nonzero_cleanup_failure(
+    tmp_path,
+    monkeypatch,
+    fake_docker_executable,
+):
     invocations: list[list[str]] = []
     monkeypatch.setattr(
         docker_backend,
@@ -705,7 +709,10 @@ def test_docker_timeout_preserves_nonzero_cleanup_failure(tmp_path, monkeypatch)
         )
 
     monkeypatch.setattr(docker_backend, "run_bounded_process", fake_bounded)
-    result = DockerBackend(image="img:1").run(["python", "-V"], cwd=tmp_path, timeout=0.1)
+    result = DockerBackend(
+        image="img:1",
+        docker=fake_docker_executable,
+    ).run(["python", "-V"], cwd=tmp_path, timeout=0.1)
 
     assert result.returncode == 126
     assert result.cleanup_unconfirmed is True
@@ -719,7 +726,11 @@ def test_docker_timeout_preserves_nonzero_cleanup_failure(tmp_path, monkeypatch)
     assert invocations[1][1:3] == ["rm", "-f"]
 
 
-def test_docker_timeout_returns_a_result_when_cleanup_also_times_out(tmp_path, monkeypatch):
+def test_docker_timeout_returns_a_result_when_cleanup_also_times_out(
+    tmp_path,
+    monkeypatch,
+    fake_docker_executable,
+):
     monkeypatch.setattr(
         docker_backend,
         "terminate_process_group",
@@ -743,7 +754,10 @@ def test_docker_timeout_returns_a_result_when_cleanup_also_times_out(tmp_path, m
         )
 
     monkeypatch.setattr(docker_backend, "run_bounded_process", fake_bounded)
-    result = DockerBackend(image="img:1").run(["python", "-V"], cwd=tmp_path, timeout=0.1)
+    result = DockerBackend(
+        image="img:1",
+        docker=fake_docker_executable,
+    ).run(["python", "-V"], cwd=tmp_path, timeout=0.1)
 
     assert result.returncode == 126
     assert result.cleanup_unconfirmed is True
@@ -754,7 +768,11 @@ def test_docker_timeout_returns_a_result_when_cleanup_also_times_out(tmp_path, m
     assert "container removed" not in result.stderr
 
 
-def test_docker_timeout_keeps_124_when_daemon_confirms_container_absent(tmp_path, monkeypatch):
+def test_docker_timeout_keeps_124_when_daemon_confirms_container_absent(
+    tmp_path,
+    monkeypatch,
+    fake_docker_executable,
+):
     monkeypatch.setattr(
         docker_backend,
         "terminate_process_group",
@@ -777,7 +795,10 @@ def test_docker_timeout_keeps_124_when_daemon_confirms_container_absent(tmp_path
 
     monkeypatch.setattr(docker_backend, "run_bounded_process", fake_bounded)
 
-    result = DockerBackend(image="img:1").run(
+    result = DockerBackend(
+        image="img:1",
+        docker=fake_docker_executable,
+    ).run(
         ["python", "-V"],
         cwd=tmp_path,
         timeout=0.1,
@@ -787,7 +808,11 @@ def test_docker_timeout_keeps_124_when_daemon_confirms_container_absent(tmp_path
     assert result.cleanup_unconfirmed is False
 
 
-def test_docker_nonzero_exit_becomes_126_when_absence_probe_fails(tmp_path, monkeypatch):
+def test_docker_nonzero_exit_becomes_126_when_absence_probe_fails(
+    tmp_path,
+    monkeypatch,
+    fake_docker_executable,
+):
     calls: list[list[str]] = []
 
     def fake_bounded(argv, **_kwargs):
@@ -801,7 +826,10 @@ def test_docker_nonzero_exit_becomes_126_when_absence_probe_fails(tmp_path, monk
 
     monkeypatch.setattr(docker_backend, "run_bounded_process", fake_bounded)
 
-    result = DockerBackend(image="img:1").run(
+    result = DockerBackend(
+        image="img:1",
+        docker=fake_docker_executable,
+    ).run(
         ["python", "-V"],
         cwd=tmp_path,
     )
@@ -818,7 +846,11 @@ def test_docker_nonzero_exit_becomes_126_when_absence_probe_fails(tmp_path, monk
     ]
 
 
-def test_docker_preserves_a_real_target_exit_126_when_cleanup_is_confirmed(tmp_path, monkeypatch):
+def test_docker_preserves_a_real_target_exit_126_when_cleanup_is_confirmed(
+    tmp_path,
+    monkeypatch,
+    fake_docker_executable,
+):
     def fake_bounded(argv, **_kwargs):
         if argv[1] == "run":
             return ProcResult(
@@ -840,7 +872,10 @@ def test_docker_preserves_a_real_target_exit_126_when_cleanup_is_confirmed(tmp_p
 
     monkeypatch.setattr(docker_backend, "run_bounded_process", fake_bounded)
 
-    result = DockerBackend(image="img:1").run(
+    result = DockerBackend(
+        image="img:1",
+        docker=fake_docker_executable,
+    ).run(
         ["python", "-V"],
         cwd=tmp_path,
     )
@@ -1190,6 +1225,7 @@ def test_docker_client_output_is_bounded_without_a_daemon(tmp_path):
 
 def test_docker_provenance_records_image_id_and_in_container_versions(
     monkeypatch,
+    fake_docker_executable,
 ) -> None:
     calls: list[list[str]] = []
 
@@ -1206,7 +1242,10 @@ def test_docker_provenance_records_image_id_and_in_container_versions(
 
     monkeypatch.setattr(docker_backend, "run_bounded_process", fake_bounded)
 
-    provenance = DockerBackend(image="img:1").provenance()
+    provenance = DockerBackend(
+        image="img:1",
+        docker=fake_docker_executable,
+    ).provenance()
 
     assert provenance["image_id"] == f"sha256:{'a' * 64}"
     assert provenance["image_id_status"] == "available"
@@ -1230,6 +1269,7 @@ def test_docker_provenance_records_image_id_and_in_container_versions(
 
 def test_docker_provenance_failure_is_explicit_and_non_raising(
     monkeypatch,
+    fake_docker_executable,
 ) -> None:
     calls = 0
 
@@ -1242,7 +1282,10 @@ def test_docker_provenance_failure_is_explicit_and_non_raising(
 
     monkeypatch.setattr(docker_backend, "run_bounded_process", fake_bounded)
 
-    provenance = DockerBackend(image="missing:1").provenance()
+    provenance = DockerBackend(
+        image="missing:1",
+        docker=fake_docker_executable,
+    ).provenance()
 
     assert provenance["image_id"] is None
     assert provenance["image_id_status"] == "unavailable"
