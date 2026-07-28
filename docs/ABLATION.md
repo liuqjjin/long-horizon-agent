@@ -64,11 +64,13 @@ summary and calling `os._exit(0)` produces no receipt and is classified as
 `ERROR`, not pass.
 
 This is not containment against hostile Python running with the scorer's UID.
-Such code can inspect the process and its writable mount; Docker protects the
-host but does not by itself make the in-container oracle immutable. The current
-ablation assumes fixed, non-adversarial corpus programs. A hostile-code scorer
-would additionally need a separate control process and read-only oracle mount.
-`trusted-local` must only be used for repositories already trusted by the user.
+Such code can inspect the process and its writable mount. Docker reduces the
+host's exposure, but the remaining boundary still depends on the image, mounts,
+network, and container permissions; it does not make the in-container oracle
+immutable. The current ablation assumes fixed, non-adversarial corpus programs.
+A hostile-code scorer would additionally need a separate control process and
+read-only oracle mount. `trusted-local` must only be used for repositories
+already trusted by the user.
 
 The first-attempt workspace excludes tests. Changes to tests, `conftest.py`,
 package or build configuration, and CI files are rejected unless an exact path
@@ -103,8 +105,8 @@ identity where applicable. It does not record credentials.
 
 ## Errors, cache, and statistics
 
-A completed cell can be reused only if its schema-6 cache fingerprint still
-matches and its patch artifact and scorer receipt both validate. The
+A completed cell can be reused only if its cache-key format v7 fingerprint
+still matches and its patch artifact and scorer receipt both validate. The
 fingerprint covers the input snapshot, LHA source, model settings, scorer,
 repair and retry settings, and runtime versions.
 
@@ -166,7 +168,7 @@ Before publishing a result, finish the registered repetitions, keep every
 scorer evidence together. `release_claims` recomputes the LHA source tree plus
 the task and corpus digests from the checkout.
 
-The authoritative committed files are
+The generated files for the historical schema-v2 run are
 [`benchmarks/ablation_report.json`](../benchmarks/ablation_report.json) and
 [`benchmarks/ablation_report.md`](../benchmarks/ablation_report.md).
 Statistical and recovery tests are in `tests/test_ablation.py` and

@@ -72,7 +72,7 @@ episodes to this analysis.
 
 ```bash
 uv run lha horizon \
-  --from-report benchmarks/ablation_report.json \
+  --from-report runs/ablation-schema4/ablation_report.json \
   --out runs/horizon
 ```
 
@@ -91,7 +91,8 @@ Before citing a result, check that model and runtime provenance match the
 intended protocol, `ERROR` cells are accounted for, the two measured units are
 labelled separately, and composition still reports zero added samples.
 
-The committed output is
+The currently committed links below are historical schema-v2 output, not a
+current chain-success result:
 [`benchmarks/horizon_report.md`](../benchmarks/horizon_report.md), with source
 data in [`benchmarks/horizon_report.json`](../benchmarks/horizon_report.json).
 Regression tests are in `tests/test_horizon.py`.

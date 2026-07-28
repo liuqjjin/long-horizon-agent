@@ -20,8 +20,11 @@ Notable changes are listed here. The format follows
   does not repeat a stage that may already have produced a side effect.
 - Added validated run inspection, self-contained HTML traces, and dry-run-first
   pruning through `lha runs`.
-- Added a preregistered Terminal-Bench 2.1 fixed-subset adapter for Harbor 0.20.
-  Adapter support and smoke jobs are not reported as a benchmark score.
+- Added a Terminal-Bench 2.1 adapter for Harbor 0.20 and preregistered the fixed
+  20-task protocol. The committed schema-v4 package contains its manifests,
+  source and wheel attestation, summary, and public trial evidence.
+- Added CI checks that rebuild the exact wheel used by Terminal-Bench from its
+  recorded Git commit and reject a release that no longer contains that commit.
 
 ### Changed
 
@@ -42,6 +45,11 @@ Notable changes are listed here. The format follows
   checks install both wheel and source distribution outside the checkout.
 - Public documentation was shortened and reorganized around commands,
   implementation, evaluation status, and known limits.
+- The application image now bundles a pinned `all-MiniLM-L6-v2` snapshot and
+  loads it offline, so container self-eval does not download model files.
+- Host, Codex, and Claude subprocesses now bound output, reject invalid timeout
+  values, remove process groups on every exit path, and fail when cleanup cannot
+  be confirmed.
 
 ### Evaluation record
 
@@ -49,7 +57,10 @@ Notable changes are listed here. The format follows
   The scoring boundary, error classification, and evidence format have since
   changed, so those files are not the current project result. New ablation
   numbers require a complete schema-v4 rerun.
-- No Terminal-Bench or SWE-bench score is claimed in this section.
+- The preregistered Terminal-Bench 2.1 fixed 20-task subset produced 7 `PASS`,
+  9 `FAIL`, and 4 `ERROR`; all errors remain in the denominator. This is a
+  fixed-subset result, not a full-dataset or leaderboard score.
+- No SWE-bench score is published.
 
 ## [0.4.1] — 2026-07-25
 

@@ -172,8 +172,10 @@ backends, failed indexes, stale data, and partial availability.
 
 `lha ablate` shares the first attempt across `trust`, `gate`, and `verify`.
 Ground truth comes from a frozen source change applied to a fresh repository and
-scored through a separate backend. Read current numbers from
-`benchmarks/ablation_report.json`; do not reconstruct them from prose.
+scored through a separate backend. The committed schema-v2 report is a historical
+record; a current result requires a complete schema-v4 report and its evidence.
+Read historical numbers from `benchmarks/ablation_report.json` instead of
+reconstructing them from prose.
 
 `lha horizon` keeps paired cells, complete-corpus repetitions, and descriptive
 composition separate. Cell and episode tests can differ. Composition adds no
@@ -189,6 +191,12 @@ For Terminal-Bench 2.1:
 - do not report direct-Harbor runs as evidence for LHA gate or repair behavior;
 - do not publish a score until protocol, manifest, raw results, and summary are
   committed together.
+
+The formal fixed-subset run is complete: 7 `PASS`, 9 `FAIL`, and 4 `ERROR`
+across 20 tasks. All four errors remain in the denominator. The evaluated source
+commit is `e63f94620ce8ddd322b19ccb159381183fc31933`; its public schema-v4
+evidence is under `benchmarks/terminal_bench_2_1/`. Do not rerun any of these
+20 scored tasks or describe the result as a full-dataset or leaderboard score.
 
 ## Reporting and retention
 
@@ -221,6 +229,7 @@ docker build -t lha:release .
 LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
   uv run pytest tests/test_sandbox.py -q
 docker run --rm lha:release lha --version
+docker run --network none --rm lha:release lha eval
 ```
 
 Also install the wheel and source archive from empty directories and import
@@ -257,5 +266,6 @@ package and container smoke checks.
   of a blocking operation; each such operation needs its own timeout.
 - Checks reduce, but do not eliminate, prompt injection from indexed content.
 - Source freshness and citation checks are weaker than executable oracles.
-- Public benchmark adapters are not benchmark results.
+- An adapter alone is not a benchmark result; a result requires the committed
+  protocol, raw evidence, provenance, and summary.
 - A horizon composition is a projection, not an executed long task.
