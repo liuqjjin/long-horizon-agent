@@ -20,9 +20,10 @@ Notable changes are listed here. The format follows
   does not repeat a stage that may already have produced a side effect.
 - Added validated run inspection, self-contained HTML traces, and dry-run-first
   pruning through `lha runs`.
-- Added a Terminal-Bench 2.1 adapter for Harbor 0.20 and preregistered the fixed
-  20-task protocol. The committed schema-v4 package contains its manifests,
-  source and wheel attestation, summary, and public trial evidence.
+- Added a Terminal-Bench 2.1 adapter for Harbor 0.20.
+- Fixed the 20-task evaluation protocol before the scored run. The committed
+  schema-v4 package contains its manifests, source and wheel attestation,
+  summary, and public trial evidence.
 - Added CI checks that rebuild the exact wheel used by Terminal-Bench from its
   recorded Git commit and reject a release that no longer contains that commit.
 

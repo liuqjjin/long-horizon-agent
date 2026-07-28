@@ -9,7 +9,7 @@ lha batch <task>...      run multiple tasks in parallel (process-isolated)
 lha trace <run_id>       render a run's ledger timeline
 lha index <path>         (re)build the code index for a repo
 lha index-docs           (re)build paper/experiment/skill indexes via CocoIndex
-lha ask <query...>       answer a query with fresh, cited context
+lha ask <query...>       retrieve fresh context with source locations
 lha runs list|show|prune inspect and safely retain persisted runs
 lha approve|reject <run_id>   resolve a pending human-approval gate
 
@@ -36,7 +36,7 @@ examples:
   lha run data/tasks/fix_average.yaml            fix a bug, verified by real pytest
   lha eval                                       run the six repository workflows
   lha run --runtime langgraph <task>             durable run with an approval gate
-  lha ask "how is average computed" --kinds code answer with fresh, cited context
+  lha ask "how is average computed" --kinds code retrieve context with source locations
   lha trace <run_id> --html                      write a self-contained run report
   lha runs prune --older-than-days 30            dry-run terminal-run retention
 """
@@ -511,7 +511,7 @@ def _print_result(result) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lha",
-        description="run model-generated task steps with executable checks and resumable state",
+        description="run task steps with executable checks and resumable state",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -589,7 +589,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pid.set_defaults(func=_cmd_index_docs)
 
-    pa = sub.add_parser("ask", help="answer a query with fresh, cited context")
+    pa = sub.add_parser(
+        "ask",
+        help="retrieve indexed context and print source locations",
+    )
     pa.add_argument("query", nargs="+")
     pa.add_argument("--root", default=".", help="code root to search")
     pa.add_argument("--kinds", default="", help="comma list: code,paper,experiment,skill")

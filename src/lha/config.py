@@ -1,8 +1,8 @@
 """Runtime configuration, populated from environment variables (``LHA_*``).
 
 A ``.env`` file in the project root is loaded automatically if python-dotenv is
-available. Everything here has a sensible default so the walking skeleton runs
-with zero configuration.
+available. Defaults allow the deterministic self-evaluation to run without
+external credentials.
 """
 
 from __future__ import annotations

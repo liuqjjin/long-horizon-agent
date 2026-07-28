@@ -8,15 +8,12 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "liuqjjin", email = "156533013+liuqjjin@users.noreply.github.com" }]
 keywords = [
-    "llm-agents",
-    "agent-harness",
-    "verification",
-    "llm-evals",
-    "research-agent",
+    "task-runner",
+    "checkpoint-recovery",
+    "code-verification",
+    "docker",
+    "reproducible-evaluation",
     "langgraph",
-    "reproducibility",
-    "ablation",
-    "swe-bench",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
