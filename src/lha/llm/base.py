@@ -25,6 +25,20 @@ _FILE_BLOCK = re.compile(
     r"^###[ \t]*(?P<path>[^\n]+?)[ \t]*\n+```[^\n]*\n(?P<body>.*?)\n?```",
     re.DOTALL | re.MULTILINE,
 )
+_PYTHON_PATH_TOKEN = re.compile(
+    r"(?<![\w./\\-])(?P<path>[\w./\\-]+\.py)(?::\d+(?:-\d+)?)?"
+)
+
+# These are byte limits rather than token estimates so every backend receives the
+# same deterministic input. Source files are whole-file inputs: a referenced target
+# that does not fit fails before the model call instead of presenting a prefix that
+# the response protocol would incorrectly ask the model to rewrite in full.
+_MAX_IMPLEMENTATION_PROMPT_BYTES = 192 * 1024
+_MAX_SOURCE_SECTION_BYTES = 128 * 1024
+_MAX_SOURCE_FILE_BYTES = 64 * 1024
+_MAX_CONTEXT_SECTION_BYTES = 32 * 1024
+_MAX_ISSUE_BYTES = 8 * 1024
+_MAX_FAILURE_BYTES = 16 * 1024
 
 _PLAN_SYSTEM = (
     "You plan work for a task runner that advances only after registered checks pass. "
@@ -225,22 +239,44 @@ class LLMClient(ABC):
             workdir,
             oracle_paths,
         )
-        ctx_text = "\n\n".join(
-            f"# {i.provenance.locator}\n{i.text}"
-            for i in visible_bundle.items[:8]
+        issue_text = _bounded_text(
+            step.goal,
+            _MAX_ISSUE_BYTES,
+            label="issue text",
+        )
+        failure_text = _bounded_text(
+            "\n".join(step.prior_failures) or "none",
+            _MAX_FAILURE_BYTES,
+            label="prior failures",
+        )
+        ctx_text = _render_context(
+            visible_bundle,
+            _MAX_CONTEXT_SECTION_BYTES,
         )
         files_text = self._read_repo_python(
             workdir,
+            referenced_paths=self._referenced_repo_python(
+                workdir,
+                step,
+                visible_bundle,
+                trusted_oracle_paths=oracle_paths,
+            ),
+            max_section_bytes=_MAX_SOURCE_SECTION_BYTES,
+            max_file_bytes=_MAX_SOURCE_FILE_BYTES,
             trusted_oracle_paths=oracle_paths,
         )
         prompt = (
-            f"## Issue\n{step.goal}\n\n"
-            f"## Prior failures (if any)\n{chr(10).join(step.prior_failures) or 'none'}\n\n"
-            f"## Retrieved context\n{ctx_text or 'none'}\n\n"
+            f"## Issue\n{issue_text}\n\n"
+            f"## Prior failures (if any)\n{failure_text}\n\n"
+            "## Retrieved context snippets (these may be partial excerpts)\n"
+            f"{ctx_text or 'none'}\n\n"
             f"## Source files\n{files_text}\n\n"
             "Return the complete corrected contents of each file you change, each "
             "preceded by a '### <path>' line, as instructed."
         )
+        wire_prompt = f"{_IMPL_SYSTEM}\n\n---\n\n{prompt}"
+        if len(wire_prompt.encode("utf-8")) > _MAX_IMPLEMENTATION_PROMPT_BYTES:
+            raise ValueError("implementation prompt exceeds the fixed byte budget")
         response = self.complete(_IMPL_SYSTEM, prompt)
         return self._patch_from_response(step, visible_bundle, workdir, response)
 
@@ -356,18 +392,200 @@ class LLMClient(ABC):
     def _read_repo_python(
         cls,
         workdir: Path,
-        limit: int = 12,
+        limit: int | None = None,
         *,
+        referenced_paths=(),
+        max_section_bytes: int = _MAX_SOURCE_SECTION_BYTES,
+        max_file_bytes: int = _MAX_SOURCE_FILE_BYTES,
         trusted_oracle_paths=(),
     ) -> str:
-        parts = []
-        for path in cls._repo_python_paths(
+        """Render deterministic whole-file context within hard byte limits.
+
+        Explicitly referenced files are mandatory. Remaining capacity goes first
+        to their siblings and then to the smallest repository sources. The legacy
+        ``limit`` argument remains for callers that need a count-limited diagnostic,
+        but production prompts rely on bytes rather than an arbitrary first-N list.
+        """
+        sources = cls._repo_python_paths(
             workdir,
             trusted_oracle_paths=trusted_oracle_paths,
-        )[:limit]:
+        )
+        by_relative = {path.relative_to(workdir).as_posix(): path for path in sources}
+        mandatory: list[Path] = []
+        seen: set[str] = set()
+        for raw in referenced_paths:
+            rel = Path(raw).as_posix()
+            path = by_relative.get(rel)
+            if path is None:
+                raise ValueError(
+                    "referenced source changed before prompt construction: "
+                    f"{rel}"
+                )
+            if rel not in seen:
+                mandatory.append(path)
+                seen.add(rel)
+
+        adjacent_parents = {
+            path.relative_to(workdir).parent.as_posix()
+            for path in mandatory
+        }
+        optional = [path for path in sources if path.relative_to(workdir).as_posix() not in seen]
+        optional.sort(
+            key=lambda path: (
+                path.relative_to(workdir).parent.as_posix() not in adjacent_parents,
+                path.lstat().st_size,
+                path.relative_to(workdir).as_posix(),
+            )
+        )
+        if limit is not None:
+            optional = optional[: max(0, limit - len(mandatory))]
+        selected = [*mandatory, *optional]
+
+        parts: list[str] = []
+        used = 0
+        mandatory_set = {
+            path.relative_to(workdir).as_posix()
+            for path in mandatory
+        }
+        for path in selected:
             rel = path.relative_to(workdir)
-            parts.append(f"### {rel}\n{_safe_repo_text(workdir, path)}")
+            text = _safe_repo_text(workdir, path)
+            body_bytes = len(text.encode("utf-8"))
+            rendered = f"### {rel.as_posix()}\n{text}"
+            rendered_bytes = len(rendered.encode("utf-8"))
+            is_mandatory = rel.as_posix() in mandatory_set
+            if body_bytes > max_file_bytes:
+                if is_mandatory:
+                    raise ValueError(
+                        "referenced source file exceeds the whole-file prompt limit: "
+                        f"{rel.as_posix()}"
+                    )
+                continue
+            separator_bytes = 2 if parts else 0
+            if used + separator_bytes + rendered_bytes > max_section_bytes:
+                if is_mandatory:
+                    raise ValueError(
+                        "referenced source files exceed the source prompt budget: "
+                        f"{rel.as_posix()}"
+                    )
+                continue
+            parts.append(rendered)
+            used += separator_bytes + rendered_bytes
         return "\n\n".join(parts)
+
+    @classmethod
+    def _referenced_repo_python(
+        cls,
+        workdir: Path,
+        step: Step,
+        bundle: ContextBundle,
+        *,
+        trusted_oracle_paths=(),
+    ) -> list[str]:
+        """Resolve task and retrieval references to safe, prompt-visible sources."""
+        visible_paths = [
+            path.relative_to(workdir).as_posix()
+            for path in cls._repo_python_paths(
+                workdir,
+                trusted_oracle_paths=trusted_oracle_paths,
+            )
+        ]
+        visible: dict[str, str] = {}
+        ambiguous: set[str] = set()
+        for path in visible_paths:
+            folded = path.casefold()
+            if folded in visible and visible[folded] != path:
+                ambiguous.add(folded)
+            else:
+                visible[folded] = path
+        selected: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str) -> None:
+            folded = path.casefold()
+            canonical = None if folded in ambiguous else visible.get(folded)
+            if canonical is not None and canonical not in seen:
+                selected.append(canonical)
+                seen.add(canonical)
+
+        for text in [step.goal, *step.prior_failures]:
+            for path in _python_paths_in_text(text):
+                add(path)
+        for item in bundle.items:
+            if item.provenance.source_kind != "code":
+                continue
+            locator_path = _context_relative_path(
+                item.provenance.locator,
+                item.provenance.source_root,
+                workdir,
+            )
+            add(locator_path)
+            for path in _python_paths_in_text(item.text):
+                add(path)
+        return selected
+
+
+def _bounded_text(text: str, limit: int, *, label: str) -> str:
+    """Return UTF-8 text within ``limit`` bytes and make every truncation explicit."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    marker = f"\n[{label} truncated to fixed prompt budget]"
+    marker_bytes = marker.encode("utf-8")
+    if len(marker_bytes) >= limit:
+        return marker_bytes[:limit].decode("utf-8", errors="ignore")
+    prefix = encoded[: limit - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return prefix + marker
+
+
+def _render_context(bundle: ContextBundle, limit: int) -> str:
+    """Render retrieval snippets in rank order without exceeding ``limit`` bytes."""
+    parts: list[str] = []
+    used = 0
+    for item in bundle.items:
+        locator = _bounded_text(
+            item.provenance.locator,
+            512,
+            label="context locator",
+        )
+        header = f"# {locator}\n"
+        separator_bytes = 2 if parts else 0
+        available = limit - used - separator_bytes - len(header.encode("utf-8"))
+        if available <= 0:
+            break
+        text = _bounded_text(
+            item.text,
+            available,
+            label="retrieved snippet",
+        )
+        rendered = header + text
+        rendered_bytes = len(rendered.encode("utf-8"))
+        if used + separator_bytes + rendered_bytes > limit:
+            raise AssertionError("context renderer exceeded its byte budget")
+        parts.append(rendered)
+        used += separator_bytes + rendered_bytes
+    return "\n\n".join(parts)
+
+
+def _python_paths_in_text(text: str) -> list[str]:
+    """Extract safe relative Python paths; existence is checked by the caller."""
+    paths: list[str] = []
+    for match in _PYTHON_PATH_TOKEN.finditer(text):
+        raw = match.group("path")
+        candidate = Path(raw)
+        if raw.startswith("./"):
+            raw = raw[2:]
+            candidate = Path(raw)
+        if (
+            not raw
+            or candidate.is_absolute()
+            or "\\" in raw
+            or "\x00" in raw
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+        ):
+            continue
+        paths.append(candidate.as_posix())
+    return paths
 
 
 def _normalize_oracle_paths(paths) -> frozenset[str]:
