@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
+import shutil
+import stat
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from lha.ablation import (
     CONDITIONS,
+    AblationProvenance,
     AblationReport,
     ConditionStats,
     PytestResult,
@@ -40,6 +46,223 @@ _PYPROJECT = (
     '[tool.pytest.ini_options]\npythonpath = ["."]\n'
 )
 _TEST = "from m import f\n\n\ndef test_f():\n    assert f() == 2\n"
+
+
+def _hold_formal_output_lock(path: str, ready, release) -> None:
+    import lha.ablation as abl
+
+    announced = False
+    try:
+        with abl._formal_ablation_lock(Path(path)):
+            ready.put(("locked", ""))
+            announced = True
+            if not release.wait(20):
+                raise TimeoutError("test did not release the formal output lock")
+    except BaseException as error:
+        if not announced:
+            ready.put(("error", f"{type(error).__name__}: {error}"))
+        raise
+
+
+def _git(repo: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        [str(Path(shutil.which("git") or "git").resolve()), *arguments],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _formal_attempt_repository(
+    root: Path,
+    *,
+    event: str,
+    output_path: str,
+    tracked: bool = True,
+):
+    import lha.ablation as abl
+    from lha.ablation_attempts import (
+        FormalAblationAttemptRegistry,
+        FormalAblationProtocol,
+        FormalCodexClientConfig,
+        RegisteredAttempt,
+        UnregisteredRunRecorded,
+        formal_ablation_attempt_registry_bytes,
+        formal_ablation_protocol_sha256,
+        formal_codex_client_sha256,
+    )
+
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.name", "LHA Test")
+    _git(root, "config", "user.email", "lha@example.invalid")
+    witness_remote = (root.parent / f"{root.name}-formal-witness.git").resolve()
+    _git(root, "init", "--bare", "-q", str(witness_remote))
+    _git(root, "remote", "add", "formal-witness", str(witness_remote))
+    (root / ".gitignore").write_text("runs/\n")
+    (root / "source.py").write_text("VALUE = 1\n")
+    _git(root, "add", ".gitignore", "source.py")
+    _git(root, "commit", "-qm", "source")
+    source_commit = _git(root, "rev-parse", "HEAD")
+
+    client_config = FormalCodexClientConfig(
+        max_retries=2,
+        timeout_s=300.0,
+        retry_backoff_s=1.0,
+    )
+    protocol = FormalAblationProtocol(
+        source_commit=source_commit,
+        source_tree_sha256=abl._source_tree_digest(abl._source_file_digests()),
+        manifest_sha256="b" * 64,
+        model="model-x",
+        reasoning_effort="medium",
+        docker_image_id="sha256:" + "c" * 64,
+        codex_cli_version="codex-cli 0.141.0",
+        codex_cli_executable_sha256="9" * 64,
+        codex_client=client_config,
+        codex_client_sha256=formal_codex_client_sha256(client_config),
+    )
+    event_type = {
+        "REGISTERED": RegisteredAttempt,
+        "UNREGISTERED_RUN_RECORDED": UnregisteredRunRecorded,
+    }[event]
+    common = {
+        "attempt_id": "a" * 64,
+        "protocol_sha256": formal_ablation_protocol_sha256(protocol),
+        "source_commit": protocol.source_commit,
+        "source_tree_sha256": protocol.source_tree_sha256,
+        "manifest_sha256": protocol.manifest_sha256,
+        "output_path": output_path,
+        "model": protocol.model,
+        "reasoning_effort": protocol.reasoning_effort,
+        "docker_image_id": protocol.docker_image_id,
+        "codex_cli_version": protocol.codex_cli_version,
+        "codex_cli_executable_sha256": protocol.codex_cli_executable_sha256,
+        "codex_client": protocol.codex_client,
+        "codex_client_sha256": protocol.codex_client_sha256,
+    }
+    if event == "REGISTERED":
+        attempt_event = event_type(
+            **common,
+            witness_remote_name="formal-witness",
+            witness_remote_url=str(witness_remote),
+            registered_at="2026-07-28T12:00:00+08:00",
+        )
+    else:
+        attempt_event = event_type(
+            **common,
+            recorded_at="2026-07-28T12:00:00+08:00",
+            reason="旧运行只作事后披露",
+            published_report_path=(
+                "benchmarks/formal_ablation_history/"
+                f"{protocol.source_commit}/ablation_report.json"
+            ),
+            report_sha256="e" * 64,
+            report_fingerprint="f" * 64,
+            scheduled_cells=204,
+            usable_cells=204,
+            error_cells=0,
+            trust_delivered_correct=190,
+            trust_delivered_wrong=14,
+            gate_delivered_correct=190,
+            gate_delivered_wrong=0,
+            gate_intercepted_wrong=14,
+            gate_rejected_correct=0,
+            verify_delivered_correct=204,
+            verify_delivered_wrong=0,
+            verify_not_delivered=0,
+        )
+    registry = FormalAblationAttemptRegistry(events=(attempt_event,))
+    registry_path = root / "benchmarks" / "formal_ablation_attempts.json"
+    registry_path.parent.mkdir()
+    registry_path.write_bytes(formal_ablation_attempt_registry_bytes(registry))
+    if tracked:
+        _git(root, "add", "benchmarks/formal_ablation_attempts.json")
+        _git(root, "commit", "-qm", "register formal attempt")
+    head = _git(root, "rev-parse", "HEAD")
+    binding = abl._FormalCorpusBinding(
+        path="benchmarks/formal_ablation_manifest.json",
+        sha256=protocol.manifest_sha256,
+        preregistration_commit=head,
+        git_executable={"path": str(Path(shutil.which("git") or "git").resolve())},
+    )
+    return binding, protocol, registry_path
+
+
+class _FakeDockerIdentity:
+    path = "/usr/bin/docker"
+
+    def as_provenance(self):
+        return {
+            "path": self.path,
+            "sha256": "d" * 64,
+            "size_bytes": 1,
+            "trusted_install": True,
+        }
+
+
+def _run_formal_until_registration(
+    repo: Path,
+    binding,
+    out: Path,
+    llm: LLMClient,
+    monkeypatch,
+    *,
+    inject_llm: bool = False,
+):
+    import lha.ablation as abl
+    from lha.llm.codex_cli import CodexCLIClient
+
+    client = CodexCLIClient(
+        model="model-x",
+        reasoning_effort="medium",
+        no_tools=True,
+    )
+
+    def preflight() -> None:
+        client._version = "codex-cli 0.141.0"
+        client._cli_identity = (
+            "/usr/bin/codex",
+            1,
+            2,
+            3,
+            4,
+            "9" * 64,
+            False,
+        )
+        client._verified_permission_roots.add(("/tmp", "lha-read"))
+
+    monkeypatch.setattr(
+        abl,
+        "_prepare_formal_corpus_binding",
+        lambda *args, **kwargs: binding,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+    monkeypatch.setattr(
+        abl,
+        "resolve_docker_executable",
+        lambda *args, **kwargs: _FakeDockerIdentity(),
+    )
+    monkeypatch.setattr(
+        abl,
+        "_inspect_docker_image_id",
+        lambda *args, **kwargs: "sha256:" + "c" * 64,
+    )
+    monkeypatch.setattr(client, "preflight", preflight)
+    monkeypatch.setattr(abl, "_make_llm", lambda *args, **kwargs: client)
+    return run_ablation(
+        _base(repo),
+        [],
+        llm="codex_cli",
+        model="model-x",
+        reps=1,
+        out_dir=out,
+        llm_client=llm if inject_llm else None,
+        scorer_backend="docker",
+    )
 
 
 def _repo(root: Path) -> Path:
@@ -563,7 +786,7 @@ def test_failed_codex_receipt_is_referenced_and_error_seal_is_resumable(tmp_path
     assert second.llm_calls == [{**reference, "cache_hit": True}]
 
 
-def test_formal_error_seal_requires_its_start_marker(tmp_path):
+def test_formal_error_seal_cannot_be_resumed_or_reused(tmp_path):
     import lha.ablation as abl
 
     out = tmp_path / "out"
@@ -599,12 +822,12 @@ def test_formal_error_seal_requires_its_start_marker(tmp_path):
     cache = out / "results" / "task__r0.json"
     assert marker.exists() and cache.exists()
 
-    second = run_cell()
+    with pytest.raises(RuntimeError, match="does not resume or reuse"):
+        run_cell()
     assert llm.calls == 1
-    assert all(record.status == "ERROR" for record in second)
 
     cache.unlink()
-    with pytest.raises(RuntimeError, match="unsealed prior cell attempt"):
+    with pytest.raises(RuntimeError, match="does not resume or reuse"):
         run_cell()
     assert llm.calls == 1
 
@@ -620,7 +843,7 @@ def test_formal_cache_without_start_marker_is_not_recomputed(tmp_path):
     (out / "results").mkdir(parents=True)
     (out / "results" / "task__r0.json").write_text("{}")
 
-    with pytest.raises(RuntimeError, match="no matching start marker"):
+    with pytest.raises(RuntimeError, match="does not resume or reuse"):
         abl._run_cell(
             abl._PromptAuditClient(llm),
             src,
@@ -640,6 +863,729 @@ def test_formal_cache_without_start_marker_is_not_recomputed(tmp_path):
             True,
         )
     assert llm.calls == 0
+
+
+def test_formal_output_lock_is_cross_process_and_precedes_run_setup(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_formal_output_lock,
+        args=(str(out), ready, release),
+    )
+    holder.start()
+    try:
+        assert ready.get(timeout=10) == ("locked", "")
+        run_setup_calls = 0
+
+        def forbidden_run_setup(*args, **kwargs):
+            nonlocal run_setup_calls
+            run_setup_calls += 1
+            raise AssertionError("formal setup ran before the output lock")
+
+        monkeypatch.setattr(
+            abl,
+            "_prepare_formal_corpus_binding",
+            lambda *args, **kwargs: object(),
+        )
+        monkeypatch.setattr(abl, "_run_ablation_with_binding", forbidden_run_setup)
+
+        with pytest.raises(RuntimeError, match="already active"):
+            run_ablation(
+                _base(tmp_path),
+                [],
+                llm="codex_cli",
+                model="model-x",
+                reps=1,
+                out_dir=out,
+                llm_client=None,
+                scorer_backend="docker",
+            )
+        assert run_setup_calls == 0
+    finally:
+        release.set()
+        holder.join(timeout=10)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=5)
+    assert holder.exitcode == 0
+
+
+@pytest.mark.parametrize("attack", ["symlink", "hardlink", "fifo"])
+def test_formal_output_lock_rejects_link_and_nonregular_inodes(tmp_path, attack):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    out.mkdir()
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("unchanged")
+    lock = out / abl._FORMAL_OUTPUT_LOCK_NAME
+    if attack == "symlink":
+        lock.symlink_to(sentinel)
+    elif attack == "hardlink":
+        os.link(sentinel, lock)
+    else:
+        os.mkfifo(lock)
+
+    with pytest.raises(RuntimeError, match="output lock is unsafe"):
+        with abl._formal_ablation_lock(out):
+            raise AssertionError("unsafe lock inode was accepted")
+    assert sentinel.read_text() == "unchanged"
+
+
+def test_formal_output_path_rejects_symbolic_link_component(tmp_path):
+    import lha.ablation as abl
+
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="output directory is unsafe"):
+        with abl._formal_ablation_lock(alias):
+            raise AssertionError("symbolic output directory was accepted")
+
+
+def test_formal_output_path_rejects_symbolic_link_parent(tmp_path):
+    import lha.ablation as abl
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="output directory is unsafe"):
+        with abl._formal_ablation_lock(alias_parent / "out"):
+            raise AssertionError("symbolic parent directory was accepted")
+
+
+def test_formal_attempt_binding_accepts_committed_matching_registration(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+    from lha.ablation_attempts import formal_ablation_protocol_sha256
+
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    corpus_binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt_binding = abl._bind_formal_attempt(
+            formal_corpus=corpus_binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+            codex_client=protocol.codex_client,
+        )
+
+    assert attempt_binding.attempt_id == attempt_id
+    assert attempt_binding.registration_commit == corpus_binding.preregistration_commit
+    assert attempt_binding.protocol_sha256 == formal_ablation_protocol_sha256(
+        protocol
+    )
+
+
+def test_formal_run_rejects_an_injected_llm_before_writing_header(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    llm = _AuditedCodexLLM()
+
+    with pytest.raises(ValueError, match="does not accept an injected LLM"):
+        _run_formal_until_registration(
+            repo,
+            binding,
+            repo / output_path,
+            llm,
+            monkeypatch,
+            inject_llm=True,
+        )
+
+    assert llm.calls == 0
+    assert not (repo / output_path / "formal_run.json").exists()
+
+
+def test_formal_run_rejects_copied_cell_evidence_before_model_call(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    copied = repo / output_path / "results"
+    copied.mkdir(parents=True)
+    (copied / "task__r0.started.json").write_text("{}")
+    (copied / "task__r0.json").write_text("{}")
+    llm = _AuditedCodexLLM()
+
+    with pytest.raises(RuntimeError, match="mark the registered attempt ABANDONED"):
+        _run_formal_until_registration(
+            repo,
+            binding,
+            repo / output_path,
+            llm,
+            monkeypatch,
+        )
+
+    assert llm.calls == 0
+
+
+def test_formal_run_rejects_witness_network_failure_before_model_call(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    remote_path = Path(_git(repo, "remote", "get-url", "formal-witness"))
+    shutil.rmtree(remote_path)
+    llm = _AuditedCodexLLM()
+
+    with pytest.raises(RuntimeError, match="start witness was not created"):
+        _run_formal_until_registration(
+            repo,
+            binding,
+            repo / output_path,
+            llm,
+            monkeypatch,
+        )
+
+    assert llm.calls == 0
+    assert not (repo / output_path / "formal_run.json").exists()
+
+
+def test_formal_run_header_prevents_retry_after_cell_files_are_deleted(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    corpus_binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt_binding = abl._bind_formal_attempt(
+            formal_corpus=corpus_binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+            codex_client=protocol.codex_client,
+        )
+        run_binding = abl._initialize_formal_run(
+            attempt_binding,
+            output_lease,
+        )
+        results = repo / output_path / "results"
+        results.mkdir()
+        (results / "task__r0.started.json").write_text("{}")
+        (results / "task__r0.json").write_text("{}")
+        for child in results.iterdir():
+            child.unlink()
+        results.rmdir()
+
+        with pytest.raises(RuntimeError, match="mark the registered attempt ABANDONED"):
+            abl._initialize_formal_run(attempt_binding, output_lease)
+
+    assert (repo / output_path / run_binding.header_path).exists()
+
+
+def test_formal_witness_prevents_retry_after_output_directory_is_deleted(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    corpus_binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt = abl._bind_formal_attempt(
+            formal_corpus=corpus_binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+            codex_client=protocol.codex_client,
+        )
+        first = abl._initialize_formal_run(attempt, output_lease)
+
+    shutil.rmtree(repo / output_path)
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt = abl._bind_formal_attempt(
+            formal_corpus=corpus_binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+            codex_client=protocol.codex_client,
+        )
+        with pytest.raises(RuntimeError, match="start witness was not created"):
+            abl._initialize_formal_run(attempt, output_lease)
+
+    remote_ref = _git(
+        repo,
+        "ls-remote",
+        "--refs",
+        first.witness_remote_url,
+        first.witness_ref,
+    )
+    assert remote_ref == f"{first.witness_commit}\t{first.witness_ref}"
+
+
+def test_formal_witness_up_to_date_push_is_not_a_new_start(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    corpus_binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt = abl._bind_formal_attempt(
+            formal_corpus=corpus_binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+            codex_client=protocol.codex_client,
+        )
+        outcome_key = "1" * 64
+        header_sha256 = "2" * 64
+        abl._create_formal_start_witness(
+            attempt,
+            outcome_key=outcome_key,
+            run_header_sha256=header_sha256,
+        )
+        with pytest.raises(RuntimeError, match="start witness was not created"):
+            abl._create_formal_start_witness(
+                attempt,
+                outcome_key=outcome_key,
+                run_header_sha256=header_sha256,
+            )
+
+
+def test_concurrent_formal_witness_creation_has_one_winner(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    corpus_binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt = abl._bind_formal_attempt(
+            formal_corpus=corpus_binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+            codex_client=protocol.codex_client,
+        )
+
+        def create(index: int) -> str:
+            return abl._create_formal_start_witness(
+                attempt,
+                outcome_key=f"{index + 1:064x}",
+                run_header_sha256="3" * 64,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(create, index) for index in range(2)]
+            outcomes: list[str] = []
+            for future in futures:
+                try:
+                    outcomes.append(future.result())
+                except RuntimeError:
+                    outcomes.append("rejected")
+
+    assert len([value for value in outcomes if value != "rejected"]) == 1
+    assert outcomes.count("rejected") == 1
+
+
+def test_header_failure_after_witness_push_consumes_the_attempt(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    corpus_binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+    original_safety_check = abl._safe_named_regular_file
+
+    def fail_header_safety_check(*_args, **_kwargs):
+        raise OSError("injected")
+
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt = abl._bind_formal_attempt(
+            formal_corpus=corpus_binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+            codex_client=protocol.codex_client,
+        )
+        monkeypatch.setattr(
+            abl,
+            "_safe_named_regular_file",
+            fail_header_safety_check,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="header could not be sealed"):
+                abl._initialize_formal_run(attempt, output_lease)
+        finally:
+            monkeypatch.setattr(
+                abl,
+                "_safe_named_regular_file",
+                original_safety_check,
+            )
+
+    shutil.rmtree(repo / output_path)
+    with abl._formal_ablation_lock(repo / output_path) as output_lease:
+        attempt = abl._bind_formal_attempt(
+            formal_corpus=corpus_binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+            codex_client=protocol.codex_client,
+        )
+        with pytest.raises(RuntimeError, match="start witness was not created"):
+            abl._initialize_formal_run(attempt, output_lease)
+
+
+def test_unregistered_run_record_cannot_authorize_a_formal_run(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="UNREGISTERED_RUN_RECORDED",
+        output_path=output_path,
+    )
+    llm = _AuditedCodexLLM()
+
+    with pytest.raises(RuntimeError, match="open REGISTERED"):
+        _run_formal_until_registration(
+            repo,
+            binding,
+            repo / output_path,
+            llm,
+            monkeypatch,
+        )
+    assert llm.calls == 0
+
+
+def test_formal_registration_rejects_a_different_output_before_model_call(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    registered_output = f"runs/formal_ablation/{attempt_id}"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=registered_output,
+    )
+    llm = _AuditedCodexLLM()
+    other_output = repo / "runs" / "formal_ablation" / ("b" * 64)
+
+    with pytest.raises(RuntimeError, match="does not match this run"):
+        _run_formal_until_registration(
+            repo,
+            binding,
+            other_output,
+            llm,
+            monkeypatch,
+        )
+    assert llm.calls == 0
+
+
+def test_formal_registration_file_must_be_tracked_before_model_call(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    binding, _protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+        tracked=False,
+    )
+    llm = _AuditedCodexLLM()
+
+    with pytest.raises(RuntimeError, match="tracked-file check"):
+        _run_formal_until_registration(
+            repo,
+            binding,
+            repo / output_path,
+            llm,
+            monkeypatch,
+        )
+    assert llm.calls == 0
+
+
+def test_formal_registration_worktree_rewrite_fails_before_model_call(
+    tmp_path,
+    monkeypatch,
+):
+    repo = tmp_path / "repo"
+    attempt_id = "a" * 64
+    output_path = f"runs/formal_ablation/{attempt_id}"
+    binding, _protocol, registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+    )
+    registry_path.write_text(registry_path.read_text() + "\n")
+    llm = _AuditedCodexLLM()
+
+    with pytest.raises(RuntimeError, match="clean committed worktree"):
+        _run_formal_until_registration(
+            repo,
+            binding,
+            repo / output_path,
+            llm,
+            monkeypatch,
+        )
+    assert llm.calls == 0
+
+
+@pytest.mark.parametrize("attack", ["symlink", "hardlink"])
+def test_formal_cell_start_link_attack_does_not_touch_target(tmp_path, attack):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    results = out / "results"
+    results.mkdir(parents=True)
+    marker = results / "task__r0.started.json"
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+    if attack == "symlink":
+        marker.symlink_to(sentinel)
+    else:
+        os.link(sentinel, marker)
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        abl._write_formal_cell_start(
+            marker,
+            b'{"started":true}',
+            out_dir=out,
+        )
+    assert sentinel.read_bytes() == b"unchanged"
+
+
+def test_formal_cell_start_is_exclusive_and_syncs_file_before_directory(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    marker = out / "results" / "task__r0.started.json"
+    payload = b'{"started":true}'
+    with abl._formal_ablation_lock(out) as lease:
+        results_descriptor = abl._open_lease_subdirectory(lease, ("results",))
+        os.close(results_descriptor)
+        real_fsync = os.fsync
+        sync_kinds = []
+
+        def recording_fsync(descriptor):
+            metadata = os.fstat(descriptor)
+            sync_kinds.append("directory" if stat.S_ISDIR(metadata.st_mode) else "file")
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(abl.os, "fsync", recording_fsync)
+        abl._write_formal_cell_start(
+            marker,
+            payload,
+            out_dir=out,
+            lease=lease,
+        )
+        assert sync_kinds == ["file", "directory"]
+        with pytest.raises(RuntimeError, match="already exists"):
+            abl._write_formal_cell_start(
+                marker,
+                b"different",
+                out_dir=out,
+                lease=lease,
+            )
+    assert marker.read_bytes() == payload
+
+
+def test_formal_cell_start_directory_sync_failure_leaves_orphan_marker(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    marker = out / "results" / "task__r0.started.json"
+    payload = b'{"started":true}'
+    with abl._formal_ablation_lock(out) as lease:
+        results_descriptor = abl._open_lease_subdirectory(lease, ("results",))
+        os.close(results_descriptor)
+        real_fsync = os.fsync
+
+        def fail_directory_sync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError("simulated crash boundary")
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(abl.os, "fsync", fail_directory_sync)
+        with pytest.raises(RuntimeError, match="was not durable"):
+            abl._write_formal_cell_start(
+                marker,
+                payload,
+                out_dir=out,
+                lease=lease,
+            )
+        monkeypatch.setattr(abl.os, "fsync", real_fsync)
+        with pytest.raises(RuntimeError, match="already exists"):
+            abl._write_formal_cell_start(
+                marker,
+                payload,
+                out_dir=out,
+                lease=lease,
+            )
+    assert marker.read_bytes() == payload
+
+
+def test_formal_cell_start_zero_length_write_fails_closed(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    marker = out / "results" / "task__r0.started.json"
+    with abl._formal_ablation_lock(out) as lease:
+        results_descriptor = abl._open_lease_subdirectory(lease, ("results",))
+        os.close(results_descriptor)
+        monkeypatch.setattr(abl.os, "write", lambda descriptor, payload: 0)
+
+        with pytest.raises(RuntimeError, match="was not durable"):
+            abl._write_formal_cell_start(
+                marker,
+                b'{"started":true}',
+                out_dir=out,
+                lease=lease,
+            )
+    assert marker.exists()
+    assert marker.read_bytes() == b""
+
+
+def test_ablation_atomic_replace_syncs_parent_directory(tmp_path, monkeypatch):
+    import lha.ablation as abl
+
+    target = tmp_path / "result.json"
+    real_fsync = os.fsync
+    sync_kinds = []
+
+    def recording_fsync(descriptor):
+        metadata = os.fstat(descriptor)
+        sync_kinds.append("directory" if stat.S_ISDIR(metadata.st_mode) else "file")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(abl.os, "fsync", recording_fsync)
+    abl._atomic_write_bytes(target, b"complete")
+
+    assert sync_kinds == ["file", "directory", "file"]
+    assert target.read_bytes() == b"complete"
 
 
 def test_formal_cell_failure_before_llm_call_fails_closed(tmp_path, monkeypatch):
@@ -849,15 +1795,17 @@ def test_formal_completed_cell_cache_write_failure_aborts(tmp_path, monkeypatch)
             for condition, _ in CONDITIONS
         ]
 
-    real_atomic_write = abl._atomic_write
+    real_formal_write = abl._write_formal_cell_start
 
-    def fail_result_cache(path, text):
-        if path.parent.name == "results":
+    def fail_result_cache(path, payload, **kwargs):
+        if path.parent.name == "results" and not path.name.endswith(
+            ".started.json"
+        ):
             raise OSError("disk full")
-        real_atomic_write(path, text)
+        real_formal_write(path, payload, **kwargs)
 
     monkeypatch.setattr(abl, "_evaluate", return_success)
-    monkeypatch.setattr(abl, "_atomic_write", fail_result_cache)
+    monkeypatch.setattr(abl, "_write_formal_cell_start", fail_result_cache)
 
     audit_log = []
     with pytest.raises(RuntimeError, match="could not seal a completed cell"):
@@ -1302,6 +2250,30 @@ def test_formal_markdown_does_not_round_nonzero_mcnemar_p_to_zero():
 
     assert "exact McNemar p = 0.0005" in markdown
     assert "exact McNemar p = 0.00\n" not in markdown
+
+
+def test_formal_markdown_names_attempt_registration():
+    attempt_id = "1" * 64
+    registration_commit = "2" * 40
+    registry_path = "benchmarks/formal_ablation_attempts.json"
+    report = AblationReport(
+        "codex_cli",
+        "model-x",
+        12,
+        [],
+        schema_version=4,
+        provenance=AblationProvenance(
+            formal_attempt_id=attempt_id,
+            formal_attempt_registration_commit=registration_commit,
+            formal_attempt_registry_path=registry_path,
+        ),
+    )
+
+    markdown = report.to_markdown()
+
+    assert f"- formal attempt: `{attempt_id}`" in markdown
+    assert registration_commit in markdown
+    assert registry_path in markdown
 
 
 def test_errored_runs_excluded_from_rates():
@@ -2003,7 +2975,7 @@ def test_completed_formal_output_directory_refuses_rerun(tmp_path, monkeypatch):
             model="model-x",
             reps=1,
             out_dir=out,
-            llm_client=_AuditedCodexLLM(),
+            llm_client=None,
             scorer_backend="docker",
         )
 
@@ -2027,7 +2999,7 @@ def test_invalid_formal_report_file_is_not_overwritten(tmp_path, monkeypatch):
             model="model-x",
             reps=1,
             out_dir=out,
-            llm_client=_AuditedCodexLLM(),
+            llm_client=None,
             scorer_backend="docker",
         )
     assert report.read_text() == "{incomplete"

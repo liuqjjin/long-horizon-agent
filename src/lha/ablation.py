@@ -41,6 +41,7 @@ harness loop.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib.metadata
 import inspect
@@ -50,21 +51,37 @@ import math
 import os
 import platform
 import re
+import secrets
 import shutil
 import stat
 import tempfile
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Iterator
 
 from . import __version__
+from .ablation_attempts import (
+    FORMAL_ABLATION_ATTEMPTS_PATH,
+    MAX_FORMAL_ABLATION_ATTEMPTS_BYTES,
+    FormalAblationProtocol,
+    FormalCodexClientConfig,
+    RegisteredAttempt,
+    formal_ablation_protocol_sha256,
+    formal_ablation_witness_commit_bytes,
+    formal_ablation_witness_commit_oid,
+    formal_ablation_witness_message,
+    formal_codex_client_sha256,
+    parse_formal_ablation_attempt_registry,
+)
 from .agents.implementer import Implementer
 from .artifacts import Patch, Step
 from .clock import now
 from .config import Config
+from .durable_io import atomic_replace_bytes, atomic_replace_text, durable_mkdir_chain
 from .live_context.models import ContextBundle, Freshness
 from .llm.base import LLMClient
 from .pytest_evidence import (
@@ -101,9 +118,12 @@ _REPORT_SCHEMA = 4
 _FROZEN_ARTIFACT_SCHEMA = 1
 _INPUT_SNAPSHOT_SCHEMA = 1
 _SCORER_EVIDENCE_SCHEMA = 2
-_LLM_CALL_RECEIPT_SCHEMA = 1
+_LLM_CALL_RECEIPT_SCHEMA = 2
 _CELL_ATTEMPT_SCHEMA = 1
 _FORMAL_CORPUS_MANIFEST_SCHEMA = 1
+_FORMAL_OUTPUT_LOCK_NAME = ".formal-ablation.lock"
+_FORMAL_RUN_HEADER_NAME = "formal_run.json"
+_FORMAL_RUN_HEADER_SCHEMA = 1
 _FORMAL_TASK_COUNT = 17
 _FORMAL_REPETITIONS = 12
 _FORMAL_CORPUS_MANIFEST_PATH = Path("benchmarks/formal_ablation_manifest.json")
@@ -113,6 +133,7 @@ _MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 _MAX_SCORER_EVIDENCE_BYTES = 12 * 1024 * 1024
 _MAX_LLM_CALL_RECEIPT_BYTES = 512 * 1024
 _MAX_CELL_ATTEMPT_BYTES = 4 * 1024
+_MAX_FORMAL_RUN_HEADER_BYTES = 4 * 1024
 _MAX_FORMAL_MANIFEST_BYTES = 512 * 1024
 _MAX_CONTROL_EXECUTABLE_BYTES = 256 * 1024 * 1024
 _MAX_CACHE_BYTES = 8 * 1024 * 1024
@@ -280,6 +301,7 @@ class AblationProvenance:
     actual_llm_backend: str = "unknown"
     model: str | None = None
     cli_version: str | None = None
+    cli_executable_sha256: str | None = None
     backend_library_version: str | None = None
     reasoning_effort: str | None = None
     backend_details: str | None = None
@@ -302,6 +324,18 @@ class AblationProvenance:
     formal_corpus_manifest_path: str | None = None
     formal_corpus_manifest_sha256: str | None = None
     preregistration_commit: str | None = None
+    formal_attempt_id: str | None = None
+    formal_attempt_registry_path: str | None = None
+    formal_attempt_registry_sha256: str | None = None
+    formal_attempt_protocol_sha256: str | None = None
+    formal_attempt_registration_commit: str | None = None
+    formal_attempt_witness_remote_name: str | None = None
+    formal_attempt_witness_remote_url: str | None = None
+    formal_attempt_witness_ref: str | None = None
+    formal_attempt_witness_commit: str | None = None
+    formal_run_header_path: str | None = None
+    formal_run_header_sha256: str | None = None
+    formal_outcome_key: str | None = None
     # Historical run provenance. Release validation checks the binding and
     # report fingerprint; it does not require another host to have these bytes.
     git_executable: dict[str, Any] = field(default_factory=dict)
@@ -394,6 +428,19 @@ class AblationReport:
                 "Provenance:",
                 f"- source: `{self.provenance.source_tree_sha256 or 'unknown'}`",
                 f"- git: `{git_commit}` · dirty: `{dirty}`",
+            ]
+            if (
+                self.provenance.formal_attempt_id
+                and self.provenance.formal_attempt_registration_commit
+                and self.provenance.formal_attempt_registry_path
+            ):
+                lines += [
+                    f"- formal attempt: `{self.provenance.formal_attempt_id}`",
+                    "- registration: "
+                    f"`{self.provenance.formal_attempt_registration_commit}` · "
+                    f"registry: `{self.provenance.formal_attempt_registry_path}`",
+                ]
+            lines += [
                 f"- runtime: Python `{self.provenance.python_version or 'unknown'}` · "
                 f"pytest `{self.provenance.pytest_version or 'unknown'}`",
                 f"- LLM call audits: {len(self.llm_calls)} · "
@@ -1427,21 +1474,343 @@ def _make_llm(
     raise ValueError(f"unknown llm backend: {llm!r}")
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+def _atomic_write(path: Path, text: str, *, anchor: Path | None = None) -> None:
+    atomic_replace_text(path, text, anchor=anchor)
 
 
-def _atomic_write_bytes(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("wb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(tmp, path)
+def _atomic_write_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    anchor: Path | None = None,
+) -> None:
+    atomic_replace_bytes(path, payload, anchor=anchor)
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _regular_file_open_flags() -> int:
+    return os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _safe_named_regular_file(
+    descriptor: int,
+    *,
+    directory_descriptor: int,
+    name: str,
+) -> os.stat_result:
+    opened = os.fstat(descriptor)
+    named = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or not stat.S_ISREG(named.st_mode)
+        or named.st_nlink != 1
+        or not _same_inode(opened, named)
+        or opened.st_uid != os.geteuid()
+        or named.st_uid != os.geteuid()
+        or stat.S_IMODE(opened.st_mode) & 0o022
+    ):
+        raise OSError(f"unsafe ablation control file: {name}")
+    return opened
+
+
+@dataclass(frozen=True)
+class _FormalOutputLease:
+    path: Path
+    directory_descriptor: int
+    device: int
+    inode: int
+
+
+def _open_or_create_formal_output(path: Path) -> tuple[Path, int]:
+    """Walk every lexical component with ``openat`` and reject directory links."""
+    output = Path(os.path.abspath(os.fspath(path)))
+    if not output.is_absolute() or not output.anchor:
+        raise OSError("formal ablation output path is not absolute")
+    descriptor = os.open(output.anchor, _directory_open_flags())
+    try:
+        for part in output.parts[1:]:
+            if not part or part in {".", ".."} or "/" in part or os.sep in part:
+                raise OSError("formal ablation output path component is unsafe")
+            created = False
+            try:
+                os.mkdir(part, 0o700, dir_fd=descriptor)
+                created = True
+            except FileExistsError:
+                pass
+            child = os.open(part, _directory_open_flags(), dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                named = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(named.st_mode)
+                    or stat.S_ISLNK(named.st_mode)
+                    or not _same_inode(opened, named)
+                ):
+                    raise OSError("formal ablation output path component is unsafe")
+                if created:
+                    os.fsync(child)
+                    os.fsync(descriptor)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        return output, descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _formal_ablation_lock(out_dir: Path) -> Iterator[_FormalOutputLease]:
+    """Hold a fail-closed lock from preflight through report and cleanup completion."""
+    try:
+        # Walking from the filesystem root intentionally rejects every symbolic
+        # component, including macOS aliases such as /var. Formal callers should
+        # provide the canonical spelling (/private/var) rather than weakening the
+        # evidence boundary for a convenience alias.
+        output, directory_descriptor = _open_or_create_formal_output(out_dir)
+    except OSError as error:
+        raise RuntimeError("formal ablation output directory is unsafe") from error
+    lock_descriptor: int | None = None
+    locked = False
+    try:
+        opened_directory = os.fstat(directory_descriptor)
+        named_directory = output.lstat()
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or not stat.S_ISDIR(named_directory.st_mode)
+            or stat.S_ISLNK(named_directory.st_mode)
+            or not _same_inode(opened_directory, named_directory)
+            or opened_directory.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_directory.st_mode) & 0o022
+        ):
+            raise RuntimeError("formal ablation output directory is unsafe")
+
+        flags = _regular_file_open_flags()
+        created = False
+        try:
+            lock_descriptor = os.open(
+                _FORMAL_OUTPUT_LOCK_NAME,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            created = True
+        except FileExistsError:
+            try:
+                lock_descriptor = os.open(
+                    _FORMAL_OUTPUT_LOCK_NAME,
+                    flags,
+                    dir_fd=directory_descriptor,
+                )
+            except OSError as error:
+                raise RuntimeError("formal ablation output lock is unsafe") from error
+        except OSError as error:
+            raise RuntimeError("formal ablation output lock could not be created") from error
+
+        try:
+            _safe_named_regular_file(
+                lock_descriptor,
+                directory_descriptor=directory_descriptor,
+                name=_FORMAL_OUTPUT_LOCK_NAME,
+            )
+        except OSError as error:
+            raise RuntimeError("formal ablation output lock is unsafe") from error
+        if created:
+            os.fchmod(lock_descriptor, 0o600)
+            os.fsync(lock_descriptor)
+            os.fsync(directory_descriptor)
+
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except (BlockingIOError, OSError) as error:
+            raise RuntimeError("formal ablation output is already active") from error
+
+        try:
+            _safe_named_regular_file(
+                lock_descriptor,
+                directory_descriptor=directory_descriptor,
+                name=_FORMAL_OUTPUT_LOCK_NAME,
+            )
+        except OSError as error:
+            raise RuntimeError("formal ablation output lock changed during acquisition") from error
+        yield _FormalOutputLease(
+            path=output,
+            directory_descriptor=directory_descriptor,
+            device=opened_directory.st_dev,
+            inode=opened_directory.st_ino,
+        )
+        final_directory = os.fstat(directory_descriptor)
+        final_named_directory = output.lstat()
+        if (
+            not _same_inode(final_directory, opened_directory)
+            or not _same_inode(final_named_directory, opened_directory)
+        ):
+            raise RuntimeError("formal ablation output directory changed during the run")
+        try:
+            _safe_named_regular_file(
+                lock_descriptor,
+                directory_descriptor=directory_descriptor,
+                name=_FORMAL_OUTPUT_LOCK_NAME,
+            )
+        except OSError as error:
+            raise RuntimeError("formal ablation output lock changed during the run") from error
+    finally:
+        if lock_descriptor is not None:
+            if locked:
+                try:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(lock_descriptor)
+        os.close(directory_descriptor)
+
+
+def _open_lease_subdirectory(
+    lease: _FormalOutputLease,
+    parts: tuple[str, ...],
+) -> int:
+    """Open a directory below a held lease without resolving a path component."""
+    descriptor = os.dup(lease.directory_descriptor)
+    try:
+        root = os.fstat(descriptor)
+        if (root.st_dev, root.st_ino) != (lease.device, lease.inode):
+            raise OSError("formal ablation output lease changed")
+        for part in parts:
+            if not part or part in {".", ".."} or "/" in part or os.sep in part:
+                raise OSError("formal ablation evidence path is unsafe")
+            created = False
+            try:
+                os.mkdir(part, 0o700, dir_fd=descriptor)
+                created = True
+            except FileExistsError:
+                pass
+            child = os.open(part, _directory_open_flags(), dir_fd=descriptor)
+            try:
+                child_metadata = os.fstat(child)
+                named_metadata = os.stat(
+                    part,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(child_metadata.st_mode)
+                    or not stat.S_ISDIR(named_metadata.st_mode)
+                    or stat.S_ISLNK(named_metadata.st_mode)
+                    or not _same_inode(child_metadata, named_metadata)
+                    or child_metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(child_metadata.st_mode) & 0o022
+                ):
+                    raise OSError("formal ablation evidence directory is unsafe")
+                if created:
+                    os.fsync(child)
+                    os.fsync(descriptor)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_formal_cell_start(
+    path: Path,
+    payload: bytes,
+    *,
+    out_dir: Path,
+    lease: _FormalOutputLease | None = None,
+    label: str = "cell-start marker",
+) -> None:
+    """Create a cell-start record once and persist it before a model can run."""
+    output = Path(os.path.abspath(os.fspath(out_dir)))
+    target = Path(os.path.abspath(os.fspath(path)))
+    try:
+        relative = target.relative_to(output)
+    except ValueError as error:
+        raise RuntimeError(f"formal ablation {label} escapes its output") from error
+    if len(relative.parts) < 2:
+        raise RuntimeError(f"formal ablation {label} has no evidence directory")
+
+    if lease is not None:
+        if output != lease.path:
+            raise RuntimeError(f"formal ablation {label} uses a different output lease")
+        try:
+            parent_descriptor = _open_lease_subdirectory(lease, relative.parts[:-1])
+        except OSError as error:
+            raise RuntimeError(f"formal ablation {label} directory is unsafe") from error
+    else:
+        try:
+            durable_mkdir_chain(output)
+            parent = durable_mkdir_chain(target.parent, anchor=output)
+            parent_descriptor = os.open(parent, _directory_open_flags())
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"formal ablation {label} directory is unsafe") from error
+
+    descriptor: int | None = None
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(
+                relative.name,
+                flags,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except FileExistsError as error:
+            raise RuntimeError(
+                f"formal ablation {label} already exists; mark the registered "
+                "attempt ABANDONED"
+            ) from error
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("cell-start marker write made no progress")
+                offset += written
+            os.fsync(descriptor)
+            _safe_named_regular_file(
+                descriptor,
+                directory_descriptor=parent_descriptor,
+                name=relative.name,
+            )
+            os.fsync(parent_descriptor)
+            _safe_named_regular_file(
+                descriptor,
+                directory_descriptor=parent_descriptor,
+                name=relative.name,
+            )
+        except OSError as error:
+            raise RuntimeError(f"formal ablation {label} was not durable") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_descriptor)
 
 
 # --- provenance fingerprint ---------------------------------------------------
@@ -1665,6 +2034,10 @@ def _validate_llm_call_receipt(
         "ordinal",
         "cell_fingerprint",
         "input_snapshot_sha256",
+        "formal_attempt_id",
+        "formal_registration_registry_sha256",
+        "formal_protocol_sha256",
+        "formal_outcome_key",
         "prompt_sha256",
         "response_sha256",
         "patch_sha256",
@@ -1687,6 +2060,21 @@ def _validate_llm_call_receipt(
         )
     ):
         raise ValueError("invalid LLM call receipt cell binding")
+    formal_binding_fields = (
+        "formal_attempt_id",
+        "formal_registration_registry_sha256",
+        "formal_protocol_sha256",
+        "formal_outcome_key",
+    )
+    formal_values = tuple(binding[name] for name in formal_binding_fields)
+    if not (
+        all(value is None for value in formal_values)
+        or all(
+            isinstance(value, str) and _HEX_64.fullmatch(value)
+            for value in formal_values
+        )
+    ):
+        raise ValueError("invalid LLM call receipt formal-run binding")
     if expected_binding is not None and any(
         binding.get(name) != expected for name, expected in expected_binding.items()
     ):
@@ -2003,6 +2391,453 @@ class _FormalCorpusBinding:
     sha256: str
     preregistration_commit: str
     git_executable: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _FormalAttemptBinding:
+    attempt_id: str
+    registry_path: str
+    registry_sha256: str
+    protocol_sha256: str
+    registration_commit: str
+    repository_root: Path
+    git_path: str
+    witness_remote_name: str
+    witness_remote_url: str
+    witness_ref: str
+
+
+@dataclass(frozen=True)
+class _FormalRunBinding:
+    attempt_id: str
+    registration_registry_sha256: str
+    protocol_sha256: str
+    outcome_key: str
+    header_path: str
+    header_sha256: str
+    witness_remote_name: str
+    witness_remote_url: str
+    witness_ref: str
+    witness_commit: str
+
+    def cell_fields(self) -> dict[str, str]:
+        return {
+            "formal_attempt_id": self.attempt_id,
+            "formal_registration_registry_sha256": (
+                self.registration_registry_sha256
+            ),
+            "formal_protocol_sha256": self.protocol_sha256,
+            "formal_outcome_key": self.outcome_key,
+        }
+
+
+def _initialize_formal_run(
+    attempt: _FormalAttemptBinding,
+    lease: _FormalOutputLease,
+) -> _FormalRunBinding:
+    """Seal a fresh-attempt header before any cell can be started.
+
+    A formal output directory is single use.  Even a header left by a failed
+    preflight proves the attempt began and therefore requires an ABANDONED
+    registry event rather than deletion and retry.
+    """
+    try:
+        entries = set(os.listdir(lease.directory_descriptor))
+    except OSError as error:
+        raise RuntimeError("formal ablation output cannot be enumerated safely") from error
+    if entries != {_FORMAL_OUTPUT_LOCK_NAME}:
+        raise RuntimeError(
+            "formal ablation output is not fresh; mark the registered attempt "
+            "ABANDONED and use a new attempt"
+        )
+
+    outcome_key = secrets.token_hex(32)
+    payload = _canonical_json_object_bytes(
+        {
+            "schema_version": _FORMAL_RUN_HEADER_SCHEMA,
+            "formal_attempt_id": attempt.attempt_id,
+            "registration_registry_sha256": attempt.registry_sha256,
+            "protocol_sha256": attempt.protocol_sha256,
+            "outcome_key": outcome_key,
+        }
+    )
+    header_sha256 = hashlib.sha256(payload).hexdigest()
+    witness_commit = _create_formal_start_witness(
+        attempt,
+        outcome_key=outcome_key,
+        run_header_sha256=header_sha256,
+    )
+    descriptor: int | None = None
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(
+            _FORMAL_RUN_HEADER_NAME,
+            flags,
+            0o600,
+            dir_fd=lease.directory_descriptor,
+        )
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("formal run header write made no progress")
+            offset += written
+        os.fsync(descriptor)
+        _safe_named_regular_file(
+            descriptor,
+            directory_descriptor=lease.directory_descriptor,
+            name=_FORMAL_RUN_HEADER_NAME,
+        )
+        os.fsync(lease.directory_descriptor)
+        _safe_named_regular_file(
+            descriptor,
+            directory_descriptor=lease.directory_descriptor,
+            name=_FORMAL_RUN_HEADER_NAME,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            "formal ablation run header could not be sealed; mark the registered "
+            "attempt ABANDONED"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    return _FormalRunBinding(
+        attempt_id=attempt.attempt_id,
+        registration_registry_sha256=attempt.registry_sha256,
+        protocol_sha256=attempt.protocol_sha256,
+        outcome_key=outcome_key,
+        header_path=_FORMAL_RUN_HEADER_NAME,
+        header_sha256=header_sha256,
+        witness_remote_name=attempt.witness_remote_name,
+        witness_remote_url=attempt.witness_remote_url,
+        witness_ref=attempt.witness_ref,
+        witness_commit=witness_commit,
+    )
+
+
+def _formal_git_output(
+    git_path: str,
+    arguments: list[str],
+    *,
+    repository_root: Path,
+    label: str,
+    input: str | None = None,
+) -> str:
+    result = run(
+        [git_path, *arguments],
+        cwd=repository_root,
+        timeout=30,
+        env=_git_control_env(),
+        input=input,
+    )
+    if (
+        result.returncode != 0
+        or result.output_truncated
+        or result.cleanup_unconfirmed
+    ):
+        raise RuntimeError(f"formal ablation attempt registry failed {label}")
+    return result.stdout
+
+
+def _create_formal_start_witness(
+    attempt: _FormalAttemptBinding,
+    *,
+    outcome_key: str,
+    run_header_sha256: str,
+) -> str:
+    """Atomically consume a registration through its preregistered remote ref."""
+    tree = _formal_git_output(
+        attempt.git_path,
+        ["rev-parse", f"{attempt.registration_commit}^{{tree}}"],
+        repository_root=attempt.repository_root,
+        label="witness tree",
+    ).strip()
+    message = formal_ablation_witness_message(
+        attempt_id=attempt.attempt_id,
+        registration_registry_sha256=attempt.registry_sha256,
+        protocol_sha256=attempt.protocol_sha256,
+        outcome_key=outcome_key,
+        run_header_sha256=run_header_sha256,
+    )
+    try:
+        commit_payload = formal_ablation_witness_commit_bytes(
+            tree=tree,
+            parent=attempt.registration_commit,
+            message=message,
+        )
+    except ValueError as error:
+        raise RuntimeError("formal ablation witness inputs are invalid") from error
+    witness_commit = formal_ablation_witness_commit_oid(commit_payload)
+    stored_commit = _formal_git_output(
+        attempt.git_path,
+        ["hash-object", "-t", "commit", "-w", "--stdin"],
+        repository_root=attempt.repository_root,
+        label="witness object creation",
+        input=commit_payload.decode("ascii"),
+    ).strip()
+    if stored_commit != witness_commit:
+        raise RuntimeError("formal ablation witness object identity is inconsistent")
+
+    refspec = f"{witness_commit}:{attempt.witness_ref}"
+    push = run(
+        [
+            attempt.git_path,
+            "push",
+            "--porcelain",
+            "--atomic",
+            "--no-verify",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            f"--force-with-lease={attempt.witness_ref}:",
+            attempt.witness_remote_url,
+            refspec,
+        ],
+        cwd=attempt.repository_root,
+        timeout=60,
+        env=_git_control_env(),
+    )
+    expected_statuses = {
+        f"*\t{refspec}\t[new branch]",
+        f"*\t{refspec}\t[new reference]",
+    }
+    status_lines = {
+        line
+        for line in push.stdout.splitlines()
+        if line[:2] in {"*\t", "=\t", "!\t", "+\t", "-\t"}
+    }
+    if (
+        push.returncode != 0
+        or push.output_truncated
+        or push.cleanup_unconfirmed
+        or status_lines.isdisjoint(expected_statuses)
+        or any(not line.startswith("*\t") for line in status_lines)
+    ):
+        raise RuntimeError(
+            "formal ablation start witness was not created; the registered "
+            "attempt cannot run"
+        )
+
+    remote_ref = _formal_git_output(
+        attempt.git_path,
+        ["ls-remote", "--refs", attempt.witness_remote_url, attempt.witness_ref],
+        repository_root=attempt.repository_root,
+        label="witness remote confirmation",
+    ).strip()
+    if remote_ref != f"{witness_commit}\t{attempt.witness_ref}":
+        raise RuntimeError(
+            "formal ablation start witness was not confirmed; the registered "
+            "attempt cannot run"
+        )
+    return witness_commit
+
+
+def _bind_formal_attempt(
+    *,
+    formal_corpus: _FormalCorpusBinding,
+    formal_output_lease: _FormalOutputLease,
+    model: str,
+    reasoning_effort: str,
+    docker_image_id: str,
+    source_tree_sha256: str,
+    codex_cli_version: str,
+    codex_cli_executable_sha256: str,
+    codex_client: FormalCodexClientConfig,
+) -> _FormalAttemptBinding:
+    """Require one committed open registration before snapshots or model calls."""
+    repository_root = _project_root()
+    if repository_root is None:
+        raise RuntimeError("formal ablation attempt registry requires a project checkout")
+    repository_root = repository_root.resolve(strict=True)
+    try:
+        output_path = formal_output_lease.path.relative_to(repository_root).as_posix()
+    except ValueError as error:
+        raise RuntimeError(
+            "formal ablation output must be a fixed repository-relative path"
+        ) from error
+
+    git_path = str(formal_corpus.git_executable.get("path", ""))
+    if not Path(git_path).is_absolute():
+        raise RuntimeError("formal ablation attempt registry has no trusted Git executable")
+    head = _formal_git_output(
+        git_path,
+        ["rev-parse", "--verify", "HEAD"],
+        repository_root=repository_root,
+        label="HEAD resolution",
+    ).strip()
+    if head != formal_corpus.preregistration_commit:
+        raise RuntimeError("formal ablation HEAD changed before attempt validation")
+    registry_relative = FORMAL_ABLATION_ATTEMPTS_PATH.as_posix()
+    _formal_git_output(
+        git_path,
+        ["ls-files", "--error-unmatch", "--", registry_relative],
+        repository_root=repository_root,
+        label="tracked-file check",
+    )
+    status = _formal_git_output(
+        git_path,
+        ["status", "--porcelain=v1", "--untracked-files=normal"],
+        repository_root=repository_root,
+        label="worktree status",
+    )
+    if status:
+        raise RuntimeError(
+            "formal ablation attempt registry requires a clean committed worktree"
+        )
+    size_text = _formal_git_output(
+        git_path,
+        ["cat-file", "-s", f"{head}:{registry_relative}"],
+        repository_root=repository_root,
+        label="committed registry size",
+    ).strip()
+    try:
+        committed_size = int(size_text)
+    except ValueError as error:
+        raise RuntimeError(
+            "formal ablation attempt registry has an invalid Git size"
+        ) from error
+    if (
+        committed_size < 0
+        or committed_size > MAX_FORMAL_ABLATION_ATTEMPTS_BYTES
+    ):
+        raise RuntimeError("formal ablation attempt registry is too large")
+    committed_text = _formal_git_output(
+        git_path,
+        ["show", f"{head}:{registry_relative}"],
+        repository_root=repository_root,
+        label="committed registry read",
+    )
+    committed_bytes = committed_text.encode("utf-8")
+    if len(committed_bytes) != committed_size:
+        raise RuntimeError("formal ablation attempt registry changed while reading")
+    registry_path = repository_root / FORMAL_ABLATION_ATTEMPTS_PATH
+    try:
+        current_bytes = _read_bounded_bytes(
+            registry_path,
+            max_bytes=MAX_FORMAL_ABLATION_ATTEMPTS_BYTES,
+        )
+    except (OSError, ValueError) as error:
+        raise RuntimeError("formal ablation attempt registry is unsafe") from error
+    if current_bytes != committed_bytes:
+        raise RuntimeError(
+            "formal ablation attempt registry differs from the committed HEAD"
+        )
+    try:
+        registry = parse_formal_ablation_attempt_registry(committed_bytes)
+    except ValueError as error:
+        raise RuntimeError("formal ablation attempt registry is invalid") from error
+    registration = registry.open_registration()
+    if not isinstance(registration, RegisteredAttempt):
+        raise RuntimeError(
+            "formal ablation requires exactly one open REGISTERED attempt"
+        )
+
+    _formal_git_output(
+        git_path,
+        ["cat-file", "-e", f"{registration.source_commit}^{{commit}}"],
+        repository_root=repository_root,
+        label="registered source commit",
+    )
+    parents = _formal_git_output(
+        git_path,
+        [
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            head,
+        ],
+        repository_root=repository_root,
+        label="registration parents",
+    ).strip().split()
+    if parents != [head, registration.source_commit]:
+        raise RuntimeError(
+            "formal ablation registration commit must directly follow its source commit"
+        )
+    changed_paths = _formal_git_output(
+        git_path,
+        [
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            head,
+        ],
+        repository_root=repository_root,
+        label="source/registration content",
+    ).splitlines()
+    if changed_paths != [registry_relative]:
+        raise RuntimeError(
+            "formal ablation registration commit may only change the attempt registry"
+        )
+    protocol = FormalAblationProtocol(
+        source_commit=registration.source_commit,
+        source_tree_sha256=source_tree_sha256,
+        manifest_sha256=formal_corpus.sha256,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        docker_image_id=docker_image_id,
+        codex_cli_version=codex_cli_version,
+        codex_cli_executable_sha256=codex_cli_executable_sha256,
+        codex_client=codex_client,
+        codex_client_sha256=formal_codex_client_sha256(codex_client),
+    )
+    protocol_sha256 = formal_ablation_protocol_sha256(protocol)
+    expected = {
+        "source_commit": protocol.source_commit,
+        "source_tree_sha256": protocol.source_tree_sha256,
+        "manifest_sha256": protocol.manifest_sha256,
+        "output_path": output_path,
+        "model": protocol.model,
+        "reasoning_effort": protocol.reasoning_effort,
+        "docker_image_id": protocol.docker_image_id,
+        "codex_cli_version": protocol.codex_cli_version,
+        "codex_cli_executable_sha256": (
+            protocol.codex_cli_executable_sha256
+        ),
+        "codex_client": protocol.codex_client,
+        "codex_client_sha256": protocol.codex_client_sha256,
+        "protocol_sha256": protocol_sha256,
+    }
+    if any(getattr(registration, field) != value for field, value in expected.items()):
+        raise RuntimeError(
+            "open formal ablation registration does not match this run"
+        )
+    configured_push_urls = _formal_git_output(
+        git_path,
+        [
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
+            registration.witness_remote_name,
+        ],
+        repository_root=repository_root,
+        label="witness remote resolution",
+    ).splitlines()
+    if configured_push_urls != [registration.witness_remote_url]:
+        raise RuntimeError(
+            "formal ablation witness remote differs from its registration"
+        )
+    return _FormalAttemptBinding(
+        attempt_id=registration.attempt_id,
+        registry_path=registry_relative,
+        registry_sha256=hashlib.sha256(committed_bytes).hexdigest(),
+        protocol_sha256=protocol_sha256,
+        registration_commit=head,
+        repository_root=repository_root,
+        git_path=git_path,
+        witness_remote_name=registration.witness_remote_name,
+        witness_remote_url=registration.witness_remote_url,
+        witness_ref=registration.witness_ref,
+    )
 
 
 def _prepare_formal_corpus_binding(
@@ -2408,6 +3243,7 @@ def _materialize_call_receipts(
     cell_fingerprint: str,
     input_snapshot_sha256: str,
     directory: Path,
+    formal_binding: dict[str, str] | None = None,
 ) -> list[str]:
     call_fields = {
         "status",
@@ -2442,6 +3278,26 @@ def _materialize_call_receipts(
                 "ordinal": ordinal,
                 "cell_fingerprint": cell_fingerprint,
                 "input_snapshot_sha256": input_snapshot_sha256,
+                "formal_attempt_id": (
+                    formal_binding.get("formal_attempt_id")
+                    if formal_binding is not None
+                    else None
+                ),
+                "formal_registration_registry_sha256": (
+                    formal_binding.get("formal_registration_registry_sha256")
+                    if formal_binding is not None
+                    else None
+                ),
+                "formal_protocol_sha256": (
+                    formal_binding.get("formal_protocol_sha256")
+                    if formal_binding is not None
+                    else None
+                ),
+                "formal_outcome_key": (
+                    formal_binding.get("formal_outcome_key")
+                    if formal_binding is not None
+                    else None
+                ),
                 "prompt_sha256": audit.get("prompt_sha256"),
                 "response_sha256": audit.get("response_sha256"),
                 "patch_sha256": audit.get("patch_sha256"),
@@ -2727,6 +3583,10 @@ def _load_cached_cell(
                             "ordinal": ordinal,
                             "cell_fingerprint": fingerprint,
                             "input_snapshot_sha256": input_snapshot_sha256,
+                            "formal_attempt_id": None,
+                            "formal_registration_registry_sha256": None,
+                            "formal_protocol_sha256": None,
+                            "formal_outcome_key": None,
                         },
                     )
                 )
@@ -2790,6 +3650,9 @@ def _run_cell(
     require_call_receipts: bool = False,
     max_inner_attempts: int = 1,
     formal_evidence: bool = False,
+    *,
+    formal_output_lease: _FormalOutputLease | None = None,
+    formal_run_binding: _FormalRunBinding | None = None,
 ) -> list[RunRecord]:
     name = task.inputs.get("_name", task.title)
     cache = out_dir / "results" / f"{name}__r{rep}.json"
@@ -2797,6 +3660,13 @@ def _run_cell(
     receipt_dir = out_dir / "llm_call_receipts"
     cell_audits: list[dict[str, Any]] = []
     cell_receipts: list[str] = []
+    if formal_output_lease is not None and formal_run_binding is None:
+        raise RuntimeError("formal ablation cell has no sealed run header")
+    formal_cell_fields = (
+        formal_run_binding.cell_fields()
+        if formal_run_binding is not None
+        else {}
+    )
 
     def error_records(detail: str, *, repairs: int = 0) -> list[RunRecord]:
         return [
@@ -2844,6 +3714,9 @@ def _run_cell(
             cell_fingerprint=fingerprint,
             input_snapshot_sha256=input_snapshot_sha256,
             directory=receipt_dir,
+            formal_binding=(
+                formal_cell_fields if formal_run_binding is not None else None
+            ),
         )
         decoded_receipts = [
             _read_llm_call_receipt(
@@ -2855,6 +3728,20 @@ def _run_cell(
                     "ordinal": ordinal,
                     "cell_fingerprint": fingerprint,
                     "input_snapshot_sha256": input_snapshot_sha256,
+                    "formal_attempt_id": formal_cell_fields.get(
+                        "formal_attempt_id"
+                    ),
+                    "formal_registration_registry_sha256": (
+                        formal_cell_fields.get(
+                            "formal_registration_registry_sha256"
+                        )
+                    ),
+                    "formal_protocol_sha256": formal_cell_fields.get(
+                        "formal_protocol_sha256"
+                    ),
+                    "formal_outcome_key": formal_cell_fields.get(
+                        "formal_outcome_key"
+                    ),
                 },
             )
             for ordinal, digest in enumerate(receipts)
@@ -2862,23 +3749,31 @@ def _run_cell(
         return receipts, decoded_receipts
 
     def write_cache(records: list[RunRecord], *, terminal_error: bool) -> None:
-        _atomic_write(
-            cache,
-            json.dumps(
-                {
-                    "schema_version": _CACHE_SCHEMA,
-                    "fingerprint": fingerprint,
-                    "terminal_error": terminal_error,
-                    "records": [asdict(record) for record in records],
-                    **(
-                        {"llm_call_receipts": cell_receipts}
-                        if require_call_receipts
-                        else {"llm_calls": cell_audits}
-                    ),
-                },
-                indent=2,
-            ),
+        payload = json.dumps(
+            {
+                "schema_version": _CACHE_SCHEMA,
+                "fingerprint": fingerprint,
+                "terminal_error": terminal_error,
+                "records": [asdict(record) for record in records],
+                **formal_cell_fields,
+                **(
+                    {"llm_call_receipts": cell_receipts}
+                    if require_call_receipts
+                    else {"llm_calls": cell_audits}
+                ),
+            },
+            indent=2,
         )
+        if formal_evidence:
+            _write_formal_cell_start(
+                cache,
+                payload.encode("utf-8"),
+                out_dir=out_dir,
+                lease=formal_output_lease,
+                label="terminal cell seal",
+            )
+        else:
+            _atomic_write(cache, payload)
 
     def snapshot_matches() -> bool:
         try:
@@ -2893,41 +3788,39 @@ def _run_cell(
             "rep": rep,
             "cell_fingerprint": fingerprint,
             "input_snapshot_sha256": input_snapshot_sha256,
+            **formal_cell_fields,
         }
     )
     marker_exists = attempt_marker.exists() or attempt_marker.is_symlink()
     cache_exists = cache.exists() or cache.is_symlink()
     if formal_evidence:
-        if marker_exists:
-            try:
-                saved_marker = _read_bounded_bytes(
-                    attempt_marker,
-                    max_bytes=_MAX_CELL_ATTEMPT_BYTES,
-                )
-            except (OSError, ValueError) as error:
-                raise RuntimeError("formal ablation cell-start marker is invalid") from error
-            if saved_marker != marker_payload:
-                raise RuntimeError("formal ablation cell-start marker is stale or corrupt")
-        if cache_exists and not marker_exists:
-            raise RuntimeError("formal ablation cell cache has no matching start marker")
+        if marker_exists or cache_exists:
+            raise RuntimeError(
+                "formal ablation does not resume or reuse cells; mark the "
+                "registered attempt ABANDONED and use a new attempt"
+            )
 
     if not snapshot_matches():
         if formal_evidence:
             raise RuntimeError("formal ablation input snapshot failed validation")
         return error_records("content-addressed input snapshot failed validation")
-    cached = _load_cached_cell(
-        cache,
-        fingerprint,
-        input_snapshot_sha256=input_snapshot_sha256,
-        scorer_backend=scorer_backend,
-        scorer_image_id=scorer_image_id,
-        require_call_receipts=require_call_receipts,
-        expected_task=name,
-        expected_rep=rep,
-        receipt_dir=receipt_dir,
-        max_outer_attempts=_LLM_RETRIES,
-        max_inner_attempts=max_inner_attempts,
-        formal_evidence=formal_evidence,
+    cached = (
+        None
+        if formal_evidence
+        else _load_cached_cell(
+            cache,
+            fingerprint,
+            input_snapshot_sha256=input_snapshot_sha256,
+            scorer_backend=scorer_backend,
+            scorer_image_id=scorer_image_id,
+            require_call_receipts=require_call_receipts,
+            expected_task=name,
+            expected_rep=rep,
+            receipt_dir=receipt_dir,
+            max_outer_attempts=_LLM_RETRIES,
+            max_inner_attempts=max_inner_attempts,
+            formal_evidence=False,
+        )
     )
     if cached is not None:
         if require_call_receipts:
@@ -2940,14 +3833,12 @@ def _run_cell(
             )
         return cached.records
     if formal_evidence:
-        if cache_exists:
-            raise RuntimeError("formal ablation cell cache is stale or corrupt")
-        if marker_exists:
-            raise RuntimeError(
-                "formal ablation found an unsealed prior cell attempt; "
-                "use a new output directory"
-            )
-        _atomic_write_bytes(attempt_marker, marker_payload)
+        _write_formal_cell_start(
+            attempt_marker,
+            marker_payload,
+            out_dir=out_dir,
+            lease=formal_output_lease,
+        )
     with tempfile.TemporaryDirectory(prefix="lha_abl_") as tmp:
         scratch = Path(tmp)
         try:
@@ -3461,6 +4352,60 @@ def run_ablation(
 ) -> AblationReport:
     if reps <= 0:
         raise ValueError("reps must be greater than zero")
+    formal_corpus = _prepare_formal_corpus_binding(
+        task_paths,
+        repetitions=reps,
+    )
+    out = Path(out_dir) if out_dir else (Path(base.runs_dir) / "ablation")
+    if formal_corpus is not None:
+        # Corpus binding is read-only preregistration work. The output lifecycle
+        # begins here: every Docker/Codex preflight, snapshot, model call, cell,
+        # final cleanup check, and report write remains inside this lease.
+        with _formal_ablation_lock(out) as formal_output_lease:
+            return _run_ablation_with_binding(
+                base,
+                task_paths,
+                llm=llm,
+                model=model,
+                reps=reps,
+                out_dir=out,
+                llm_client=llm_client,
+                scorer_backend=scorer_backend,
+                formal_corpus=formal_corpus,
+                formal_output_lease=formal_output_lease,
+            )
+    return _run_ablation_with_binding(
+        base,
+        task_paths,
+        llm=llm,
+        model=model,
+        reps=reps,
+        out_dir=out,
+        llm_client=llm_client,
+        scorer_backend=scorer_backend,
+        formal_corpus=None,
+        formal_output_lease=None,
+    )
+
+
+def _run_ablation_with_binding(
+    base: Config,
+    task_paths: list[str],
+    *,
+    llm: str,
+    model: str | None,
+    reps: int,
+    out_dir: Path,
+    llm_client: LLMClient | None,
+    scorer_backend: str,
+    formal_corpus: _FormalCorpusBinding | None,
+    formal_output_lease: _FormalOutputLease | None,
+) -> AblationReport:
+    if formal_corpus is not None and llm_client is not None:
+        raise ValueError(
+            "formal ablation does not accept an injected LLM client; "
+            "the built-in Codex CLI backend is required"
+        )
     client_probe: Any = llm_client
     seen_clients: set[int] = set()
     rejects_formal_evidence = False
@@ -3475,18 +4420,18 @@ def run_ablation(
             "claude_cli is experimental and cannot produce ablation evidence; "
             "use codex_cli with protocol validation"
         )
-    formal_corpus = _prepare_formal_corpus_binding(
-        task_paths,
-        repetitions=reps,
-    )
-    out = Path(out_dir) if out_dir else (Path(base.runs_dir) / "ablation")
+    out = Path(out_dir)
     report_path = out / "ablation_report.json"
     if formal_corpus is not None and (report_path.exists() or report_path.is_symlink()):
         raise RuntimeError(
             "formal ablation output already contains ablation_report.json; "
             "reports are immutable, so use a new output directory"
         )
-    out.mkdir(parents=True, exist_ok=True)
+    if formal_corpus is not None:
+        if formal_output_lease is None:
+            raise RuntimeError("formal ablation output lock is not held")
+    else:
+        out.mkdir(parents=True, exist_ok=True)
     # The backend's own env vars apply here exactly as in `lha run`; an explicit
     # --model wins. The resolved name feeds the provenance fingerprint.
     if llm == "codex_cli":
@@ -3504,6 +4449,12 @@ def run_ablation(
     requested_docker_image: str | None = None
     pinned_scorer_image_id: str | None = None
     docker_executable: dict[str, Any] = {}
+    formal_attempt_binding: _FormalAttemptBinding | None = None
+    formal_run_binding: _FormalRunBinding | None = None
+    registered_source_tree_sha256: str | None = None
+    formal_preflight_done = False
+    formal_cli_executable_sha256: str | None = None
+    formal_codex_client: FormalCodexClientConfig | None = None
     if scorer_backend == "docker":
         requested_docker_image = base.exec_image
         docker_identity = resolve_docker_executable()
@@ -3516,6 +4467,86 @@ def run_ablation(
             docker=docker_identity.path,
         )
     client = llm_client or _make_llm(llm, model, cli_path=cli_path, effort=effort)
+    if formal_corpus is not None:
+        from .llm.codex_cli import CodexCLIClient
+
+        if (
+            formal_output_lease is None
+            or pinned_scorer_image_id is None
+            or not isinstance(model, str)
+            or not model
+        ):
+            raise RuntimeError("formal ablation attempt registration inputs are incomplete")
+        if (
+            type(client) is not CodexCLIClient
+            or client.name != "codex_cli"
+            or client.no_tools is not True
+            or client.model != model
+            or client.reasoning_effort != effort
+            or client.cli_path != cli_path
+            or client.sandbox_mode != "read-only"
+            or client.externally_sandboxed is not False
+        ):
+            raise RuntimeError(
+                "formal ablation did not construct the required Codex CLI client"
+            )
+        client.preflight()
+        formal_preflight_done = True
+        identity = client._cli_identity
+        cli_version = client._version
+        if (
+            not isinstance(identity, tuple)
+            or len(identity) != 7
+            or not isinstance(identity[5], str)
+            or _HEX_64.fullmatch(identity[5]) is None
+            or not isinstance(cli_version, str)
+            or not cli_version
+            or cli_version == "unknown"
+        ):
+            raise RuntimeError(
+                "formal ablation Codex preflight did not resolve a stable CLI identity"
+            )
+        if (
+            client.permission_model != "profile"
+            or client.permission_profile != "lha-read"
+            or client.credential_barrier != "verified"
+        ):
+            raise RuntimeError(
+                "formal ablation Codex preflight did not verify the fixed "
+                "permission boundary"
+            )
+        formal_cli_executable_sha256 = identity[5]
+        formal_codex_client = FormalCodexClientConfig(
+            no_tools=True,
+            sandbox_mode="read-only",
+            permission_model="profile",
+            permission_profile="lha-read",
+            credential_barrier="verified",
+            externally_sandboxed=False,
+            max_retries=client.max_retries,
+            timeout_s=float(client.timeout),
+            retry_backoff_s=float(client.retry_backoff_s),
+        )
+        registered_source_tree_sha256 = _source_tree_digest(
+            _source_file_digests()
+        )
+        formal_attempt_binding = _bind_formal_attempt(
+            formal_corpus=formal_corpus,
+            formal_output_lease=formal_output_lease,
+            model=model,
+            reasoning_effort=effort,
+            docker_image_id=pinned_scorer_image_id,
+            source_tree_sha256=registered_source_tree_sha256,
+            codex_cli_version=cli_version,
+            codex_cli_executable_sha256=formal_cli_executable_sha256,
+            codex_client=formal_codex_client,
+        )
+        assert formal_attempt_binding is not None
+        assert formal_output_lease is not None
+        formal_run_binding = _initialize_formal_run(
+            formal_attempt_binding,
+            formal_output_lease,
+        )
     codex_operation_lease_bound = _bind_client_operation_lease(client, out)
     if formal_corpus is not None and not codex_operation_lease_bound:
         raise RuntimeError("formal ablation requires Codex processes to use the output lease store")
@@ -3571,7 +4602,7 @@ def run_ablation(
             docker_operations_recovered_before_run = _recover_docker_operations(
                 agent_exec,
                 out,
-                allow_recovered=True,
+                allow_recovered=False,
             )
         agent_requested = "docker"
     else:
@@ -3588,7 +4619,7 @@ def run_ablation(
             workdir=out,
         )
     preflight = getattr(client, "preflight", None)
-    if callable(preflight):
+    if callable(preflight) and not formal_preflight_done:
         # The shared operation store is recovered first. Preflight then proves
         # CLI setup and credential cleanup without spending a model call.
         preflight()
@@ -3610,6 +4641,14 @@ def run_ablation(
             logger.warning("could not read the backend provenance", exc_info=True)
     source_files = _source_file_digests()
     source_tree_sha256 = _source_tree_digest(source_files)
+    if (
+        registered_source_tree_sha256 is not None
+        and source_tree_sha256 != registered_source_tree_sha256
+    ):
+        raise RuntimeError(
+            "formal ablation source changed after attempt registration; "
+            "mark the attempt ABANDONED"
+        )
     llm_runtime = _client_runtime(
         llm,
         client,
@@ -3722,6 +4761,8 @@ def run_ablation(
                     require_call_receipts,
                     max_inner_attempts,
                     formal_corpus is not None,
+                    formal_output_lease=formal_output_lease,
+                    formal_run_binding=formal_run_binding,
                 )
             )
 
@@ -3782,6 +4823,27 @@ def run_ablation(
         "scorer_evidence_schema": _SCORER_EVIDENCE_SCHEMA,
         "llm_call_receipt_schema": _LLM_CALL_RECEIPT_SCHEMA,
         "cell_attempt_schema": _CELL_ATTEMPT_SCHEMA,
+        "formal_output_lock": (
+            {
+                "protocol": "flock-exclusive-nonblocking",
+                "path": _FORMAL_OUTPUT_LOCK_NAME,
+                "lifetime": "full-run",
+            }
+            if formal_corpus is not None
+            else None
+        ),
+        "formal_fresh_run": (
+            {
+                "run_header_schema": _FORMAL_RUN_HEADER_SCHEMA,
+                "run_header_path": _FORMAL_RUN_HEADER_NAME,
+                "resume": False,
+                "cache_reads": False,
+                "expected_cell_starts": total,
+                "expected_terminal_cells": total,
+            }
+            if formal_corpus is not None
+            else None
+        ),
         "codex_operation_lease_store": ("." if codex_operation_lease_bound else None),
         "docker_operation_lease_store": ("." if scorer_backend == "docker" else None),
         "docker_container_absence_filter": (
@@ -3811,6 +4873,7 @@ def run_ablation(
         cli_version=(
             llm_runtime["cli_version"] if isinstance(llm_runtime["cli_version"], str) else None
         ),
+        cli_executable_sha256=formal_cli_executable_sha256,
         backend_library_version=(
             llm_runtime["backend_library_version"]
             if isinstance(llm_runtime["backend_library_version"], str)
@@ -3846,6 +4909,66 @@ def run_ablation(
         formal_corpus_manifest_sha256=(formal_corpus.sha256 if formal_corpus is not None else None),
         preregistration_commit=(
             formal_corpus.preregistration_commit if formal_corpus is not None else None
+        ),
+        formal_attempt_id=(
+            formal_attempt_binding.attempt_id
+            if formal_attempt_binding is not None
+            else None
+        ),
+        formal_attempt_registry_path=(
+            formal_attempt_binding.registry_path
+            if formal_attempt_binding is not None
+            else None
+        ),
+        formal_attempt_registry_sha256=(
+            formal_attempt_binding.registry_sha256
+            if formal_attempt_binding is not None
+            else None
+        ),
+        formal_attempt_protocol_sha256=(
+            formal_attempt_binding.protocol_sha256
+            if formal_attempt_binding is not None
+            else None
+        ),
+        formal_attempt_registration_commit=(
+            formal_attempt_binding.registration_commit
+            if formal_attempt_binding is not None
+            else None
+        ),
+        formal_attempt_witness_remote_name=(
+            formal_run_binding.witness_remote_name
+            if formal_run_binding is not None
+            else None
+        ),
+        formal_attempt_witness_remote_url=(
+            formal_run_binding.witness_remote_url
+            if formal_run_binding is not None
+            else None
+        ),
+        formal_attempt_witness_ref=(
+            formal_run_binding.witness_ref
+            if formal_run_binding is not None
+            else None
+        ),
+        formal_attempt_witness_commit=(
+            formal_run_binding.witness_commit
+            if formal_run_binding is not None
+            else None
+        ),
+        formal_run_header_path=(
+            formal_run_binding.header_path
+            if formal_run_binding is not None
+            else None
+        ),
+        formal_run_header_sha256=(
+            formal_run_binding.header_sha256
+            if formal_run_binding is not None
+            else None
+        ),
+        formal_outcome_key=(
+            formal_run_binding.outcome_key
+            if formal_run_binding is not None
+            else None
         ),
         git_executable=git_executable,
         docker_executable=docker_executable,
@@ -3918,6 +5041,11 @@ def run_ablation(
     _atomic_write(
         out / "ablation_report.json",
         json.dumps(report_raw, indent=2),
+        anchor=out if formal_corpus is not None else None,
     )
-    _atomic_write(out / "ablation_report.md", report.to_markdown())
+    _atomic_write(
+        out / "ablation_report.md",
+        report.to_markdown(),
+        anchor=out if formal_corpus is not None else None,
+    )
     return report

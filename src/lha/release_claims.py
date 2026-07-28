@@ -26,12 +26,18 @@ from .ablation import (
     _CACHE_SCHEMA,
     _CELL_ATTEMPT_SCHEMA,
     _FORMAL_CORPUS_MANIFEST_PATH,
+    _FORMAL_OUTPUT_LOCK_NAME,
     _FORMAL_REPETITIONS,
+    _FORMAL_RUN_HEADER_NAME,
+    _FORMAL_RUN_HEADER_SCHEMA,
     _FORMAL_TASK_COUNT,
     _LLM_CALL_RECEIPT_SCHEMA,
     _LLM_RETRIES,
     _MAX_ARTIFACT_BYTES,
+    _MAX_CACHE_BYTES,
+    _MAX_CELL_ATTEMPT_BYTES,
     _MAX_FORMAL_MANIFEST_BYTES,
+    _MAX_FORMAL_RUN_HEADER_BYTES,
     _MAX_REPAIRS,
     _MAX_REPORT_BYTES,
     _MAX_SCORER_EVIDENCE_BYTES,
@@ -42,6 +48,7 @@ from .ablation import (
     ScoreOutcome,
     ScorerEvidenceBinding,
     _ablation_report_from_raw,
+    _canonical_json_object_bytes,
     _frozen_artifact_bytes,
     _git_control_env,
     _input_snapshot_digest,
@@ -58,6 +65,22 @@ from .ablation import (
     _trusted_control_executable,
     _validate_cell_call_sequence,
     _validate_scorer_evidence,
+)
+from .ablation_attempts import (
+    FORMAL_ABLATION_ATTEMPTS_PATH,
+    MAX_FORMAL_ABLATION_ATTEMPTS_BYTES,
+    CompletedAttempt,
+    FormalAblationProtocol,
+    FormalCodexClientConfig,
+    RegisteredAttempt,
+    UnregisteredRunRecorded,
+    formal_ablation_protocol_sha256,
+    formal_ablation_witness_commit_bytes,
+    formal_ablation_witness_commit_oid,
+    formal_ablation_witness_message,
+    formal_codex_client_sha256,
+    parse_formal_ablation_attempt_registry,
+    registry_has_prefix,
 )
 from .bench.stats import mcnemar_exact, wilson_interval
 from .bench.terminal_public_evidence import (
@@ -682,6 +705,708 @@ def _git_success(
     return result.stdout
 
 
+def _git_blob_bytes(
+    repository_root: Path,
+    *,
+    commit: str,
+    path: str,
+    git_executable: str,
+    max_bytes: int,
+    label: str,
+) -> bytes:
+    object_name = f"{commit}:{path}"
+    size_raw = _git_success(
+        repository_root,
+        ["cat-file", "-s", object_name],
+        git_executable=git_executable,
+        label=f"{label} size",
+    )
+    try:
+        size = int(size_raw.decode("ascii", errors="strict").strip())
+    except (UnicodeDecodeError, ValueError) as error:
+        _fail(f"formal ablation Git evidence has an invalid {label} size: {error}")
+    if size < 0 or size > max_bytes:
+        _fail(f"formal ablation Git evidence {label} is too large")
+    payload = _git_success(
+        repository_root,
+        ["show", object_name],
+        git_executable=git_executable,
+        label=label,
+    )
+    if len(payload) != size:
+        _fail(f"formal ablation Git evidence {label} changed while reading")
+    return payload
+
+
+def _disclosed_report_counts(
+    raw: dict[str, Any],
+) -> tuple[dict[str, int], tuple[dict[str, Any], ...]]:
+    tasks = raw.get("tasks")
+    reps = raw.get("reps")
+    if (
+        raw.get("schema_version") != 4
+        or not isinstance(tasks, list)
+        or len(tasks) != _FORMAL_TASK_COUNT
+        or len(set(tasks)) != len(tasks)
+        or not all(isinstance(task, str) and task for task in tasks)
+        or type(reps) is not int
+        or reps != _FORMAL_REPETITIONS
+    ):
+        _fail("disclosed formal ablation report is not the fixed schema-4 grid")
+    records_raw = raw.get("records")
+    if not isinstance(records_raw, list):
+        _fail("disclosed formal ablation report has no record grid")
+    records: list[dict[str, Any]] = []
+    by_key: dict[tuple[str, int, str], dict[str, Any]] = {}
+    boolean_fields = (
+        "claimed_success",
+        "artifact_correct",
+        "true_success",
+        "false_success",
+    )
+    for value in records_raw:
+        if not isinstance(value, dict):
+            _fail("disclosed formal ablation report has a non-object record")
+        task = value.get("task")
+        rep = value.get("rep")
+        condition = value.get("condition")
+        status = value.get("status")
+        key = (task, rep, condition)
+        if (
+            not isinstance(task, str)
+            or task not in tasks
+            or type(rep) is not int
+            or rep < 0
+            or rep >= reps
+            or condition not in _CONDITION_NAMES
+            or not isinstance(status, str)
+            or not status
+            or any(type(value.get(field)) is not bool for field in boolean_fields)
+            or key in by_key
+        ):
+            _fail("disclosed formal ablation report has an invalid record key")
+        claimed = cast(bool, value["claimed_success"])
+        correct = cast(bool, value["artifact_correct"])
+        if (
+            value["true_success"] != (claimed and correct)
+            or value["false_success"] != (claimed and not correct)
+            or (
+                status == "ERROR"
+                and any(cast(bool, value[field]) for field in boolean_fields)
+            )
+        ):
+            _fail("disclosed formal ablation report has inconsistent outcomes")
+        by_key[cast(tuple[str, int, str], key)] = value
+        records.append(value)
+    expected_keys = {
+        (task, rep, condition)
+        for task in tasks
+        for rep in range(reps)
+        for condition in _CONDITION_NAMES
+    }
+    if set(by_key) != expected_keys:
+        _fail("disclosed formal ablation report does not cover its fixed grid")
+    error_keys: set[tuple[str, int]] = set()
+    for task in cast(list[str], tasks):
+        for rep in range(reps):
+            statuses = {
+                by_key[(task, rep, condition)]["status"]
+                for condition in _CONDITION_NAMES
+            }
+            contains_error = "ERROR" in statuses
+            if contains_error and statuses != {"ERROR"}:
+                _fail(
+                    "disclosed formal ablation report has a condition-local ERROR"
+                )
+            if contains_error:
+                error_keys.add((task, rep))
+    usable = [
+        record
+        for record in records
+        if (cast(str, record["task"]), cast(int, record["rep"])) not in error_keys
+    ]
+    by_condition = {
+        condition: [
+            record for record in usable if record["condition"] == condition
+        ]
+        for condition in _CONDITION_NAMES
+    }
+    trust = by_condition["trust"]
+    gate = by_condition["gate"]
+    verify = by_condition["verify"]
+    counts = {
+        "scheduled_cells": len(tasks) * reps,
+        "usable_cells": len(trust),
+        "error_cells": len(error_keys),
+        "trust_delivered_correct": sum(record["true_success"] for record in trust),
+        "trust_delivered_wrong": sum(record["false_success"] for record in trust),
+        "gate_delivered_correct": sum(record["true_success"] for record in gate),
+        "gate_delivered_wrong": sum(record["false_success"] for record in gate),
+        "gate_intercepted_wrong": sum(
+            not record["claimed_success"] and not record["artifact_correct"]
+            for record in gate
+        ),
+        "gate_rejected_correct": sum(
+            not record["claimed_success"] and record["artifact_correct"]
+            for record in gate
+        ),
+        "verify_delivered_correct": sum(record["true_success"] for record in verify),
+        "verify_delivered_wrong": sum(record["false_success"] for record in verify),
+        "verify_not_delivered": sum(
+            not record["claimed_success"] for record in verify
+        ),
+    }
+    return counts, tuple(records)
+
+
+def _formal_codex_client_from_provenance(
+    provenance: dict[str, Any],
+    *,
+    label: str,
+) -> FormalCodexClientConfig:
+    configuration = provenance.get("configuration")
+    client = (
+        configuration.get("client")
+        if isinstance(configuration, dict)
+        else None
+    )
+    if not isinstance(client, dict):
+        _fail(f"{label} has no Codex client configuration")
+    fixed_values = {
+        "no_tools": True,
+        "sandbox_mode": "read-only",
+        "permission_model": "profile",
+        "permission_profile": "lha-read",
+        "credential_barrier": "verified",
+        "externally_sandboxed": False,
+    }
+    if any(
+        client.get(field) != expected
+        for field, expected in fixed_values.items()
+    ):
+        _fail(f"{label} has an invalid fixed Codex permission boundary")
+    timeout = client.get("timeout")
+    retry_backoff = client.get("retry_backoff_s")
+    max_retries = client.get("max_retries")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or isinstance(retry_backoff, bool)
+        or not isinstance(retry_backoff, (int, float))
+        or type(max_retries) is not int
+        or max_retries < 0
+    ):
+        _fail(f"{label} has an invalid Codex timeout or retry budget")
+    try:
+        return FormalCodexClientConfig(
+            no_tools=True,
+            sandbox_mode="read-only",
+            permission_model="profile",
+            permission_profile="lha-read",
+            credential_barrier="verified",
+            externally_sandboxed=False,
+            max_retries=cast(int, max_retries),
+            timeout_s=float(timeout),
+            retry_backoff_s=float(retry_backoff),
+        )
+    except ValueError as error:
+        _fail(f"{label} has an invalid fixed Codex client configuration: {error}")
+
+
+def _codex_executable_sha256_from_provenance(
+    provenance: dict[str, Any],
+    *,
+    label: str,
+    allow_backend_details: bool,
+) -> str:
+    recorded = provenance.get("cli_executable_sha256")
+    if isinstance(recorded, str) and _HEX_64.fullmatch(recorded):
+        return recorded
+    if allow_backend_details:
+        details = provenance.get("backend_details")
+        if isinstance(details, str):
+            matches = re.findall(
+                r"(?:^|\s)cli_sha256=([0-9a-f]{64})(?=\s|$)",
+                details,
+            )
+            if len(matches) == 1:
+                return matches[0]
+    _fail(f"{label} has no unambiguous Codex executable digest")
+
+
+def _validate_disclosed_formal_report(
+    disclosure: UnregisteredRunRecorded,
+    repo_root: Path,
+    *,
+    git_executable: str,
+    head: str,
+) -> None:
+    _git_success(
+        repo_root,
+        ["cat-file", "-e", f"{disclosure.source_commit}^{{commit}}"],
+        git_executable=git_executable,
+        label="disclosed formal source commit",
+    )
+    report_relative = disclosure.published_report_path
+    report_path = _repo_evidence_path(
+        repo_root,
+        report_relative,
+        label="disclosed formal report",
+    )
+    try:
+        current_bytes = _read_bounded_bytes(
+            report_path,
+            max_bytes=_MAX_REPORT_BYTES,
+        )
+    except (OSError, ValueError) as error:
+        _fail(f"disclosed formal ablation report is unavailable: {error}")
+    committed_bytes = _git_blob_bytes(
+        repo_root,
+        commit=head,
+        path=report_relative,
+        git_executable=git_executable,
+        max_bytes=_MAX_REPORT_BYTES,
+        label="disclosed formal report",
+    )
+    if (
+        current_bytes != committed_bytes
+        or hashlib.sha256(current_bytes).hexdigest()
+        != disclosure.report_sha256
+    ):
+        _fail("disclosed formal ablation report digest is stale")
+    try:
+        raw = json.loads(current_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _fail(f"disclosed formal ablation report is invalid JSON: {error}")
+    if not isinstance(raw, dict):
+        _fail("disclosed formal ablation report is not an object")
+    if (
+        raw.get("fingerprint") != disclosure.report_fingerprint
+        or raw.get("fingerprint") != _report_fingerprint(raw)
+    ):
+        _fail("disclosed formal ablation report fingerprint is stale")
+    provenance = raw.get("provenance")
+    if (
+        raw.get("model") != disclosure.model
+        or not isinstance(provenance, dict)
+    ):
+        _fail("disclosed formal ablation report differs from its recorded protocol")
+    provenance = cast(dict[str, Any], provenance)
+    cli_version = provenance.get("cli_version")
+    if not isinstance(cli_version, str) or not cli_version:
+        _fail("disclosed formal ablation report has no Codex CLI version")
+    client = _formal_codex_client_from_provenance(
+        provenance,
+        label="disclosed formal ablation report",
+    )
+    try:
+        protocol = FormalAblationProtocol(
+            source_commit=cast(str, provenance.get("git_commit")),
+            source_tree_sha256=cast(str, provenance.get("source_tree_sha256")),
+            manifest_sha256=cast(
+                str,
+                provenance.get("formal_corpus_manifest_sha256"),
+            ),
+            model=cast(str, provenance.get("model")),
+            reasoning_effort=cast(str, provenance.get("reasoning_effort")),
+            docker_image_id=cast(str, provenance.get("scorer_image_id")),
+            codex_cli_version=cli_version,
+            codex_cli_executable_sha256=(
+                _codex_executable_sha256_from_provenance(
+                    provenance,
+                    label="disclosed formal ablation report",
+                    allow_backend_details=True,
+                )
+            ),
+            codex_client=client,
+            codex_client_sha256=formal_codex_client_sha256(client),
+        )
+    except ValueError as error:
+        _fail(f"disclosed formal ablation protocol is invalid: {error}")
+    if (
+        protocol != disclosure.protocol()
+        or disclosure.protocol_sha256
+        != formal_ablation_protocol_sha256(protocol)
+    ):
+        _fail("disclosed formal ablation report differs from its recorded protocol")
+    measured_counts, _records = _disclosed_report_counts(raw)
+    expected_counts = {
+        field: getattr(disclosure, field) for field in measured_counts
+    }
+    if measured_counts != expected_counts:
+        _fail("disclosed formal ablation report counts are stale")
+
+
+def _validate_formal_ablation_disclosures(repo_root: Path) -> None:
+    registry_path = repo_root / FORMAL_ABLATION_ATTEMPTS_PATH
+    history_root = repo_root / "benchmarks" / "formal_ablation_history"
+    registry_present = registry_path.exists() or registry_path.is_symlink()
+    history_present = history_root.exists() or history_root.is_symlink()
+    if not registry_present and not history_present:
+        return
+    git_executable = str(_trusted_control_executable("git")["path"])
+    head = (
+        _git_success(
+            repo_root,
+            ["rev-parse", "--verify", "HEAD"],
+            git_executable=git_executable,
+            label="disclosure HEAD resolution",
+        )
+        .decode("ascii", errors="strict")
+        .strip()
+    )
+    history_lines = (
+        _git_success(
+            repo_root,
+            [
+                "ls-tree",
+                "-r",
+                "--name-only",
+                head,
+                "--",
+                "benchmarks/formal_ablation_history",
+            ],
+            git_executable=git_executable,
+            label="formal ablation history paths",
+        )
+        .decode("utf-8", errors="strict")
+        .splitlines()
+    )
+    tracked_reports = {
+        path
+        for path in history_lines
+        if path.endswith("/ablation_report.json")
+    }
+    if not registry_present:
+        if tracked_reports:
+            _fail(
+                "tracked formal ablation history reports have no registry disclosures"
+            )
+        return
+    current_path = _repo_evidence_path(
+        repo_root,
+        FORMAL_ABLATION_ATTEMPTS_PATH.as_posix(),
+        label="attempt registry",
+    )
+    try:
+        current_bytes = _read_bounded_bytes(
+            current_path,
+            max_bytes=MAX_FORMAL_ABLATION_ATTEMPTS_BYTES,
+        )
+    except (OSError, ValueError) as error:
+        _fail(f"formal ablation attempt registry is unsafe: {error}")
+    committed_bytes = _git_blob_bytes(
+        repo_root,
+        commit=head,
+        path=FORMAL_ABLATION_ATTEMPTS_PATH.as_posix(),
+        git_executable=git_executable,
+        max_bytes=MAX_FORMAL_ABLATION_ATTEMPTS_BYTES,
+        label="current attempt registry",
+    )
+    if current_bytes != committed_bytes:
+        _fail("formal ablation current attempt registry differs from HEAD")
+    try:
+        registry = parse_formal_ablation_attempt_registry(current_bytes)
+    except ValueError as error:
+        _fail(f"formal ablation current attempt registry is invalid: {error}")
+    disclosed_reports = {
+        disclosure.published_report_path
+        for disclosure in registry.disclosures()
+    }
+    if tracked_reports != disclosed_reports:
+        _fail(
+            "tracked formal ablation history reports and registry disclosures differ"
+        )
+    for disclosure in registry.disclosures():
+        _validate_disclosed_formal_report(
+            disclosure,
+            repo_root,
+            git_executable=git_executable,
+            head=head,
+        )
+
+
+def _validate_formal_attempt_provenance(
+    raw: dict[str, Any],
+    repo_root: Path,
+    *,
+    git_executable: str,
+    head: str,
+) -> None:
+    provenance = cast(dict[str, Any], raw["provenance"])
+    attempt_id = cast(str, provenance["formal_attempt_id"])
+    registry_relative = cast(str, provenance["formal_attempt_registry_path"])
+    registration_sha256 = cast(
+        str,
+        provenance["formal_attempt_registry_sha256"],
+    )
+    protocol_sha256 = cast(str, provenance["formal_attempt_protocol_sha256"])
+    registration_commit = cast(
+        str,
+        provenance["formal_attempt_registration_commit"],
+    )
+
+    registration_bytes = _git_blob_bytes(
+        repo_root,
+        commit=registration_commit,
+        path=registry_relative,
+        git_executable=git_executable,
+        max_bytes=MAX_FORMAL_ABLATION_ATTEMPTS_BYTES,
+        label="attempt registry at registration",
+    )
+    if hashlib.sha256(registration_bytes).hexdigest() != registration_sha256:
+        _fail("formal ablation registration registry digest is stale")
+    try:
+        registration_registry = parse_formal_ablation_attempt_registry(
+            registration_bytes
+        )
+    except ValueError as error:
+        _fail(f"formal ablation registration registry is invalid: {error}")
+    registration = registration_registry.open_registration()
+    if (
+        not isinstance(registration, RegisteredAttempt)
+        or registration.attempt_id != attempt_id
+    ):
+        _fail("formal ablation attempt was not open in the registration commit")
+
+    parents_raw = _git_success(
+        repo_root,
+        ["rev-list", "--parents", "-n", "1", registration_commit],
+        git_executable=git_executable,
+        label="attempt registration parents",
+    )
+    parents = parents_raw.decode("ascii", errors="strict").strip().split()
+    if parents != [registration_commit, registration.source_commit]:
+        _fail("formal ablation registration commit does not directly follow its source")
+    changed_paths = (
+        _git_success(
+            repo_root,
+            [
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                registration_commit,
+            ],
+            git_executable=git_executable,
+            label="attempt registration changes",
+        )
+        .decode("utf-8", errors="strict")
+        .splitlines()
+    )
+    if changed_paths != [registry_relative]:
+        _fail("formal ablation registration commit changed files other than the registry")
+
+    effort = provenance.get("reasoning_effort")
+    if not isinstance(effort, str) or not effort:
+        _fail("formal ablation attempt registration has no reasoning effort")
+    cli_version = provenance.get("cli_version")
+    if not isinstance(cli_version, str) or not cli_version:
+        _fail("formal ablation attempt registration has no Codex CLI version")
+    codex_client = _formal_codex_client_from_provenance(
+        provenance,
+        label="formal ablation report",
+    )
+    try:
+        protocol = FormalAblationProtocol(
+            source_commit=registration.source_commit,
+            source_tree_sha256=cast(str, provenance["source_tree_sha256"]),
+            manifest_sha256=cast(
+                str,
+                provenance["formal_corpus_manifest_sha256"],
+            ),
+            model=cast(str, provenance["model"]),
+            reasoning_effort=effort,
+            docker_image_id=cast(str, provenance["scorer_image_id"]),
+            codex_cli_version=cli_version,
+            codex_cli_executable_sha256=(
+                _codex_executable_sha256_from_provenance(
+                    provenance,
+                    label="formal ablation report",
+                    allow_backend_details=False,
+                )
+            ),
+            codex_client=codex_client,
+            codex_client_sha256=formal_codex_client_sha256(codex_client),
+        )
+    except ValueError as error:
+        _fail(f"formal ablation attempt protocol is invalid: {error}")
+    measured_protocol_sha256 = formal_ablation_protocol_sha256(protocol)
+    expected_registration = {
+        "source_tree_sha256": protocol.source_tree_sha256,
+        "manifest_sha256": protocol.manifest_sha256,
+        "model": protocol.model,
+        "reasoning_effort": protocol.reasoning_effort,
+        "docker_image_id": protocol.docker_image_id,
+        "codex_cli_version": protocol.codex_cli_version,
+        "codex_cli_executable_sha256": protocol.codex_cli_executable_sha256,
+        "codex_client": protocol.codex_client,
+        "codex_client_sha256": protocol.codex_client_sha256,
+        "output_path": f"runs/formal_ablation/{attempt_id}",
+        "protocol_sha256": measured_protocol_sha256,
+    }
+    if (
+        protocol_sha256 != measured_protocol_sha256
+        or any(
+            getattr(registration, field) != expected
+            for field, expected in expected_registration.items()
+        )
+    ):
+        _fail("formal ablation attempt registration differs from report provenance")
+    _validate_formal_start_witness(
+        registration,
+        provenance,
+        repo_root,
+        git_executable=git_executable,
+        registration_commit=registration_commit,
+    )
+
+    current_path = _repo_evidence_path(
+        repo_root,
+        registry_relative,
+        label="attempt registry",
+    )
+    try:
+        current_bytes = _read_bounded_bytes(
+            current_path,
+            max_bytes=MAX_FORMAL_ABLATION_ATTEMPTS_BYTES,
+        )
+    except (OSError, ValueError) as error:
+        _fail(f"formal ablation current attempt registry is unsafe: {error}")
+    head_bytes = _git_blob_bytes(
+        repo_root,
+        commit=head,
+        path=registry_relative,
+        git_executable=git_executable,
+        max_bytes=MAX_FORMAL_ABLATION_ATTEMPTS_BYTES,
+        label="current attempt registry",
+    )
+    if current_bytes != head_bytes:
+        _fail("formal ablation current attempt registry differs from HEAD")
+    try:
+        current_registry = parse_formal_ablation_attempt_registry(current_bytes)
+    except ValueError as error:
+        _fail(f"formal ablation current attempt registry is invalid: {error}")
+    if not registry_has_prefix(current_registry, registration_registry):
+        _fail("formal ablation current attempt registry rewrites historical events")
+    if current_registry.open_registration() is not None:
+        _fail("formal ablation release has an open attempt")
+
+    completions = [
+        event
+        for event in current_registry.completions()
+        if event.attempt_id == attempt_id
+    ]
+    if len(completions) != 1:
+        _fail("formal ablation report does not have one matching COMPLETED event")
+    completion = completions[0]
+    if not isinstance(completion, CompletedAttempt):
+        _fail("formal ablation completion event is invalid")
+    report_path = repo_root / "benchmarks" / "ablation_report.json"
+    try:
+        report_bytes = _read_bounded_bytes(
+            report_path,
+            max_bytes=_MAX_REPORT_BYTES,
+        )
+    except (OSError, ValueError) as error:
+        _fail(f"formal ablation report bytes are unavailable: {error}")
+    if (
+        completion.protocol_sha256 != protocol_sha256
+        or completion.registration_registry_sha256 != registration_sha256
+        or completion.report_sha256 != hashlib.sha256(report_bytes).hexdigest()
+        or completion.report_fingerprint != raw.get("fingerprint")
+    ):
+        _fail("formal ablation COMPLETED event differs from the published report")
+
+
+def _validate_formal_start_witness(
+    registration: RegisteredAttempt,
+    provenance: dict[str, Any],
+    repo_root: Path,
+    *,
+    git_executable: str,
+    registration_commit: str,
+) -> None:
+    """Verify the external, create-only ref that consumed this registration."""
+    witness_ref = provenance.get("formal_attempt_witness_ref")
+    witness_commit = provenance.get("formal_attempt_witness_commit")
+    expected_fields = {
+        "formal_attempt_witness_remote_name": registration.witness_remote_name,
+        "formal_attempt_witness_remote_url": registration.witness_remote_url,
+        "formal_attempt_witness_ref": registration.witness_ref,
+    }
+    if any(provenance.get(field) != value for field, value in expected_fields.items()):
+        _fail("formal ablation witness provenance differs from its registration")
+    if (
+        not isinstance(witness_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", witness_commit) is None
+        or not isinstance(witness_ref, str)
+    ):
+        _fail("formal ablation witness provenance is invalid")
+
+    tree = (
+        _git_success(
+            repo_root,
+            ["rev-parse", f"{registration_commit}^{{tree}}"],
+            git_executable=git_executable,
+            label="formal ablation witness tree",
+        )
+        .decode("ascii", errors="strict")
+        .strip()
+    )
+    try:
+        message = formal_ablation_witness_message(
+            attempt_id=registration.attempt_id,
+            registration_registry_sha256=cast(
+                str,
+                provenance["formal_attempt_registry_sha256"],
+            ),
+            protocol_sha256=registration.protocol_sha256,
+            outcome_key=cast(str, provenance["formal_outcome_key"]),
+            run_header_sha256=cast(
+                str,
+                provenance["formal_run_header_sha256"],
+            ),
+        )
+        expected_commit_bytes = formal_ablation_witness_commit_bytes(
+            tree=tree,
+            parent=registration_commit,
+            message=message,
+        )
+    except (KeyError, ValueError) as error:
+        _fail(f"formal ablation witness binding is invalid: {error}")
+    if formal_ablation_witness_commit_oid(expected_commit_bytes) != witness_commit:
+        _fail("formal ablation witness commit does not bind the recorded run")
+    witness_bytes = _git_success(
+        repo_root,
+        ["cat-file", "commit", witness_commit],
+        git_executable=git_executable,
+        label="formal ablation witness commit",
+    )
+    if witness_bytes != expected_commit_bytes:
+        _fail(
+            "formal ablation witness commit has the wrong tree, parent, or message"
+        )
+
+    remote_ref = (
+        _git_success(
+            repo_root,
+            [
+                "ls-remote",
+                "--refs",
+                registration.witness_remote_url,
+                registration.witness_ref,
+            ],
+            git_executable=git_executable,
+            label="formal ablation witness remote ref",
+        )
+        .decode("ascii", errors="strict")
+        .strip()
+    )
+    if remote_ref != f"{witness_commit}\t{registration.witness_ref}":
+        _fail("formal ablation witness remote ref is missing or changed")
+
+
 def _recorded_control_executable(
     provenance: dict[str, Any],
     field: str,
@@ -789,7 +1514,7 @@ def _validate_operation_lease_store(
             configuration.get("docker_operations_recovered_before_run"),
             bool,
         )
-        or configuration["docker_operations_recovered_before_run"] < 0
+        or configuration["docker_operations_recovered_before_run"] != 0
         or configuration.get("docker_operations_recovered_at_completion") != 0
     ):
         _fail("formal ablation has no complete operation-lease attestation")
@@ -893,6 +1618,13 @@ def _validate_formal_manifest_provenance(
             label=label,
         )
 
+    _validate_formal_attempt_provenance(
+        raw,
+        repo_root,
+        git_executable=git_executable,
+        head=head,
+    )
+
     manifest_bytes = _git_success(
         repo_root,
         ["show", f"{preregistration_commit}:{manifest_relative}"],
@@ -970,12 +1702,26 @@ def _validate_provenance(
         "requested_llm_backend",
         "actual_llm_backend",
         "model",
+        "cli_version",
+        "cli_executable_sha256",
         "agent_backend",
         "scorer_requested",
         "scorer_backend",
         "platform",
         "python_version",
         "pytest_version",
+        "formal_attempt_id",
+        "formal_attempt_registry_path",
+        "formal_attempt_registry_sha256",
+        "formal_attempt_protocol_sha256",
+        "formal_attempt_registration_commit",
+        "formal_attempt_witness_remote_name",
+        "formal_attempt_witness_remote_url",
+        "formal_attempt_witness_ref",
+        "formal_attempt_witness_commit",
+        "formal_run_header_path",
+        "formal_run_header_sha256",
+        "formal_outcome_key",
     )
     for field in required_strings:
         if not isinstance(provenance.get(field), str) or not provenance[field]:
@@ -984,6 +1730,34 @@ def _validate_provenance(
         _fail("formal ablation provenance must come from a clean git worktree")
     if re.fullmatch(r"[0-9a-f]{40}", provenance["git_commit"]) is None:
         _fail("formal ablation provenance has an invalid git_commit")
+    if (
+        _HEX_64.fullmatch(provenance["formal_attempt_id"]) is None
+        or provenance["formal_attempt_registry_path"]
+        != FORMAL_ABLATION_ATTEMPTS_PATH.as_posix()
+        or _HEX_64.fullmatch(provenance["formal_attempt_registry_sha256"]) is None
+        or _HEX_64.fullmatch(provenance["formal_attempt_protocol_sha256"]) is None
+        or re.fullmatch(
+            r"[0-9a-f]{40}",
+            provenance["formal_attempt_registration_commit"],
+        )
+        is None
+        or provenance["formal_attempt_registration_commit"]
+        != provenance["git_commit"]
+        or provenance["formal_attempt_witness_ref"]
+        != (
+            "refs/heads/formal-attempts/"
+            f"{provenance['formal_attempt_id']}"
+        )
+        or re.fullmatch(
+            r"[0-9a-f]{40}",
+            provenance["formal_attempt_witness_commit"],
+        )
+        is None
+        or provenance["formal_run_header_path"] != _FORMAL_RUN_HEADER_NAME
+        or _HEX_64.fullmatch(provenance["formal_run_header_sha256"]) is None
+        or _HEX_64.fullmatch(provenance["formal_outcome_key"]) is None
+    ):
+        _fail("formal ablation provenance has an invalid attempt registration")
     if provenance["model"] != raw.get("model"):
         _fail("formal ablation model differs from provenance")
     if provenance["requested_llm_backend"] != raw.get("llm"):
@@ -1024,6 +1798,8 @@ def _validate_provenance(
         _fail("formal ablation report has an invalid fingerprint")
     if provenance["actual_llm_backend"].endswith("_cli") and not provenance.get("cli_version"):
         _fail("formal CLI-backed ablation provenance is missing cli_version")
+    if _HEX_64.fullmatch(provenance["cli_executable_sha256"]) is None:
+        _fail("formal ablation provenance has an invalid Codex executable digest")
     for field in (
         "task_paths",
         "corpus_paths",
@@ -1090,6 +1866,19 @@ def _validate_provenance(
         "scorer_evidence_schema": 2,
         "llm_call_receipt_schema": _LLM_CALL_RECEIPT_SCHEMA,
         "cell_attempt_schema": _CELL_ATTEMPT_SCHEMA,
+        "formal_output_lock": {
+            "protocol": "flock-exclusive-nonblocking",
+            "path": _FORMAL_OUTPUT_LOCK_NAME,
+            "lifetime": "full-run",
+        },
+        "formal_fresh_run": {
+            "run_header_schema": _FORMAL_RUN_HEADER_SCHEMA,
+            "run_header_path": _FORMAL_RUN_HEADER_NAME,
+            "resume": False,
+            "cache_reads": False,
+            "expected_cell_starts": len(tasks) * cast(int, raw.get("reps")),
+            "expected_terminal_cells": len(tasks) * cast(int, raw.get("reps")),
+        },
         "scorer_result_source": "nonce-bound-pytest-hook-receipt",
     }
     if any(configuration.get(field) != expected for field, expected in required_protocol.items()):
@@ -1113,6 +1902,10 @@ def _validate_llm_call_audits(
     provenance = cast(dict[str, Any], raw["provenance"])
     configuration = provenance.get("configuration")
     client = configuration.get("client") if isinstance(configuration, dict) else None
+    fixed_client = _formal_codex_client_from_provenance(
+        provenance,
+        label="formal ablation report",
+    )
     required_client = {
         "no_tools": True,
         "sandbox_mode": "read-only",
@@ -1129,13 +1922,7 @@ def _validate_llm_call_audits(
             "Codex permission boundary"
         )
     configuration = cast(dict[str, Any], configuration)
-    max_inner_retries = client.get("max_retries")
-    if (
-        not isinstance(max_inner_retries, int)
-        or isinstance(max_inner_retries, bool)
-        or max_inner_retries < 0
-    ):
-        _fail("formal ablation has no bounded Codex inner retry budget")
+    max_inner_retries = fixed_client.max_retries
 
     calls = raw.get("llm_calls")
     if not isinstance(calls, list) or not calls:
@@ -1184,6 +1971,8 @@ def _validate_llm_call_audits(
             or type(reference.get("cache_hit")) is not bool
         ):
             _fail("formal ablation Codex call audit has an invalid cell binding")
+        if reference["cache_hit"] is not False:
+            _fail("formal ablation must not reuse any cached cell")
         if digest in receipt_digests:
             _fail("formal ablation reuses one LLM call receipt")
         receipt_digests.add(digest)
@@ -1197,6 +1986,14 @@ def _validate_llm_call_audits(
                     "ordinal": ordinal,
                     "cell_fingerprint": provenance["cell_fingerprints"][task],
                     "input_snapshot_sha256": provenance["input_snapshot_sha256"][task],
+                    "formal_attempt_id": provenance["formal_attempt_id"],
+                    "formal_registration_registry_sha256": provenance[
+                        "formal_attempt_registry_sha256"
+                    ],
+                    "formal_protocol_sha256": provenance[
+                        "formal_attempt_protocol_sha256"
+                    ],
+                    "formal_outcome_key": provenance["formal_outcome_key"],
                 },
             )
         except (
@@ -1210,6 +2007,8 @@ def _validate_llm_call_audits(
         call = receipt["call"]
         if (
             call["cli_version"] != provenance.get("cli_version")
+            or call["cli_executable_sha256"]
+            != provenance.get("cli_executable_sha256")
             or call["model"] != provenance.get("model")
             or call["reasoning_effort"] != provenance.get("reasoning_effort")
         ):
@@ -1217,7 +2016,7 @@ def _validate_llm_call_audits(
         executable_digests.add(call["cli_executable_sha256"])
         calls_by_cell[cast(tuple[str, int], cell)].append(receipt)
         cache_modes[cast(tuple[str, int], cell)].add(reference["cache_hit"])
-    if len(executable_digests) != 1:
+    if executable_digests != {provenance["cli_executable_sha256"]}:
         _fail("formal ablation mixed Codex executable bytes")
 
     records_by_key = {
@@ -1263,14 +2062,6 @@ def _validate_llm_call_audits(
         if first != trust or first != gate or final != verify["artifact_sha256"]:
             _fail(f"formal ablation cell {cell!r} call outputs do not bind its artifacts")
 
-    saw_uncached = False
-    for rep in range(reps):
-        for task in tasks:
-            cache_hit = next(iter(cache_modes[(task, rep)]))
-            if cache_hit and saw_uncached:
-                _fail("formal ablation cache-hit cells are not a scheduled prefix")
-            saw_uncached = saw_uncached or not cache_hit
-
     try:
         stored_receipts = {path.name for path in receipt_dir.iterdir()}
     except OSError as error:
@@ -1278,6 +2069,169 @@ def _validate_llm_call_audits(
     expected_receipts = {f"{digest}.json" for digest in receipt_digests}
     if stored_receipts != expected_receipts:
         _fail("formal ablation LLM call receipt store contains unreferenced or missing entries")
+
+
+def _validate_formal_fresh_cells(
+    raw: dict[str, Any],
+    tasks: list[str],
+    reps: int,
+    report_dir: Path,
+) -> None:
+    """Require one new start and terminal seal for every scheduled formal cell."""
+    provenance = cast(dict[str, Any], raw["provenance"])
+    attempt_id = cast(str, provenance["formal_attempt_id"])
+    registration_sha256 = cast(
+        str,
+        provenance["formal_attempt_registry_sha256"],
+    )
+    protocol_sha256 = cast(str, provenance["formal_attempt_protocol_sha256"])
+    outcome_key = cast(str, provenance["formal_outcome_key"])
+    header_path = report_dir / cast(str, provenance["formal_run_header_path"])
+    try:
+        header_bytes = _read_bounded_bytes(
+            header_path,
+            max_bytes=_MAX_FORMAL_RUN_HEADER_BYTES,
+        )
+    except (OSError, ValueError) as error:
+        _fail(f"formal ablation run header is unavailable: {error}")
+    expected_header = _canonical_json_object_bytes(
+        {
+            "schema_version": _FORMAL_RUN_HEADER_SCHEMA,
+            "formal_attempt_id": attempt_id,
+            "registration_registry_sha256": registration_sha256,
+            "protocol_sha256": protocol_sha256,
+            "outcome_key": outcome_key,
+        }
+    )
+    if (
+        header_bytes != expected_header
+        or hashlib.sha256(header_bytes).hexdigest()
+        != provenance["formal_run_header_sha256"]
+    ):
+        _fail("formal ablation run header differs from report provenance")
+
+    results_dir = report_dir / "results"
+    if results_dir.is_symlink() or not results_dir.is_dir():
+        _fail("formal ablation fresh-cell store is unavailable")
+    expected_names = {
+        name
+        for task in tasks
+        for rep in range(reps)
+        for name in (f"{task}__r{rep}.started.json", f"{task}__r{rep}.json")
+    }
+    try:
+        actual_names = {entry.name for entry in results_dir.iterdir()}
+    except OSError as error:
+        _fail(f"cannot enumerate formal ablation fresh-cell store: {error}")
+    if actual_names != expected_names:
+        _fail(
+            "formal ablation must contain exactly one new start and terminal "
+            "seal for every scheduled cell"
+        )
+
+    records = cast(list[dict[str, Any]], raw["records"])
+    references = cast(list[dict[str, Any]], raw["llm_calls"])
+    condition_order = {name: index for index, name in enumerate(_CONDITION_NAMES)}
+    formal_fields = {
+        "formal_attempt_id": attempt_id,
+        "formal_registration_registry_sha256": registration_sha256,
+        "formal_protocol_sha256": protocol_sha256,
+        "formal_outcome_key": outcome_key,
+    }
+    cache_keys = {
+        "schema_version",
+        "fingerprint",
+        "terminal_error",
+        "records",
+        "llm_call_receipts",
+        *formal_fields,
+    }
+    for task in tasks:
+        for rep in range(reps):
+            marker_path = results_dir / f"{task}__r{rep}.started.json"
+            cache_path = results_dir / f"{task}__r{rep}.json"
+            expected_marker = _canonical_json_object_bytes(
+                {
+                    "schema_version": _CELL_ATTEMPT_SCHEMA,
+                    "task": task,
+                    "rep": rep,
+                    "cell_fingerprint": provenance["cell_fingerprints"][task],
+                    "input_snapshot_sha256": (
+                        provenance["input_snapshot_sha256"][task]
+                    ),
+                    **formal_fields,
+                }
+            )
+            try:
+                marker_bytes = _read_bounded_bytes(
+                    marker_path,
+                    max_bytes=_MAX_CELL_ATTEMPT_BYTES,
+                )
+            except (OSError, ValueError) as error:
+                _fail(f"formal ablation cell-start seal is invalid: {error}")
+            if marker_bytes != expected_marker:
+                _fail(
+                    f"formal ablation cell-start seal is stale for {(task, rep)!r}"
+                )
+
+            try:
+                cache_bytes = _read_bounded_bytes(
+                    cache_path,
+                    max_bytes=_MAX_CACHE_BYTES,
+                )
+                cache = json.loads(cache_bytes)
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as error:
+                _fail(f"formal ablation terminal seal is invalid: {error}")
+            if not isinstance(cache, dict) or set(cache) != cache_keys:
+                _fail(
+                    f"formal ablation terminal seal has an invalid shape for "
+                    f"{(task, rep)!r}"
+                )
+            expected_records = sorted(
+                [
+                    record
+                    for record in records
+                    if record.get("task") == task and record.get("rep") == rep
+                ],
+                key=lambda record: condition_order.get(
+                    cast(str, record.get("condition")),
+                    len(condition_order),
+                ),
+            )
+            expected_receipts = [
+                cast(str, reference["receipt_sha256"])
+                for reference in sorted(
+                    (
+                        reference
+                        for reference in references
+                        if reference.get("task") == task
+                        and reference.get("rep") == rep
+                    ),
+                    key=lambda reference: cast(int, reference["ordinal"]),
+                )
+            ]
+            terminal_error = any(
+                record.get("status") == "ERROR" for record in expected_records
+            )
+            if (
+                len(expected_records) != len(_CONDITION_NAMES)
+                or cache.get("schema_version") != _CACHE_SCHEMA
+                or cache.get("fingerprint")
+                != provenance["cell_fingerprints"][task]
+                or cache.get("terminal_error") is not terminal_error
+                or cache.get("records") != expected_records
+                or cache.get("llm_call_receipts") != expected_receipts
+                or any(cache.get(field) != value for field, value in formal_fields.items())
+            ):
+                _fail(
+                    f"formal ablation terminal seal differs from report cell "
+                    f"{(task, rep)!r}"
+                )
 
 
 def _expected_formal_tasks(repository_root: Path) -> list[str]:
@@ -1388,6 +2342,7 @@ def _validate_ablation(ablation_json: Path, ablation_md: Path) -> _AblationFacts
             cast(dict[str, Any], raw["provenance"]["configuration"]),
         )
         _validate_llm_call_audits(raw, tasks, reps, ablation_json.parent)
+        _validate_formal_fresh_cells(raw, tasks, reps, ablation_json.parent)
         if boundary_problems:
             _fail("formal ablation report violates the Wilson contract: " + boundary_problems[0])
         if raw.get("fingerprint") != _report_fingerprint(raw):
@@ -1755,6 +2710,7 @@ def validate_release_claims(root: str | Path = ".") -> ReleaseClaimsSummary:
     """
     repo = Path(root).resolve()
     benchmarks = repo / "benchmarks"
+    _validate_formal_ablation_disclosures(repo)
     ablation = _validate_ablation(
         benchmarks / "ablation_report.json",
         benchmarks / "ablation_report.md",

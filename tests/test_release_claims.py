@@ -10,10 +10,16 @@ from pathlib import Path
 import pytest
 
 from lha.ablation import (
+    _CACHE_SCHEMA,
+    _CELL_ATTEMPT_SCHEMA,
+    _FORMAL_RUN_HEADER_NAME,
+    _FORMAL_RUN_HEADER_SCHEMA,
+    _LLM_CALL_RECEIPT_SCHEMA,
     AblationProvenance,
     AblationReport,
     RunRecord,
     _aggregate,
+    _canonical_json_object_bytes,
     _frozen_artifact_bytes,
     _input_snapshot_digest,
     _llm_call_receipt_bytes,
@@ -23,6 +29,20 @@ from lha.ablation import (
     _source_file_digests,
     _source_tree_digest,
     load_ablation_report,
+)
+from lha.ablation_attempts import (
+    CompletedAttempt,
+    FormalAblationAttemptRegistry,
+    FormalAblationProtocol,
+    FormalCodexClientConfig,
+    RegisteredAttempt,
+    UnregisteredRunRecorded,
+    formal_ablation_attempt_registry_bytes,
+    formal_ablation_protocol_sha256,
+    formal_ablation_witness_commit_bytes,
+    formal_ablation_witness_commit_oid,
+    formal_ablation_witness_message,
+    formal_codex_client_sha256,
 )
 from lha.bench.terminal_public_evidence import (
     TerminalBenchPublicEvidenceValidation,
@@ -280,6 +300,19 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (source_root / "sentinel.py").write_text("VALUE = 1\n")
     source_files = _source_file_digests(source_root)
     source_tree_digest = _source_tree_digest(source_files)
+    formal_attempt_id = "1" * 64
+    formal_registry_sha256 = "2" * 64
+    formal_protocol_sha256 = "3" * 64
+    formal_outcome_key = "4" * 64
+    formal_header_bytes = _canonical_json_object_bytes(
+        {
+            "schema_version": _FORMAL_RUN_HEADER_SCHEMA,
+            "formal_attempt_id": formal_attempt_id,
+            "registration_registry_sha256": formal_registry_sha256,
+            "protocol_sha256": formal_protocol_sha256,
+            "outcome_key": formal_outcome_key,
+        }
+    )
 
     task_paths: dict[str, str] = {}
     corpus_paths: dict[str, str] = {}
@@ -446,6 +479,7 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         actual_llm_backend="codex_cli",
         model="model-x",
         cli_version="codex-cli 1.0",
+        cli_executable_sha256="9" * 64,
         reasoning_effort="low",
         agent_backend="docker",
         scorer_requested="docker",
@@ -475,6 +509,20 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         cell_fingerprints={
             task: hashlib.sha256(f"cell:{task}".encode()).hexdigest() for task in tasks
         },
+        formal_attempt_id=formal_attempt_id,
+        formal_attempt_registry_path="benchmarks/formal_ablation_attempts.json",
+        formal_attempt_registry_sha256=formal_registry_sha256,
+        formal_attempt_protocol_sha256=formal_protocol_sha256,
+        formal_attempt_registration_commit="a" * 40,
+        formal_attempt_witness_remote_name="formal-witness",
+        formal_attempt_witness_remote_url="/tmp/lha-formal-witness.git",
+        formal_attempt_witness_ref=(
+            f"refs/heads/formal-attempts/{formal_attempt_id}"
+        ),
+        formal_attempt_witness_commit="5" * 40,
+        formal_run_header_path=_FORMAL_RUN_HEADER_NAME,
+        formal_run_header_sha256=hashlib.sha256(formal_header_bytes).hexdigest(),
+        formal_outcome_key=formal_outcome_key,
         configuration={
             "repetitions": reps,
             "task_count": len(tasks),
@@ -486,8 +534,21 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
             "frozen_artifact_schema": 1,
             "input_snapshot_schema": 1,
             "scorer_evidence_schema": 2,
-            "llm_call_receipt_schema": 1,
+            "llm_call_receipt_schema": _LLM_CALL_RECEIPT_SCHEMA,
             "cell_attempt_schema": 1,
+            "formal_output_lock": {
+                "protocol": "flock-exclusive-nonblocking",
+                "path": ".formal-ablation.lock",
+                "lifetime": "full-run",
+            },
+            "formal_fresh_run": {
+                "run_header_schema": _FORMAL_RUN_HEADER_SCHEMA,
+                "run_header_path": _FORMAL_RUN_HEADER_NAME,
+                "resume": False,
+                "cache_reads": False,
+                "expected_cell_starts": len(tasks) * reps,
+                "expected_terminal_cells": len(tasks) * reps,
+            },
             "codex_operation_lease_store": ".",
             "docker_operation_lease_store": ".",
             "docker_container_absence_filter": "label=lha.operation_id",
@@ -525,6 +586,8 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
                 "credential_barrier": "verified",
                 "externally_sandboxed": False,
                 "max_retries": 2,
+                "timeout": 300.0,
+                "retry_backoff_s": 1.0,
             },
         },
     )
@@ -542,6 +605,7 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
     benchmarks = root / "benchmarks"
     benchmarks.mkdir(parents=True)
+    (benchmarks / _FORMAL_RUN_HEADER_NAME).write_bytes(formal_header_bytes)
     artifacts = benchmarks / "artifacts"
     artifacts.mkdir()
     for digest, artifact_payload in artifact_payloads.items():
@@ -611,7 +675,7 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
             )
             for ordinal, label in enumerate(["first", *(["repair"] * repair_count)]):
                 receipt = {
-                    "schema_version": 1,
+                    "schema_version": _LLM_CALL_RECEIPT_SCHEMA,
                     "binding": {
                         "task": task,
                         "rep": rep,
@@ -619,6 +683,12 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
                         "ordinal": ordinal,
                         "cell_fingerprint": provenance.cell_fingerprints[task],
                         "input_snapshot_sha256": snapshot_digests[task],
+                        "formal_attempt_id": formal_attempt_id,
+                        "formal_registration_registry_sha256": (
+                            formal_registry_sha256
+                        ),
+                        "formal_protocol_sha256": formal_protocol_sha256,
+                        "formal_outcome_key": formal_outcome_key,
                         "prompt_sha256": hashlib.sha256(
                             f"prompt:{task}:{rep}:{ordinal}".encode()
                         ).hexdigest(),
@@ -645,6 +715,52 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
                     }
                 )
     report.llm_calls = llm_calls
+    results_dir = benchmarks / "results"
+    results_dir.mkdir()
+    record_dicts = [asdict(record) for record in records]
+    for task in tasks:
+        for rep in range(reps):
+            formal_fields = {
+                "formal_attempt_id": formal_attempt_id,
+                "formal_registration_registry_sha256": formal_registry_sha256,
+                "formal_protocol_sha256": formal_protocol_sha256,
+                "formal_outcome_key": formal_outcome_key,
+            }
+            (results_dir / f"{task}__r{rep}.started.json").write_bytes(
+                _canonical_json_object_bytes(
+                    {
+                        "schema_version": _CELL_ATTEMPT_SCHEMA,
+                        "task": task,
+                        "rep": rep,
+                        "cell_fingerprint": provenance.cell_fingerprints[task],
+                        "input_snapshot_sha256": snapshot_digests[task],
+                        **formal_fields,
+                    }
+                )
+            )
+            cell_records = [
+                record
+                for record in record_dicts
+                if record["task"] == task and record["rep"] == rep
+            ]
+            cell_receipts = [
+                reference["receipt_sha256"]
+                for reference in llm_calls
+                if reference["task"] == task and reference["rep"] == rep
+            ]
+            (results_dir / f"{task}__r{rep}.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": _CACHE_SCHEMA,
+                        "fingerprint": provenance.cell_fingerprints[task],
+                        "terminal_error": False,
+                        "records": cell_records,
+                        **formal_fields,
+                        "llm_call_receipts": cell_receipts,
+                    },
+                    indent=2,
+                )
+            )
 
     ablation_json = {
         "schema_version": report.schema_version,
@@ -670,7 +786,7 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
             "count": len(evidence_payloads),
         },
         "llm_call_receipt_store": {
-            "schema_version": 1,
+            "schema_version": _LLM_CALL_RECEIPT_SCHEMA,
             "path": "llm_call_receipts",
             "encoding": "canonical-json",
             "count": len(llm_calls),
@@ -707,6 +823,202 @@ Horizon 曲线是描述性组合，不增加样本。
 ## 其他
 """
     )
+
+
+def _disclosed_report_fixture(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import lha.release_claims as claims
+
+    _write_formal_report(root, monkeypatch)
+    _git(root, "init", "-q")
+    _git(root, "config", "user.name", "Test")
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "historical source")
+    source_commit = _git(root, "rev-parse", "HEAD")
+    manifest_sha256 = "b" * 64
+    report = json.loads(
+        (root / "benchmarks" / "ablation_report.json").read_text()
+    )
+    report["provenance"]["git_commit"] = source_commit
+    report["provenance"]["formal_corpus_manifest_sha256"] = manifest_sha256
+    report["provenance"].pop("cli_executable_sha256")
+    report["provenance"]["backend_details"] = (
+        "codex-cli 1.0 model=model-x effort=low sandbox=read-only "
+        f"permission_model=profile cli_sha256={'9' * 64} cli_trusted=false"
+    )
+    report["fingerprint"] = _report_fingerprint(report)
+    report_bytes = json.dumps(report, indent=2).encode("utf-8")
+    published = (
+        root
+        / "benchmarks"
+        / "formal_ablation_history"
+        / source_commit
+        / "ablation_report.json"
+    )
+    published.parent.mkdir(parents=True)
+    published.write_bytes(report_bytes)
+    counts, _records = claims._disclosed_report_counts(report)
+    codex_client = FormalCodexClientConfig(
+        max_retries=2,
+        timeout_s=300.0,
+        retry_backoff_s=1.0,
+    )
+    protocol = FormalAblationProtocol(
+        source_commit=source_commit,
+        source_tree_sha256=report["provenance"]["source_tree_sha256"],
+        manifest_sha256=manifest_sha256,
+        model=report["model"],
+        reasoning_effort=report["provenance"]["reasoning_effort"],
+        docker_image_id=report["provenance"]["scorer_image_id"],
+        codex_cli_version=report["provenance"]["cli_version"],
+        codex_cli_executable_sha256="9" * 64,
+        codex_client=codex_client,
+        codex_client_sha256=formal_codex_client_sha256(codex_client),
+    )
+    disclosure = UnregisteredRunRecorded(
+        attempt_id="9" * 64,
+        protocol_sha256=formal_ablation_protocol_sha256(protocol),
+        source_commit=protocol.source_commit,
+        source_tree_sha256=protocol.source_tree_sha256,
+        manifest_sha256=protocol.manifest_sha256,
+        output_path="runs/formal_ablation/old-unregistered",
+        model=protocol.model,
+        reasoning_effort=protocol.reasoning_effort,
+        docker_image_id=protocol.docker_image_id,
+        codex_cli_version=protocol.codex_cli_version,
+        codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+        codex_client=protocol.codex_client,
+        codex_client_sha256=protocol.codex_client_sha256,
+        recorded_at="2026-07-28T12:00:00+08:00",
+        reason="登记机制加入前已经完成的正式运行",
+        published_report_path=published.relative_to(root).as_posix(),
+        report_sha256=hashlib.sha256(report_bytes).hexdigest(),
+        report_fingerprint=report["fingerprint"],
+        **counts,
+    )
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "publish historical report")
+    return claims, disclosure, published, _git(root, "rev-parse", "HEAD")
+
+
+def test_disclosed_formal_report_is_bound_to_tracked_bytes_and_counts(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    claims, disclosure, _published, head = _disclosed_report_fixture(
+        root,
+        monkeypatch,
+    )
+
+    claims._validate_disclosed_formal_report(
+        disclosure,
+        root,
+        git_executable=str(claims._trusted_control_executable("git")["path"]),
+        head=head,
+    )
+
+
+def test_disclosed_formal_report_rejects_worktree_rewrite(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    claims, disclosure, published, head = _disclosed_report_fixture(
+        root,
+        monkeypatch,
+    )
+    published.write_bytes(published.read_bytes() + b"\n")
+
+    with pytest.raises(ReleaseClaimsError, match="digest is stale"):
+        claims._validate_disclosed_formal_report(
+            disclosure,
+            root,
+            git_executable=str(
+                claims._trusted_control_executable("git")["path"]
+            ),
+            head=head,
+        )
+
+
+def test_disclosed_formal_report_rejects_recorded_count_drift(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    claims, disclosure, _published, head = _disclosed_report_fixture(
+        root,
+        monkeypatch,
+    )
+    fields = disclosure.model_dump(mode="json", exclude={"event"})
+    fields["gate_delivered_correct"] -= 1
+    fields["gate_rejected_correct"] += 1
+    wrong_counts = UnregisteredRunRecorded(**fields)
+
+    with pytest.raises(ReleaseClaimsError, match="counts are stale"):
+        claims._validate_disclosed_formal_report(
+            wrong_counts,
+            root,
+            git_executable=str(
+                claims._trusted_control_executable("git")["path"]
+            ),
+            head=head,
+        )
+
+
+def test_formal_history_reports_and_disclosures_match_in_both_directions(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    claims, disclosure, _published, _head = _disclosed_report_fixture(
+        root,
+        monkeypatch,
+    )
+    registry_path = root / "benchmarks" / "formal_ablation_attempts.json"
+    registry_path.write_bytes(
+        formal_ablation_attempt_registry_bytes(
+            FormalAblationAttemptRegistry(events=(disclosure,))
+        )
+    )
+    _git(root, "add", "benchmarks/formal_ablation_attempts.json")
+    _git(root, "commit", "-qm", "record historical disclosure")
+
+    claims._validate_formal_ablation_disclosures(root)
+
+
+@pytest.mark.parametrize("attack", ["unregistered_report", "missing_report"])
+def test_formal_history_reports_and_disclosures_reject_one_sided_entries(
+    tmp_path,
+    monkeypatch,
+    attack,
+):
+    root = tmp_path / "repo"
+    claims, disclosure, published, _head = _disclosed_report_fixture(
+        root,
+        monkeypatch,
+    )
+    registry_path = root / "benchmarks" / "formal_ablation_attempts.json"
+    events = () if attack == "unregistered_report" else (disclosure,)
+    registry_path.write_bytes(
+        formal_ablation_attempt_registry_bytes(
+            FormalAblationAttemptRegistry(events=events)
+        )
+    )
+    _git(root, "add", "benchmarks/formal_ablation_attempts.json")
+    if attack == "missing_report":
+        published.unlink()
+        _git(root, "add", "-u", published.relative_to(root).as_posix())
+    _git(root, "commit", "-qm", "make history disclosure one-sided")
+
+    with pytest.raises(
+        ReleaseClaimsError,
+        match="history reports and registry disclosures differ",
+    ):
+        claims._validate_formal_ablation_disclosures(root)
 
 
 def _write_legacy_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -799,7 +1111,7 @@ def test_formal_report_accepts_receipt_backed_terminal_error_cell(
     assert summary.verify_successes == 3
 
 
-def test_formal_report_accepts_cached_terminal_error_seal(
+def test_formal_report_rejects_cached_terminal_error_seal(
     tmp_path,
     monkeypatch,
 ):
@@ -807,9 +1119,8 @@ def test_formal_report_accepts_cached_terminal_error_seal(
     _write_formal_report(root, monkeypatch)
     _write_terminal_error_cell(root, cache_hit=True)
 
-    summary = validate_release_claims(root)
-
-    assert summary.error_cells == 1
+    with pytest.raises(ReleaseClaimsError, match="must not reuse"):
+        validate_release_claims(root)
 
 
 def test_formal_report_rejects_error_cell_without_receipt(
@@ -953,11 +1264,11 @@ def test_formal_error_cell_rejects_mixed_cache_provenance(
     references[0]["cache_hit"] = True
     path.write_text(json.dumps(raw))
 
-    with pytest.raises(ReleaseClaimsError, match="mixes cache provenance"):
+    with pytest.raises(ReleaseClaimsError, match="must not reuse"):
         validate_release_claims(root)
 
 
-def test_formal_cache_hits_must_form_scheduled_prefix(
+def test_formal_cache_hits_are_never_publishable(
     tmp_path,
     monkeypatch,
 ):
@@ -969,7 +1280,54 @@ def test_formal_cache_hits_must_form_scheduled_prefix(
             reference["cache_hit"] = True
     path.write_text(json.dumps(raw))
 
-    with pytest.raises(ReleaseClaimsError, match="scheduled prefix"):
+    with pytest.raises(ReleaseClaimsError, match="must not reuse"):
+        validate_release_claims(root)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["task_one__r0.started.json", "task_one__r0.json"],
+)
+def test_formal_release_requires_every_fresh_cell_seal(
+    tmp_path,
+    monkeypatch,
+    name,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    (root / "benchmarks" / "results" / name).unlink()
+
+    with pytest.raises(ReleaseClaimsError, match="exactly one new start and terminal"):
+        validate_release_claims(root)
+
+
+def test_formal_release_rejects_a_copied_unregistered_cache(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    results = root / "benchmarks" / "results"
+    (results / "copied__r0.json").write_bytes(
+        (results / "task_one__r0.json").read_bytes()
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="exactly one new start and terminal"):
+        validate_release_claims(root)
+
+
+def test_formal_release_binds_terminal_seals_to_the_run_outcome_key(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    cache = root / "benchmarks" / "results" / "task_one__r0.json"
+    raw = json.loads(cache.read_text())
+    raw["formal_outcome_key"] = "9" * 64
+    cache.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match="terminal seal differs"):
         validate_release_claims(root)
 
 
@@ -1113,6 +1471,28 @@ def _write_terminal_error_cell(
     )
     raw["llm_call_receipt_store"]["count"] = len(raw["llm_calls"])
     raw["fingerprint"] = _report_fingerprint(raw)
+    cache_path = (
+        root / "benchmarks" / "results" / f"{task}__r{rep}.json"
+    )
+    cache = json.loads(cache_path.read_text())
+    cache["terminal_error"] = True
+    cache["records"] = [
+        record
+        for record in raw["records"]
+        if record["task"] == task and record["rep"] == rep
+    ]
+    cache["llm_call_receipts"] = [
+        reference["receipt_sha256"]
+        for reference in sorted(
+            (
+                reference
+                for reference in raw["llm_calls"]
+                if reference["task"] == task and reference["rep"] == rep
+            ),
+            key=lambda reference: reference["ordinal"],
+        )
+    ]
+    cache_path.write_text(json.dumps(cache, indent=2))
     path.write_text(json.dumps(raw, indent=2))
     (root / "benchmarks" / "ablation_report.md").write_text(
         load_ablation_report(path).to_markdown()
@@ -1268,6 +1648,57 @@ def test_formal_report_rejects_tampered_call_receipt_bytes(
     receipt.write_bytes(receipt.read_bytes() + b"\n")
 
     with pytest.raises(ReleaseClaimsError, match="digest"):
+        validate_release_claims(root)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("formal_outcome_key", "a" * 64, "another cell"),
+        (
+            "cli_executable_sha256",
+            "b" * 64,
+            "disagrees with its protocol",
+        ),
+    ],
+)
+def test_formal_report_rejects_receipt_protocol_rebinding(
+    tmp_path,
+    monkeypatch,
+    field,
+    replacement,
+    message,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path, raw = _formal_raw(root)
+    reference = raw["llm_calls"][0]
+    old_digest = reference["receipt_sha256"]
+    old_path = _receipt_path(root, reference)
+    receipt = json.loads(old_path.read_text())
+    target = receipt["binding"] if field == "formal_outcome_key" else receipt["call"]
+    target[field] = replacement
+    payload = _llm_call_receipt_bytes(receipt)
+    digest = hashlib.sha256(payload).hexdigest()
+    new_path = old_path.with_name(f"{digest}.json")
+    new_path.write_bytes(payload)
+    old_path.unlink()
+    reference["receipt_sha256"] = digest
+    cache = (
+        root
+        / "benchmarks"
+        / "results"
+        / f"{reference['task']}__r{reference['rep']}.json"
+    )
+    cache_raw = json.loads(cache.read_text())
+    cache_raw["llm_call_receipts"] = [
+        digest if value == old_digest else value
+        for value in cache_raw["llm_call_receipts"]
+    ]
+    cache.write_text(json.dumps(cache_raw))
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match=message):
         validate_release_claims(root)
 
 
@@ -1431,6 +1862,81 @@ def test_formal_report_requires_codex_operation_lease_binding(
         validate_release_claims(root)
 
 
+@pytest.mark.parametrize(
+    "formal_output_lock",
+    [
+        None,
+        {},
+        {
+            "protocol": "advisory",
+            "path": ".formal-ablation.lock",
+            "lifetime": "full-run",
+        },
+        {
+            "protocol": "flock-exclusive-nonblocking",
+            "path": ".other.lock",
+            "lifetime": "full-run",
+        },
+        {
+            "protocol": "flock-exclusive-nonblocking",
+            "path": ".formal-ablation.lock",
+            "lifetime": "cell",
+        },
+        {
+            "protocol": "flock-exclusive-nonblocking",
+            "path": ".formal-ablation.lock",
+            "lifetime": "full-run",
+            "unverified": True,
+        },
+    ],
+)
+def test_formal_report_requires_exact_full_run_output_lock_protocol(
+    tmp_path,
+    monkeypatch,
+    formal_output_lock,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path, raw = _formal_raw(root)
+    if formal_output_lock is None:
+        raw["provenance"]["configuration"].pop("formal_output_lock")
+    else:
+        raw["provenance"]["configuration"]["formal_output_lock"] = formal_output_lock
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match="schema-4 evidence protocol"):
+        validate_release_claims(root)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("formal_attempt_id", None),
+        ("formal_attempt_registry_path", "benchmarks/other.json"),
+        ("formal_attempt_registry_sha256", "0" * 63),
+        ("formal_attempt_protocol_sha256", "not-a-digest"),
+        ("formal_attempt_registration_commit", "f" * 40),
+        ("formal_run_header_path", "other.json"),
+        ("formal_run_header_sha256", "0" * 63),
+        ("formal_outcome_key", "not-a-digest"),
+    ],
+)
+def test_formal_report_requires_complete_attempt_registration_provenance(
+    tmp_path,
+    monkeypatch,
+    field,
+    replacement,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path, raw = _formal_raw(root)
+    raw["provenance"][field] = replacement
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ReleaseClaimsError, match="attempt registration|missing"):
+        validate_release_claims(root)
+
+
 def test_formal_report_binds_docker_probe_to_pinned_image(
     tmp_path,
     monkeypatch,
@@ -1497,12 +2003,186 @@ def _git(root: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def _formal_attempt_release_fixture(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    completed: bool = True,
+    extra_registration_change: bool = False,
+):
+    import lha.release_claims as claims
+
+    _write_formal_report(root, monkeypatch)
+    report_path = root / "benchmarks" / "ablation_report.json"
+    raw = json.loads(report_path.read_text())
+    _git(root, "init", "-q")
+    _git(root, "config", "user.name", "Test")
+    _git(root, "config", "user.email", "test@example.com")
+    witness_remote = (root.parent / f"{root.name}-formal-witness.git").resolve()
+    _git(root, "init", "--bare", "-q", str(witness_remote))
+    _git(root, "remote", "add", "formal-witness", str(witness_remote))
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "source for formal attempt")
+    source_commit = _git(root, "rev-parse", "HEAD")
+
+    attempt_id = "1" * 64
+    manifest_sha256 = "2" * 64
+    codex_client = FormalCodexClientConfig(
+        max_retries=2,
+        timeout_s=300.0,
+        retry_backoff_s=1.0,
+    )
+    protocol = FormalAblationProtocol(
+        source_commit=source_commit,
+        source_tree_sha256=raw["provenance"]["source_tree_sha256"],
+        manifest_sha256=manifest_sha256,
+        model=raw["model"],
+        reasoning_effort=raw["provenance"]["reasoning_effort"],
+        docker_image_id=raw["provenance"]["scorer_image_id"],
+        codex_cli_version=raw["provenance"]["cli_version"],
+        codex_cli_executable_sha256=raw["provenance"][
+            "cli_executable_sha256"
+        ],
+        codex_client=codex_client,
+        codex_client_sha256=formal_codex_client_sha256(codex_client),
+    )
+    protocol_sha256 = formal_ablation_protocol_sha256(protocol)
+    registration = RegisteredAttempt(
+        attempt_id=attempt_id,
+        protocol_sha256=protocol_sha256,
+        source_commit=source_commit,
+        source_tree_sha256=protocol.source_tree_sha256,
+        manifest_sha256=manifest_sha256,
+        output_path=f"runs/formal_ablation/{attempt_id}",
+        model=protocol.model,
+        reasoning_effort=protocol.reasoning_effort,
+        docker_image_id=protocol.docker_image_id,
+        codex_cli_version=protocol.codex_cli_version,
+        codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+        codex_client=protocol.codex_client,
+        codex_client_sha256=protocol.codex_client_sha256,
+        witness_remote_name="formal-witness",
+        witness_remote_url=str(witness_remote),
+        registered_at="2026-07-28T12:00:00+08:00",
+    )
+    registration_registry = FormalAblationAttemptRegistry(events=(registration,))
+    registration_bytes = formal_ablation_attempt_registry_bytes(
+        registration_registry
+    )
+    registry_path = root / "benchmarks" / "formal_ablation_attempts.json"
+    registry_path.write_bytes(registration_bytes)
+    _git(root, "add", "benchmarks/formal_ablation_attempts.json")
+    if extra_registration_change:
+        (root / "unrelated.txt").write_text("must not be in registration commit\n")
+        _git(root, "add", "unrelated.txt")
+    _git(root, "commit", "-qm", "register formal attempt")
+    registration_commit = _git(root, "rev-parse", "HEAD")
+    registration_sha256 = hashlib.sha256(registration_bytes).hexdigest()
+    witness_tree = _git(root, "rev-parse", f"{registration_commit}^{{tree}}")
+    witness_message = formal_ablation_witness_message(
+        attempt_id=attempt_id,
+        registration_registry_sha256=registration_sha256,
+        protocol_sha256=protocol_sha256,
+        outcome_key=raw["provenance"]["formal_outcome_key"],
+        run_header_sha256=raw["provenance"]["formal_run_header_sha256"],
+    )
+    witness_payload = formal_ablation_witness_commit_bytes(
+        tree=witness_tree,
+        parent=registration_commit,
+        message=witness_message,
+    )
+    witness_commit = formal_ablation_witness_commit_oid(witness_payload)
+    stored = subprocess.run(
+        ["git", "hash-object", "-t", "commit", "-w", "--stdin"],
+        cwd=root,
+        check=True,
+        input=witness_payload,
+        capture_output=True,
+    ).stdout.decode("ascii").strip()
+    assert stored == witness_commit
+    witness_ref = registration.witness_ref
+    _git(
+        root,
+        "push",
+        "-q",
+        str(witness_remote),
+        f"{witness_commit}:{witness_ref}",
+    )
+
+    raw["provenance"].update(
+        {
+            "git_commit": registration_commit,
+            "git_dirty": False,
+            "formal_corpus_manifest_sha256": manifest_sha256,
+            "formal_attempt_id": attempt_id,
+            "formal_attempt_registry_path": (
+                "benchmarks/formal_ablation_attempts.json"
+            ),
+            "formal_attempt_registry_sha256": registration_sha256,
+            "formal_attempt_protocol_sha256": protocol_sha256,
+            "formal_attempt_registration_commit": registration_commit,
+            "formal_attempt_witness_remote_name": "formal-witness",
+            "formal_attempt_witness_remote_url": str(witness_remote),
+            "formal_attempt_witness_ref": witness_ref,
+            "formal_attempt_witness_commit": witness_commit,
+        }
+    )
+    raw["fingerprint"] = ""
+    raw["fingerprint"] = _report_fingerprint(raw)
+
+    if completed:
+        report_bytes = json.dumps(raw, indent=2).encode("utf-8")
+        completion = CompletedAttempt(
+            attempt_id=attempt_id,
+            protocol_sha256=protocol_sha256,
+            registration_registry_sha256=registration_sha256,
+            recorded_at="2026-07-28T13:00:00+08:00",
+            report_sha256=hashlib.sha256(report_bytes).hexdigest(),
+            report_fingerprint=raw["fingerprint"],
+        )
+        current_registry = FormalAblationAttemptRegistry(
+            events=(registration, completion)
+        )
+        report_path.write_bytes(report_bytes)
+        registry_path.write_bytes(
+            formal_ablation_attempt_registry_bytes(current_registry)
+        )
+        _git(
+            root,
+            "add",
+            "benchmarks/ablation_report.json",
+            "benchmarks/formal_ablation_attempts.json",
+        )
+        _git(root, "commit", "-qm", "complete formal attempt")
+
+    head = _git(root, "rev-parse", "HEAD")
+    return {
+        "raw": raw,
+        "registration": registration,
+        "registration_bytes": registration_bytes,
+        "registry_path": registry_path,
+        "report_path": report_path,
+        "registration_commit": registration_commit,
+        "witness_remote": witness_remote,
+        "witness_ref": witness_ref,
+        "witness_commit": witness_commit,
+        "head": head,
+        "git_executable": str(claims._trusted_control_executable("git")["path"]),
+    }
+
+
 def _formal_manifest_git_fixture(
     root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict:
     import lha.ablation as abl
     import lha.release_claims as claims
+
+    monkeypatch.setattr(
+        claims,
+        "_validate_formal_attempt_provenance",
+        lambda *args, **kwargs: None,
+    )
 
     source = root / "src" / "lha"
     source.mkdir(parents=True)
@@ -1563,6 +2243,289 @@ def _formal_manifest_git_fixture(
             "git_executable": claims._trusted_control_executable("git"),
         }
     }
+
+
+def test_formal_attempt_release_binding_accepts_registered_then_completed(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(root, monkeypatch)
+
+    claims._validate_formal_attempt_provenance(
+        facts["raw"],
+        root,
+        git_executable=facts["git_executable"],
+        head=facts["head"],
+    )
+
+
+@pytest.mark.parametrize("attack", ["delete", "change"])
+def test_formal_attempt_release_rejects_changed_remote_witness(
+    tmp_path,
+    monkeypatch,
+    attack,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(root, monkeypatch)
+    if attack == "delete":
+        _git(
+            root,
+            f"--git-dir={facts['witness_remote']}",
+            "update-ref",
+            "-d",
+            facts["witness_ref"],
+        )
+    else:
+        _git(
+            root,
+            f"--git-dir={facts['witness_remote']}",
+            "update-ref",
+            facts["witness_ref"],
+            facts["registration_commit"],
+        )
+
+    with pytest.raises(
+        ReleaseClaimsError,
+        match="witness remote ref is missing or changed",
+    ):
+        claims._validate_formal_attempt_provenance(
+            facts["raw"],
+            root,
+            git_executable=facts["git_executable"],
+            head=facts["head"],
+        )
+
+
+def test_formal_attempt_release_rejects_client_config_drift(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(root, monkeypatch)
+    facts["raw"]["provenance"]["configuration"]["client"]["max_retries"] += 1
+
+    with pytest.raises(ReleaseClaimsError, match="differs from report provenance"):
+        claims._validate_formal_attempt_provenance(
+            facts["raw"],
+            root,
+            git_executable=facts["git_executable"],
+            head=facts["head"],
+        )
+
+
+def test_formal_attempt_release_rejects_open_attempt(tmp_path, monkeypatch):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(
+        root,
+        monkeypatch,
+        completed=False,
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="open attempt"):
+        claims._validate_formal_attempt_provenance(
+            facts["raw"],
+            root,
+            git_executable=facts["git_executable"],
+            head=facts["head"],
+        )
+
+
+def test_formal_attempt_release_requires_registration_in_running_head(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(root, monkeypatch)
+    source_commit = facts["registration"].source_commit
+    facts["raw"]["provenance"]["formal_attempt_registration_commit"] = source_commit
+
+    with pytest.raises(ReleaseClaimsError, match="attempt registry at registration"):
+        claims._validate_formal_attempt_provenance(
+            facts["raw"],
+            root,
+            git_executable=facts["git_executable"],
+            head=facts["head"],
+        )
+
+
+def test_formal_attempt_release_rejects_registration_commit_with_other_changes(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(
+        root,
+        monkeypatch,
+        extra_registration_change=True,
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="files other than the registry"):
+        claims._validate_formal_attempt_provenance(
+            facts["raw"],
+            root,
+            git_executable=facts["git_executable"],
+            head=facts["head"],
+        )
+
+
+def test_formal_attempt_release_rejects_rewritten_registry_prefix(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(root, monkeypatch)
+    current = json.loads(facts["registry_path"].read_text())
+    current["events"][0]["registered_at"] = "2026-07-28T12:00:01+08:00"
+    facts["registry_path"].write_text(json.dumps(current, indent=2))
+    _git(root, "add", "benchmarks/formal_ablation_attempts.json")
+    _git(root, "commit", "-qm", "rewrite old registration")
+    head = _git(root, "rev-parse", "HEAD")
+
+    with pytest.raises(ReleaseClaimsError, match="rewrites historical events"):
+        claims._validate_formal_attempt_provenance(
+            facts["raw"],
+            root,
+            git_executable=facts["git_executable"],
+            head=head,
+        )
+
+
+def test_formal_attempt_release_rejects_a_second_completed_protocol(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(root, monkeypatch)
+    current = json.loads(facts["registry_path"].read_text())
+    first = facts["registration"]
+    second_id = "4" * 64
+    second = RegisteredAttempt(
+        attempt_id=second_id,
+        protocol_sha256=first.protocol_sha256,
+        source_commit=first.source_commit,
+        source_tree_sha256=first.source_tree_sha256,
+        manifest_sha256=first.manifest_sha256,
+        output_path=f"runs/formal_ablation/{second_id}",
+        model=first.model,
+        reasoning_effort=first.reasoning_effort,
+        docker_image_id=first.docker_image_id,
+        codex_cli_version=first.codex_cli_version,
+        codex_cli_executable_sha256=first.codex_cli_executable_sha256,
+        codex_client=first.codex_client,
+        codex_client_sha256=first.codex_client_sha256,
+        witness_remote_name=first.witness_remote_name,
+        witness_remote_url=first.witness_remote_url,
+        registered_at="2026-07-28T14:00:00+08:00",
+    )
+    duplicate_completion = CompletedAttempt(
+        attempt_id=second_id,
+        protocol_sha256=first.protocol_sha256,
+        registration_registry_sha256=hashlib.sha256(
+            facts["registration_bytes"]
+        ).hexdigest(),
+        recorded_at="2026-07-28T15:00:00+08:00",
+        report_sha256="5" * 64,
+        report_fingerprint="6" * 64,
+    )
+    current["events"].extend(
+        [
+            second.model_dump(mode="json"),
+            duplicate_completion.model_dump(mode="json"),
+        ]
+    )
+    facts["registry_path"].write_text(json.dumps(current, indent=2))
+    _git(root, "add", "benchmarks/formal_ablation_attempts.json")
+    _git(root, "commit", "-qm", "add duplicate completion")
+    head = _git(root, "rev-parse", "HEAD")
+
+    with pytest.raises(ReleaseClaimsError, match="current attempt registry is invalid"):
+        claims._validate_formal_attempt_provenance(
+            facts["raw"],
+            root,
+            git_executable=facts["git_executable"],
+            head=head,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("report_sha256", "7" * 64),
+        ("report_fingerprint", "8" * 64),
+        ("registration_registry_sha256", "9" * 64),
+        ("protocol_sha256", "0" * 64),
+    ],
+)
+def test_formal_attempt_release_rejects_wrong_completion_binding(
+    tmp_path,
+    monkeypatch,
+    field,
+    value,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(root, monkeypatch)
+    current = json.loads(facts["registry_path"].read_text())
+    current["events"][1][field] = value
+    facts["registry_path"].write_text(json.dumps(current, indent=2))
+    _git(root, "add", "benchmarks/formal_ablation_attempts.json")
+    _git(root, "commit", "-qm", "change completion binding")
+    head = _git(root, "rev-parse", "HEAD")
+
+    with pytest.raises(
+        ReleaseClaimsError,
+        match="current attempt registry is invalid|COMPLETED event differs",
+    ):
+        claims._validate_formal_attempt_provenance(
+            facts["raw"],
+            root,
+            git_executable=facts["git_executable"],
+            head=head,
+        )
+
+
+def test_formal_attempt_release_rejects_changed_report_summary(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(root, monkeypatch)
+    changed = json.loads(facts["report_path"].read_text())
+    changed["stats"][0]["n"] += 1
+    changed["fingerprint"] = ""
+    changed["fingerprint"] = _report_fingerprint(changed)
+    facts["report_path"].write_text(json.dumps(changed, indent=2))
+    _git(root, "add", "benchmarks/ablation_report.json")
+    _git(root, "commit", "-qm", "change report summary")
+    head = _git(root, "rev-parse", "HEAD")
+
+    with pytest.raises(ReleaseClaimsError, match="COMPLETED event differs"):
+        claims._validate_formal_attempt_provenance(
+            changed,
+            root,
+            git_executable=facts["git_executable"],
+            head=head,
+        )
 
 
 def test_formal_manifest_git_binding_accepts_preregistered_clean_tree(
