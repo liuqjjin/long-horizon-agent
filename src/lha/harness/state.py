@@ -568,7 +568,7 @@ class RunState(BaseModel):
                 runtime=runtime,
                 exec_backend=exec_backend,
                 llm=llm,
-                code_root=task.target_repo or workdir,
+                code_root=workdir,
             ),
         )
 
@@ -632,7 +632,7 @@ class RunState(BaseModel):
             runtime=runtime,
             exec_backend=exec_backend,
             llm=llm,
-            code_root=self.task.target_repo or self.workdir,
+            code_root=self.workdir,
         )
         if current != recorded:
             changed = ", ".join(

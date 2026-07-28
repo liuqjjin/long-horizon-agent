@@ -408,7 +408,7 @@ class LangGraphHarness:
         if isinstance(self._h.llm, TracedLLM):
             self._h.llm.bind(run_dir)
             self._h.llm.restore_totals(state.llm_usage)
-        code_root = state.task.target_repo or str(workdir)
+        code_root = str(workdir)
         live_context.configure(code_root=code_root, config=self.config)
         try:
             live_context.index_code(code_root)

@@ -47,9 +47,10 @@ class ContextEngineer:
                 # freshness verifier fails it closed with a diagnosable reason.
                 bundle.status = "index_failed"
                 bundle.status_notes.append(str(e))
-        if workdir is not None and step.repair_of:
-            # A repair must reason over the CURRENT sandbox, not the pristine
-            # repo the index was built from — the failing state is the point.
+        if workdir is not None:
+            # Indexed locators are only candidates. Re-read every code item
+            # from the run snapshot so stale backend bytes or later source-repo
+            # edits can never become model context.
             self._overlay_workdir(bundle, Path(workdir))
         if step.action == "answer_query":
             bundle.answer = self._synthesize(bundle)

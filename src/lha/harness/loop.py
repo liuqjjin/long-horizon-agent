@@ -1496,10 +1496,10 @@ class Harness:
             self.llm.bind(run_dir)  # per-call records land in llm_trace.jsonl
             self.llm.restore_totals(state.llm_usage)
 
-        # Point code context at the stable target repo (indexed once, reused across
-        # runs) rather than the ephemeral per-run workdir — the latter churns the
-        # ccc daemon with throwaway projects. Edits/verification still hit workdir.
-        code_root = state.task.target_repo or str(workdir)
+        # A run's context is isolated from later edits to the source repository.
+        # Never point an index at the enclosing run directory: it also contains
+        # approvals, model traces, backups, and other non-code evidence.
+        code_root = str(workdir)
         live_context.configure(code_root=code_root, config=self.config)
         try:
             live_context.index_code(code_root)
@@ -1946,6 +1946,13 @@ class Harness:
             )
             return bundle
 
+        # Refresh the exact per-run code root for each new context attempt.
+        # The enclosing runs/<id> directory is intentionally never indexed.
+        live_context.configure(code_root=workdir, config=self.config)
+        try:
+            live_context.index_code(workdir)
+        except Exception:
+            logger.debug("index_code(%s) failed", workdir, exc_info=True)
         bundle = ContextEngineer(self.config).gather(step, workdir=workdir)
         data = bundle.model_dump_json(indent=2).encode("utf-8")
         _write_immutable(path, data, run_dir=run_dir)
