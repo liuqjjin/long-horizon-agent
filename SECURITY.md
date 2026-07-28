@@ -30,10 +30,12 @@ commands you trust.
 
 ### `docker`
 
-The Docker backend runs a disposable container with network disabled, an empty
-task environment, memory and process limits, and read-only source mounts where
-the operation permits. Use it for external repositories and the separate
-ablation scoring path.
+The Docker backend runs a disposable container with network disabled, memory
+and process limits, and read-only source mounts where the operation permits. It
+does not inherit the host process environment; image-defined variables remain,
+and LHA sets `HOME=/tmp`. The working directory and a restricted `/tmp` tmpfs
+are writable. Use it for external repositories and the separate ablation
+scoring path.
 
 The execution image must contain every command a task needs. The default
 `python:3.12-slim` image does not include pytest, `pytest-json-report`, or Ruff;
@@ -41,6 +43,15 @@ select a purpose-built `LHA_EXEC_IMAGE` for code verification.
 
 The LHA application image documented in `docs/DEPLOY.md` is not automatically
 the execution-backend image.
+
+LHA resolves the Docker client to an absolute path, records its size and
+SHA-256, and checks the same bytes before and after backend operations. A
+standard macOS Docker Desktop installation may be owned by the logged-in
+operator; that fact is recorded but is not treated as a failed boundary. The
+host, Docker daemon, and operator account are trusted. A malicious process
+already running as the same user could temporarily replace and restore the
+client, source checkout, credentials, or report files and is outside this
+project's threat model.
 
 ## Patch and recovery integrity
 

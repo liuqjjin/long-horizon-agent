@@ -101,6 +101,73 @@ class _RepairLLM(LLMClient):
         )
 
 
+class _AuditedCodexLLM(LLMClient):
+    name = "codex_cli"
+
+    def __init__(self):
+        self.calls = 0
+        self.model = "model-x"
+        self.reasoning_effort = "low"
+        self.no_tools = True
+        self.sandbox_mode = "read-only"
+        self.permission_model = "profile"
+        self.permission_profile = "lha-read"
+        self.credential_barrier = "verified"
+        self.externally_sandboxed = False
+        self.max_retries = 0
+        self.retry_backoff_s = 0.0
+        self._version = "codex-cli 1.0"
+        self.last_call = None
+        self.last_usage = None
+
+    def complete(self, system: str, prompt: str) -> str:
+        self.calls += 1
+        summary = {
+            "total_events": 4,
+            "events": {
+                "thread.started": 1,
+                "turn.started": 1,
+                "item.completed": 1,
+                "turn.completed": 1,
+            },
+            "items": {"agent_message": 1},
+            "invalid_json_lines": 0,
+        }
+        self.last_call = {
+            "status": "succeeded",
+            "cli_version": self._version,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "sandbox_mode": self.sandbox_mode,
+            "permission_model": self.permission_model,
+            "permission_profile": self.permission_profile,
+            "credential_barrier": self.credential_barrier,
+            "cli_executable_sha256": "9" * 64,
+            "cli_executable_trusted": False,
+            "externally_sandboxed": False,
+            "retries": 0,
+            "attempt_count": 1,
+            "duration_s": 0.1,
+            "event_summary": summary,
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "status": "succeeded",
+                    "duration_s": 0.1,
+                    "event_summary": summary,
+                }
+            ],
+        }
+        self.last_usage = {
+            "input_tokens": 10,
+            "cached_input_tokens": 0,
+            "output_tokens": 5,
+            "cost_usd": None,
+            "model": self.model,
+        }
+        return "### m.py\n```python\ndef f():\n    return 2\n```"
+
+
 def _base(tmp_path: Path) -> Config:
     return Config(runs_dir=tmp_path / "runs", data_dir=tmp_path / "nodata")
 
@@ -108,8 +175,12 @@ def _base(tmp_path: Path) -> Config:
 def _run(tmp_path, llm, out="out"):
     src = _repo(tmp_path / "src")
     return run_ablation(
-        _base(tmp_path), [_task(tmp_path, src)], llm="stub", reps=1,
-        out_dir=tmp_path / out, llm_client=llm,
+        _base(tmp_path),
+        [_task(tmp_path, src)],
+        llm="stub",
+        reps=1,
+        out_dir=tmp_path / out,
+        llm_client=llm,
     )
 
 
@@ -119,6 +190,67 @@ def _by_cond(report) -> dict[str, RunRecord]:
 
 def test_programmatic_ablation_default_matches_cli_backend():
     assert run_ablation.__kwdefaults__["llm"] == "codex_cli"
+
+
+def test_client_operation_lease_binding_walks_wrapper_chain(tmp_path):
+    import lha.ablation as abl
+
+    class _LeaseClient:
+        operation_lease_dir = None
+
+        def set_operation_lease_dir(self, path):
+            self.operation_lease_dir = Path(path).resolve()
+
+    inner = _LeaseClient()
+    outer = type("Wrapper", (), {"inner": inner})()
+
+    assert abl._bind_client_operation_lease(outer, tmp_path)
+    assert inner.operation_lease_dir == tmp_path.resolve()
+
+
+def test_docker_image_probe_returns_versioned_receipt(tmp_path):
+    import lha.ablation as abl
+    from lha.tools.shell import ProcResult
+
+    image_id = "sha256:" + "a" * 64
+
+    class _ProbeBackend:
+        name = "docker"
+        image = image_id
+
+        @staticmethod
+        def python():
+            return "python"
+
+        @staticmethod
+        def run(cmd, *, cwd, timeout=300.0, input=None, limits=None):
+            assert cmd[:3] == ["python", "-I", "-c"]
+            assert cwd == tmp_path
+            payload = {
+                "python_version": "3.11.9",
+                "pytest_version": "9.1.1",
+                "pytest_json_report_version": "1.5.0",
+            }
+            return ProcResult(
+                0,
+                abl._DOCKER_IMAGE_PROBE_MARKER + json.dumps(payload) + "\n",
+                "",
+                0.01,
+            )
+
+    assert abl._probe_docker_image(
+        _ProbeBackend(),
+        image_id=image_id,
+        workdir=tmp_path,
+    ) == {
+        "schema_version": 1,
+        "image_id": image_id,
+        "network": "none",
+        "minimal_pytest": "passed",
+        "python_version": "3.11.9",
+        "pytest_version": "9.1.1",
+        "pytest_json_report_version": "1.5.0",
+    }
 
 
 def test_experimental_claude_cli_cannot_produce_ablation_evidence(tmp_path):
@@ -243,13 +375,7 @@ def test_independent_scorer_ignores_candidate_writable_json_report(tmp_path):
 def test_candidate_cannot_forge_pass_by_printing_summary_and_exiting_zero(tmp_path):
     """Exercise the real interpreter path, not a fake ExecutionBackend."""
     src = _repo(tmp_path / "src")
-    frozen = {
-        "m.py": (
-            'print("1 passed in 0.01s", flush=True)\n'
-            "import os\n"
-            "os._exit(0)\n"
-        )
-    }
+    frozen = {"m.py": ('print("1 passed in 0.01s", flush=True)\nimport os\nos._exit(0)\n')}
 
     result = _score(
         src,
@@ -333,6 +459,20 @@ def test_error_records_are_never_reused_from_cache(tmp_path):
     assert abl._load_cached(cache, fingerprint) is None
 
 
+def test_committed_formal_corpus_manifest_matches_fixed_inputs():
+    import lha.ablation as abl
+
+    root = Path(__file__).resolve().parents[1]
+    manifest, digest = abl._load_formal_corpus_manifest(
+        root / abl._FORMAL_CORPUS_MANIFEST_PATH,
+        root,
+    )
+
+    assert len(manifest["tasks"]) == 17
+    assert manifest["repetitions"] == 12
+    assert len(digest) == 64
+
+
 def test_cache_reader_rejects_oversized_file(tmp_path, monkeypatch):
     import lha.ablation as abl
 
@@ -401,6 +541,88 @@ def test_resumable_caches_real_outcomes(tmp_path):
     assert _by_cond(rep2)["trust"].true_success  # served from cache, no LLM call
     assert llm.calls == calls_after_first_run
     assert rep2.llm_calls[0]["cache_hit"] is True
+
+
+def test_formal_cache_without_call_receipts_is_a_cache_miss(tmp_path):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    base = _base(tmp_path)
+    run_ablation(
+        base,
+        [task],
+        reps=1,
+        out_dir=out,
+        llm_client=_FixedLLM(2),
+    )
+    cache = out / "results" / "task__r0.json"
+    raw = json.loads(cache.read_text())
+    report = json.loads((out / "ablation_report.json").read_text())
+
+    assert (
+        abl._load_cached_cell(
+            cache,
+            raw["fingerprint"],
+            input_snapshot_sha256=report["provenance"]["input_snapshot_sha256"]["task"],
+            scorer_backend="trusted-local",
+            scorer_image_id=None,
+            require_call_receipts=True,
+            expected_task="task",
+            expected_rep=0,
+            receipt_dir=out / "llm_call_receipts",
+            max_outer_attempts=3,
+            max_inner_attempts=3,
+        )
+        is None
+    )
+
+
+def test_codex_cache_with_missing_receipt_reference_is_recomputed(tmp_path):
+    import lha.ablation as abl
+
+    out = tmp_path / "out"
+    src = _repo(tmp_path / "src")
+    task = _task(tmp_path, src)
+    llm = _AuditedCodexLLM()
+    run_ablation(
+        _base(tmp_path),
+        [task],
+        reps=1,
+        out_dir=out,
+        llm_client=llm,
+        model=llm.model,
+    )
+    calls_after_first = llm.calls
+    cache = out / "results" / "task__r0.json"
+    raw = json.loads(cache.read_text())
+    raw.pop("llm_call_receipts")
+    cache.write_text(json.dumps(raw))
+
+    second = run_ablation(
+        _base(tmp_path),
+        [task],
+        reps=1,
+        out_dir=out,
+        llm_client=llm,
+        model=llm.model,
+    )
+
+    assert llm.calls > calls_after_first
+    assert second.llm_calls[0]["cache_hit"] is False
+    assert json.loads(cache.read_text())["llm_call_receipts"]
+    report = json.loads((out / "ablation_report.json").read_text())
+    reference = report["llm_calls"][0]
+    receipt = json.loads(
+        (out / "llm_call_receipts" / f"{reference['receipt_sha256']}.json").read_text()
+    )
+    assert receipt["binding"]["task"] == "task"
+    assert receipt["binding"]["rep"] == 0
+    assert len(receipt["binding"]["prompt_sha256"]) == 64
+    assert len(receipt["binding"]["response_sha256"]) == 64
+    assert len(receipt["binding"]["patch_sha256"]) == 64
+    assert report["fingerprint"] == abl._report_fingerprint(report)
 
 
 def test_cache_is_rejected_when_frozen_artifact_bytes_are_damaged(tmp_path):
@@ -567,8 +789,7 @@ def test_errored_runs_excluded_from_rates():
 
 def test_boundary_rate_intervals_use_wilson_instead_of_collapsing():
     records = [
-        RunRecord(f"t{i}", "verify", 0, "DONE", True, True, True, False, 0)
-        for i in range(4)
+        RunRecord(f"t{i}", "verify", 0, "DONE", True, True, True, False, 0) for i in range(4)
     ]
     verify = {s.condition: s for s in _aggregate(records)}["verify"]
     assert verify.true_ci is not None and verify.true_ci[0] < 1.0
@@ -741,6 +962,19 @@ def test_docker_scorer_also_runs_internal_gate_in_docker(tmp_path, monkeypatch):
     instances = []
     image_id = "sha256:" + "a" * 64
     requested_images = []
+    docker_provenance = {
+        "path": "/fixed/docker",
+        "sha256": "d" * 64,
+        "size_bytes": 123,
+        "trusted_install": True,
+    }
+
+    class _DockerIdentity:
+        path = "/fixed/docker"
+
+        @staticmethod
+        def as_provenance():
+            return docker_provenance
 
     class _RecordingDocker:
         name = "docker"
@@ -752,6 +986,20 @@ def test_docker_scorer_also_runs_internal_gate_in_docker(tmp_path, monkeypatch):
 
         def run(self, cmd, *, cwd, timeout=300.0, input=None, limits=None):
             self.calls.append(list(cmd))
+            if any(abl._DOCKER_IMAGE_PROBE_MARKER in part for part in cmd):
+                payload = {
+                    "python_version": "3.11.9",
+                    "pytest_version": "9.1.1",
+                    "pytest_json_report_version": "1.5.0",
+                }
+                return ProcResult(
+                    0,
+                    abl._DOCKER_IMAGE_PROBE_MARKER
+                    + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+                    + "\n",
+                    "",
+                    0.01,
+                )
             if "--json-report" in cmd:
                 (Path(cwd) / ".lha_pytest.json").write_text(
                     json.dumps(
@@ -814,14 +1062,23 @@ def test_docker_scorer_also_runs_internal_gate_in_docker(tmp_path, monkeypatch):
 
     def fake_backend(name, **kwargs):
         assert name == "docker"
-        assert kwargs == {"image": image_id}
+        assert kwargs == {
+            "image": image_id,
+            "docker": "/fixed/docker",
+            "operation_lease_dir": tmp_path / "out",
+        }
         return _RecordingDocker(kwargs["image"])
 
     monkeypatch.setattr(abl, "make_backend", fake_backend)
     monkeypatch.setattr(
         abl,
-        "_resolve_docker_image_id",
-        lambda image: requested_images.append(image) or image_id,
+        "resolve_docker_executable",
+        lambda _docker="docker": _DockerIdentity(),
+    )
+    monkeypatch.setattr(
+        abl,
+        "_inspect_docker_image_id",
+        lambda image, *, docker: requested_images.append((image, docker)) or image_id,
     )
     monkeypatch.setattr(
         abl,
@@ -840,7 +1097,7 @@ def test_docker_scorer_also_runs_internal_gate_in_docker(tmp_path, monkeypatch):
     )
 
     assert len(instances) == 2
-    assert requested_images == [_base(tmp_path).exec_image]
+    assert requested_images == [(_base(tmp_path).exec_image, "/fixed/docker")]
     assert all(instance.image == image_id for instance in instances)
     assert sum("-I" in command and "-c" in command for command in instances[0].calls) >= 2
     assert all("--json-report" not in command for command in instances[0].calls)
@@ -850,13 +1107,20 @@ def test_docker_scorer_also_runs_internal_gate_in_docker(tmp_path, monkeypatch):
     assert report.provenance.scorer_backend == "docker"
     assert report.provenance.scorer_image == _base(tmp_path).exec_image
     assert report.provenance.scorer_image_id == image_id
+    assert report.provenance.docker_executable == docker_provenance
     raw = json.loads((tmp_path / "out" / "ablation_report.json").read_text())
+    assert raw["provenance"]["configuration"]["docker_image_probe"] == {
+        "schema_version": 1,
+        "image_id": image_id,
+        "network": "none",
+        "minimal_pytest": "passed",
+        "python_version": "3.11.9",
+        "pytest_version": "9.1.1",
+        "pytest_json_report_version": "1.5.0",
+    }
     for record in raw["records"]:
         evidence_path = (
-            tmp_path
-            / "out"
-            / "scorer_evidence"
-            / f"{record['scorer_evidence_sha256']}.json"
+            tmp_path / "out" / "scorer_evidence" / f"{record['scorer_evidence_sha256']}.json"
         )
         evidence = json.loads(evidence_path.read_text())
         assert evidence["binding"]["scorer_image_id"] == image_id
@@ -868,11 +1132,76 @@ def test_docker_image_resolution_failure_precedes_any_model_call(tmp_path, monke
     llm = _FixedLLM(2)
     monkeypatch.setattr(
         abl,
-        "_resolve_docker_image_id",
-        lambda _image: (_ for _ in ()).throw(RuntimeError("invalid image binding")),
+        "resolve_docker_executable",
+        lambda _docker="docker": (_ for _ in ()).throw(RuntimeError("invalid image binding")),
     )
 
     with pytest.raises(RuntimeError, match="invalid image binding"):
+        run_ablation(
+            _base(tmp_path),
+            [_task(tmp_path, _repo(tmp_path / "src"))],
+            llm="stub",
+            reps=1,
+            out_dir=tmp_path / "out",
+            llm_client=llm,
+            scorer_backend="docker",
+        )
+
+    assert llm.calls == 0
+
+
+def test_docker_capability_probe_precedes_any_model_call(tmp_path, monkeypatch):
+    import lha.ablation as abl
+    from lha.tools.shell import ProcResult
+
+    llm = _FixedLLM(2)
+    image_id = "sha256:" + "b" * 64
+    provenance = {
+        "path": "/fixed/docker",
+        "sha256": "d" * 64,
+        "size_bytes": 123,
+        "trusted_install": False,
+    }
+
+    class _DockerIdentity:
+        path = "/fixed/docker"
+
+        @staticmethod
+        def as_provenance():
+            return provenance
+
+    class _UnusableDocker:
+        name = "docker"
+
+        def __init__(self, image):
+            self.image = image
+
+        def bind_control_plane(self, *, verify_digest=False):
+            return provenance
+
+        def run(self, cmd, *, cwd, timeout=300.0, input=None, limits=None):
+            return ProcResult(1, "", "pytest-json-report is unavailable", 0.01)
+
+        def python(self):
+            return "python"
+
+    monkeypatch.setattr(
+        abl,
+        "resolve_docker_executable",
+        lambda _docker="docker": _DockerIdentity(),
+    )
+    monkeypatch.setattr(
+        abl,
+        "_inspect_docker_image_id",
+        lambda image, *, docker: image_id,
+    )
+    monkeypatch.setattr(
+        abl,
+        "make_backend",
+        lambda name, **kwargs: _UnusableDocker(kwargs["image"]),
+    )
+
+    with pytest.raises(RuntimeError, match="capability probe"):
         run_ablation(
             _base(tmp_path),
             [_task(tmp_path, _repo(tmp_path / "src"))],
@@ -904,11 +1233,41 @@ def test_docker_image_resolution_keeps_only_required_host_configuration(
         return ProcResult(0, image_id + "\n", "", 0.0)
 
     monkeypatch.setattr(abl, "run", recording_run)
+    monkeypatch.setattr(
+        abl,
+        "resolve_docker_executable",
+        lambda _docker="docker": type(
+            "DockerIdentity",
+            (),
+            {"path": "/fixed/docker"},
+        )(),
+    )
 
     assert abl._resolve_docker_image_id("lha:test") == image_id
+    assert observed["cmd"][0] == "/fixed/docker"
     assert observed["env"]["DOCKER_CONFIG"] == "/tmp/lha-test-docker-config"
     assert observed["env"]["DOCKER_HOST"] == "unix:///tmp/lha-test-docker.sock"
     assert "OPENAI_API_KEY" not in observed["env"]
+
+
+def test_formal_container_absence_audit_fails_on_owned_residue(monkeypatch):
+    import lha.ablation as abl
+    from lha.tools.shell import ProcResult
+
+    observed = {}
+
+    def recording_run(cmd, **kwargs):
+        observed["cmd"] = cmd
+        observed.update(kwargs)
+        return ProcResult(0, "a" * 64 + "\n", "", 0.0)
+
+    monkeypatch.setattr(abl, "run", recording_run)
+
+    with pytest.raises(RuntimeError, match="still has LHA-owned containers"):
+        abl._assert_no_lha_containers("/fixed/docker")
+
+    assert observed["cmd"][0] == "/fixed/docker"
+    assert observed["cmd"][-1] == "label=lha.operation_id"
 
 
 def test_pinned_docker_backend_argv_uses_image_id_not_mutable_tag(tmp_path):
@@ -963,15 +1322,9 @@ def test_confusion_matrix_measures_false_positives():
     """A gate that passes a wrong fix (flaky oracle, dirty env) shows up as FP;
     nothing in the aggregation forces FP to zero."""
     records = [
-        RunRecord(
-            "t1", "gate", 0, "DONE", True, False, False, True, 0, "", True, "sha1"
-        ),
-        RunRecord(
-            "t2", "gate", 0, "DONE", True, True, True, False, 0, "", True, "sha2"
-        ),
-        RunRecord(
-            "t3", "gate", 0, "FAILED", False, True, False, False, 0, "", False, "sha3"
-        ),
+        RunRecord("t1", "gate", 0, "DONE", True, False, False, True, 0, "", True, "sha1"),
+        RunRecord("t2", "gate", 0, "DONE", True, True, True, False, 0, "", True, "sha2"),
+        RunRecord("t3", "gate", 0, "FAILED", False, True, False, False, 0, "", False, "sha3"),
     ]
     stats = {s.condition: s for s in _aggregate(records)}
     g = stats["gate"]
@@ -1013,14 +1366,10 @@ def test_cache_fingerprint_includes_all_outcome_source(tmp_path, source_path):
     task = _task(tmp_path, src)
     source_files = abl._source_file_digests()
     assert source_path in source_files
-    original = abl._fingerprint(
-        task, src, "stub", None, source_files=source_files
-    )
+    original = abl._fingerprint(task, src, "stub", None, source_files=source_files)
     changed_files = dict(source_files)
     changed_files[source_path] = "0" * 64
-    changed = abl._fingerprint(
-        task, src, "stub", None, source_files=changed_files
-    )
+    changed = abl._fingerprint(task, src, "stub", None, source_files=changed_files)
     assert changed != original
 
 
@@ -1149,9 +1498,7 @@ def test_new_report_records_complete_secret_free_provenance(tmp_path):
         artifact = tmp_path / "out" / "artifacts" / f"{digest}.json"
         assert artifact.is_file()
         assert hashlib.sha256(artifact.read_bytes()).hexdigest() == digest
-    evidence_digests = {
-        record["scorer_evidence_sha256"] for record in raw["records"]
-    }
+    evidence_digests = {record["scorer_evidence_sha256"] for record in raw["records"]}
     assert raw["scorer_evidence_store"]["count"] == len(evidence_digests)
     for digest in evidence_digests:
         evidence = tmp_path / "out" / "scorer_evidence" / f"{digest}.json"
@@ -1162,21 +1509,33 @@ def test_new_report_records_complete_secret_free_provenance(tmp_path):
         assert envelope["pytest_evidence"]["schema_version"] == 1
         assert envelope["binding"]["task"] == "task"
         assert envelope["binding"]["rep"] == 0
-        assert envelope["binding"]["input_snapshot_sha256"] == provenance[
-            "input_snapshot_sha256"
-        ]["task"]
+        assert (
+            envelope["binding"]["input_snapshot_sha256"]
+            == provenance["input_snapshot_sha256"]["task"]
+        )
         assert envelope["binding"]["scorer_backend"] == "trusted-local"
         assert envelope["binding"]["scorer_image_id"] is None
-    assert raw["llm_calls"] == [
-        {
-            "task": "task",
-            "rep": 0,
-            "cache_hit": False,
-            "label": "first",
-            "status": "succeeded",
-            "backend": "base",
-        }
-    ]
+    assert len(raw["llm_calls"]) == 1
+    assert {
+        name: raw["llm_calls"][0][name]
+        for name in (
+            "task",
+            "rep",
+            "cache_hit",
+            "label",
+            "status",
+            "backend",
+        )
+    } == {
+        "task": "task",
+        "rep": 0,
+        "cache_hit": False,
+        "label": "first",
+        "status": "succeeded",
+        "backend": "base",
+    }
+    assert len(raw["llm_calls"][0]["patch_sha256"]) == 64
+    assert raw["llm_calls"][0]["result_artifact_sha256"] == raw["records"][0]["artifact_sha256"]
 
     loaded = abl.load_ablation_report(tmp_path / "out" / "ablation_report.json")
     assert loaded.schema_version == 4

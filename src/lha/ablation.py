@@ -46,6 +46,7 @@ import importlib.metadata
 import inspect
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -76,11 +77,12 @@ from .pytest_evidence import (
     run_with_evidence,
     validate_evidence,
 )
-from .sandbox import ExecutionBackend, TrustedLocalBackend, make_backend
+from .sandbox import DockerBackend, ExecutionBackend, TrustedLocalBackend, make_backend
+from .sandbox.docker import resolve_docker_executable
 from .tasks.spec import TaskSpec
 from .tools import policy
 from .tools.patch import apply_patch
-from .tools.shell import run
+from .tools.shell import run, sanitized_absolute_path, trusted_executable
 from .verifiers import VerifyContext
 from .verifiers.code.pytest_verifier import PytestVerifier
 
@@ -99,14 +101,79 @@ _REPORT_SCHEMA = 4
 _FROZEN_ARTIFACT_SCHEMA = 1
 _INPUT_SNAPSHOT_SCHEMA = 1
 _SCORER_EVIDENCE_SCHEMA = 2
+_LLM_CALL_RECEIPT_SCHEMA = 1
+_FORMAL_CORPUS_MANIFEST_SCHEMA = 1
+_FORMAL_TASK_COUNT = 17
+_FORMAL_REPETITIONS = 12
+_FORMAL_CORPUS_MANIFEST_PATH = Path("benchmarks/formal_ablation_manifest.json")
 _BOOTSTRAP_N = 10_000
 _READ_CHUNK_BYTES = 64 * 1024
 _MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 _MAX_SCORER_EVIDENCE_BYTES = 12 * 1024 * 1024
+_MAX_LLM_CALL_RECEIPT_BYTES = 512 * 1024
+_MAX_FORMAL_MANIFEST_BYTES = 512 * 1024
+_MAX_CONTROL_EXECUTABLE_BYTES = 256 * 1024 * 1024
 _MAX_CACHE_BYTES = 8 * 1024 * 1024
 _MAX_REPORT_BYTES = 32 * 1024 * 1024
 _MAX_TASK_BYTES = 2 * 1024 * 1024
 _MAX_SOURCE_TEXT_BYTES = 8 * 1024 * 1024
+_DOCKER_IMAGE_PROBE_SCHEMA = 1
+_DOCKER_IMAGE_PROBE_MARKER = "LHA_DOCKER_IMAGE_PROBE "
+_DOCKER_IMAGE_PROBE_SCRIPT = r"""
+import importlib.metadata
+import json
+import os
+import pathlib
+import sys
+import tempfile
+
+os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+import pytest
+
+with tempfile.TemporaryDirectory(prefix="lha_image_probe_") as raw:
+    root = pathlib.Path(raw)
+    test_path = root / "test_probe.py"
+    report_path = root / "report.json"
+    test_path.write_text("def test_probe():\n    assert 2 + 2 == 4\n", encoding="utf-8")
+    code = pytest.main(
+        [
+            "-q",
+            "-p",
+            "pytest_jsonreport.plugin",
+            "--json-report",
+            f"--json-report-file={report_path}",
+            "-p",
+            "no:cacheprovider",
+            str(test_path),
+        ]
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    summary = report.get("summary", {})
+    if code != 0 or summary.get("passed") != 1 or summary.get("total") != 1:
+        raise SystemExit("minimal Pytest execution did not pass")
+
+payload = {
+    "python_version": ".".join(str(value) for value in sys.version_info[:3]),
+    "pytest_version": importlib.metadata.version("pytest"),
+    "pytest_json_report_version": importlib.metadata.version("pytest-json-report"),
+}
+print("LHA_DOCKER_IMAGE_PROBE " + json.dumps(payload, sort_keys=True, separators=(",", ":")))
+""".strip()
+_HEX_40 = re.compile(r"^[0-9a-f]{40}$")
+_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
+_CODEX_EVENT_TYPES = frozenset(
+    {
+        "thread.started",
+        "turn.started",
+        "turn.completed",
+        "turn.failed",
+        "item.started",
+        "item.updated",
+        "item.completed",
+        "error",
+    }
+)
+_CODEX_TEXT_ITEMS = frozenset({"agent_message", "reasoning", "todo_list"})
 
 
 class _Transient(Exception):
@@ -229,6 +296,14 @@ class AblationProvenance:
     task_files_sha256: dict[str, str] = field(default_factory=dict)
     corpus_sha256: dict[str, str] = field(default_factory=dict)
     input_snapshot_sha256: dict[str, str] = field(default_factory=dict)
+    cell_fingerprints: dict[str, str] = field(default_factory=dict)
+    formal_corpus_manifest_path: str | None = None
+    formal_corpus_manifest_sha256: str | None = None
+    preregistration_commit: str | None = None
+    # Historical run provenance. Release validation checks the binding and
+    # report fingerprint; it does not require another host to have these bytes.
+    git_executable: dict[str, Any] = field(default_factory=dict)
+    docker_executable: dict[str, Any] = field(default_factory=dict)
     configuration: dict[str, Any] = field(default_factory=dict)
 
 
@@ -426,10 +501,9 @@ def _consume_stable_regular_file(
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or _stable_file_signature(opened) != _stable_file_signature(path_before)
-        ):
+        if not stat.S_ISREG(opened.st_mode) or _stable_file_signature(
+            opened
+        ) != _stable_file_signature(path_before):
             raise ValueError(f"{path} changed before it could be read")
         total = 0
         while True:
@@ -530,6 +604,48 @@ def _copy_repo(source: Path, dst: Path, *, include_tests: bool) -> None:
         shutil.rmtree(dst / "tests", ignore_errors=True)
 
 
+class _PromptAuditClient(LLMClient):
+    """Record the exact prompt and response bytes without persisting either.
+
+    The wrapper deliberately uses ``LLMClient.propose_patch`` so the hash covers
+    the same system and user strings sent to Codex. The inner client's process,
+    usage, and protocol metadata remain the source of truth.
+    """
+
+    def __init__(self, inner: LLMClient):
+        self.inner = inner
+        self.name = getattr(inner, "name", type(inner).__name__) or "unknown"
+        self.last_prompt_sha256: str | None = None
+        self.last_response_sha256: str | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    def complete(self, system: str, prompt: str) -> str:
+        self.last_prompt_sha256 = _canonical_digest(
+            {
+                "schema_version": 1,
+                "system": system,
+                "prompt": prompt,
+            }
+        )
+        self.last_response_sha256 = None
+        response = self.inner.complete(system, prompt)
+        if not isinstance(response, str):
+            raise TypeError("LLM completion must return text")
+        self.last_response_sha256 = _sha256_bytes(response.encode("utf-8"))
+        return response
+
+
+def _patch_sha256(patch: Patch) -> str:
+    return _canonical_digest(
+        {
+            "schema_version": 1,
+            "patch": patch.model_dump(mode="json"),
+        }
+    )
+
+
 def _safe_call_audit(
     llm: LLMClient, *, label: str, status: str, error: Exception | None = None
 ) -> dict[str, Any]:
@@ -547,6 +663,11 @@ def _safe_call_audit(
             "model",
             "reasoning_effort",
             "sandbox_mode",
+            "permission_model",
+            "permission_profile",
+            "credential_barrier",
+            "cli_executable_sha256",
+            "cli_executable_trusted",
             "externally_sandboxed",
             "retries",
             "attempt_count",
@@ -586,6 +707,12 @@ def _safe_call_audit(
                 "model",
             )
         }
+    prompt_sha256 = getattr(llm, "last_prompt_sha256", None)
+    response_sha256 = getattr(llm, "last_response_sha256", None)
+    if isinstance(prompt_sha256, str):
+        audit["prompt_sha256"] = prompt_sha256
+    if isinstance(response_sha256, str):
+        audit["response_sha256"] = response_sha256
     if error is not None and "error_type" not in audit:
         audit["error_type"] = type(error).__name__
         audit["retryable"] = bool(getattr(error, "retryable", False))
@@ -623,7 +750,10 @@ def _retry(
             time.sleep(2 * (i + 1))
         else:
             if llm is not None and audit_log is not None:
-                audit_log.append(_safe_call_audit(llm, label=label, status="succeeded"))
+                audit = _safe_call_audit(llm, label=label, status="succeeded")
+                if isinstance(result, Patch):
+                    audit["patch_sha256"] = _patch_sha256(result)
+                audit_log.append(audit)
             return result
     raise _Transient(f"{label}: {last}")
 
@@ -635,7 +765,9 @@ def _pytest(
     isolated_interpreter: bool = False,
 ) -> PytestResult:
     """Run the prediction-side gate and retain an explicit infrastructure state."""
-    step = Step(step_id="grade", kind="code", action="edit_code", goal="grade", verifiers=["pytest"])
+    step = Step(
+        step_id="grade", kind="code", action="edit_code", goal="grade", verifiers=["pytest"]
+    )
     check = PytestVerifier(isolated_interpreter=isolated_interpreter).verify(
         None, VerifyContext(workdir=workdir, step=step, exec=exec_backend)
     )
@@ -648,9 +780,7 @@ def _pytest(
     return PytestResult(
         outcome=outcome,
         returncode=(
-            check.detail.get("returncode")
-            if type(check.detail.get("returncode")) is int
-            else None
+            check.detail.get("returncode") if type(check.detail.get("returncode")) is int else None
         ),
         detail=str(check.detail.get("summary") or "pytest produced no summary"),
         messages=tuple(str(message) for message in messages if isinstance(message, str)),
@@ -668,12 +798,12 @@ def _first_attempt(
     wd = scratch / "attempt"
     _copy_repo(source, wd, include_tests=False)
     patch = _retry(
-        lambda: Implementer(llm).implement(_fix_step(task), _empty_bundle(), wd),
+        lambda: _sanitize(Implementer(llm).implement(_fix_step(task), _empty_bundle(), wd)),
         "first",
         llm=llm,
         audit_log=audit_log,
     )
-    return _sanitize(patch)
+    return patch
 
 
 # --- frozen artifact + independent scorer ------------------------------------
@@ -710,12 +840,16 @@ def _frozen_diff(source: Path, wd: Path) -> dict[str, str | None]:
                 errors="replace",
                 reject_hardlinks=False,
             )
-            if s is None or _read_bounded_text(
-                s,
-                max_bytes=_MAX_SOURCE_TEXT_BYTES,
-                errors="replace",
-                reject_hardlinks=False,
-            ) != text:
+            if (
+                s is None
+                or _read_bounded_text(
+                    s,
+                    max_bytes=_MAX_SOURCE_TEXT_BYTES,
+                    errors="replace",
+                    reject_hardlinks=False,
+                )
+                != text
+            ):
                 frozen[rel] = text
     return frozen
 
@@ -744,9 +878,7 @@ def _frozen_artifact_bytes(frozen: dict[str, str | None]) -> bytes:
         ensure_ascii=False,
     ).encode()
     if len(payload) > _MAX_ARTIFACT_BYTES:
-        raise ValueError(
-            f"frozen artifact exceeds the {_MAX_ARTIFACT_BYTES}-byte limit"
-        )
+        raise ValueError(f"frozen artifact exceeds the {_MAX_ARTIFACT_BYTES}-byte limit")
     return payload
 
 
@@ -760,10 +892,7 @@ def _store_frozen_artifact(frozen: dict[str, str | None], artifact_dir: Path) ->
     digest = _sha256_bytes(payload)
     path = artifact_dir / f"{digest}.json"
     if path.exists():
-        if (
-            _read_bounded_bytes(path, max_bytes=_MAX_ARTIFACT_BYTES)
-            != payload
-        ):
+        if _read_bounded_bytes(path, max_bytes=_MAX_ARTIFACT_BYTES) != payload:
             raise RuntimeError(f"frozen artifact store is corrupt for {digest}")
         return digest
     _atomic_write_bytes(path, payload)
@@ -913,10 +1042,7 @@ def _classify_scorer_receipt(
 def _scorer_evidence_bytes(evidence: dict[str, Any]) -> bytes:
     payload = canonical_json_bytes(evidence)
     if len(payload) > _MAX_SCORER_EVIDENCE_BYTES:
-        raise ValueError(
-            "scorer evidence exceeds "
-            f"the {_MAX_SCORER_EVIDENCE_BYTES}-byte limit"
-        )
+        raise ValueError(f"scorer evidence exceeds the {_MAX_SCORER_EVIDENCE_BYTES}-byte limit")
     return payload
 
 
@@ -979,8 +1105,7 @@ def _validate_scorer_evidence(
         raise ValueError("invalid scorer evidence binding")
     image_id = binding_raw.get("scorer_image_id")
     if image_id is not None and (
-        not isinstance(image_id, str)
-        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+        not isinstance(image_id, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
     ):
         raise ValueError("invalid scorer evidence image ID")
     if binding_raw["scorer_backend"] == "docker" and image_id is None:
@@ -1067,6 +1192,21 @@ def _control_plane_pytest(
     )
 
 
+def _bind_latest_success_artifact(
+    audits: list[dict[str, Any]] | None,
+    *,
+    label: str,
+    artifact_sha256: str,
+) -> None:
+    if audits is None:
+        return
+    for audit in reversed(audits):
+        if audit.get("label") == label and audit.get("status") == "succeeded":
+            audit["result_artifact_sha256"] = artifact_sha256
+            return
+    raise RuntimeError(f"missing successful {label!r} call audit")
+
+
 def _evaluate(
     llm: LLMClient,
     source: Path,
@@ -1094,6 +1234,11 @@ def _evaluate(
     first_gate = _pytest(wd, agent_exec)
     frozen = _frozen_diff(source, wd)
     sha = _store_frozen_artifact(frozen, artifact_dir)
+    _bind_latest_success_artifact(
+        audit_log,
+        label="first",
+        artifact_sha256=sha,
+    )
     scorer_evidence_dir = artifact_dir.parent / "scorer_evidence"
     first_binding = ScorerEvidenceBinding(
         task=name,
@@ -1158,9 +1303,7 @@ def _evaluate(
                 if gate_error
                 else first_score.detail
             ),
-            gate_prediction=(
-                None if first_gate.outcome is ScoreOutcome.INFRA_ERROR else gate_pred
-            ),
+            gate_prediction=(None if first_gate.outcome is ScoreOutcome.INFRA_ERROR else gate_pred),
             artifact_sha256=sha,
             scorer_outcome=first_score.outcome.value,
             scorer_evidence_sha256=first_score.evidence_sha256,
@@ -1187,8 +1330,18 @@ def _evaluate(
             audit_log=audit_log,
         )
         if not repair.file_contents:
+            _bind_latest_success_artifact(
+                audit_log,
+                label="repair",
+                artifact_sha256=_artifact_digest(_frozen_diff(source, wd2)),
+            )
             break  # nothing new to try
         apply_patch(repair, wd2)
+        _bind_latest_success_artifact(
+            audit_log,
+            label="repair",
+            artifact_sha256=_artifact_digest(_frozen_diff(source, wd2)),
+        )
         verify_gate = _pytest(wd2, agent_exec)
         failures = list(verify_gate.messages)
     frozen2 = _frozen_diff(source, wd2)
@@ -1228,13 +1381,9 @@ def _evaluate(
             false_success=False if verify_error else ok and not artifact_correct2,
             repairs=repairs,
             detail=(
-                f"gate: {verify_gate.detail}; {score2.detail}"
-                if verify_error
-                else score2.detail
+                f"gate: {verify_gate.detail}; {score2.detail}" if verify_error else score2.detail
             ),
-            gate_prediction=(
-                None if verify_gate.outcome is ScoreOutcome.INFRA_ERROR else ok
-            ),
+            gate_prediction=(None if verify_gate.outcome is ScoreOutcome.INFRA_ERROR else ok),
             artifact_sha256=sha2,
             scorer_outcome=score2.outcome.value,
             scorer_evidence_sha256=score2.evidence_sha256,
@@ -1260,8 +1409,9 @@ def _make_llm(
     if llm == "codex_cli":
         from .llm.codex_cli import CodexCLIClient
 
-        # no_tools here means "refuse a result produced with any tool": codex has
-        # no deny-list flag, so leak-freedom is audited from the event stream.
+        # no_tools rejects every result produced with a tool. The generated
+        # permission profile also prevents tool subprocesses from reading the
+        # credential home or files outside the empty attempt workspace.
         return CodexCLIClient(
             cli_path=cli_path, model=model, reasoning_effort=effort, no_tools=True
         )
@@ -1349,9 +1499,7 @@ def _freeze_ablation_input(
             or corpus_before != corpus_after
             or corpus_digest != corpus_before
         ):
-            raise RuntimeError(
-                f"ablation input changed while snapshotting task {name!r}"
-            )
+            raise RuntimeError(f"ablation input changed while snapshotting task {name!r}")
         snapshot_digest = _input_snapshot_digest(task_digest, corpus_digest)
         metadata = {
             "schema_version": _INPUT_SNAPSHOT_SCHEMA,
@@ -1387,9 +1535,7 @@ def _freeze_ablation_input(
                 )
                 != metadata
             ):
-                raise RuntimeError(
-                    f"ablation input snapshot is corrupt for {snapshot_digest}"
-                )
+                raise RuntimeError(f"ablation input snapshot is corrupt for {snapshot_digest}")
             shutil.rmtree(temporary)
         else:
             os.replace(temporary, destination)
@@ -1417,6 +1563,522 @@ def _canonical_digest(values: dict[str, Any]) -> str:
     return _sha256_bytes(payload.encode())
 
 
+def _canonical_json_object_bytes(value: dict[str, Any]) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _nonnegative_int(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _finite_nonnegative(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and value >= 0
+    )
+
+
+def _validate_codex_event_summary(
+    value: Any,
+    *,
+    successful: bool,
+) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "total_events",
+        "events",
+        "items",
+        "invalid_json_lines",
+    }:
+        raise ValueError("Codex event summary has an invalid shape")
+    total = value["total_events"]
+    invalid = value["invalid_json_lines"]
+    events = value["events"]
+    items = value["items"]
+    item_events = ("item.started", "item.updated", "item.completed")
+    if (
+        not _nonnegative_int(total)
+        or not _nonnegative_int(invalid)
+        or not isinstance(events, dict)
+        or not isinstance(items, dict)
+        or any(
+            not isinstance(name, str)
+            or name not in _CODEX_EVENT_TYPES
+            or type(count) is not int
+            or count <= 0
+            for name, count in events.items()
+        )
+        or any(
+            not isinstance(name, str) or not name or type(count) is not int or count <= 0
+            for name, count in items.items()
+        )
+        or total != sum(events.values())
+        or sum(items.values()) != sum(events.get(name, 0) for name in item_events)
+    ):
+        raise ValueError("Codex event summary counts are inconsistent")
+    if not successful:
+        return
+    if (
+        invalid != 0
+        or events.get("thread.started") != 1
+        or events.get("turn.started") != 1
+        or events.get("turn.completed") != 1
+        or events.get("turn.failed", 0) != 0
+        or events.get("error", 0) != 0
+        or events.get("item.completed", 0) < 1
+        or items.get("agent_message", 0) < 1
+        or not set(items).issubset(_CODEX_TEXT_ITEMS)
+    ):
+        raise ValueError("successful Codex call is not a strict no-tools turn")
+
+
+def _validate_llm_call_receipt(
+    value: Any,
+    *,
+    expected_binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate one canonical receipt without trusting report-side call fields."""
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "binding", "call"}
+        or value.get("schema_version") != _LLM_CALL_RECEIPT_SCHEMA
+        or not isinstance(value.get("binding"), dict)
+        or not isinstance(value.get("call"), dict)
+    ):
+        raise ValueError("invalid LLM call receipt envelope")
+    binding = value["binding"]
+    if set(binding) != {
+        "task",
+        "rep",
+        "label",
+        "ordinal",
+        "cell_fingerprint",
+        "input_snapshot_sha256",
+        "prompt_sha256",
+        "response_sha256",
+        "patch_sha256",
+        "result_artifact_sha256",
+    }:
+        raise ValueError("invalid LLM call receipt binding")
+    if (
+        not isinstance(binding["task"], str)
+        or not binding["task"]
+        or not _nonnegative_int(binding["rep"])
+        or binding["label"] not in {"first", "repair"}
+        or not _nonnegative_int(binding["ordinal"])
+        or not all(
+            isinstance(binding[name], str) and _HEX_64.fullmatch(binding[name])
+            for name in (
+                "cell_fingerprint",
+                "input_snapshot_sha256",
+                "prompt_sha256",
+            )
+        )
+    ):
+        raise ValueError("invalid LLM call receipt cell binding")
+    if expected_binding is not None and any(
+        binding.get(name) != expected for name, expected in expected_binding.items()
+    ):
+        raise ValueError("LLM call receipt is bound to another cell")
+
+    call = value["call"]
+    required_call_fields = {
+        "status",
+        "backend",
+        "cli_version",
+        "model",
+        "reasoning_effort",
+        "sandbox_mode",
+        "permission_model",
+        "permission_profile",
+        "credential_barrier",
+        "cli_executable_sha256",
+        "cli_executable_trusted",
+        "externally_sandboxed",
+        "retries",
+        "attempt_count",
+        "duration_s",
+        "event_summary",
+        "attempts",
+        "usage",
+    }
+    optional_call_fields = {"error_type", "retryable"}
+    if (
+        not required_call_fields.issubset(call)
+        or not set(call).issubset(required_call_fields | optional_call_fields)
+        or call["status"] not in {"succeeded", "failed"}
+        or call["backend"] != "codex_cli"
+        or not isinstance(call["cli_version"], str)
+        or not call["cli_version"]
+        or not isinstance(call["model"], str)
+        or not call["model"]
+        or not isinstance(call["reasoning_effort"], str)
+        or not call["reasoning_effort"]
+        or call["sandbox_mode"] != "read-only"
+        or call["permission_model"] != "profile"
+        or call["permission_profile"] != "lha-read"
+        or call["credential_barrier"] != "verified"
+        or not isinstance(call["cli_executable_sha256"], str)
+        or _HEX_64.fullmatch(call["cli_executable_sha256"]) is None
+        or type(call["cli_executable_trusted"]) is not bool
+        or call["externally_sandboxed"] is not False
+        or not _nonnegative_int(call["retries"])
+        or not _nonnegative_int(call["attempt_count"])
+        or not _finite_nonnegative(call["duration_s"])
+        or not isinstance(call["attempts"], list)
+        or not isinstance(call["usage"], dict)
+    ):
+        raise ValueError("invalid LLM call receipt protocol")
+    successful = call["status"] == "succeeded"
+    response_sha256 = binding["response_sha256"]
+    patch_sha256 = binding["patch_sha256"]
+    artifact_sha256 = binding["result_artifact_sha256"]
+    if successful:
+        if not all(
+            isinstance(digest, str) and _HEX_64.fullmatch(digest)
+            for digest in (response_sha256, patch_sha256, artifact_sha256)
+        ):
+            raise ValueError("successful LLM call receipt lacks output bindings")
+        if "error_type" in call or "retryable" in call:
+            raise ValueError("successful LLM call receipt carries failure metadata")
+    else:
+        if (
+            response_sha256 is not None
+            or patch_sha256 is not None
+            or artifact_sha256 is not None
+            or not isinstance(call.get("error_type"), str)
+            or not call["error_type"]
+            or type(call.get("retryable")) is not bool
+        ):
+            raise ValueError("failed LLM call receipt has invalid outcome bindings")
+
+    attempts = call["attempts"]
+    if call["attempt_count"] != len(attempts) or call["retries"] != max(0, len(attempts) - 1):
+        raise ValueError("LLM call receipt retry counters are inconsistent")
+    for index, attempt in enumerate(attempts, start=1):
+        if (
+            not isinstance(attempt, dict)
+            or attempt.get("attempt") != index
+            or attempt.get("status") not in {"succeeded", "failed"}
+            or not _finite_nonnegative(attempt.get("duration_s"))
+            or not isinstance(attempt.get("event_summary"), dict)
+        ):
+            raise ValueError("LLM call receipt has an invalid inner attempt")
+        attempt_succeeded = attempt["status"] == "succeeded"
+        if attempt_succeeded:
+            if index != len(attempts) or "error_type" in attempt:
+                raise ValueError("LLM call receipt succeeded before its final attempt")
+        elif not isinstance(attempt.get("error_type"), str) or not attempt["error_type"]:
+            raise ValueError("failed LLM inner attempt lacks an error type")
+        _validate_codex_event_summary(
+            attempt["event_summary"],
+            successful=attempt_succeeded,
+        )
+    if successful:
+        if not attempts or attempts[-1]["status"] != "succeeded":
+            raise ValueError("successful LLM call receipt has no successful final attempt")
+    elif any(attempt["status"] == "succeeded" for attempt in attempts):
+        raise ValueError("failed LLM call receipt contains a successful inner attempt")
+    _validate_codex_event_summary(call["event_summary"], successful=successful)
+    if attempts and call["event_summary"] != attempts[-1]["event_summary"]:
+        raise ValueError("LLM call receipt event summary is not the final attempt")
+
+    usage = call["usage"]
+    if (
+        set(usage)
+        != {
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "cost_usd",
+            "model",
+        }
+        or usage["model"] != call["model"]
+    ):
+        raise ValueError("LLM call receipt usage does not match the model")
+    for name in ("input_tokens", "cached_input_tokens", "output_tokens"):
+        token_count = usage[name]
+        if successful:
+            if not _nonnegative_int(token_count):
+                raise ValueError("successful LLM call receipt lacks token usage")
+        elif token_count is not None and not _nonnegative_int(token_count):
+            raise ValueError("failed LLM call receipt has invalid token usage")
+    if usage["cost_usd"] is not None and not _finite_nonnegative(usage["cost_usd"]):
+        raise ValueError("LLM call receipt has invalid cost")
+    return value
+
+
+def _llm_call_receipt_bytes(value: dict[str, Any]) -> bytes:
+    _validate_llm_call_receipt(value)
+    payload = _canonical_json_object_bytes(value)
+    if len(payload) > _MAX_LLM_CALL_RECEIPT_BYTES:
+        raise ValueError("LLM call receipt exceeds the byte limit")
+    return payload
+
+
+def _store_llm_call_receipt(value: dict[str, Any], directory: Path) -> str:
+    payload = _llm_call_receipt_bytes(value)
+    digest = _sha256_bytes(payload)
+    directory.mkdir(parents=True, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("LLM call receipt store must be a real directory")
+    path = directory / f"{digest}.json"
+    if path.exists():
+        if (
+            _read_bounded_bytes(
+                path,
+                max_bytes=_MAX_LLM_CALL_RECEIPT_BYTES,
+            )
+            != payload
+        ):
+            raise RuntimeError(f"LLM call receipt store is corrupt for {digest}")
+        return digest
+    _atomic_write_bytes(path, payload)
+    return digest
+
+
+def _read_llm_call_receipt(
+    path: Path,
+    expected_digest: str,
+    *,
+    expected_binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if _HEX_64.fullmatch(expected_digest) is None:
+        raise ValueError("invalid LLM call receipt digest")
+    payload = _read_bounded_bytes(
+        path,
+        max_bytes=_MAX_LLM_CALL_RECEIPT_BYTES,
+    )
+    if _sha256_bytes(payload) != expected_digest:
+        raise ValueError("LLM call receipt digest does not match its bytes")
+    value = json.loads(payload)
+    receipt = _validate_llm_call_receipt(
+        value,
+        expected_binding=expected_binding,
+    )
+    if payload != _canonical_json_object_bytes(receipt):
+        raise ValueError("LLM call receipt is not canonical JSON")
+    return receipt
+
+
+def _report_fingerprint(raw: dict[str, Any]) -> str:
+    """Hash every public report field except the digest itself."""
+    payload = dict(raw)
+    payload.pop("fingerprint", None)
+    return _sha256_bytes(_canonical_json_object_bytes(payload))
+
+
+def _repo_relative_evidence_path(
+    repository_root: Path,
+    value: Any,
+    *,
+    kind: str,
+) -> tuple[str, Path]:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"formal corpus {kind} path is missing")
+    relative = PurePosixPath(value)
+    if (
+        relative.is_absolute()
+        or "\\" in value
+        or "\x00" in value
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise ValueError(f"formal corpus {kind} path is unsafe")
+    path = repository_root.joinpath(*relative.parts)
+    try:
+        path.resolve(strict=True).relative_to(repository_root.resolve())
+    except (OSError, ValueError) as error:
+        raise ValueError(f"formal corpus {kind} path is unavailable") from error
+    if path.is_symlink():
+        raise ValueError(f"formal corpus {kind} path must not be a symlink")
+    return relative.as_posix(), path
+
+
+def _load_formal_corpus_manifest(
+    path: Path,
+    repository_root: Path,
+) -> tuple[dict[str, Any], str]:
+    payload = _read_bounded_bytes(
+        path,
+        max_bytes=_MAX_FORMAL_MANIFEST_BYTES,
+    )
+    digest = _sha256_bytes(payload)
+    try:
+        raw = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("formal corpus manifest is not valid JSON") from error
+    if (
+        not isinstance(raw, dict)
+        or set(raw)
+        != {
+            "schema_version",
+            "benchmark",
+            "repetitions",
+            "corpus_commit",
+            "tasks",
+        }
+        or raw.get("schema_version") != _FORMAL_CORPUS_MANIFEST_SCHEMA
+        or raw.get("benchmark") != "lha-verification-ablation"
+        or raw.get("repetitions") != _FORMAL_REPETITIONS
+        or not isinstance(raw.get("corpus_commit"), str)
+        or _HEX_40.fullmatch(raw["corpus_commit"]) is None
+        or not isinstance(raw.get("tasks"), list)
+        or len(raw["tasks"]) != _FORMAL_TASK_COUNT
+    ):
+        raise ValueError("formal corpus manifest has an invalid envelope")
+    names: list[str] = []
+    task_paths: list[str] = []
+    for entry in raw["tasks"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry)
+            != {
+                "name",
+                "task_path",
+                "task_sha256",
+                "corpus_path",
+                "corpus_sha256",
+            }
+            or not isinstance(entry.get("name"), str)
+            or not entry["name"]
+            or not isinstance(entry.get("task_sha256"), str)
+            or _HEX_64.fullmatch(entry["task_sha256"]) is None
+            or not isinstance(entry.get("corpus_sha256"), str)
+            or _HEX_64.fullmatch(entry["corpus_sha256"]) is None
+        ):
+            raise ValueError("formal corpus manifest has an invalid task entry")
+        task_relative, task_path = _repo_relative_evidence_path(
+            repository_root,
+            entry["task_path"],
+            kind="task",
+        )
+        corpus_relative, corpus_path = _repo_relative_evidence_path(
+            repository_root,
+            entry["corpus_path"],
+            kind="corpus",
+        )
+        if (
+            not task_path.is_file()
+            or not corpus_path.is_dir()
+            or Path(task_relative).stem != entry["name"]
+            or _sha256_bytes(_read_bounded_bytes(task_path, max_bytes=_MAX_TASK_BYTES))
+            != entry["task_sha256"]
+            or _repo_digest(corpus_path) != entry["corpus_sha256"]
+        ):
+            raise ValueError(f"formal corpus bytes disagree for {entry['name']!r}")
+        spec = TaskSpec.from_file(task_path)
+        target = Path(spec.target_repo or ".")
+        target = target if target.is_absolute() else repository_root / target
+        try:
+            target_relative = target.resolve().relative_to(repository_root.resolve()).as_posix()
+        except ValueError as error:
+            raise ValueError("formal task target_repo escapes the repository") from error
+        if target_relative != corpus_relative:
+            raise ValueError(f"formal task target_repo disagrees for {entry['name']!r}")
+        names.append(entry["name"])
+        task_paths.append(task_relative)
+    if (
+        len(names) != len(set(names))
+        or len(task_paths) != len(set(task_paths))
+        or names != sorted(names)
+    ):
+        raise ValueError("formal corpus task order is not unique and stable")
+    return raw, digest
+
+
+@dataclass(frozen=True)
+class _FormalCorpusBinding:
+    path: str
+    sha256: str
+    preregistration_commit: str
+    git_executable: dict[str, Any]
+
+
+def _prepare_formal_corpus_binding(
+    task_paths: list[str],
+    *,
+    repetitions: int,
+) -> _FormalCorpusBinding | None:
+    """Fail before model execution when a formal-grid run is not preregistered."""
+    if len(task_paths) != _FORMAL_TASK_COUNT or repetitions != _FORMAL_REPETITIONS:
+        return None
+    repository_root = _project_root()
+    if repository_root is None:
+        raise RuntimeError("formal ablation requires a Git project checkout")
+    manifest_path = repository_root / _FORMAL_CORPUS_MANIFEST_PATH
+    manifest, manifest_sha256 = _load_formal_corpus_manifest(
+        manifest_path,
+        repository_root,
+    )
+    supplied_paths = [_provenance_path(path) for path in task_paths]
+    registered_paths = [entry["task_path"] for entry in manifest["tasks"]]
+    if supplied_paths != registered_paths:
+        raise RuntimeError(
+            "formal ablation tasks or task order differ from the preregistered manifest"
+        )
+    git_executable = _trusted_control_executable("git")
+    git_path = str(git_executable["path"])
+    commit, dirty = _git_provenance(git_path)
+    if commit is None or _HEX_40.fullmatch(commit) is None or dirty is not False:
+        raise RuntimeError("formal ablation must start from a clean committed Git checkout")
+    manifest_relative = _FORMAL_CORPUS_MANIFEST_PATH.as_posix()
+    tracked = run(
+        [git_path, "cat-file", "-e", f"{commit}:{manifest_relative}"],
+        cwd=repository_root,
+        timeout=10,
+        env=_git_control_env(),
+    )
+    ancestor = run(
+        [
+            git_path,
+            "merge-base",
+            "--is-ancestor",
+            manifest["corpus_commit"],
+            commit,
+        ],
+        cwd=repository_root,
+        timeout=10,
+        env=_git_control_env(),
+    )
+    registered_inputs = [
+        value for entry in manifest["tasks"] for value in (entry["task_path"], entry["corpus_path"])
+    ]
+    unchanged = run(
+        [
+            git_path,
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+            manifest["corpus_commit"],
+            commit,
+            "--",
+            *registered_inputs,
+        ],
+        cwd=repository_root,
+        timeout=30,
+        env=_git_control_env(),
+    )
+    controls = (tracked, ancestor, unchanged)
+    if any(
+        result.returncode != 0 or result.output_truncated or result.cleanup_unconfirmed
+        for result in controls
+    ):
+        raise RuntimeError("formal corpus manifest or registered inputs are not anchored in Git")
+    return _FormalCorpusBinding(
+        path=manifest_relative,
+        sha256=manifest_sha256,
+        preregistration_commit=commit,
+        git_executable=git_executable,
+    )
+
+
 def _source_file_digests(root: Path | None = None) -> dict[str, str]:
     """Hash the complete installed ``lha`` source tree.
 
@@ -1429,11 +2091,7 @@ def _source_file_digests(root: Path | None = None) -> dict[str, str]:
     package_root = (root or Path(__file__).resolve().parent).resolve()
     files: dict[str, str] = {}
     for path in sorted(package_root.rglob("*")):
-        if (
-            not path.is_file()
-            or "__pycache__" in path.parts
-            or path.suffix in {".pyc", ".pyo"}
-        ):
+        if not path.is_file() or "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
             continue
         files[path.relative_to(package_root).as_posix()] = _sha256_regular_file(path)
     return files
@@ -1450,6 +2108,75 @@ def _project_root() -> Path | None:
     return None
 
 
+def _trusted_control_executable(
+    name: str,
+    *,
+    executable: str | None = None,
+) -> dict[str, Any]:
+    """Bind a control command to immutable-looking bytes outside writable PATH entries."""
+    if executable is None:
+        resolved_text = trusted_executable(name, require_unwritable=True)
+    else:
+        configured = Path(executable)
+        if not configured.is_absolute():
+            raise RuntimeError(f"{name} executable must be an absolute path")
+        try:
+            resolved = configured.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(f"{name} executable is unavailable") from error
+        if resolved.name != name:
+            raise RuntimeError(f"{name} executable has an unexpected basename")
+        resolved_text = trusted_executable(
+            resolved.name,
+            path="",
+            extra_dirs=(resolved.parent,),
+            require_unwritable=True,
+        )
+        if resolved_text != str(resolved):
+            resolved_text = None
+    if resolved_text is None:
+        raise RuntimeError(f"{name} executable was not found in a non-writable installation")
+    path = Path(resolved_text)
+    before = path.lstat()
+    if (
+        not path.is_absolute()
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or before.st_size > _MAX_CONTROL_EXECUTABLE_BYTES
+    ):
+        raise RuntimeError(f"{name} executable is not a bounded regular file")
+    digest = hashlib.sha256()
+    _consume_stable_regular_file(
+        path,
+        digest.update,
+        max_bytes=_MAX_CONTROL_EXECUTABLE_BYTES,
+        reject_hardlinks=False,
+    )
+    after = path.lstat()
+    if _stable_file_signature(before) != _stable_file_signature(after):
+        raise RuntimeError(f"{name} executable changed while it was bound")
+    return {
+        "path": str(path),
+        "sha256": digest.hexdigest(),
+        "size_bytes": after.st_size,
+        "trusted_install": True,
+    }
+
+
+def _git_control_env() -> dict[str, str]:
+    """Minimal deterministic environment for absolute-path Git control calls."""
+    env = {
+        "PATH": sanitized_absolute_path(require_unwritable=True),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_PAGER": "cat",
+    }
+    return {key: value for key, value in env.items() if value}
+
+
 def _provenance_path(path: str | Path) -> str:
     value = Path(path)
     root = _project_root()
@@ -1461,21 +2188,56 @@ def _provenance_path(path: str | Path) -> str:
     return str(value)
 
 
-def _git_provenance() -> tuple[str | None, bool | None]:
+def _git_provenance(
+    git_executable: str | None = None,
+) -> tuple[str | None, bool | None]:
     root = _project_root()
     if root is None:
         return None, None
     try:
-        head = run(["git", "rev-parse", "--verify", "HEAD"], cwd=root, timeout=10)
-        status = run(
-            ["git", "status", "--porcelain=v1", "--untracked-files=normal"],
+        git_path = (
+            git_executable
+            if git_executable is not None
+            else str(_trusted_control_executable("git")["path"])
+        )
+        head = run(
+            [git_path, "rev-parse", "--verify", "HEAD"],
             cwd=root,
             timeout=10,
+            env=_git_control_env(),
         )
-    except OSError:
+        status = run(
+            [
+                git_path,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=normal",
+            ],
+            cwd=root,
+            timeout=10,
+            env=_git_control_env(),
+        )
+    except (OSError, RuntimeError, ValueError):
         return None, None
-    commit = head.stdout.strip() if head.returncode == 0 and head.stdout.strip() else None
-    dirty = bool(status.stdout) if status.returncode == 0 else None
+    commit = (
+        head.stdout.strip()
+        if (
+            head.returncode == 0
+            and not head.output_truncated
+            and not head.cleanup_unconfirmed
+            and head.stdout.strip()
+        )
+        else None
+    )
+    dirty = (
+        bool(status.stdout)
+        if (
+            status.returncode == 0
+            and not status.output_truncated
+            and not status.cleanup_unconfirmed
+        )
+        else None
+    )
     return commit, dirty
 
 
@@ -1500,12 +2262,11 @@ def _cli_version(llm: str, client: LLMClient, cli_path: str) -> str | None:
     return value if result.returncode == 0 and value else None
 
 
-def _resolve_docker_image_id(image: str, *, docker: str = "docker") -> str:
-    """Resolve a mutable Docker reference once, before any experiment cell runs."""
+def _docker_control_env() -> dict[str, str]:
+    """Keep daemon selection while excluding credentials and writable PATH entries."""
     docker_env = {
         key: value
         for key in (
-            "PATH",
             "HOME",
             "LANG",
             "LC_ALL",
@@ -1519,22 +2280,87 @@ def _resolve_docker_image_id(image: str, *, docker: str = "docker") -> str:
         )
         if (value := os.environ.get(key))
     }
-    docker_env.setdefault("PATH", os.defpath)
+    safe_path = sanitized_absolute_path(require_unwritable=True)
+    if safe_path:
+        docker_env["PATH"] = safe_path
+    return docker_env
+
+
+def _inspect_docker_image_id(image: str, *, docker: str) -> str:
+    """Bind a mutable image reference with a previously bound Docker executable."""
+    if not Path(docker).is_absolute():
+        raise RuntimeError("Docker image inspection requires an absolute executable")
     result = run(
         [docker, "image", "inspect", "--format", "{{.Id}}", image],
         timeout=30,
-        env=docker_env,
+        env=_docker_control_env(),
     )
     value = result.stdout.strip()
     if (
         result.returncode != 0
         or result.output_truncated
+        or result.cleanup_unconfirmed
         or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
     ):
-        raise RuntimeError(
-            f"Docker image {image!r} could not be bound to an immutable image ID"
-        )
+        raise RuntimeError(f"Docker image {image!r} could not be bound to an immutable image ID")
     return value
+
+
+def _resolve_docker_image_id(image: str, *, docker: str = "docker") -> str:
+    """Resolve Docker bytes and bind a mutable image reference to its image ID."""
+    identity = resolve_docker_executable(docker)
+    return _inspect_docker_image_id(image, docker=identity.path)
+
+
+def _probe_docker_image(
+    backend: ExecutionBackend,
+    *,
+    image_id: str,
+    workdir: Path,
+) -> dict[str, Any]:
+    """Prove the pinned image can run the scorer before a model call is spent."""
+    if (
+        getattr(backend, "name", None) != "docker"
+        or getattr(backend, "image", None) != image_id
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+    ):
+        raise RuntimeError("Docker image probe is not bound to the pinned scorer image")
+    result = backend.run(
+        [backend.python(), "-I", "-c", _DOCKER_IMAGE_PROBE_SCRIPT],
+        cwd=workdir,
+        timeout=60,
+    )
+    if result.returncode != 0 or result.output_truncated or result.cleanup_unconfirmed:
+        raise RuntimeError("pinned Docker image failed its scorer capability probe")
+    payloads = [
+        line.removeprefix(_DOCKER_IMAGE_PROBE_MARKER)
+        for line in result.stdout.splitlines()
+        if line.startswith(_DOCKER_IMAGE_PROBE_MARKER)
+    ]
+    if len(payloads) != 1:
+        raise RuntimeError("pinned Docker image returned an invalid capability receipt")
+    try:
+        payload = json.loads(payloads[0])
+    except json.JSONDecodeError as error:
+        raise RuntimeError("pinned Docker image returned an invalid capability receipt") from error
+    required = {
+        "python_version",
+        "pytest_version",
+        "pytest_json_report_version",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != required
+        or any(not isinstance(payload.get(field), str) or not payload[field] for field in required)
+    ):
+        raise RuntimeError("pinned Docker image returned an invalid capability receipt")
+    return {
+        "schema_version": _DOCKER_IMAGE_PROBE_SCHEMA,
+        "image_id": image_id,
+        "network": "none",
+        "minimal_pytest": "passed",
+        **payload,
+    }
 
 
 def _fingerprint(
@@ -1567,6 +2393,119 @@ def _fingerprint(
         "runtime": runtime or {},
     }
     return _canonical_digest(payload)
+
+
+def _materialize_call_receipts(
+    audits: list[dict[str, Any]],
+    *,
+    task: str,
+    rep: int,
+    cell_fingerprint: str,
+    input_snapshot_sha256: str,
+    directory: Path,
+) -> list[str]:
+    call_fields = {
+        "status",
+        "backend",
+        "cli_version",
+        "model",
+        "reasoning_effort",
+        "sandbox_mode",
+        "permission_model",
+        "permission_profile",
+        "credential_barrier",
+        "cli_executable_sha256",
+        "cli_executable_trusted",
+        "externally_sandboxed",
+        "retries",
+        "attempt_count",
+        "duration_s",
+        "event_summary",
+        "attempts",
+        "usage",
+        "error_type",
+        "retryable",
+    }
+    receipts: list[str] = []
+    for ordinal, audit in enumerate(audits):
+        receipt = {
+            "schema_version": _LLM_CALL_RECEIPT_SCHEMA,
+            "binding": {
+                "task": task,
+                "rep": rep,
+                "label": audit.get("label"),
+                "ordinal": ordinal,
+                "cell_fingerprint": cell_fingerprint,
+                "input_snapshot_sha256": input_snapshot_sha256,
+                "prompt_sha256": audit.get("prompt_sha256"),
+                "response_sha256": audit.get("response_sha256"),
+                "patch_sha256": audit.get("patch_sha256"),
+                "result_artifact_sha256": audit.get("result_artifact_sha256"),
+            },
+            "call": {name: audit[name] for name in call_fields if name in audit},
+        }
+        receipts.append(_store_llm_call_receipt(receipt, directory))
+    return receipts
+
+
+def _validate_cell_call_sequence(
+    receipts: list[dict[str, Any]],
+    *,
+    repairs: int,
+    max_outer_attempts: int,
+    max_inner_attempts: int,
+) -> None:
+    if not receipts or max_outer_attempts <= 0 or max_inner_attempts <= 0:
+        raise ValueError("cell has no bounded LLM call sequence")
+    for ordinal, receipt in enumerate(receipts):
+        binding = receipt["binding"]
+        call = receipt["call"]
+        if binding["ordinal"] != ordinal:
+            raise ValueError("cell LLM call ordinals are not contiguous")
+        if call["attempt_count"] > max_inner_attempts:
+            raise ValueError("cell LLM call exceeded its inner retry budget")
+
+    first_end = next(
+        (
+            index
+            for index, receipt in enumerate(receipts)
+            if receipt["binding"]["label"] == "repair"
+        ),
+        len(receipts),
+    )
+    first_calls = receipts[:first_end]
+    if (
+        not first_calls
+        or len(first_calls) > max_outer_attempts
+        or any(receipt["binding"]["label"] != "first" for receipt in first_calls)
+        or any(receipt["call"]["status"] != "failed" for receipt in first_calls[:-1])
+        or first_calls[-1]["call"]["status"] != "succeeded"
+    ):
+        raise ValueError("cell first-call retry sequence is invalid")
+
+    repair_calls = receipts[first_end:]
+    repair_successes = 0
+    segment_length = 0
+    for receipt in repair_calls:
+        if receipt["binding"]["label"] != "repair":
+            raise ValueError("cell returned to first-call evidence after repair")
+        segment_length += 1
+        if segment_length > max_outer_attempts:
+            raise ValueError("cell repair exceeded its outer retry budget")
+        if receipt["call"]["status"] == "succeeded":
+            repair_successes += 1
+            segment_length = 0
+    if segment_length:
+        raise ValueError("cell repair sequence ended in a failed call")
+    if repair_successes != repairs:
+        raise ValueError("cell repair receipt count is stale")
+
+
+@dataclass(frozen=True)
+class _CachedCell:
+    records: list[RunRecord]
+    call_receipts: list[str]
+    legacy_calls: list[dict[str, Any]]
 
 
 def _record_from_raw(raw: dict[str, Any], *, schema_version: int) -> RunRecord:
@@ -1616,26 +2555,28 @@ def _decode_cache(data: Any) -> tuple[str | None, list[RunRecord]] | None:
 def _read_cache(path: Path) -> tuple[str | None, list[RunRecord]] | None:
     """Decode a bounded, stable legacy or current cache file."""
     try:
-        data = json.loads(
-            _read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES)
-        )
+        data = json.loads(_read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None  # corrupt/partial cache -> recompute
     return _decode_cache(data)
 
 
-def _load_cached(
+def _load_cached_cell(
     path: Path,
     fingerprint: str,
     *,
     input_snapshot_sha256: str | None = None,
     scorer_backend: str | None = None,
     scorer_image_id: str | None = None,
-) -> list[RunRecord] | None:
+    require_call_receipts: bool = False,
+    expected_task: str | None = None,
+    expected_rep: int | None = None,
+    receipt_dir: Path | None = None,
+    max_outer_attempts: int = _LLM_RETRIES,
+    max_inner_attempts: int = 1,
+) -> _CachedCell | None:
     try:
-        cache_envelope = json.loads(
-            _read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES)
-        )
+        cache_envelope = json.loads(_read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
     if (
@@ -1655,9 +2596,7 @@ def _load_cached(
         return None
     if any(
         record.true_success != (record.claimed_success and record.artifact_correct)
-        or record.false_success != (
-            record.claimed_success and not record.artifact_correct
-        )
+        or record.false_success != (record.claimed_success and not record.artifact_correct)
         for record in records
     ):
         return None
@@ -1695,18 +2634,79 @@ def _load_cached(
         for record in records
     ):
         return None
-    return records
+    calls = cache_envelope.get("llm_calls")
+    legacy_calls = (
+        [call for call in calls if isinstance(call, dict)] if isinstance(calls, list) else []
+    )
+    if isinstance(calls, list) and len(legacy_calls) != len(calls):
+        return None
+    receipt_values = cache_envelope.get("llm_call_receipts")
+    call_receipts = (
+        list(receipt_values)
+        if isinstance(receipt_values, list)
+        and all(isinstance(value, str) for value in receipt_values)
+        else []
+    )
+    if require_call_receipts:
+        if (
+            not call_receipts
+            or len(call_receipts) != len(set(call_receipts))
+            or receipt_dir is None
+            or receipt_dir.is_symlink()
+            or not receipt_dir.is_dir()
+            or not isinstance(expected_task, str)
+            or not expected_task
+            or not _nonnegative_int(expected_rep)
+        ):
+            return None
+        decoded_receipts: list[dict[str, Any]] = []
+        try:
+            for ordinal, digest in enumerate(call_receipts):
+                decoded_receipts.append(
+                    _read_llm_call_receipt(
+                        receipt_dir / f"{digest}.json",
+                        digest,
+                        expected_binding={
+                            "task": expected_task,
+                            "rep": expected_rep,
+                            "ordinal": ordinal,
+                            "cell_fingerprint": fingerprint,
+                            "input_snapshot_sha256": input_snapshot_sha256,
+                        },
+                    )
+                )
+            verify = next(record for record in records if record.condition == "verify")
+            _validate_cell_call_sequence(
+                decoded_receipts,
+                repairs=verify.repairs,
+                max_outer_attempts=max_outer_attempts,
+                max_inner_attempts=max_inner_attempts,
+            )
+        except (OSError, StopIteration, TypeError, ValueError):
+            return None
+    return _CachedCell(
+        records=records,
+        call_receipts=call_receipts,
+        legacy_calls=legacy_calls,
+    )
 
 
-def _read_cached_audits(path: Path) -> list[dict[str, Any]]:
-    try:
-        raw = json.loads(
-            _read_bounded_text(path, max_bytes=_MAX_CACHE_BYTES)
-        )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return []
-    calls = raw.get("llm_calls") if isinstance(raw, dict) else None
-    return [call for call in calls if isinstance(call, dict)] if isinstance(calls, list) else []
+def _load_cached(
+    path: Path,
+    fingerprint: str,
+    *,
+    input_snapshot_sha256: str | None = None,
+    scorer_backend: str | None = None,
+    scorer_image_id: str | None = None,
+) -> list[RunRecord] | None:
+    cached = _load_cached_cell(
+        path,
+        fingerprint,
+        input_snapshot_sha256=input_snapshot_sha256,
+        scorer_backend=scorer_backend,
+        scorer_image_id=scorer_image_id,
+    )
+    return cached.records if cached is not None else None
 
 
 def _run_cell(
@@ -1723,6 +2723,8 @@ def _run_cell(
     scorer_backend: str,
     scorer_image_id: str | None,
     audit_log: list[dict[str, Any]] | None = None,
+    require_call_receipts: bool = False,
+    max_inner_attempts: int = 1,
 ) -> list[RunRecord]:
     name = task.inputs.get("_name", task.title)
     cache = out_dir / "results" / f"{name}__r{rep}.json"
@@ -1752,21 +2754,41 @@ def _run_cell(
 
     if not snapshot_matches():
         return error_records("content-addressed input snapshot failed validation")
-    cached = _load_cached(
+    receipt_dir = out_dir / "llm_call_receipts"
+    cached = _load_cached_cell(
         cache,
         fingerprint,
         input_snapshot_sha256=input_snapshot_sha256,
         scorer_backend=scorer_backend,
         scorer_image_id=scorer_image_id,
+        require_call_receipts=require_call_receipts,
+        expected_task=name,
+        expected_rep=rep,
+        receipt_dir=receipt_dir,
+        max_outer_attempts=_LLM_RETRIES,
+        max_inner_attempts=max_inner_attempts,
     )
     if cached is not None:
         if audit_log is not None:
-            audit_log.extend(
-                {"task": name, "rep": rep, "cache_hit": True, **call}
-                for call in _read_cached_audits(cache)
-            )
-        return cached
+            if require_call_receipts:
+                audit_log.extend(
+                    {
+                        "task": name,
+                        "rep": rep,
+                        "ordinal": ordinal,
+                        "receipt_sha256": digest,
+                        "cache_hit": True,
+                    }
+                    for ordinal, digest in enumerate(cached.call_receipts)
+                )
+            else:
+                audit_log.extend(
+                    {"task": name, "rep": rep, "cache_hit": True, **call}
+                    for call in cached.legacy_calls
+                )
+        return cached.records
     cell_audits: list[dict[str, Any]] = []
+    cell_receipts: list[str] = []
     with tempfile.TemporaryDirectory(prefix="lha_abl_") as tmp:
         scratch = Path(tmp)
         try:
@@ -1786,12 +2808,41 @@ def _run_cell(
                 scorer_image_id,
                 cell_audits,
             )
+            if require_call_receipts:
+                cell_receipts = _materialize_call_receipts(
+                    cell_audits,
+                    task=name,
+                    rep=rep,
+                    cell_fingerprint=fingerprint,
+                    input_snapshot_sha256=input_snapshot_sha256,
+                    directory=receipt_dir,
+                )
+                decoded_receipts = [
+                    _read_llm_call_receipt(
+                        receipt_dir / f"{digest}.json",
+                        digest,
+                        expected_binding={
+                            "task": name,
+                            "rep": rep,
+                            "ordinal": ordinal,
+                            "cell_fingerprint": fingerprint,
+                            "input_snapshot_sha256": input_snapshot_sha256,
+                        },
+                    )
+                    for ordinal, digest in enumerate(cell_receipts)
+                ]
+                verify = next(record for record in records if record.condition == "verify")
+                _validate_cell_call_sequence(
+                    decoded_receipts,
+                    repairs=verify.repairs,
+                    max_outer_attempts=_LLM_RETRIES,
+                    max_inner_attempts=max_inner_attempts,
+                )
         except _Transient as e:
             logger.error("transient failure on %s rep %d: %s — not caching", name, rep, e)
-            if audit_log is not None:
+            if audit_log is not None and not require_call_receipts:
                 audit_log.extend(
-                    {"task": name, "rep": rep, "cache_hit": False, **call}
-                    for call in cell_audits
+                    {"task": name, "rep": rep, "cache_hit": False, **call} for call in cell_audits
                 )
             return error_records(f"transient cell failure: {type(e).__name__}")
         except Exception as error:
@@ -1805,19 +2856,27 @@ def _run_cell(
                 type(error).__name__,
                 exc_info=True,
             )
-            if audit_log is not None:
+            if audit_log is not None and not require_call_receipts:
                 audit_log.extend(
-                    {"task": name, "rep": rep, "cache_hit": False, **call}
-                    for call in cell_audits
+                    {"task": name, "rep": rep, "cache_hit": False, **call} for call in cell_audits
                 )
-            return error_records(
-                f"cell infrastructure failure: {type(error).__name__}"
-            )
+            return error_records(f"cell infrastructure failure: {type(error).__name__}")
     if audit_log is not None:
-        audit_log.extend(
-            {"task": name, "rep": rep, "cache_hit": False, **call}
-            for call in cell_audits
-        )
+        if require_call_receipts:
+            audit_log.extend(
+                {
+                    "task": name,
+                    "rep": rep,
+                    "ordinal": ordinal,
+                    "receipt_sha256": digest,
+                    "cache_hit": False,
+                }
+                for ordinal, digest in enumerate(cell_receipts)
+            )
+        else:
+            audit_log.extend(
+                {"task": name, "rep": rep, "cache_hit": False, **call} for call in cell_audits
+            )
     if any(record.status == "ERROR" for record in records):
         return records
     if not snapshot_matches():
@@ -1830,7 +2889,11 @@ def _run_cell(
                     "schema_version": _CACHE_SCHEMA,
                     "fingerprint": fingerprint,
                     "records": [asdict(r) for r in records],
-                    "llm_calls": cell_audits,
+                    **(
+                        {"llm_call_receipts": cell_receipts}
+                        if require_call_receipts
+                        else {"llm_calls": cell_audits}
+                    ),
                 },
                 indent=2,
             ),
@@ -1967,9 +3030,7 @@ def _client_runtime(
     actual_model = getattr(client, "model", model)
     if actual_model is not None and not isinstance(actual_model, str):
         actual_model = str(actual_model)
-    reasoning_effort = getattr(
-        client, "reasoning_effort", getattr(client, "effort", None)
-    )
+    reasoning_effort = getattr(client, "reasoning_effort", getattr(client, "effort", None))
     if reasoning_effort is not None and not isinstance(reasoning_effort, str):
         reasoning_effort = str(reasoning_effort)
     safe_configuration: dict[str, Any] = {}
@@ -1977,6 +3038,9 @@ def _client_runtime(
         "timeout",
         "no_tools",
         "sandbox_mode",
+        "permission_model",
+        "permission_profile",
+        "credential_barrier",
         "externally_sandboxed",
         "max_retries",
         "retry_backoff_s",
@@ -1998,13 +3062,28 @@ def _client_runtime(
         "client_source_sha256": client_source_sha256,
         "model": actual_model,
         "cli_version": _cli_version(llm, client, cli_path),
-        "backend_library_version": (
-            _package_version("anthropic") if llm == "anthropic" else None
-        ),
+        "backend_library_version": (_package_version("anthropic") if llm == "anthropic" else None),
         "reasoning_effort": reasoning_effort,
         "backend_details": backend_details or None,
         "configuration": safe_configuration,
     }
+
+
+def _bind_client_operation_lease(
+    client: LLMClient,
+    run_dir: Path,
+) -> bool:
+    """Bind the first lease-aware client in a wrapper chain to this run."""
+    current: Any = client
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        setter = getattr(current, "set_operation_lease_dir", None)
+        if callable(setter):
+            setter(run_dir)
+            return True
+        current = getattr(current, "inner", None)
+    return False
 
 
 def _execution_runtime(
@@ -2013,6 +3092,7 @@ def _execution_runtime(
     requested: str,
     requested_image: str | None = None,
     pinned_image_id: str | None = None,
+    control_executable: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     image = getattr(backend, "image", None)
     return {
@@ -2024,7 +3104,65 @@ def _execution_runtime(
         else (image if isinstance(image, str) and image else None),
         "execution_image": image if isinstance(image, str) and image else None,
         "image_id": pinned_image_id,
+        "control_executable": dict(control_executable or {}),
     }
+
+
+def _operation_lease_directories_are_empty(run_dir: Path) -> None:
+    """Reject any lease or cidfile residue, including ignored temporary entries."""
+    for name in ("active-operations", "active-container-ids"):
+        directory = run_dir / name
+        if not directory.exists() and not directory.is_symlink():
+            continue
+        if directory.is_symlink() or not directory.is_dir():
+            raise RuntimeError(f"Docker operation store is unsafe: {directory}")
+        if any(directory.iterdir()):
+            raise RuntimeError(f"Docker operation store still contains entries: {directory}")
+
+
+def _assert_no_lha_containers(docker: str) -> None:
+    """Confirm the daemon has no container carrying LHA's ownership label."""
+    if not Path(docker).is_absolute():
+        raise RuntimeError("Docker container audit requires an absolute executable")
+    result = run(
+        [
+            docker,
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            "label=lha.operation_id",
+        ],
+        timeout=30,
+        env=_docker_control_env(),
+    )
+    if result.returncode != 0 or result.output_truncated or result.cleanup_unconfirmed:
+        raise RuntimeError("Docker daemon could not confirm absence of LHA-owned containers")
+    if result.stdout.strip():
+        raise RuntimeError("Docker daemon still has LHA-owned containers")
+
+
+def _recover_docker_operations(
+    backend: DockerBackend,
+    run_dir: Path,
+    *,
+    allow_recovered: bool,
+) -> int:
+    """Reap crash residue and prove the formal output owns no live container."""
+    recovery = backend.recover_active_operations(run_dir)
+    if not recovery.confirmed:
+        raise RuntimeError(
+            "Docker operation recovery could not be confirmed"
+            + (f": {recovery.detail}" if recovery.detail else "")
+        )
+    _operation_lease_directories_are_empty(run_dir)
+    _assert_no_lha_containers(backend.docker)
+    recovered = len(recovery.recovered_operation_ids)
+    if recovered and not allow_recovered:
+        raise RuntimeError("Docker operations remained active after the formal ablation")
+    return recovered
 
 
 def _read_condition_stats(raw: dict[str, Any]) -> ConditionStats:
@@ -2043,9 +3181,7 @@ def _ablation_report_from_raw(raw: dict[str, Any]) -> AblationReport:
     raw_schema = raw.get("schema_version", 1)
     schema_version = raw_schema if type(raw_schema) is int else 1
     provenance_raw = raw.get("provenance")
-    provenance = (
-        AblationProvenance(**provenance_raw) if isinstance(provenance_raw, dict) else None
-    )
+    provenance = AblationProvenance(**provenance_raw) if isinstance(provenance_raw, dict) else None
     return AblationReport(
         llm=str(raw.get("llm", "unknown")),
         model=str(raw.get("model", "")),
@@ -2062,17 +3198,13 @@ def _ablation_report_from_raw(raw: dict[str, Any]) -> AblationReport:
         backend_version=str(raw.get("backend_version", "")),
         schema_version=schema_version,
         provenance=provenance,
-        llm_calls=[
-            call for call in raw.get("llm_calls", []) if isinstance(call, dict)
-        ],
+        llm_calls=[call for call in raw.get("llm_calls", []) if isinstance(call, dict)],
     )
 
 
 def load_ablation_report(path: str | Path) -> AblationReport:
     """Read a bounded, stable historical or current ablation report."""
-    raw = json.loads(
-        _read_bounded_text(Path(path), max_bytes=_MAX_REPORT_BYTES)
-    )
+    raw = json.loads(_read_bounded_text(Path(path), max_bytes=_MAX_REPORT_BYTES))
     if not isinstance(raw, dict):
         raise ValueError("ablation report must contain a JSON object")
     return _ablation_report_from_raw(raw)
@@ -2103,8 +3235,12 @@ def run_ablation(
     if llm == "claude_cli" or rejects_formal_evidence:
         raise ValueError(
             "claude_cli is experimental and cannot produce ablation evidence; "
-            "use the hardened codex_cli backend"
+            "use codex_cli with protocol validation"
         )
+    formal_corpus = _prepare_formal_corpus_binding(
+        task_paths,
+        repetitions=reps,
+    )
     out = Path(out_dir) if out_dir else (Path(base.runs_dir) / "ablation")
     out.mkdir(parents=True, exist_ok=True)
     # The backend's own env vars apply here exactly as in `lha run`; an explicit
@@ -2115,44 +3251,119 @@ def run_ablation(
     else:
         model = model or (base.claude_cli_model or None)
         cli_path, effort = base.claude_cli_path, "medium"
+    if formal_corpus is not None and (
+        llm != "codex_cli" or scorer_backend != "docker" or not isinstance(model, str) or not model
+    ):
+        raise ValueError(
+            "formal ablation requires Codex CLI, an explicit model, and Docker scoring"
+        )
     requested_docker_image: str | None = None
     pinned_scorer_image_id: str | None = None
+    docker_executable: dict[str, Any] = {}
     if scorer_backend == "docker":
         requested_docker_image = base.exec_image
+        docker_identity = resolve_docker_executable()
+        docker_executable = docker_identity.as_provenance()
         # Resolve the mutable tag before constructing the model client or
         # running any cell. Both prediction and truth execute the same immutable
         # image bytes even if the tag moves during a long experiment.
-        pinned_scorer_image_id = _resolve_docker_image_id(requested_docker_image)
+        pinned_scorer_image_id = _inspect_docker_image_id(
+            requested_docker_image,
+            docker=docker_identity.path,
+        )
     client = llm_client or _make_llm(llm, model, cli_path=cli_path, effort=effort)
-    # Pin whatever the backend can say about itself (CLI version, reasoning
-    # effort) into the fingerprint, so an upgrade or a settings change re-samples
-    # instead of quietly mixing generations of results.
-    backend_version = ""
-    probe = getattr(client, "backend_provenance", None)
-    if callable(probe):
-        try:
-            backend_version = str(probe())
-        except Exception:  # a probe failure must not stop the experiment
-            logger.warning("could not read the backend provenance", exc_info=True)
+    codex_operation_lease_bound = _bind_client_operation_lease(client, out)
+    if formal_corpus is not None and not codex_operation_lease_bound:
+        raise RuntimeError("formal ablation requires Codex processes to use the output lease store")
     # Prediction and truth use separate backend instances, but the same
     # isolation class. Selecting Docker must never execute model-influenced code
     # in a host-side gate before the container scorer runs.
+    docker_operations_recovered_before_run = 0
     if scorer_backend == "docker":
         if pinned_scorer_image_id is None:  # defensive; resolution above is fail-closed
             raise RuntimeError("Docker scorer image was not pinned")
-        agent_exec = make_backend("docker", image=pinned_scorer_image_id)
-        scorer = make_backend("docker", image=pinned_scorer_image_id)
+        docker_path = docker_executable.get("path")
+        if not isinstance(docker_path, str) or not Path(docker_path).is_absolute():
+            raise RuntimeError("Docker executable identity is incomplete")
+        agent_exec = make_backend(
+            "docker",
+            image=pinned_scorer_image_id,
+            docker=docker_path,
+            operation_lease_dir=out,
+        )
+        scorer = make_backend(
+            "docker",
+            image=pinned_scorer_image_id,
+            docker=docker_path,
+            operation_lease_dir=out,
+        )
         if any(
             getattr(backend, "name", None) != "docker"
             or getattr(backend, "image", None) != pinned_scorer_image_id
             for backend in (agent_exec, scorer)
         ):
             raise RuntimeError("Docker execution backends did not retain the pinned image ID")
+        for backend in (agent_exec, scorer):
+            bind_control_plane = getattr(backend, "bind_control_plane", None)
+            if not callable(bind_control_plane):
+                if formal_corpus is not None:
+                    raise RuntimeError(
+                        "formal ablation Docker backend cannot bind its control executable"
+                    )
+                continue
+            if bind_control_plane(verify_digest=True) != docker_executable:
+                raise RuntimeError("Docker execution backend disagrees with the bound executable")
+        if formal_corpus is not None:
+            if not isinstance(agent_exec, DockerBackend) or not isinstance(
+                scorer,
+                DockerBackend,
+            ):
+                raise RuntimeError("formal ablation requires the built-in Docker backend")
+            if (
+                agent_exec.operation_lease_dir != out.resolve()
+                or scorer.operation_lease_dir != out.resolve()
+            ):
+                raise RuntimeError("formal Docker backends do not share the output lease store")
+            docker_operations_recovered_before_run = _recover_docker_operations(
+                agent_exec,
+                out,
+                allow_recovered=True,
+            )
         agent_requested = "docker"
     else:
         agent_exec = TrustedLocalBackend()
         scorer = make_backend(scorer_backend)
         agent_requested = "trusted-local"
+    docker_image_probe: dict[str, Any] | None = None
+    if scorer_backend == "docker":
+        if pinned_scorer_image_id is None:
+            raise RuntimeError("Docker scorer image was not pinned")
+        docker_image_probe = _probe_docker_image(
+            agent_exec,
+            image_id=pinned_scorer_image_id,
+            workdir=out,
+        )
+    preflight = getattr(client, "preflight", None)
+    if callable(preflight):
+        # The shared operation store is recovered first. Preflight then proves
+        # CLI setup and credential cleanup without spending a model call.
+        preflight()
+    require_call_receipts = getattr(client, "name", type(client).__name__) == "codex_cli"
+    measurement_client: LLMClient = _PromptAuditClient(client) if require_call_receipts else client
+    configured_inner_retries = getattr(client, "max_retries", 0)
+    max_inner_attempts = (
+        configured_inner_retries + 1 if _nonnegative_int(configured_inner_retries) else 1
+    )
+    # Pin whatever the backend can say about itself (CLI version, reasoning
+    # effort) into the fingerprint, so an upgrade or a settings change re-samples
+    # instead of quietly mixing generations of results.
+    backend_version = ""
+    client_provenance = getattr(client, "backend_provenance", None)
+    if callable(client_provenance):
+        try:
+            backend_version = str(client_provenance())
+        except Exception:  # a probe failure must not stop the experiment
+            logger.warning("could not read the backend provenance", exc_info=True)
     source_files = _source_file_digests()
     source_tree_sha256 = _source_tree_digest(source_files)
     llm_runtime = _client_runtime(
@@ -2167,12 +3378,14 @@ def run_ablation(
         requested=agent_requested,
         requested_image=requested_docker_image,
         pinned_image_id=pinned_scorer_image_id,
+        control_executable=docker_executable,
     )
     scorer_runtime = _execution_runtime(
         scorer,
         requested=scorer_backend,
         requested_image=requested_docker_image,
         pinned_image_id=pinned_scorer_image_id,
+        control_executable=docker_executable,
     )
     runtime_packages = {
         name: _package_version(name)
@@ -2182,9 +3395,11 @@ def run_ablation(
         "llm": llm_runtime,
         "agent": agent_runtime,
         "scorer": scorer_runtime,
+        "formal_git": (formal_corpus.git_executable if formal_corpus is not None else None),
         "platform": platform.platform(),
         "python_version": platform.python_version(),
         "packages": runtime_packages,
+        "docker_image_probe": docker_image_probe,
     }
 
     tasks: list[tuple[str, TaskSpec, Path, str]] = []
@@ -2247,7 +3462,7 @@ def run_ablation(
             logger.info("ablation %d/%d: %s (rep %d)", i, total, name, rep)
             records.extend(
                 _run_cell(
-                    client,
+                    measurement_client,
                     source,
                     spec,
                     rep,
@@ -2260,6 +3475,8 @@ def run_ablation(
                     str(scorer_runtime["actual"]),
                     pinned_scorer_image_id,
                     llm_calls,
+                    require_call_receipts,
+                    max_inner_attempts,
                 )
             )
 
@@ -2270,7 +3487,42 @@ def run_ablation(
             "refusing to publish a mixed-implementation report"
         )
 
-    git_commit, git_dirty = _git_provenance()
+    git_executable: dict[str, Any] = {}
+    if formal_corpus is not None:
+        git_executable = _trusted_control_executable(
+            "git",
+            executable=str(formal_corpus.git_executable["path"]),
+        )
+        if git_executable != formal_corpus.git_executable:
+            raise RuntimeError("Git executable changed during the formal ablation")
+        git_commit, git_dirty = _git_provenance(str(git_executable["path"]))
+        if git_commit != formal_corpus.preregistration_commit or git_dirty is not False:
+            raise RuntimeError("Git state changed during the formal ablation; refusing its report")
+    else:
+        try:
+            git_executable = _trusted_control_executable("git")
+        except (OSError, RuntimeError, ValueError):
+            git_executable = {}
+        git_commit, git_dirty = _git_provenance(
+            str(git_executable["path"]) if git_executable else None
+        )
+    if docker_executable:
+        current_docker = resolve_docker_executable(str(docker_executable["path"])).as_provenance()
+        if current_docker != docker_executable:
+            raise RuntimeError("Docker executable changed during the ablation")
+        for backend in (agent_exec, scorer):
+            bind_control_plane = getattr(backend, "bind_control_plane", None)
+            if callable(bind_control_plane) and (
+                bind_control_plane(verify_digest=True) != docker_executable
+            ):
+                raise RuntimeError("Docker backend executable changed during the ablation")
+        if formal_corpus is not None:
+            assert isinstance(agent_exec, DockerBackend)
+            _recover_docker_operations(
+                agent_exec,
+                out,
+                allow_recovered=False,
+            )
     configuration: dict[str, Any] = {
         "repetitions": reps,
         "task_count": len(tasks),
@@ -2283,8 +3535,21 @@ def run_ablation(
         "frozen_artifact_schema": _FROZEN_ARTIFACT_SCHEMA,
         "input_snapshot_schema": _INPUT_SNAPSHOT_SCHEMA,
         "scorer_evidence_schema": _SCORER_EVIDENCE_SCHEMA,
+        "llm_call_receipt_schema": _LLM_CALL_RECEIPT_SCHEMA,
+        "codex_operation_lease_store": ("." if codex_operation_lease_bound else None),
+        "docker_operation_lease_store": ("." if scorer_backend == "docker" else None),
+        "docker_container_absence_filter": (
+            "label=lha.operation_id" if scorer_backend == "docker" else None
+        ),
+        "docker_operations_recovered_before_run": (docker_operations_recovered_before_run),
+        "docker_operations_recovered_at_completion": 0,
+        "run_control_executables": {
+            "git": git_executable,
+            "docker": docker_executable,
+        },
         "scorer_isolated_interpreter": True,
         "scorer_result_source": "nonce-bound-pytest-hook-receipt",
+        "docker_image_probe": docker_image_probe,
         "client": llm_runtime["configuration"],
     }
     provenance = AblationProvenance(
@@ -2298,9 +3563,7 @@ def run_ablation(
         actual_llm_backend=str(llm_runtime["actual_backend"]),
         model=llm_runtime["model"] if isinstance(llm_runtime["model"], str) else None,
         cli_version=(
-            llm_runtime["cli_version"]
-            if isinstance(llm_runtime["cli_version"], str)
-            else None
+            llm_runtime["cli_version"] if isinstance(llm_runtime["cli_version"], str) else None
         ),
         backend_library_version=(
             llm_runtime["backend_library_version"]
@@ -2320,9 +3583,7 @@ def run_ablation(
             scorer_runtime["image"] if isinstance(scorer_runtime["image"], str) else None
         ),
         scorer_image_id=(
-            scorer_runtime["image_id"]
-            if isinstance(scorer_runtime["image_id"], str)
-            else None
+            scorer_runtime["image_id"] if isinstance(scorer_runtime["image_id"], str) else None
         ),
         platform=platform.platform(),
         python_version=platform.python_version(),
@@ -2334,17 +3595,15 @@ def run_ablation(
         task_files_sha256=task_files_sha256,
         corpus_sha256=corpus_sha256,
         input_snapshot_sha256=input_snapshot_sha256,
+        cell_fingerprints={name: fingerprint for name, _spec, _source, fingerprint in tasks},
+        formal_corpus_manifest_path=(formal_corpus.path if formal_corpus is not None else None),
+        formal_corpus_manifest_sha256=(formal_corpus.sha256 if formal_corpus is not None else None),
+        preregistration_commit=(
+            formal_corpus.preregistration_commit if formal_corpus is not None else None
+        ),
+        git_executable=git_executable,
+        docker_executable=docker_executable,
         configuration=configuration,
-    )
-    combined = _canonical_digest(
-        {
-            "report_schema": _REPORT_SCHEMA,
-            "task_fingerprints": {name: fingerprint for name, _, _, fingerprint in tasks},
-            "configuration": configuration,
-            "runtime": runtime_fingerprint,
-            "source_tree_sha256": source_tree_sha256,
-            "git": {"commit": git_commit, "dirty": git_dirty},
-        }
     )
     report = AblationReport(
         llm=llm,
@@ -2354,17 +3613,13 @@ def run_ablation(
         records=records,
         stats=_aggregate(records),
         scorer=scorer.name,
-        fingerprint=combined,
+        fingerprint="",
         backend_version=backend_version,
         provenance=provenance,
         llm_calls=llm_calls,
     )
     artifact_digests = sorted(
-        {
-            record.artifact_sha256
-            for record in report.records
-            if record.artifact_sha256
-        }
+        {record.artifact_sha256 for record in report.records if record.artifact_sha256}
     )
     scorer_evidence_digests = sorted(
         {
@@ -2373,38 +3628,50 @@ def run_ablation(
             if record.scorer_evidence_sha256
         }
     )
+    report_raw: dict[str, Any] = {
+        "schema_version": report.schema_version,
+        "llm": report.llm,
+        "model": report.model,
+        "reps": report.reps,
+        "tasks": report.tasks,
+        "scorer": report.scorer,
+        "fingerprint": "",
+        "backend_version": report.backend_version,
+        "harness_version": __version__,
+        "provenance": asdict(provenance),
+        "artifact_store": {
+            "schema_version": _FROZEN_ARTIFACT_SCHEMA,
+            "path": "artifacts",
+            "encoding": "canonical-json",
+            "count": len(artifact_digests),
+        },
+        "scorer_evidence_store": {
+            "schema_version": _SCORER_EVIDENCE_SCHEMA,
+            "path": "scorer_evidence",
+            "encoding": "canonical-json",
+            "count": len(scorer_evidence_digests),
+        },
+        "llm_calls": report.llm_calls,
+        "stats": [asdict(s) for s in report.stats],
+        "records": [asdict(r) for r in report.records],
+    }
+    if require_call_receipts:
+        receipt_digests = {
+            call["receipt_sha256"]
+            for call in report.llm_calls
+            if isinstance(call.get("receipt_sha256"), str)
+        }
+        report_raw["llm_call_receipt_store"] = {
+            "schema_version": _LLM_CALL_RECEIPT_SCHEMA,
+            "path": "llm_call_receipts",
+            "encoding": "canonical-json",
+            "count": len(receipt_digests),
+        }
+    report.fingerprint = _report_fingerprint(report_raw)
+    report_raw["fingerprint"] = report.fingerprint
     _atomic_write(
         out / "ablation_report.json",
-        json.dumps(
-            {
-                "schema_version": report.schema_version,
-                "llm": report.llm,
-                "model": report.model,
-                "reps": report.reps,
-                "tasks": report.tasks,
-                "scorer": report.scorer,
-                "fingerprint": report.fingerprint,
-                "backend_version": report.backend_version,
-                "harness_version": __version__,
-                "provenance": asdict(provenance),
-                "artifact_store": {
-                    "schema_version": _FROZEN_ARTIFACT_SCHEMA,
-                    "path": "artifacts",
-                    "encoding": "canonical-json",
-                    "count": len(artifact_digests),
-                },
-                "scorer_evidence_store": {
-                    "schema_version": _SCORER_EVIDENCE_SCHEMA,
-                    "path": "scorer_evidence",
-                    "encoding": "canonical-json",
-                    "count": len(scorer_evidence_digests),
-                },
-                "llm_calls": report.llm_calls,
-                "stats": [asdict(s) for s in report.stats],
-                "records": [asdict(r) for r in report.records],
-            },
-            indent=2,
-        ),
+        json.dumps(report_raw, indent=2),
     )
     _atomic_write(out / "ablation_report.md", report.to_markdown())
     return report

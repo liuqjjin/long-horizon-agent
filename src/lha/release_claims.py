@@ -16,13 +16,21 @@ import hashlib
 import json
 import math
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
 from .ablation import (
+    _FORMAL_CORPUS_MANIFEST_PATH,
+    _FORMAL_REPETITIONS,
+    _FORMAL_TASK_COUNT,
+    _LLM_CALL_RECEIPT_SCHEMA,
+    _LLM_RETRIES,
     _MAX_ARTIFACT_BYTES,
+    _MAX_FORMAL_MANIFEST_BYTES,
+    _MAX_REPAIRS,
     _MAX_REPORT_BYTES,
     _MAX_SCORER_EVIDENCE_BYTES,
     _MAX_TASK_BYTES,
@@ -33,14 +41,20 @@ from .ablation import (
     ScorerEvidenceBinding,
     _ablation_report_from_raw,
     _frozen_artifact_bytes,
+    _git_control_env,
     _input_snapshot_digest,
+    _load_formal_corpus_manifest,
     _read_bounded_bytes,
     _read_bounded_text,
+    _read_llm_call_receipt,
     _record_from_raw,
     _repo_digest,
+    _report_fingerprint,
     _scorer_evidence_bytes,
     _source_file_digests,
     _source_tree_digest,
+    _trusted_control_executable,
+    _validate_cell_call_sequence,
     _validate_scorer_evidence,
 )
 from .bench.stats import mcnemar_exact, wilson_interval
@@ -108,9 +122,7 @@ def _fail(message: str) -> NoReturn:
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(
-            _read_bounded_text(path, max_bytes=_MAX_REPORT_BYTES)
-        )
+        value = json.loads(_read_bounded_text(path, max_bytes=_MAX_REPORT_BYTES))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         _fail(f"cannot read {path}: {exc}")
     if not isinstance(value, dict):
@@ -126,8 +138,10 @@ def _read_text(path: Path) -> str:
 
 
 def _is_close(left: Any, right: float) -> bool:
-    return isinstance(left, (int, float)) and not isinstance(left, bool) and math.isclose(
-        float(left), right, rel_tol=1e-12, abs_tol=1e-12
+    return (
+        isinstance(left, (int, float))
+        and not isinstance(left, bool)
+        and math.isclose(float(left), right, rel_tol=1e-12, abs_tol=1e-12)
     )
 
 
@@ -197,9 +211,7 @@ def _validate_record_grid(raw: dict[str, Any]) -> tuple[list[str], int, tuple[Ru
         claimed = _record_bool(record_raw, "claimed_success")
         true_success = _record_bool(record_raw, "true_success")
         artifact_correct = (
-            _record_bool(record_raw, "artifact_correct")
-            if schema_version >= 4
-            else true_success
+            _record_bool(record_raw, "artifact_correct") if schema_version >= 4 else true_success
         )
         false_success = _record_bool(record_raw, "false_success")
         if false_success != (claimed and not artifact_correct):
@@ -211,11 +223,7 @@ def _validate_record_grid(raw: dict[str, Any]) -> tuple[list[str], int, tuple[Ru
             expected_outcome = (
                 ScoreOutcome.INFRA_ERROR.value
                 if status == "ERROR"
-                else (
-                    ScoreOutcome.PASS.value
-                    if artifact_correct
-                    else ScoreOutcome.TEST_FAIL.value
-                )
+                else (ScoreOutcome.PASS.value if artifact_correct else ScoreOutcome.TEST_FAIL.value)
             )
             if scorer_outcome != expected_outcome:
                 _fail(f"ablation scorer_outcome is inconsistent for {key!r}")
@@ -255,12 +263,10 @@ def _validate_record_artifacts(records: tuple[RunRecord, ...]) -> None:
                 "formal ablation record has an invalid artifact_sha256 "
                 f"for {(record.task, record.condition, record.rep)!r}"
             )
-        by_cell.setdefault((record.task, record.rep), {})[
-            record.condition
-        ] = record.artifact_sha256
-        evidence_by_cell.setdefault((record.task, record.rep), {})[
-            record.condition
-        ] = record.scorer_evidence_sha256
+        by_cell.setdefault((record.task, record.rep), {})[record.condition] = record.artifact_sha256
+        evidence_by_cell.setdefault((record.task, record.rep), {})[record.condition] = (
+            record.scorer_evidence_sha256
+        )
     for key, conditions in by_cell.items():
         if conditions["trust"] != conditions["gate"]:
             _fail(
@@ -334,9 +340,7 @@ def _validate_scorer_evidence_store(
     report_dir: Path,
 ) -> None:
     expected_digests = {
-        record.scorer_evidence_sha256
-        for record in records
-        if record.status != "ERROR"
+        record.scorer_evidence_sha256 for record in records if record.status != "ERROR"
     }
     expected_store = {
         "schema_version": 2,
@@ -377,11 +381,7 @@ def _validate_scorer_evidence_store(
     snapshots = provenance.get("input_snapshot_sha256")
     scorer_backend = provenance.get("scorer_backend")
     scorer_image_id = provenance.get("scorer_image_id")
-    if (
-        not isinstance(snapshots, dict)
-        or not isinstance(scorer_backend, str)
-        or not scorer_backend
-    ):
+    if not isinstance(snapshots, dict) or not isinstance(scorer_backend, str) or not scorer_backend:
         _fail("schema-4 scorer evidence has invalid provenance bindings")
     for record in records:
         if record.status == "ERROR":
@@ -439,15 +439,12 @@ def _boundary_interval_problem(
     expected = wilson_interval(successes, total)
     if not all(_is_close(actual, wanted) for actual, wanted in zip(interval, expected)):
         return (
-            f"{stat.get('condition')} {interval_name} must use Wilson "
-            f"{expected}, got {interval!r}"
+            f"{stat.get('condition')} {interval_name} must use Wilson {expected}, got {interval!r}"
         )
     return None
 
 
-def _validate_condition_stats(
-    raw: dict[str, Any], records: tuple[RunRecord, ...]
-) -> list[str]:
+def _validate_condition_stats(raw: dict[str, Any], records: tuple[RunRecord, ...]) -> list[str]:
     schema_version = raw.get("schema_version", 1)
     current_schema = isinstance(schema_version, int) and schema_version >= 4
     stats_raw = raw.get("stats")
@@ -511,8 +508,7 @@ def _validate_condition_stats(
                     for record in predictions
                 ),
                 "fn": sum(
-                    not record.gate_prediction and record.artifact_correct
-                    for record in predictions
+                    not record.gate_prediction and record.artifact_correct for record in predictions
                 ),
             }
             for field, expected in confusion.items():
@@ -532,17 +528,13 @@ def _validate_condition_stats(
             )
         )
         for field, successes in rate_fields:
-            problem = _boundary_interval_problem(
-                stat, field=field, successes=successes, total=n
-            )
+            problem = _boundary_interval_problem(stat, field=field, successes=successes, total=n)
             if problem:
                 boundary_problems.append(problem)
     return boundary_problems
 
 
-def _paired_p(
-    records: tuple[RunRecord, ...], left: str, right: str, metric: str
-) -> float:
+def _paired_p(records: tuple[RunRecord, ...], left: str, right: str, metric: str) -> float:
     def outcomes(condition: str) -> dict[tuple[str, int], bool]:
         return {
             (record.task, record.rep): bool(getattr(record, metric))
@@ -577,6 +569,316 @@ def _repo_evidence_path(repo_root: Path, value: Any, *, label: str) -> Path:
     return path
 
 
+def _git_bytes(
+    repository_root: Path,
+    arguments: list[str],
+    *,
+    git_executable: str,
+    timeout: float = 15,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            [git_executable, *arguments],
+            cwd=repository_root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            env=_git_control_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        _fail(f"cannot inspect formal ablation Git evidence: {type(error).__name__}")
+
+
+def _git_success(
+    repository_root: Path,
+    arguments: list[str],
+    *,
+    git_executable: str,
+    label: str,
+) -> bytes:
+    result = _git_bytes(
+        repository_root,
+        arguments,
+        git_executable=git_executable,
+    )
+    if result.returncode != 0:
+        _fail(f"formal ablation Git evidence failed {label}")
+    return result.stdout
+
+
+def _recorded_control_executable(
+    provenance: dict[str, Any],
+    field: str,
+    *,
+    require_trusted_install: bool,
+) -> dict[str, Any]:
+    raw = provenance.get(field)
+    required = {"path", "sha256", "size_bytes", "trusted_install"}
+    expected_name = {
+        "git_executable": "git",
+        "docker_executable": "docker",
+    }.get(field)
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != required
+        or not isinstance(raw.get("path"), str)
+        or not Path(raw["path"]).is_absolute()
+        or (expected_name is not None and Path(raw["path"]).name != expected_name)
+        or not isinstance(raw.get("sha256"), str)
+        or _HEX_64.fullmatch(raw["sha256"]) is None
+        or not isinstance(raw.get("size_bytes"), int)
+        or isinstance(raw.get("size_bytes"), bool)
+        or raw["size_bytes"] <= 0
+        or type(raw.get("trusted_install")) is not bool
+        or (require_trusted_install and raw["trusted_install"] is not True)
+    ):
+        _fail(f"formal ablation provenance has an invalid {field} identity")
+    return cast(dict[str, Any], raw)
+
+
+def _validate_git_executable_provenance(provenance: dict[str, Any]) -> str:
+    """Validate historical identity, then choose this host's trusted Git for checks."""
+    _recorded_control_executable(
+        provenance,
+        "git_executable",
+        require_trusted_install=True,
+    )
+    try:
+        current = _trusted_control_executable("git")
+    except (OSError, RuntimeError, ValueError) as error:
+        _fail(
+            "a trusted local Git executable is required to validate commit evidence: "
+            f"{type(error).__name__}"
+        )
+    return cast(str, current["path"])
+
+
+def _validate_docker_executable_provenance(
+    provenance: dict[str, Any],
+) -> None:
+    """Validate portable run provenance without requiring Docker on the reader host."""
+    _recorded_control_executable(
+        provenance,
+        "docker_executable",
+        require_trusted_install=False,
+    )
+
+
+def _validate_docker_image_probe(
+    provenance: dict[str, Any],
+    configuration: dict[str, Any],
+) -> None:
+    probe = configuration.get("docker_image_probe")
+    required = {
+        "schema_version",
+        "image_id",
+        "network",
+        "minimal_pytest",
+        "python_version",
+        "pytest_version",
+        "pytest_json_report_version",
+    }
+    if (
+        not isinstance(probe, dict)
+        or set(probe) != required
+        or probe.get("schema_version") != 1
+        or probe.get("image_id") != provenance.get("scorer_image_id")
+        or probe.get("network") != "none"
+        or probe.get("minimal_pytest") != "passed"
+        or any(
+            not isinstance(probe.get(field), str) or not probe[field]
+            for field in (
+                "python_version",
+                "pytest_version",
+                "pytest_json_report_version",
+            )
+        )
+    ):
+        _fail("formal ablation has no valid pinned Docker image capability probe")
+
+
+def _validate_operation_lease_store(
+    report_dir: Path,
+    configuration: dict[str, Any],
+) -> None:
+    if (
+        configuration.get("codex_operation_lease_store") != "."
+        or configuration.get("docker_operation_lease_store") != "."
+        or configuration.get("docker_container_absence_filter") != "label=lha.operation_id"
+        or not isinstance(
+            configuration.get("docker_operations_recovered_before_run"),
+            int,
+        )
+        or isinstance(
+            configuration.get("docker_operations_recovered_before_run"),
+            bool,
+        )
+        or configuration["docker_operations_recovered_before_run"] < 0
+        or configuration.get("docker_operations_recovered_at_completion") != 0
+    ):
+        _fail("formal ablation has no complete operation-lease attestation")
+    for name in ("active-operations", "active-container-ids"):
+        directory = report_dir / name
+        if not directory.exists() and not directory.is_symlink():
+            continue
+        if directory.is_symlink() or not directory.is_dir():
+            _fail(f"formal ablation operation store is unsafe: {name}")
+        if any(directory.iterdir()):
+            _fail(f"formal ablation operation store is not empty: {name}")
+
+
+def _validate_formal_manifest_provenance(
+    raw: dict[str, Any],
+    tasks: list[str],
+    repo_root: Path,
+) -> None:
+    provenance = cast(dict[str, Any], raw["provenance"])
+    git_executable = _validate_git_executable_provenance(provenance)
+    manifest_relative = provenance.get("formal_corpus_manifest_path")
+    manifest_sha256 = provenance.get("formal_corpus_manifest_sha256")
+    preregistration_commit = provenance.get("preregistration_commit")
+    evaluated_commit = provenance.get("git_commit")
+    if (
+        manifest_relative != _FORMAL_CORPUS_MANIFEST_PATH.as_posix()
+        or not isinstance(manifest_sha256, str)
+        or _HEX_64.fullmatch(manifest_sha256) is None
+        or not isinstance(preregistration_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", preregistration_commit) is None
+        or not isinstance(evaluated_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", evaluated_commit) is None
+    ):
+        _fail("formal ablation has no valid preregistered corpus binding")
+    manifest_relative = cast(str, manifest_relative)
+    preregistration_commit = cast(str, preregistration_commit)
+    evaluated_commit = cast(str, evaluated_commit)
+    manifest_path = _repo_evidence_path(
+        repo_root,
+        manifest_relative,
+        label="formal corpus manifest",
+    )
+    try:
+        manifest, measured_manifest_sha256 = _load_formal_corpus_manifest(
+            manifest_path,
+            repo_root,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        _fail(f"formal corpus manifest is invalid: {error}")
+    if measured_manifest_sha256 != manifest_sha256:
+        _fail("formal corpus manifest digest disagrees with current bytes")
+    if [entry["name"] for entry in manifest["tasks"]] != tasks:
+        _fail("formal ablation tasks differ from the preregistered manifest")
+
+    status = _git_success(
+        repo_root,
+        ["status", "--porcelain=v1", "--untracked-files=normal"],
+        git_executable=git_executable,
+        label="worktree status",
+    )
+    if status:
+        _fail("formal ablation release validation requires a clean Git worktree")
+    head = (
+        _git_success(
+            repo_root,
+            ["rev-parse", "--verify", "HEAD"],
+            git_executable=git_executable,
+            label="HEAD resolution",
+        )
+        .decode("ascii", errors="strict")
+        .strip()
+    )
+    for commit, label in (
+        (manifest["corpus_commit"], "corpus commit"),
+        (preregistration_commit, "preregistration commit"),
+        (evaluated_commit, "evaluated commit"),
+    ):
+        _git_success(
+            repo_root,
+            ["cat-file", "-e", f"{commit}^{{commit}}"],
+            git_executable=git_executable,
+            label=label,
+        )
+    for earlier, later, label in (
+        (
+            manifest["corpus_commit"],
+            preregistration_commit,
+            "corpus/preregistration ancestry",
+        ),
+        (
+            preregistration_commit,
+            evaluated_commit,
+            "preregistration/evaluation ancestry",
+        ),
+        (evaluated_commit, head, "evaluation/HEAD ancestry"),
+    ):
+        _git_success(
+            repo_root,
+            ["merge-base", "--is-ancestor", earlier, later],
+            git_executable=git_executable,
+            label=label,
+        )
+
+    manifest_bytes = _git_success(
+        repo_root,
+        ["show", f"{preregistration_commit}:{manifest_relative}"],
+        git_executable=git_executable,
+        label="manifest blob",
+    )
+    if (
+        len(manifest_bytes) > _MAX_FORMAL_MANIFEST_BYTES
+        or hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256
+        or manifest_bytes
+        != _read_bounded_bytes(
+            manifest_path,
+            max_bytes=_MAX_FORMAL_MANIFEST_BYTES,
+        )
+    ):
+        _fail("formal corpus manifest was not fixed before model execution")
+
+    registered_inputs = [
+        str(value)
+        for entry in manifest["tasks"]
+        for value in (entry["task_path"], entry["corpus_path"])
+    ]
+    comparisons: tuple[tuple[str, str, list[str], str], ...] = (
+        (
+            str(manifest["corpus_commit"]),
+            evaluated_commit,
+            registered_inputs,
+            "registered task/corpus bytes",
+        ),
+        (
+            preregistration_commit,
+            head,
+            [manifest_relative],
+            "preregistered manifest bytes",
+        ),
+        (
+            evaluated_commit,
+            head,
+            ["src/lha", *registered_inputs],
+            "evaluated source and inputs",
+        ),
+    )
+    for left, right, paths, label in comparisons:
+        _git_success(
+            repo_root,
+            [
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--no-textconv",
+                left,
+                right,
+                "--",
+                *paths,
+            ],
+            git_executable=git_executable,
+            label=label,
+        )
+
+
 def _validate_provenance(
     raw: dict[str, Any],
     tasks: list[str],
@@ -606,6 +908,8 @@ def _validate_provenance(
             _fail(f"formal ablation provenance is missing {field!r}")
     if provenance.get("git_dirty") is not False:
         _fail("formal ablation provenance must come from a clean git worktree")
+    if re.fullmatch(r"[0-9a-f]{40}", provenance["git_commit"]) is None:
+        _fail("formal ablation provenance has an invalid git_commit")
     if provenance["model"] != raw.get("model"):
         _fail("formal ablation model differs from provenance")
     if provenance["requested_llm_backend"] != raw.get("llm"):
@@ -614,13 +918,14 @@ def _validate_provenance(
         provenance["requested_llm_backend"] != "codex_cli"
         or provenance["actual_llm_backend"] != "codex_cli"
     ):
-        _fail("formal ablation evidence requires the hardened Codex CLI backend")
+        _fail("formal ablation evidence requires Codex CLI protocol validation")
     if (
         provenance.get("agent_backend") != "docker"
         or provenance.get("scorer_requested") != "docker"
         or provenance.get("scorer_backend") != "docker"
     ):
         _fail("formal ablation evidence requires Docker for gate and independent scoring")
+    _validate_docker_executable_provenance(provenance)
     scorer_image_id = provenance.get("scorer_image_id")
     if (
         not isinstance(scorer_image_id, str)
@@ -651,6 +956,7 @@ def _validate_provenance(
         "task_files_sha256",
         "corpus_sha256",
         "input_snapshot_sha256",
+        "cell_fingerprints",
     ):
         values = provenance.get(field)
         if not isinstance(values, dict) or set(values) != set(tasks):
@@ -691,20 +997,186 @@ def _validate_provenance(
         "conditions": list(_CONDITION_NAMES),
     }
     if not isinstance(configuration, dict) or any(
-        configuration.get(field) != expected
-        for field, expected in expected_configuration.items()
+        configuration.get(field) != expected for field, expected in expected_configuration.items()
     ):
         _fail("formal ablation provenance configuration differs from the report")
+    _validate_docker_image_probe(provenance, configuration)
+    if configuration.get("run_control_executables") != {
+        "git": provenance.get("git_executable"),
+        "docker": provenance.get("docker_executable"),
+    }:
+        _fail("formal ablation control-executable provenance is not internally bound")
     required_protocol = {
+        "max_repairs": _MAX_REPAIRS,
+        "llm_retries": _LLM_RETRIES,
         "cache_schema": 7,
         "report_schema": 4,
         "frozen_artifact_schema": 1,
         "input_snapshot_schema": 1,
         "scorer_evidence_schema": 2,
+        "llm_call_receipt_schema": _LLM_CALL_RECEIPT_SCHEMA,
         "scorer_result_source": "nonce-bound-pytest-hook-receipt",
     }
     if any(configuration.get(field) != expected for field, expected in required_protocol.items()):
         _fail("formal ablation provenance does not use the schema-4 evidence protocol")
+    if any(
+        not isinstance(provenance["cell_fingerprints"][task], str)
+        or _HEX_64.fullmatch(provenance["cell_fingerprints"][task]) is None
+        for task in tasks
+    ):
+        _fail("formal ablation provenance has an invalid cell fingerprint")
+    _validate_formal_manifest_provenance(raw, tasks, repo_root)
+
+
+def _validate_llm_call_audits(
+    raw: dict[str, Any],
+    tasks: list[str],
+    reps: int,
+    report_dir: Path,
+) -> None:
+    """Load content-addressed receipts and bind every call to one measured cell."""
+    provenance = cast(dict[str, Any], raw["provenance"])
+    configuration = provenance.get("configuration")
+    client = configuration.get("client") if isinstance(configuration, dict) else None
+    required_client = {
+        "no_tools": True,
+        "sandbox_mode": "read-only",
+        "permission_model": "profile",
+        "permission_profile": "lha-read",
+        "credential_barrier": "verified",
+        "externally_sandboxed": False,
+    }
+    if not isinstance(client, dict) or any(
+        client.get(field) != expected for field, expected in required_client.items()
+    ):
+        _fail(
+            "formal ablation provenance is missing the verified prompt-only "
+            "Codex permission boundary"
+        )
+    configuration = cast(dict[str, Any], configuration)
+    max_inner_retries = client.get("max_retries")
+    if (
+        not isinstance(max_inner_retries, int)
+        or isinstance(max_inner_retries, bool)
+        or max_inner_retries < 0
+    ):
+        _fail("formal ablation has no bounded Codex inner retry budget")
+
+    calls = raw.get("llm_calls")
+    if not isinstance(calls, list) or not calls:
+        _fail("formal ablation report is missing Codex call audits")
+    store = raw.get("llm_call_receipt_store")
+    if not isinstance(store, dict) or store != {
+        "schema_version": _LLM_CALL_RECEIPT_SCHEMA,
+        "path": "llm_call_receipts",
+        "encoding": "canonical-json",
+        "count": len(calls),
+    }:
+        _fail("formal ablation has an invalid LLM call receipt store")
+    receipt_dir = report_dir / "llm_call_receipts"
+    if receipt_dir.is_symlink() or not receipt_dir.is_dir():
+        _fail("formal ablation LLM call receipt store is unavailable")
+
+    cells = {(task, rep) for task in tasks for rep in range(reps)}
+    calls_by_cell: dict[tuple[str, int], list[dict[str, Any]]] = {cell: [] for cell in cells}
+    executable_digests: set[str] = set()
+    receipt_digests: set[str] = set()
+    cache_modes: dict[tuple[str, int], set[bool]] = {cell: set() for cell in cells}
+    for reference in calls:
+        if not isinstance(reference, dict) or set(reference) != {
+            "task",
+            "rep",
+            "ordinal",
+            "receipt_sha256",
+            "cache_hit",
+        }:
+            _fail("formal ablation Codex call reference must be an exact object")
+        task = reference.get("task")
+        rep = reference.get("rep")
+        ordinal = reference.get("ordinal")
+        digest = reference.get("receipt_sha256")
+        cell = (task, rep)
+        if (
+            not isinstance(task, str)
+            or not isinstance(rep, int)
+            or isinstance(rep, bool)
+            or cell not in cells
+            or not isinstance(ordinal, int)
+            or isinstance(ordinal, bool)
+            or ordinal < 0
+            or not isinstance(digest, str)
+            or _HEX_64.fullmatch(digest) is None
+            or type(reference.get("cache_hit")) is not bool
+        ):
+            _fail("formal ablation Codex call audit has an invalid cell binding")
+        if digest in receipt_digests:
+            _fail("formal ablation reuses one LLM call receipt")
+        receipt_digests.add(digest)
+        try:
+            receipt = _read_llm_call_receipt(
+                receipt_dir / f"{digest}.json",
+                digest,
+                expected_binding={
+                    "task": task,
+                    "rep": rep,
+                    "ordinal": ordinal,
+                    "cell_fingerprint": provenance["cell_fingerprints"][task],
+                    "input_snapshot_sha256": provenance["input_snapshot_sha256"][task],
+                },
+            )
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            _fail(f"formal ablation LLM call receipt {digest} is invalid: {error}")
+        call = receipt["call"]
+        if (
+            call["cli_version"] != provenance.get("cli_version")
+            or call["model"] != provenance.get("model")
+            or call["reasoning_effort"] != provenance.get("reasoning_effort")
+        ):
+            _fail("formal ablation Codex call audit disagrees with its protocol")
+        executable_digests.add(call["cli_executable_sha256"])
+        calls_by_cell[cast(tuple[str, int], cell)].append(receipt)
+        cache_modes[cast(tuple[str, int], cell)].add(reference["cache_hit"])
+    if len(executable_digests) != 1:
+        _fail("formal ablation mixed Codex executable bytes")
+
+    records_by_key = {
+        (record["task"], record["rep"], record["condition"]): record
+        for record in cast(list[dict[str, Any]], raw["records"])
+    }
+    for cell, cell_calls in calls_by_cell.items():
+        if len(cache_modes[cell]) != 1:
+            _fail(f"formal ablation cell {cell!r} mixes cache provenance")
+        verify = records_by_key[(*cell, "verify")]
+        try:
+            _validate_cell_call_sequence(
+                cell_calls,
+                repairs=verify["repairs"],
+                max_outer_attempts=configuration["llm_retries"],
+                max_inner_attempts=max_inner_retries + 1,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            _fail(f"formal ablation cell {cell!r} call sequence is invalid: {error}")
+        successful = [receipt for receipt in cell_calls if receipt["call"]["status"] == "succeeded"]
+        first = successful[0]["binding"]["result_artifact_sha256"]
+        trust = records_by_key[(*cell, "trust")]["artifact_sha256"]
+        gate = records_by_key[(*cell, "gate")]["artifact_sha256"]
+        final = successful[-1]["binding"]["result_artifact_sha256"]
+        if first != trust or first != gate or final != verify["artifact_sha256"]:
+            _fail(f"formal ablation cell {cell!r} call outputs do not bind its artifacts")
+
+
+def _expected_formal_tasks(repository_root: Path) -> list[str]:
+    manifest, _digest = _load_formal_corpus_manifest(
+        repository_root / _FORMAL_CORPUS_MANIFEST_PATH,
+        repository_root,
+    )
+    return [entry["name"] for entry in manifest["tasks"]]
 
 
 def _format_percent(value: float) -> str:
@@ -787,14 +1259,32 @@ def _validate_ablation(ablation_json: Path, ablation_md: Path) -> _AblationFacts
     errors = sum(record.status == "ERROR" for record in records)
     markdown = _read_text(ablation_md)
     if status == "formal":
+        if len(tasks) != _FORMAL_TASK_COUNT or reps != _FORMAL_REPETITIONS:
+            _fail(
+                "formal ablation must contain the fixed "
+                f"{_FORMAL_TASK_COUNT}-task x {_FORMAL_REPETITIONS}-repetition grid"
+            )
+        try:
+            expected_tasks = _expected_formal_tasks(ablation_json.parent.parent)
+        except (OSError, TypeError, ValueError) as error:
+            _fail(f"formal corpus manifest is invalid: {error}")
+        if tasks != expected_tasks:
+            _fail("formal ablation tasks differ from the fixed committed corpus")
         _validate_record_artifacts(records)
         _validate_artifact_store(raw, records, ablation_json.parent)
         _validate_scorer_evidence_store(raw, records, ablation_json.parent)
         if errors:
             _fail(f"formal ablation report contains {errors} ERROR cells")
         _validate_provenance(raw, tasks, ablation_json.parent.parent)
+        _validate_operation_lease_store(
+            ablation_json.parent,
+            cast(dict[str, Any], raw["provenance"]["configuration"]),
+        )
+        _validate_llm_call_audits(raw, tasks, reps, ablation_json.parent)
         if boundary_problems:
             _fail("formal ablation report violates the Wilson contract: " + boundary_problems[0])
+        if raw.get("fingerprint") != _report_fingerprint(raw):
+            _fail("formal ablation report fingerprint does not match its contents")
         if _LEGACY_ABLATION_MARKER in markdown.lower():
             _fail("formal ablation Markdown is still labelled as a legacy snapshot")
         if markdown.strip() != report.to_markdown().strip():
@@ -838,13 +1328,7 @@ def _validate_horizon(
         )
     cells = Cells(
         tasks=sorted(ablation.report.tasks),
-        reps=sorted(
-            {
-                record.rep
-                for record in ablation.records
-                if record.status != "ERROR"
-            }
-        ),
+        reps=sorted({record.rep for record in ablation.records if record.status != "ERROR"}),
         outcome={
             (record.condition, record.task, record.rep): record.true_success
             for record in ablation.records
@@ -892,7 +1376,9 @@ def _result_section(readme: str) -> str:
     return match.group("body")
 
 
-def _require_readme_match(section: str, pattern: str, expected: tuple[str, ...], label: str) -> None:
+def _require_readme_match(
+    section: str, pattern: str, expected: tuple[str, ...], label: str
+) -> None:
     match = re.search(pattern, section)
     if match is None or match.groups() != expected:
         _fail(f"README {label} claim differs from the committed reports")
@@ -916,8 +1402,7 @@ def _validate_terminal_evidence(
     )
     if any(value is None for value in source_identity):
         _fail(
-            "committed Terminal-Bench evidence must use schema 4 with a complete "
-            "source attestation"
+            "committed Terminal-Bench evidence must use schema 4 with a complete source attestation"
         )
     return validation
 
@@ -957,10 +1442,7 @@ def _validate_terminal_readme(
 
     marker = section.find(_TERMINAL_SUBSET_LABEL)
     if marker < 0:
-        _fail(
-            "README measured-results section must name "
-            f"'{_TERMINAL_SUBSET_LABEL}'"
-        )
+        _fail(f"README measured-results section must name '{_TERMINAL_SUBSET_LABEL}'")
     claim = section[marker : marker + 1600]
     passed = _terminal_claim_value(
         claim,
@@ -1007,9 +1489,7 @@ def _validate_terminal_readme(
     for pattern, expected, label in expected_labels:
         actual = _terminal_claim_value(claim, pattern, label=label)
         if actual != expected:
-            _fail(
-                f"README Terminal-Bench {label} differs from the committed evidence"
-            )
+            _fail(f"README Terminal-Bench {label} differs from the committed evidence")
 
 
 def _validate_readme(
@@ -1021,9 +1501,7 @@ def _validate_readme(
     readme = _read_text(readme_path)
     section = _result_section(readme)
     _validate_terminal_readme(readme, section, terminal)
-    pending = bool(
-        re.search(r"204.{0,160}(?:未完成|尚未|只有在|后才)", section, re.DOTALL)
-    )
+    pending = bool(re.search(r"204.{0,160}(?:未完成|尚未|只有在|后才)", section, re.DOTALL))
     if ablation.status == "legacy":
         if _LEGACY_README_MARKER not in section:
             _fail("README must label historical evidence as '历史报告'")
@@ -1073,8 +1551,7 @@ def _validate_readme(
     for expected in {ablation.trust_gate_p, horizon_cell_p}:
         if not any(
             len(value.partition(".")[2]) >= 2
-            and
-            math.isclose(
+            and math.isclose(
                 float(value),
                 expected,
                 rel_tol=1e-9,
@@ -1105,9 +1582,7 @@ def validate_release_claims(root: str | Path = ".") -> ReleaseClaimsSummary:
         benchmarks / "ablation_report.json",
         ablation,
     )
-    terminal = _validate_terminal_evidence(
-        benchmarks / _TERMINAL_EVIDENCE_DIR
-    )
+    terminal = _validate_terminal_evidence(benchmarks / _TERMINAL_EVIDENCE_DIR)
     _validate_readme(repo / "README.md", ablation, horizon_p, terminal)
     return ReleaseClaimsSummary(
         status=ablation.status,

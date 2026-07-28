@@ -94,10 +94,10 @@ directory. The parent environment is reduced to an allowlist. The process group
 is stopped before temporary credentials are removed.
 
 Other model backends remain available for exploratory runs, but the public
-release check accepts only evidence produced by the hardened `codex_cli`
-backend. Formal reports also require Docker for both the prediction-side gate
-and the independent scorer, with the scorer image bound by its immutable image
-ID.
+release check accepts only evidence produced by `codex_cli` with its JSONL and
+process-cleanup checks enabled. Formal reports also require Docker for both the
+prediction-side gate and the independent scorer, with the scorer image bound by
+its immutable image ID.
 
 The report records model and CLI settings, event summary, usage, runtime
 versions, Git state, source and task digests, scorer backend, and container

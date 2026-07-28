@@ -1,0 +1,127 @@
+{
+  "benchmark": "lha-verification-ablation",
+  "corpus_commit": "6be3aafa6e80329b7dac367e3b2a30a334f9619a",
+  "repetitions": 12,
+  "schema_version": 1,
+  "tasks": [
+    {
+      "corpus_path": "data/bench/basen",
+      "corpus_sha256": "c9f13393ffc17452cebf292cd91223093724aa2e33351748ef5d261cf5303b1a",
+      "name": "bench_basen",
+      "task_path": "data/tasks/bench_basen.yaml",
+      "task_sha256": "c26dfbf44c77eeb9d97f18b9a0a23582db65925d2d2d33e183bc713ce76cd0fd"
+    },
+    {
+      "corpus_path": "data/bench/brackets",
+      "corpus_sha256": "4bfa876ea77df66fbc9ffcbe7f8564e5890ba458a628745d99d7346b2454b5b9",
+      "name": "bench_brackets",
+      "task_path": "data/tasks/bench_brackets.yaml",
+      "task_sha256": "ef8b0649cbbffc1745d45a505732a6cc2bce32b5d58e2b6ad2eb55b7342d02e4"
+    },
+    {
+      "corpus_path": "data/bench/bsearch",
+      "corpus_sha256": "9434c18c0135eea219b5ca8092fc7902235fe7cad7288768d8ee596a996d1d42",
+      "name": "bench_bsearch",
+      "task_path": "data/tasks/bench_bsearch.yaml",
+      "task_sha256": "73d71e2e7bab00bf433638add79d9a6faa34a712140635a5cff6ee544ed2e3ae"
+    },
+    {
+      "corpus_path": "data/bench/caesar",
+      "corpus_sha256": "e8e16f03b5f91e40125b2a47f75e7e30bd6dffeb326fbae32553ba04f9a66ebd",
+      "name": "bench_caesar",
+      "task_path": "data/tasks/bench_caesar.yaml",
+      "task_sha256": "0751e7038598982935608824ef1271e51f2b05cad59fca648fb4afe84756cb2e"
+    },
+    {
+      "corpus_path": "data/bench/csvlite",
+      "corpus_sha256": "bea574168dbb792e520a8a0bf33f5ebfd9ca88b58ffff3ca10fb77b8a842f7f6",
+      "name": "bench_csvlite",
+      "task_path": "data/tasks/bench_csvlite.yaml",
+      "task_sha256": "788afc8c8cc2048449b5ae769228671a89e7acfacbf536967bfd8c19791a9cae"
+    },
+    {
+      "corpus_path": "data/bench/flatten",
+      "corpus_sha256": "7d88bfdf8a3f1ef84b1e54b69ef62d943907edfd60baa797f8f184c85f0e2dfe",
+      "name": "bench_flatten",
+      "task_path": "data/tasks/bench_flatten.yaml",
+      "task_sha256": "b307ea5d64bc4842e235275e27120cd0f6edbe3b158ee39bb56d22e2ce317892"
+    },
+    {
+      "corpus_path": "data/bench/lru",
+      "corpus_sha256": "e0958884c284e9dd12e206cd416354197e514a5ffb112dbecafc3e35a99682ed",
+      "name": "bench_lru",
+      "task_path": "data/tasks/bench_lru.yaml",
+      "task_sha256": "db0a76af7cc6e4835467bd6e2312d9a4877a91a10880bc52af8e762119977723"
+    },
+    {
+      "corpus_path": "data/bench/median",
+      "corpus_sha256": "7aef643c2ed65660017f9aeca64be495d81149f191236938a2600f575ef856e5",
+      "name": "bench_median",
+      "task_path": "data/tasks/bench_median.yaml",
+      "task_sha256": "901fc529e2a8f1ea88ae693b40b12134801ddee1ea30fba2176356f2474310b1"
+    },
+    {
+      "corpus_path": "data/bench/merge_intervals",
+      "corpus_sha256": "d804179759766e86425c5efd79a86425ea15cc9f1dd28ae1293b40f25c95dc5f",
+      "name": "bench_merge_intervals",
+      "task_path": "data/tasks/bench_merge_intervals.yaml",
+      "task_sha256": "a14764ed77a33a3048a7eaf5ebb1a1821510bc316a4354d787eb34c20205dfdb"
+    },
+    {
+      "corpus_path": "data/bench/paginate",
+      "corpus_sha256": "a2187fae92342c5bde200d8d4c22b5543223511d373417388903bef51fd77c84",
+      "name": "bench_paginate",
+      "task_path": "data/tasks/bench_paginate.yaml",
+      "task_sha256": "f6443936aea262e8f27f7578b38907a545e0f2d7dbbf4148de5a879c690859cb"
+    },
+    {
+      "corpus_path": "data/bench/roman",
+      "corpus_sha256": "82bc7cd0ab80920a8d9ac5ab99194d8fdefdc4bed0a4bf52a593d23efc0eff97",
+      "name": "bench_roman",
+      "task_path": "data/tasks/bench_roman.yaml",
+      "task_sha256": "9dd1bf06656979f145133e618d63cad96c72ab7692e60c6a9e52d2e02c1319a0"
+    },
+    {
+      "corpus_path": "data/bench/rpn",
+      "corpus_sha256": "43967a8a1d5305fb3e8dd584c5fc7ad6a672aef5ca865212f2e3544174ae3a46",
+      "name": "bench_rpn",
+      "task_path": "data/tasks/bench_rpn.yaml",
+      "task_sha256": "c2d561a04d0f44f802fd8d90f7b07ae4c4289fc721519a1b0c720778e7c44e49"
+    },
+    {
+      "corpus_path": "data/bench/runstats",
+      "corpus_sha256": "76d4794e61dfe609253fee3f9fffc202733b12de717fbc73169c4a13760b2030",
+      "name": "bench_runstats",
+      "task_path": "data/tasks/bench_runstats.yaml",
+      "task_sha256": "8afba974c48fe835e3528c685a2040eb444eb079a38bdca18fb054f66ee75c97"
+    },
+    {
+      "corpus_path": "data/bench/slugify",
+      "corpus_sha256": "ed9cbaacdbbd2bb972994533556b932ef68a89529e5e8aff6a4b8e28107a6979",
+      "name": "bench_slugify",
+      "task_path": "data/tasks/bench_slugify.yaml",
+      "task_sha256": "2996bd2593e16096187587c44442135355af49d54ed3f7e958d242884f1b381c"
+    },
+    {
+      "corpus_path": "data/bench/spans",
+      "corpus_sha256": "30934a44256aeecc44a39433b370093e303b34b0be7d9b3d8f6fca70c6ded325",
+      "name": "bench_spans",
+      "task_path": "data/tasks/bench_spans.yaml",
+      "task_sha256": "20417639ecec004377b46be7a67844dcd0d9863e9e70e3a26bb0c5050212300b"
+    },
+    {
+      "corpus_path": "data/bench/urljoin",
+      "corpus_sha256": "3995af74144a63f8a37eac83f3490ec64c411a023df6af128957c26ae7ac9534",
+      "name": "bench_urljoin",
+      "task_path": "data/tasks/bench_urljoin.yaml",
+      "task_sha256": "b2864df8f5e785789f36d61b5a7d6a5c5b7b905027f5dfb080b052a374e38e03"
+    },
+    {
+      "corpus_path": "data/bench/window",
+      "corpus_sha256": "897813d47ae7af03f7cef3bb902fabf9ac1829ba6770a7bef367e221f89bbfaf",
+      "name": "bench_window",
+      "task_path": "data/tasks/bench_window.yaml",
+      "task_sha256": "63c5d1bd2f0e81d5fc99ea8cf3ef5a7a738fde063be676324aa45e825d46d095"
+    }
+  ]
+}
