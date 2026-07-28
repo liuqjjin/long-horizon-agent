@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import unicodedata
 import uuid
 from pathlib import Path
@@ -14,10 +13,14 @@ from pydantic import BaseModel, Field, model_validator
 
 from ..clock import now
 from ..durable_io import (
-    atomic_replace_bytes,
-    atomic_replace_text,
+    AnchoredAtomicReplaceTemp,
+    anchored_atomic_replace_bytes,
+    anchored_read_bytes,
+    anchored_update_bytes,
+    atomic_replace_temp_target_name,
     durable_mkdir_chain,
-    fsync_directory,
+    inspect_anchored_atomic_replace_temp,
+    remove_anchored_atomic_replace_temp,
 )
 from ..step_ids import canonical_artifact_segment
 from ..tools.patch import ResolvedPatch
@@ -214,8 +217,21 @@ def _safe_seg(value: str) -> str:
     return canonical_artifact_segment(value)
 
 
-def _read_transaction_state(path: Path) -> tuple[PatchTransaction, str]:
-    raw = json.loads(path.read_text())
+def _read_transaction_state(
+    run_dir: Path,
+    path: Path,
+) -> tuple[PatchTransaction, str]:
+    encoded = anchored_read_bytes(path, anchor=run_dir)
+    assert encoded is not None
+    return _decode_transaction_state_bytes(encoded, path)
+
+
+def _decode_transaction_state_bytes(
+    encoded: bytes,
+    path: Path,
+) -> tuple[PatchTransaction, str]:
+    """Decode and authenticate one transaction state snapshot."""
+    raw = json.loads(encoded)
     payload = raw["payload"]
     digest = hashlib.sha256(_canonical(payload)).hexdigest()
     if digest != raw["sha256"]:
@@ -232,7 +248,7 @@ def _persisted_transactions(
     records: list[tuple[Path, PatchTransaction, str]] = []
     for path in sorted(root.rglob("*.json")):
         try:
-            transaction, digest = _read_transaction_state(path)
+            transaction, digest = _read_transaction_state(run_dir, path)
         except Exception as error:
             raise TransactionCorrupt(
                 f"invalid patch transaction {path}: {error}"
@@ -330,13 +346,31 @@ def _canonical(payload: dict) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _fsync_replace(path: Path, data: str) -> None:
-    atomic_replace_text(path, data)
+def _fsync_replace(
+    path: Path,
+    data: str,
+    *,
+    anchor: Path | None = None,
+) -> None:
+    anchored_atomic_replace_bytes(
+        path,
+        data.encode("utf-8"),
+        anchor=anchor or path.parent,
+    )
 
 
 def durable_artifact_write(path: Path, data: bytes) -> None:
     """Atomically persist transaction evidence before PREPARED is recorded."""
-    atomic_replace_bytes(path, data)
+    anchor = path.parent
+    while True:
+        try:
+            anchor.lstat()
+            break
+        except FileNotFoundError:
+            if anchor.parent == anchor:
+                raise
+            anchor = anchor.parent
+    anchored_atomic_replace_bytes(path, data, anchor=anchor)
 
 
 def save_transaction(run_dir: Path, tx: PatchTransaction) -> None:
@@ -392,7 +426,7 @@ def save_transaction(run_dir: Path, tx: PatchTransaction) -> None:
         "sha256": hashlib.sha256(_canonical(payload)).hexdigest(),
         "payload": payload,
     }
-    _fsync_replace(path, json.dumps(envelope, indent=2))
+    _fsync_replace(path, json.dumps(envelope, indent=2), anchor=run_dir)
     _append_transaction_event(run_dir, tx, envelope["sha256"])
 
 
@@ -464,11 +498,15 @@ def _append_transaction_event(
         "sha256": hashlib.sha256(_canonical(payload)).hexdigest(),
         "payload": payload,
     }
-    with open(path, "a") as f:
-        f.write(json.dumps(envelope, sort_keys=True) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    fsync_directory(path.parent)
+    line = (json.dumps(envelope, sort_keys=True) + "\n").encode()
+    try:
+        anchored_update_bytes(
+            path,
+            lambda current: (current or b"") + line,
+            anchor=run_dir,
+        )
+    except OSError as error:
+        raise TransactionCorrupt(f"transaction log is unsafe: {path}: {error}") from error
 
 
 def _validate_transaction_event_history(
@@ -561,11 +599,28 @@ def _read_transaction_events(
     allow_torn_tail: bool,
 ) -> tuple[Path, list[PatchTransactionEvent], int | None]:
     path = transaction_log_path(run_dir, step_id, attempt_id)
-    if not path.exists():
+    try:
+        value = anchored_read_bytes(path, anchor=run_dir, missing_ok=True)
+    except OSError as error:
+        raise TransactionCorrupt(f"transaction log is unsafe: {path}: {error}") from error
+    if value is None:
         return path, [], None
-    if path.is_symlink() or not path.is_file():
-        raise TransactionCorrupt(f"transaction log is unsafe: {path}")
-    raw = path.read_bytes()
+    events, committed_size = _decode_transaction_event_bytes(
+        value,
+        path,
+        allow_torn_tail=allow_torn_tail,
+    )
+    return path, events, committed_size
+
+
+def _decode_transaction_event_bytes(
+    value: bytes,
+    path: Path,
+    *,
+    allow_torn_tail: bool,
+) -> tuple[list[PatchTransactionEvent], int | None]:
+    """Decode a journal snapshot without trusting the name that supplied it."""
+    raw = value
     committed_size: int | None = None
     if raw and not raw.endswith(b"\n"):
         if not allow_torn_tail:
@@ -610,17 +665,33 @@ def _read_transaction_events(
             raise TransactionCorrupt(
                 f"transaction log {path} changes transaction sequence"
             )
-    return path, events, committed_size
+    return events, committed_size
 
 
 def _truncate_transaction_log(path: Path, committed_size: int) -> None:
     """Discard one uncommitted append while the caller holds the run lock."""
-    if path.is_symlink() or not path.is_file():
-        raise TransactionCorrupt(f"transaction log is unsafe: {path}")
-    with open(path, "rb+") as stream:
-        stream.truncate(committed_size)
-        stream.flush()
-        os.fsync(stream.fileno())
+    try:
+        run_dir = path.parents[2]
+    except IndexError as error:
+        raise TransactionCorrupt(f"transaction log path is invalid: {path}") from error
+    try:
+        anchored_update_bytes(
+            path,
+            lambda current: _truncate_bytes(current, committed_size, path),
+            anchor=run_dir,
+        )
+    except OSError as error:
+        raise TransactionCorrupt(f"transaction log is unsafe: {path}: {error}") from error
+
+
+def _truncate_bytes(
+    current: bytes | None,
+    committed_size: int,
+    path: Path,
+) -> bytes:
+    if current is None or committed_size < 0 or committed_size > len(current):
+        raise TransactionCorrupt(f"transaction log truncation is invalid: {path}")
+    return current[:committed_size]
 
 
 def load_transaction(
@@ -629,10 +700,11 @@ def load_transaction(
     attempt_id: str,
 ) -> PatchTransaction | None:
     path = transaction_path(run_dir, step_id, attempt_id)
-    if not path.exists():
-        return None
     try:
-        raw = json.loads(path.read_text())
+        encoded = anchored_read_bytes(path, anchor=run_dir, missing_ok=True)
+        if encoded is None:
+            return None
+        raw = json.loads(encoded)
         payload = raw["payload"]
         digest = hashlib.sha256(_canonical(payload)).hexdigest()
         if digest != raw["sha256"]:
@@ -666,6 +738,278 @@ def list_transactions(run_dir: Path, step_id: str) -> list[PatchTransaction]:
     return [
         transaction for transaction in ordered if transaction.step_id == step_id
     ]
+
+
+def _transaction_temp_target(
+    run_dir: Path,
+    root: Path,
+    temporary: Path,
+) -> tuple[Path, Literal["state", "events"], str, str]:
+    """Bind one exact temporary name to a legal transaction evidence target."""
+    try:
+        relative = temporary.relative_to(root)
+    except ValueError as error:
+        raise TransactionCorrupt(
+            f"transaction temporary file escapes its root: {temporary}"
+        ) from error
+    if len(relative.parts) != 2:
+        raise TransactionCorrupt(
+            f"transaction temporary file has an invalid location: {temporary}"
+        )
+    try:
+        step_id = _safe_seg(relative.parts[0])
+    except ValueError as error:
+        raise TransactionCorrupt(
+            f"transaction temporary file has an invalid step: {temporary}"
+        ) from error
+
+    target_name = atomic_replace_temp_target_name(temporary.name)
+    if target_name is None:
+        raise TransactionCorrupt(
+            f"unknown transaction temporary file: {temporary}"
+        )
+    if target_name.endswith(".events.jsonl"):
+        attempt_id = target_name[: -len(".events.jsonl")]
+        kind: Literal["state", "events"] = "events"
+    elif target_name.endswith(".json"):
+        attempt_id = target_name[: -len(".json")]
+        kind = "state"
+    else:
+        raise TransactionCorrupt(
+            f"transaction temporary file targets unknown evidence: {temporary}"
+        )
+    try:
+        attempt_id = _safe_seg(attempt_id)
+    except ValueError as error:
+        raise TransactionCorrupt(
+            f"transaction temporary file has an invalid attempt: {temporary}"
+        ) from error
+    expected = (
+        transaction_path(run_dir, step_id, attempt_id)
+        if kind == "state"
+        else transaction_log_path(run_dir, step_id, attempt_id)
+    )
+    if expected.parent != temporary.parent or expected.name != target_name:
+        raise TransactionCorrupt(
+            f"transaction temporary target does not match its location: {temporary}"
+        )
+    return expected, kind, step_id, attempt_id
+
+
+def _validate_transaction_state_temp(
+    run_dir: Path,
+    target: Path,
+    record: AnchoredAtomicReplaceTemp,
+    records: list[tuple[Path, PatchTransaction, str]],
+) -> None:
+    try:
+        candidate, _digest = _decode_transaction_state_bytes(record.data, target)
+    except Exception as error:
+        raise TransactionCorrupt(
+            f"invalid transaction atomic-replace temporary file {record.path}: {error}"
+        ) from error
+    if target != transaction_path(
+        run_dir,
+        candidate.step_id,
+        candidate.attempt_id,
+    ):
+        raise TransactionCorrupt(
+            f"transaction temporary payload does not own its target: {record.path}"
+        )
+
+    persisted = next(
+        (
+            transaction
+            for path, transaction, _digest in records
+            if path == target
+        ),
+        None,
+    )
+    if persisted is not None:
+        _validate_transaction_update(persisted, candidate)
+        if candidate.status not in _TRANSITIONS[persisted.status]:
+            raise TransactionCorrupt(
+                f"invalid temporary transaction transition: "
+                f"{persisted.status} -> {candidate.status}"
+            )
+        return
+
+    if candidate.status != "PREPARED":
+        raise TransactionCorrupt(
+            f"new transaction temporary file is not PREPARED: {record.path}"
+        )
+    existing = [transaction for _path, transaction, _digest in records]
+    if candidate.schema_version == 3:
+        if any(transaction.schema_version == 2 for transaction in existing):
+            raise TransactionCorrupt(
+                "new transaction temporary file follows a legacy history"
+            )
+        if candidate.sequence != len(_ordered_transactions(existing)) + 1:
+            raise TransactionCorrupt(
+                f"transaction temporary file has an invalid sequence: {record.path}"
+            )
+    elif any(transaction.schema_version == 3 for transaction in existing):
+        raise TransactionCorrupt(
+            "legacy transaction temporary file follows a sequenced history"
+        )
+
+
+def _validate_transaction_event_temp(
+    run_dir: Path,
+    target: Path,
+    record: AnchoredAtomicReplaceTemp,
+    step_id: str,
+    attempt_id: str,
+    records: list[tuple[Path, PatchTransaction, str]],
+) -> None:
+    state_target = transaction_path(run_dir, step_id, attempt_id)
+    persisted = next(
+        (
+            transaction
+            for path, transaction, _digest in records
+            if path == state_target
+        ),
+        None,
+    )
+    if persisted is None:
+        raise TransactionCorrupt(
+            f"transaction journal temporary file has no durable state: {record.path}"
+        )
+    try:
+        events, _committed_size = _decode_transaction_event_bytes(
+            record.data,
+            target,
+            allow_torn_tail=False,
+        )
+        _validate_transaction_event_history(persisted, events, state_target)
+    except Exception as error:
+        raise TransactionCorrupt(
+            f"invalid transaction atomic-replace temporary file {record.path}: {error}"
+        ) from error
+    if events:
+        return
+
+    # An empty candidate is only produced when recovery truncates a torn first
+    # append. It is not a valid stand-alone journal temporary file.
+    _path, _current, committed_size = _read_transaction_events(
+        run_dir,
+        step_id,
+        attempt_id,
+        allow_torn_tail=True,
+    )
+    if committed_size != 0:
+        raise TransactionCorrupt(
+            f"empty transaction journal temporary file is not recoverable: {record.path}"
+        )
+
+
+def _recover_transaction_atomic_temps(run_dir: Path) -> None:
+    """Remove one proven uncommitted replace file while the run lock is held."""
+    root = run_dir / "transactions"
+    if not root.exists() and not root.is_symlink():
+        return
+    if root.is_symlink() or not root.is_dir():
+        raise TransactionCorrupt(f"transaction directory is unsafe: {root}")
+    run_metadata = run_dir.lstat()
+    root_metadata = root.lstat()
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        raise TransactionCorrupt(f"run directory is unsafe: {run_dir}")
+    if root_metadata.st_uid != run_metadata.st_uid:
+        raise TransactionCorrupt(f"transaction directory owner is unsafe: {root}")
+
+    temporary_paths: list[Path] = []
+    actual_logs: set[Path] = set()
+    state_paths: set[Path] = set()
+    for descendant in sorted(root.rglob("*")):
+        if descendant.is_symlink():
+            raise TransactionCorrupt(
+                f"refusing symlink transaction evidence: {descendant}"
+            )
+        if descendant.is_dir():
+            continue
+        if descendant.name.endswith(".tmp"):
+            temporary_paths.append(descendant)
+        elif descendant.name.endswith(".events.jsonl"):
+            actual_logs.add(descendant)
+        elif descendant.suffix == ".json":
+            state_paths.add(descendant)
+        else:
+            raise TransactionCorrupt(f"unknown transaction evidence: {descendant}")
+    if not temporary_paths:
+        return
+    if len(temporary_paths) != 1:
+        raise TransactionCorrupt(
+            "multiple transaction atomic-replace temporary files require manual review"
+        )
+
+    records = _persisted_transactions(run_dir)
+    _ordered_transactions(
+        [transaction for _path, transaction, _digest in records]
+    )
+    if {path for path, _transaction, _digest in records} != state_paths:
+        raise TransactionCorrupt("transaction state inventory changed while reading")
+    expected_logs = {
+        transaction_log_path(
+            run_dir,
+            transaction.step_id,
+            transaction.attempt_id,
+        )
+        for _path, transaction, _digest in records
+    }
+    orphaned = actual_logs - expected_logs
+    if orphaned:
+        raise TransactionCorrupt(f"orphaned transaction log: {sorted(orphaned)[0]}")
+    for path, transaction, _digest in records:
+        _log_path, events, _committed_size = _read_transaction_events(
+            run_dir,
+            transaction.step_id,
+            transaction.attempt_id,
+            allow_torn_tail=True,
+        )
+        _validate_transaction_event_history(transaction, events, path)
+
+    temporary = temporary_paths[0]
+    target, kind, step_id, attempt_id = _transaction_temp_target(
+        run_dir,
+        root,
+        temporary,
+    )
+    try:
+        record = inspect_anchored_atomic_replace_temp(
+            temporary,
+            anchor=run_dir,
+            expected_target_name=target.name,
+            owner_uid=run_metadata.st_uid,
+            mode=0o600,
+        )
+    except OSError as error:
+        raise TransactionCorrupt(
+            f"transaction atomic-replace temporary file is unsafe: "
+            f"{temporary}: {error}"
+        ) from error
+    if kind == "state":
+        _validate_transaction_state_temp(run_dir, target, record, records)
+    else:
+        _validate_transaction_event_temp(
+            run_dir,
+            target,
+            record,
+            step_id,
+            attempt_id,
+            records,
+        )
+    try:
+        remove_anchored_atomic_replace_temp(
+            record,
+            anchor=run_dir,
+            owner_uid=run_metadata.st_uid,
+            mode=0o600,
+        )
+    except OSError as error:
+        raise TransactionCorrupt(
+            f"could not remove transaction atomic-replace temporary file "
+            f"{temporary}: {error}"
+        ) from error
 
 
 def _transaction_journal_inventory(
@@ -723,6 +1067,7 @@ def recover_transaction_journals(run_dir: Path) -> None:
     """
     repairs: list[tuple[PatchTransaction, str]] = []
     truncations: list[tuple[Path, int]] = []
+    _recover_transaction_atomic_temps(run_dir)
     records = _transaction_journal_inventory(run_dir)
 
     # Validate every committed prefix before changing any journal.  A damaged
@@ -814,6 +1159,7 @@ def validate_terminal_transaction_state(
             try:
                 backup = load_backup(
                     resolve_transaction_evidence(run_dir, reference),
+                    run_dir=run_dir,
                     required=True,
                 )
                 assert backup is not None

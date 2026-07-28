@@ -258,6 +258,7 @@ def test_traced_patch_journal_binds_trusted_oracle_paths(tmp_path):
         freshness=Freshness(index_version="v", indexed_at=now()),
     )
     run_dir = tmp_path / "run"
+    run_dir.mkdir()
     first = TracedLLM(_CapturePrompt()).bind(run_dir)
     first.set_call_context(attempt_id="s-r0")
     first.set_trusted_oracle_paths(["quality/helper.py"])

@@ -54,6 +54,26 @@ class _WrongIdentityLLM(_CountingLLM):
         )
 
 
+class _FailingPatchLLM(_CountingLLM):
+    name = "failing-patch"
+
+    def plan(self, task, template):
+        self.calls += 1
+        return None
+
+    def propose_patch(self, step, bundle, workdir):
+        self.calls += 1
+        raise RuntimeError("private-secret-marker patch backend failed")
+
+
+class _FailingPlanLLM(_CountingLLM):
+    name = "failing-plan"
+
+    def plan(self, task, template):
+        self.calls += 1
+        raise RuntimeError("private-plan-secret-marker planning failed")
+
+
 def _context(run_id: str, attempt_id: str, task, **config):
     return {
         "run_id": run_id,
@@ -192,3 +212,92 @@ def test_wrong_patch_identity_never_reaches_done_or_trusted_reporting(
     ).read_text()
     with pytest.raises(ReportingError, match="journaled patch call is orphaned"):
         collect_run(config.runs_dir, result.state.run_id)
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_failed_patch_call_has_replayable_terminal_evidence(
+    runtime: str,
+    tmp_path: Path,
+) -> None:
+    config = Config(
+        llm_backend="stub",
+        code_backend="null",
+        runs_dir=tmp_path / "runs",
+        data_dir=tmp_path / "data",
+        use_skill_memory=False,
+    )
+    if runtime == "langgraph":
+        pytest.importorskip("langgraph")
+        from lha.runtime.langgraph_runner import LangGraphHarness
+
+        harness = LangGraphHarness(config)
+        harness._h.llm = TracedLLM(_FailingPatchLLM())
+    else:
+        harness = Harness(config)
+        harness.llm = TracedLLM(_FailingPatchLLM())
+    task = hermetic_task("data/tasks/fix_average.yaml").model_copy(
+        update={"context_requirement": "optional"}
+    )
+
+    result = harness.run(task, run_id=f"{runtime}-failed-patch")
+
+    assert result.status == "FAILED"
+    report = collect_run(config.runs_dir, result.state.run_id)
+    assert report.state.failed_steps == ["s2-fix"]
+    run_dir = Path(result.state.run_dir)
+    for path in run_dir.rglob("*"):
+        if path.is_file():
+            assert b"private-secret-marker" not in path.read_bytes()
+
+    if runtime == "langgraph":
+        resumed_harness = LangGraphHarness(config)
+        resumed_harness._h.llm = TracedLLM(_FailingPatchLLM())
+    else:
+        resumed_harness = Harness(config)
+        resumed_harness.llm = TracedLLM(_FailingPatchLLM())
+    resumed = resumed_harness.resume(result.state.run_id)
+    assert resumed.status == "FAILED"
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_failed_plan_call_has_replayable_terminal_evidence(
+    runtime: str,
+    tmp_path: Path,
+) -> None:
+    config = Config(
+        llm_backend="stub",
+        code_backend="null",
+        dynamic_planning=True,
+        runs_dir=tmp_path / "runs",
+        data_dir=tmp_path / "data",
+        use_skill_memory=False,
+    )
+    if runtime == "langgraph":
+        pytest.importorskip("langgraph")
+        from lha.runtime.langgraph_runner import LangGraphHarness
+
+        harness = LangGraphHarness(config)
+        harness._h.llm = TracedLLM(_FailingPlanLLM())
+    else:
+        harness = Harness(config)
+        harness.llm = TracedLLM(_FailingPlanLLM())
+    task = hermetic_task("data/tasks/fix_average.yaml")
+
+    result = harness.run(task, run_id=f"{runtime}-failed-plan")
+
+    assert result.status == "FAILED"
+    report = collect_run(config.runs_dir, result.state.run_id)
+    assert report.state.plan is None
+    run_dir = Path(result.state.run_dir)
+    for path in run_dir.rglob("*"):
+        if path.is_file():
+            assert b"private-plan-secret-marker" not in path.read_bytes()
+
+    if runtime == "langgraph":
+        resumed_harness = LangGraphHarness(config)
+        resumed_harness._h.llm = TracedLLM(_FailingPlanLLM())
+    else:
+        resumed_harness = Harness(config)
+        resumed_harness.llm = TracedLLM(_FailingPlanLLM())
+    resumed = resumed_harness.resume(result.state.run_id)
+    assert resumed.status == "FAILED"

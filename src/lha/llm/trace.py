@@ -25,9 +25,13 @@ from typing import Any, Callable, TypeVar
 
 from ..artifacts import Patch, Plan
 from ..clock import now
-from ..durable_io import atomic_replace_text
+from ..durable_io import (
+    anchored_atomic_replace_bytes,
+    anchored_read_bytes,
+    anchored_update_bytes,
+    anchored_write_once_bytes,
+)
 from ..harness.errors import BudgetExceeded, CheckpointCorrupt
-from ..harness.transaction import durable_artifact_write
 from .base import LLMClient, _normalize_oracle_paths, _without_oracle_context
 
 _USAGE_FILE = "llm_usage.json"
@@ -94,13 +98,13 @@ def _validated_totals(value) -> LLMUsageTotals:
 
 def load_usage_checkpoint(run_dir: str | Path) -> LLMUsageTotals | None:
     """Read the per-call write-ahead usage checkpoint."""
-    path = Path(run_dir) / _USAGE_FILE
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise CheckpointCorrupt(f"LLM usage checkpoint path is unsafe: {path}")
-    if not path.exists():
-        return None
+    root = Path(run_dir)
+    path = root / _USAGE_FILE
     try:
-        envelope = json.loads(path.read_text())
+        encoded = anchored_read_bytes(path, anchor=root, missing_ok=True)
+        if encoded is None:
+            return None
+        envelope = json.loads(encoded)
         if envelope.get("schema_version") != _USAGE_SCHEMA:
             raise ValueError("unsupported schema")
         payload = envelope["payload"]
@@ -114,17 +118,15 @@ def load_usage_checkpoint(run_dir: str | Path) -> LLMUsageTotals | None:
 
 def _save_usage_checkpoint(run_dir: Path, totals: LLMUsageTotals) -> None:
     path = run_dir / _USAGE_FILE
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise CheckpointCorrupt(f"LLM usage checkpoint path is unsafe: {path}")
     payload = asdict(_validated_totals(totals))
     envelope = {
         "schema_version": _USAGE_SCHEMA,
         "sha256": hashlib.sha256(_canonical(payload)).hexdigest(),
         "payload": payload,
     }
-    atomic_replace_text(
+    anchored_atomic_replace_bytes(
         path,
-        json.dumps(envelope, sort_keys=True),
+        json.dumps(envelope, sort_keys=True).encode(),
         anchor=run_dir,
     )
 
@@ -329,20 +331,33 @@ class TracedLLM(LLMClient):
         result_path = attempt_dir / "result.json"
 
         if result_path.exists() or result_path.is_symlink():
-            _require_exact_file(intent_path, intent_bytes, "LLM call intent")
+            _require_exact_file(
+                intent_path,
+                intent_bytes,
+                "LLM call intent",
+                anchor=self._sink.parent,
+            )
             result = _load_call_result(
-                result_path, kind=kind, input_sha256=input_sha256
+                result_path,
+                kind=kind,
+                input_sha256=input_sha256,
+                anchor=self._sink.parent,
             )
             return decode(result)
         if intent_path.exists() or intent_path.is_symlink():
-            _require_exact_file(intent_path, intent_bytes, "LLM call intent")
+            _require_exact_file(
+                intent_path,
+                intent_bytes,
+                "LLM call intent",
+                anchor=self._sink.parent,
+            )
             raise CheckpointCorrupt(
                 f"LLM {kind} attempt {input_sha256[:12]} has durable intent "
                 "but no committed result; refusing an ambiguous replay"
             )
 
         self._check_call_budget(kind)
-        _write_once(intent_path, intent_bytes)
+        _write_once(intent_path, intent_bytes, anchor=self._sink.parent)
         value = self._call(kind, fn)
         encoded = encode(value)
         result_payload = {
@@ -352,7 +367,11 @@ class TracedLLM(LLMClient):
             "result_sha256": hashlib.sha256(_canonical(encoded)).hexdigest(),
             "result": encoded,
         }
-        _write_once(result_path, _canonical(result_payload))
+        _write_once(
+            result_path,
+            _canonical(result_payload),
+            anchor=self._sink.parent,
+        )
         return value
 
     def _check_call_budget(self, kind: str) -> None:
@@ -389,8 +408,14 @@ class TracedLLM(LLMClient):
             self._reserve_call(kind)
         self._active_call_kind = kind
         start = time.monotonic()
+        outcome = "success"
+        error_type: str | None = None
         try:
             return fn()
+        except BaseException as error:
+            outcome = "error"
+            error_type = type(error).__name__
+            raise
         finally:
             self._active_call_kind = previous_kind
             duration = time.monotonic() - start
@@ -415,6 +440,8 @@ class TracedLLM(LLMClient):
                 duration,
                 usage,
                 attempt_count=self.totals.calls - calls_before,
+                outcome=outcome,
+                error_type=error_type,
             )
 
     def _record(
@@ -424,34 +451,58 @@ class TracedLLM(LLMClient):
         usage: dict | None,
         *,
         attempt_count: int,
+        outcome: str,
+        error_type: str | None,
     ) -> None:
         if self._sink is None:
             return
-        rec = {
-            "at": now().isoformat(),
-            "kind": kind,
-            "backend": getattr(self.inner, "name", type(self.inner).__name__),
-            "duration_s": round(duration, 3),
-            "attempt_count": attempt_count,
-            "usage": usage,
-            "totals": asdict(self.totals),
-        }
-        call_meta = getattr(self.inner, "last_call", None)
-        if isinstance(call_meta, dict):
-            rec["call"] = call_meta
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(self._sink, flags, 0o600)
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                os.close(descriptor)
-                return
-            with os.fdopen(descriptor, "a") as f:
-                f.write(json.dumps(rec) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except OSError:  # tracing must never take the run down
+            rec = {
+                "at": now().isoformat(),
+                "kind": kind,
+                "backend": getattr(self.inner, "name", type(self.inner).__name__),
+                "duration_s": round(duration, 3),
+                "attempt_count": attempt_count,
+                "outcome": outcome,
+                "error_type": error_type,
+                "usage": usage,
+                "totals": asdict(self.totals),
+            }
+            call_meta = getattr(self.inner, "last_call", None)
+            if isinstance(call_meta, dict):
+                rec["call"] = call_meta
+            line = (json.dumps(rec) + "\n").encode()
+            anchored_update_bytes(
+                self._sink,
+                lambda current: _append_trace_line(current, line),
+                anchor=self._sink.parent,
+            )
+        except Exception:
+            # The usage checkpoint above is the accounting boundary. This JSONL
+            # file is diagnostic only, so unserializable backend metadata or a
+            # failed trace write must not turn a completed model call into a
+            # failed run.
             pass
+
+
+def _append_trace_line(current: bytes | None, line: bytes) -> bytes:
+    """Append without joining a new record onto a legacy torn final fragment."""
+    existing = current or b""
+    if not existing or existing.endswith(b"\n"):
+        return existing + line
+
+    boundary = existing.rfind(b"\n")
+    prefix = existing[: boundary + 1] if boundary >= 0 else b""
+    tail = existing[boundary + 1 :]
+    try:
+        value = json.loads(tail)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        # Legacy append writers could leave a partial final record after a
+        # crash. Keep complete physical lines and discard only that fragment.
+        return prefix + line
+    if not isinstance(value, dict):
+        return prefix + line
+    return existing + b"\n" + line
 
 
 def _non_negative_int(value) -> int:
@@ -471,20 +522,36 @@ def _non_negative_float(value) -> float:
     return float(value)
 
 
-def _write_once(path: Path, data: bytes) -> None:
-    if path.is_symlink():
-        raise CheckpointCorrupt(f"LLM attempt artifact is a symlink: {path}")
-    if path.exists():
-        if not path.is_file() or path.read_bytes() != data:
-            raise CheckpointCorrupt(f"LLM attempt artifact changed: {path}")
-        return
-    durable_artifact_write(path, data)
+def _write_once(
+    path: Path,
+    data: bytes,
+    *,
+    anchor: Path | None = None,
+) -> None:
+    try:
+        anchored_write_once_bytes(
+            path,
+            data,
+            anchor=anchor or path.parent,
+        )
+    except OSError as error:
+        raise CheckpointCorrupt(
+            f"LLM attempt artifact is unsafe or changed: {path}: {error}"
+        ) from error
 
 
-def _require_exact_file(path: Path, expected: bytes, label: str) -> None:
-    if path.is_symlink() or not path.is_file():
-        raise CheckpointCorrupt(f"{label} is missing or unsafe: {path}")
-    if path.read_bytes() != expected:
+def _require_exact_file(
+    path: Path,
+    expected: bytes,
+    label: str,
+    *,
+    anchor: Path | None = None,
+) -> None:
+    try:
+        value = anchored_read_bytes(path, anchor=anchor or path.parent)
+    except OSError as error:
+        raise CheckpointCorrupt(f"{label} is missing or unsafe: {path}: {error}") from error
+    if value != expected:
         raise CheckpointCorrupt(f"{label} does not match the current input: {path}")
 
 
@@ -493,11 +560,12 @@ def _load_call_result(
     *,
     kind: str,
     input_sha256: str,
+    anchor: Path | None = None,
 ) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise CheckpointCorrupt(f"LLM call result is missing or unsafe: {path}")
     try:
-        value = json.loads(path.read_bytes())
+        encoded = anchored_read_bytes(path, anchor=anchor or path.parent)
+        assert encoded is not None
+        value = json.loads(encoded)
         encoded = value["result"]
         if (
             value.get("schema_version") != _CALL_SCHEMA

@@ -22,10 +22,11 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 import time
 from collections.abc import Hashable
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Callable, NotRequired, TypedDict
 
 from .. import live_context
 from ..agents import Supervisor, VerifierAgent
@@ -33,6 +34,10 @@ from ..agents.experimenter import ExperimentEvidence
 from ..artifacts import Patch
 from ..clock import now
 from ..config import Config
+from ..durable_io import (
+    anchored_atomic_replace_bytes,
+    anchored_read_bytes,
+)
 from ..harness.approval import (
     HumanApprovalGate,
     validate_decision_binding,
@@ -87,11 +92,186 @@ from ..verifiers.verdict import verdict_requires_process_quarantine
 
 logger = logging.getLogger(__name__)
 
+_GRAPH_DATABASE = "graph.sqlite"
+_GRAPH_SIDECARS = (
+    f"{_GRAPH_DATABASE}-journal",
+    f"{_GRAPH_DATABASE}-wal",
+    f"{_GRAPH_DATABASE}-shm",
+)
+
 
 class GraphState(TypedDict):
     rs: dict  # RunState.model_dump(mode="json")
     # routing hint set by each node: "gate" | "verify" | "continue" | "done"
     next: NotRequired[str]
+
+
+class _SanitizedNodeError(RuntimeError):
+    """A graph-persisted error that carries no backend-controlled message."""
+
+    def __init__(self, node: str, original_type: str) -> None:
+        self.original_type = original_type
+        super().__init__(f"{original_type} in {node} node")
+
+
+def _sanitize_graph_node(
+    node: str,
+    function: Callable[[GraphState], GraphState],
+) -> Callable[[GraphState], GraphState]:
+    """Keep arbitrary exception text out of LangGraph's SQLite error channel."""
+
+    def invoke(state: GraphState) -> GraphState:
+        try:
+            return function(state)
+        except BudgetExceeded:
+            raise
+        except ProcessCleanupUnconfirmed:
+            raise ProcessCleanupUnconfirmed(
+                f"{node} node process cleanup was not confirmed"
+            ) from None
+        except Exception as error:
+            raise _SanitizedNodeError(node, type(error).__name__) from None
+
+    return invoke
+
+
+class _GraphPersistence:
+    """Serialize SQLite mutations and their durable main-file snapshot."""
+
+    def __init__(self, connection: sqlite3.Connection, run_dir: Path) -> None:
+        self.connection = connection
+        self.run_dir = run_dir
+        # SqliteSaver also uses this lock. Sharing one re-entrant lock keeps
+        # cursor reads and mutation-plus-snapshot writes in one lock order.
+        self.lock = threading.RLock()
+
+    def __call__(self) -> None:
+        with self.lock:
+            try:
+                self.connection.commit()
+                encoded = self.connection.serialize()
+                anchored_atomic_replace_bytes(
+                    self.run_dir / _GRAPH_DATABASE,
+                    encoded,
+                    anchor=self.run_dir,
+                )
+            except (OSError, sqlite3.DatabaseError) as error:
+                raise CheckpointCorrupt(
+                    f"LangGraph SQLite checkpoint is unsafe: {error}"
+                ) from error
+
+
+def _graph_database_connection(
+    run_dir: Path,
+) -> tuple[sqlite3.Connection, _GraphPersistence]:
+    """Load SQLite through verified bytes so it never opens run-owned paths.
+
+    New writes are serialized from the in-memory connection and committed with
+    the same anchored atomic-file protocol as other run state. A legacy
+    rollback journal or WAL is a multi-file snapshot without an atomic switch;
+    fail closed instead of risking application of an old sidecar to a new main.
+    """
+    files: dict[str, bytes] = {}
+    try:
+        for name in (_GRAPH_DATABASE, *_GRAPH_SIDECARS):
+            value = anchored_read_bytes(
+                run_dir / name,
+                anchor=run_dir,
+                missing_ok=True,
+            )
+            if value is not None:
+                files[name] = value
+    except OSError as error:
+        raise CheckpointCorrupt(
+            f"LangGraph SQLite path is unsafe: {error}"
+        ) from error
+
+    sidecars = {name: files[name] for name in _GRAPH_SIDECARS if name in files}
+    if sidecars:
+        names = ", ".join(sorted(sidecars))
+        raise CheckpointCorrupt(
+            f"LangGraph SQLite sidecar requires offline recovery: {names}"
+        )
+
+    memory = sqlite3.connect(":memory:", check_same_thread=False)
+    try:
+        main = files.get(_GRAPH_DATABASE)
+        if main is not None:
+            if not main:
+                raise CheckpointCorrupt("LangGraph SQLite main file is empty")
+            memory.deserialize(main)
+            result = memory.execute("PRAGMA integrity_check").fetchone()
+            if result != ("ok",):
+                raise CheckpointCorrupt(
+                    f"LangGraph SQLite integrity check failed: {result!r}"
+                )
+    except sqlite3.DatabaseError as error:
+        memory.close()
+        raise CheckpointCorrupt(
+            f"LangGraph SQLite checkpoint is invalid: {error}"
+        ) from error
+    except BaseException:
+        memory.close()
+        raise
+
+    return memory, _GraphPersistence(memory, run_dir)
+
+
+def _durable_sqlite_saver(
+    conn: sqlite3.Connection,
+    persist_graph: _GraphPersistence,
+):
+    """Build a SqliteSaver whose reads and durable writes share one RLock."""
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    class DurableSqliteSaver(SqliteSaver):
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            super().__init__(connection)
+            # Base cursor/get paths acquire ``self.lock``. Mutation wrappers
+            # acquire the same RLock before the base cursor and before
+            # serializing, so there is no second lock to invert.
+            self.lock = persist_graph.lock
+
+        def setup(self) -> None:
+            with self.lock:
+                already_setup = self.is_setup
+                super().setup()
+                if not already_setup:
+                    persist_graph()
+
+        def put(self, config, checkpoint, metadata, new_versions):
+            with self.lock:
+                result = super().put(
+                    config,
+                    checkpoint,
+                    metadata,
+                    new_versions,
+                )
+                persist_graph()
+                return result
+
+        def put_writes(
+            self,
+            config,
+            writes,
+            task_id,
+            task_path="",
+        ) -> None:
+            with self.lock:
+                super().put_writes(
+                    config,
+                    writes,
+                    task_id,
+                    task_path,
+                )
+                persist_graph()
+
+        def delete_thread(self, thread_id: str) -> None:
+            with self.lock:
+                super().delete_thread(thread_id)
+                persist_graph()
+
+    return DurableSqliteSaver(conn)
 
 
 class LangGraphHarness:
@@ -173,6 +353,7 @@ class LangGraphHarness:
                     f"run recovery evidence is invalid: {error}"
                 ) from error
             if state.is_terminal():
+                self._h._validate_terminal_resume(state, records)
                 return RunResult(state, state.status, "run already terminal")
             state.recover_active_elapsed()
             if records:
@@ -189,6 +370,7 @@ class LangGraphHarness:
                     state.quarantine.detail,
                 )
             if state.is_terminal():
+                self._h._validate_terminal_resume(state, records)
                 save_state(state)
                 return RunResult(
                     state,
@@ -252,14 +434,20 @@ class LangGraphHarness:
                 state.plan = Supervisor(self.config, self._h.llm).plan(
                     state.task
                 )
-                from ..harness.transaction import durable_artifact_write
-
                 plan_bytes = state.plan.model_dump_json(indent=2).encode(
                     "utf-8"
                 )
                 initial_ref = _initial_plan_ref()
-                _write_immutable(run_dir / initial_ref, plan_bytes)
-                durable_artifact_write(run_dir / "plan.json", plan_bytes)
+                _write_immutable(
+                    run_dir / initial_ref,
+                    plan_bytes,
+                    run_dir=run_dir,
+                )
+                anchored_atomic_replace_bytes(
+                    run_dir / "plan.json",
+                    plan_bytes,
+                    anchor=run_dir,
+                )
                 append_ledger(
                     state,
                     StepRecord(
@@ -301,7 +489,10 @@ class LangGraphHarness:
                     time.monotonic() - self._t0
                 )
                 state.active_since = None
-                state.status = "FAILED"
+                self._h._record_plan_failure(
+                    state,
+                    type(error).__name__,
+                )
                 self._h._save(state)
                 return RunResult(
                     state,
@@ -309,9 +500,9 @@ class LangGraphHarness:
                     f"{type(error).__name__}: {error}",
                 )
 
-        conn = sqlite3.connect(str(run_dir / "graph.sqlite"), check_same_thread=False)
+        conn, persist_graph = _graph_database_connection(run_dir)
         try:
-            graph = self._compile(conn)
+            graph = self._compile(conn, persist_graph)
             gcfg: Any = {"configurable": {"thread_id": state.run_id}}  # LangGraph RunnableConfig
             snap = graph.get_state(gcfg)
             has_interrupt = bool(snap.next) and bool(snap.interrupts or [])
@@ -448,11 +639,17 @@ class LangGraphHarness:
                 final = load_state_by_id(self.config.runs_dir, state.run_id)
                 final.recover_active_elapsed()
                 step = final.next_step()
+                failure_type = (
+                    e.original_type
+                    if isinstance(e, _SanitizedNodeError)
+                    else type(e).__name__
+                )
                 return self._fail_after_safe_revert(
                     final,
-                    f"{type(e).__name__}: {e}",
+                    f"{failure_type} during graph execution",
                     step=step,
                     mark_failed_step=True,
+                    failure_type=failure_type,
                 )
 
             # paused on a fresh interrupt?
@@ -470,6 +667,7 @@ class LangGraphHarness:
                     "graph stopped mid-run without an interrupt",
                     step=final.next_step(),
                     mark_failed_step=True,
+                    failure_type="GraphStopped",
                 )
         finally:
             conn.close()
@@ -500,16 +698,25 @@ class LangGraphHarness:
         return RunResult(final, final.status)
 
     # --- graph -------------------------------------------------------------
-    def _compile(self, conn: sqlite3.Connection):
-        from langgraph.checkpoint.sqlite import SqliteSaver
+    def _compile(
+        self,
+        conn: sqlite3.Connection,
+        persist_graph: _GraphPersistence,
+    ):
         from langgraph.graph import END, START, StateGraph
 
-        saver = SqliteSaver(conn)
+        saver = _durable_sqlite_saver(conn, persist_graph)
         saver.setup()
         builder = StateGraph(GraphState)
-        builder.add_node("prepare", self._prepare_node)  # type: ignore[arg-type]
+        builder.add_node(
+            "prepare",
+            _sanitize_graph_node("prepare", self._prepare_node),  # type: ignore[arg-type]
+        )
         builder.add_node("gate", self._gate_node)  # type: ignore[arg-type]
-        builder.add_node("verify", self._verify_node)  # type: ignore[arg-type]
+        builder.add_node(
+            "verify",
+            _sanitize_graph_node("verify", self._verify_node),  # type: ignore[arg-type]
+        )
         builder.add_edge(START, "prepare")
         routes: dict[Hashable, str] = {
             "gate": "gate",
@@ -546,15 +753,19 @@ class LangGraphHarness:
         if not non_retryable and state.repairs_for(step) < limits.max_repairs:
             assert state.plan is not None  # plan set before stepping
             state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
-            from ..harness.transaction import durable_artifact_write
-
             plan_bytes = state.plan.model_dump_json(indent=2).encode("utf-8")
             attempt_id = state.attempt_id(step)
             repair_ref = _repair_plan_ref(attempt_id)
-            _write_immutable(Path(state.run_dir) / repair_ref, plan_bytes)
-            durable_artifact_write(
-                Path(state.run_dir) / "plan.json",
+            run_dir = Path(state.run_dir)
+            _write_immutable(
+                run_dir / repair_ref,
                 plan_bytes,
+                run_dir=run_dir,
+            )
+            anchored_atomic_replace_bytes(
+                run_dir / "plan.json",
+                plan_bytes,
+                anchor=run_dir,
             )
             self._ledger(
                 state,
@@ -650,6 +861,7 @@ class LangGraphHarness:
                 verdict_ref=verdict_ref,
                 evidence_sha256=verdict_sha,
                 notes=str(e)[:300],
+                idempotency_key=f"{attempt_id}:policy",
             )
             self._repair_or_fail(state, step, verdict, workdir)
             state.elapsed_s = self._prior_elapsed + (
@@ -893,6 +1105,7 @@ class LangGraphHarness:
         *,
         step,
         mark_failed_step: bool = False,
+        failure_type: str | None = None,
     ) -> RunResult:
         if step is not None and step.step_id not in final.completed_steps:
             try:
@@ -908,6 +1121,23 @@ class LangGraphHarness:
                     f"{type(error).__name__}: {error}",
                 )
             if mark_failed_step and step.step_id not in final.failed_steps:
+                attempt_id = final.attempt_id(step)
+                fail_key = f"{attempt_id}:fail"
+                if not any(
+                    record.idempotency_key == fail_key
+                    for record in read_ledger(final.run_dir)
+                ):
+                    append_ledger(
+                        final,
+                        StepRecord(
+                            seq=final.next_seq(),
+                            step_id=step.step_id,
+                            phase="fail",
+                            notes=f"error: {failure_type or 'RuntimeFailure'}",
+                            attempt_id=attempt_id,
+                            idempotency_key=fail_key,
+                        ),
+                    )
                 final.fail_current(step)
             else:
                 final.status = "FAILED"
@@ -945,11 +1175,12 @@ def _current_artifact_sha(run_dir: Path, step_id: str | None, action: str) -> st
         return None
     candidates = [run_dir / "steps" / _safe_seg(step_id) / "patch.json", run_dir / "patch.json"]
     for path in candidates:
-        if path.exists():
-            try:
-                return sha256_bytes(path.read_bytes())
-            except OSError:
-                return None
+        try:
+            value = anchored_read_bytes(path, anchor=run_dir, missing_ok=True)
+        except OSError:
+            return None
+        if value is not None:
+            return sha256_bytes(value)
     return None
 
 
@@ -980,12 +1211,15 @@ def _load_step_artifacts(
         ) from error
     if step.action == "edit_code":
         ppath = sdir / "patch.json"
-        if ppath.is_symlink() or not ppath.is_file():
-            raise TransactionCorrupt(
-                f"persisted patch is missing or unsafe for {step.step_id}"
-            )
         try:
-            patch = Patch.model_validate_json(ppath.read_text())
+            patch_bytes = anchored_read_bytes(ppath, anchor=run_dir)
+        except OSError as error:
+            raise TransactionCorrupt(
+                f"persisted patch is missing or unsafe for {step.step_id}: {error}"
+            ) from error
+        try:
+            assert patch_bytes is not None
+            patch = Patch.model_validate_json(patch_bytes)
         except Exception as error:
             raise TransactionCorrupt(
                 f"persisted patch is invalid for {step.step_id}: {error}"
@@ -1017,13 +1251,22 @@ def _load_step_artifacts(
             )
         return evidence.result, bundle
     if step.action == "repo_integrity":
-        ipath = sdir / "repo_integrity.json"
-        if ipath.exists():
-            try:
-                return RepoIntegrityResult.model_validate_json(ipath.read_text()), bundle
-            except Exception:
-                pass
-        return None, bundle
+        integrity_bytes = _read_ledger_bound_bytes(
+            state,
+            step,
+            phase="execute",
+            expected_ref=_attempt_ref(
+                attempt_id, "repo_integrity.json"
+            ),
+        )
+        try:
+            integrity = RepoIntegrityResult.model_validate_json(integrity_bytes)
+        except Exception as error:
+            raise CheckpointCorrupt(
+                "persisted repository integrity evidence is invalid for "
+                f"{step.step_id}/{attempt_id}: {type(error).__name__}"
+            ) from error
+        return integrity, bundle
     if step.action == "repo_stage":
         evidence = _read_checksumming_envelope(
             _read_ledger_bound_bytes(
@@ -1092,11 +1335,13 @@ def _read_ledger_bound_bytes(
         / _safe_seg(step.step_id)
         / expected_ref
     )
-    if path.is_symlink() or not path.is_file():
+    try:
+        data = anchored_read_bytes(path, anchor=state.run_dir)
+    except OSError as error:
         raise CheckpointCorrupt(
-            f"immutable {phase} evidence is missing or unsafe: {path}"
-        )
-    data = path.read_bytes()
+            f"immutable {phase} evidence is missing or unsafe: {path}: {error}"
+        ) from error
+    assert data is not None
     if sha256_bytes(data) != record.evidence_sha256:
         raise CheckpointCorrupt(
             f"immutable {phase} evidence changed for {step.step_id}/{attempt_id}"

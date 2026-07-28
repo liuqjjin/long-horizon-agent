@@ -139,7 +139,7 @@ def _record_terminal_transaction(
     resolved = resolve_patch(patch, patch_bytes=patch_bytes)
     backup = snapshot_paths(resolved.paths, workdir)
     primary = run_dir / "backups" / step_id / f"{attempt_id}.json"
-    backup_digest = save_backup(backup, primary)
+    backup_digest = save_backup(backup, primary, run_dir=run_dir)
     transaction = build_transaction(
         run_dir=run_dir,
         step_id=step_id,
@@ -152,7 +152,11 @@ def _record_terminal_transaction(
             "updated_at": created_at,
         }
     )
-    save_backup(backup, run_dir / transaction.backup_mirror_ref)
+    save_backup(
+        backup,
+        run_dir / transaction.backup_mirror_ref,
+        run_dir=run_dir,
+    )
     save_transaction(run_dir, transaction)
     apply_patch(patch, workdir, resolved=resolved, backup=backup)
     transaction = transaction.transition("APPLIED", workdir=workdir)
@@ -622,6 +626,7 @@ def test_backup_rejects_a_checksummed_traversal_path(tmp_path):
     save_backup(
         Backup(originals={"src/app.py": b"old\n"}, modes={"src/app.py": 0o644}),
         path,
+        run_dir=tmp_path,
     )
     envelope = json.loads(path.read_text())
     envelope["originals_b64"] = {
@@ -642,7 +647,7 @@ def test_backup_rejects_a_checksummed_traversal_path(tmp_path):
     path.write_text(json.dumps(envelope))
 
     with pytest.raises(ValueError, match="unsafe patch path"):
-        load_backup(path, required=True)
+        load_backup(path, run_dir=tmp_path, required=True)
 
 
 @pytest.mark.parametrize(

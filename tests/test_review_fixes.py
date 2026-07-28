@@ -151,9 +151,16 @@ def test_backup_persists_to_disk_and_reverts(tmp_path):
     )
     target.write_text("changed\n")  # simulate an applied patch
 
-    save_backup(backup, tmp_path / "backups" / "s.json")
+    save_backup(
+        backup,
+        tmp_path / "backups" / "s.json",
+        run_dir=tmp_path,
+    )
     # simulate a fresh process: only the disk copy survives
-    loaded = load_backup(tmp_path / "backups" / "s.json")
+    loaded = load_backup(
+        tmp_path / "backups" / "s.json",
+        run_dir=tmp_path,
+    )
     assert loaded is not None
     revert_patch(loaded, tmp_path)
     assert target.read_text() == "orig\n"

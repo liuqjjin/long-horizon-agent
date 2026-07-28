@@ -190,9 +190,11 @@ def test_loop_fails_closed_on_midstep_exception(tmp_path, monkeypatch):
     # run() must return a clean FAILED, not propagate the exception or wedge at RUNNING.
     result = Harness(_cfg(tmp_path)).run(hermetic_task("data/tasks/fix_average.yaml"))
     assert result.status == "FAILED"
-    # the fault is ledgered as a fail (not silently dropped).
+    # The fault type is durable, while backend-controlled exception text is
+    # returned to the caller but never copied into long-lived run evidence.
     ledger = (Path(result.state.run_dir) / "ledger.jsonl").read_text()
-    assert '"phase":"fail"' in ledger and "execute boom" in ledger
+    assert '"phase":"fail"' in ledger and "error: RuntimeError" in ledger
+    assert "execute boom" not in ledger
 
 
 def test_loop_reverts_applied_patch_on_midstep_fault(tmp_path, monkeypatch):

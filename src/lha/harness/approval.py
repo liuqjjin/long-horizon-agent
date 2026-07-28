@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import stat
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,11 +24,13 @@ from typing import Generic, Iterator, Literal, TypeVar
 from pydantic import BaseModel, Field, model_validator
 
 from ..durable_io import (
-    atomic_replace_text,
-    durable_mkdir_chain,
-    fsync_directory,
+    anchored_atomic_replace_bytes,
+    anchored_open_lock_file,
+    anchored_read_bytes,
+    anchored_unlink_file,
+    anchored_write_once_bytes,
 )
-from .transaction import attempt_artifact_dir, durable_artifact_write
+from .transaction import attempt_artifact_dir
 
 _Model = TypeVar("_Model", bound=BaseModel)
 
@@ -144,24 +145,49 @@ class HumanApprovalGate:
         self.decision_file = self.run_dir / "approval.json"
         self.lock_file = self.run_dir / ".approval.lock"
 
-    @staticmethod
-    def _atomic_write(path: Path, text: str) -> None:
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise ValueError(f"unsafe approval path: {path}")
-        durable_mkdir_chain(path.parent)
-        atomic_replace_text(path, text)
+    def _atomic_write(self, path: Path, text: str) -> None:
+        try:
+            anchored_atomic_replace_bytes(
+                path,
+                text.encode("utf-8"),
+                anchor=self.run_dir,
+            )
+        except (OSError, ValueError) as error:
+            raise ValueError(f"unsafe approval path: {path}") from error
+
+    def _read_alias(self, path: Path) -> bytes | None:
+        try:
+            return anchored_read_bytes(
+                path,
+                anchor=self.run_dir,
+                missing_ok=True,
+            )
+        except (OSError, ValueError) as error:
+            raise ValueError(f"unsafe approval alias: {path}") from error
+
+    def _unlink_alias(self, path: Path, *, missing_ok: bool) -> bool:
+        try:
+            return anchored_unlink_file(
+                path,
+                anchor=self.run_dir,
+                missing_ok=missing_ok,
+            )
+        except FileNotFoundError:
+            raise
+        except (OSError, ValueError) as error:
+            raise ValueError(f"unsafe approval alias: {path}") from error
 
     @contextmanager
     def _decision_lock(self) -> Iterator[None]:
-        if self.lock_file.is_symlink() or (
-            self.lock_file.exists() and not self.lock_file.is_file()
-        ):
-            raise ValueError(f"unsafe approval lock path: {self.lock_file}")
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self.lock_file, flags, 0o600)
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            os.close(descriptor)
-            raise ValueError(f"approval lock is not a regular file: {self.lock_file}")
+        try:
+            descriptor = anchored_open_lock_file(
+                self.lock_file,
+                anchor=self.run_dir,
+            )
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"unsafe approval lock path: {self.lock_file}"
+            ) from error
         try:
             try:
                 import fcntl
@@ -189,18 +215,17 @@ class HumanApprovalGate:
             summary=summary,
             artifact_sha256=artifact_sha256,
         )
-        if self.pending.exists() or self.pending.is_symlink():
+        if self._read_alias(self.pending) is not None:
             existing = self.pending_request()
             if existing != request:
                 raise ValueError(
                     "pending approval request belongs to another attempt"
                 )
-        if self.decision_file.exists() or self.decision_file.is_symlink():
-            if self.decision_file.is_symlink() or not self.decision_file.is_file():
-                raise ValueError("approval decision alias is unsafe")
+        decision_alias = self._read_alias(self.decision_file)
+        if decision_alias is not None:
             try:
                 alias = ApprovalDecision.model_validate_json(
-                    self.decision_file.read_bytes()
+                    decision_alias
                 )
             except Exception as error:
                 raise ValueError(
@@ -221,18 +246,21 @@ class HumanApprovalGate:
 
         # A decision may already be durable after a crash between its fsync and
         # alias cleanup. Do not re-advertise that request as still pending.
-        decision_path = approval_decision_path(
-            self.run_dir, step.step_id, attempt_id
+        decision_evidence = read_approval_decision(
+            self.run_dir,
+            step.step_id,
+            attempt_id,
         )
-        if not (decision_path.exists() or decision_path.is_symlink()):
+        if decision_evidence is None:
             self._atomic_write(self.pending, request.model_dump_json(indent=2))
         return evidence
 
     def pending_request(self) -> ApprovalRequest:
-        if self.pending.is_symlink() or not self.pending.is_file():
+        data = self._read_alias(self.pending)
+        if data is None:
             raise ValueError("no safe pending approval request exists")
         try:
-            request = ApprovalRequest.model_validate_json(self.pending.read_bytes())
+            request = ApprovalRequest.model_validate_json(data)
             evidence = read_approval_request(
                 self.run_dir, request.step_id, request.attempt_id
             )
@@ -252,9 +280,7 @@ class HumanApprovalGate:
         validate_alias: bool = True,
     ) -> ApprovalEvidence[ApprovalRequest] | None:
         evidence = read_approval_request(self.run_dir, step_id, attempt_id)
-        if validate_alias and (
-            self.pending.exists() or self.pending.is_symlink()
-        ):
+        if validate_alias and self._read_alias(self.pending) is not None:
             pending = self.pending_request()
             if pending.step_id != step_id or pending.attempt_id != attempt_id:
                 raise ValueError(
@@ -274,14 +300,14 @@ class HumanApprovalGate:
         validate_alias: bool = True,
     ) -> ApprovalEvidence[ApprovalDecision] | None:
         evidence = read_approval_decision(self.run_dir, step_id, attempt_id)
-        if validate_alias and (
-            self.decision_file.exists() or self.decision_file.is_symlink()
-        ):
-            if self.decision_file.is_symlink() or not self.decision_file.is_file():
-                raise ValueError("approval decision alias is unsafe")
+        if validate_alias:
+            decision_alias = self._read_alias(self.decision_file)
+        else:
+            decision_alias = None
+        if decision_alias is not None:
             try:
                 alias = ApprovalDecision.model_validate_json(
-                    self.decision_file.read_bytes()
+                    decision_alias
                 )
             except Exception as error:
                 raise ValueError(f"invalid approval decision alias: {error}") from error
@@ -336,15 +362,13 @@ class HumanApprovalGate:
             self._atomic_write(
                 self.decision_file, decision.model_dump_json(indent=2)
             )
-            self.pending.unlink()
-            _fsync_directory(self.run_dir)
+            self._unlink_alias(self.pending, missing_ok=False)
             return evidence
 
     def clear_transient(self) -> None:
         """Remove aliases only; immutable request and decision remain."""
-        self.pending.unlink(missing_ok=True)
-        self.decision_file.unlink(missing_ok=True)
-        _fsync_directory(self.run_dir)
+        self._unlink_alias(self.pending, missing_ok=True)
+        self._unlink_alias(self.decision_file, missing_ok=True)
 
     # Kept as a narrow compatibility name for callers that clear stale aliases.
     def clear(self) -> None:
@@ -397,15 +421,15 @@ def _read_evidence(
     *,
     required: bool,
 ) -> ApprovalEvidence[_Model] | None:
-    _validate_evidence_path(path)
-    if not path.exists():
-        if required:
-            raise ValueError(f"approval evidence is missing: {path}")
-        return None
-    if not path.is_file():
-        raise ValueError(f"approval evidence is not a regular file: {path}")
+    run_dir = _validate_evidence_path(path)
     try:
-        data = path.read_bytes()
+        data = anchored_read_bytes(
+            path,
+            anchor=run_dir,
+            missing_ok=not required,
+        )
+        if data is None:
+            return None
         raw = json.loads(data)
         payload = raw["payload"]
         if (
@@ -420,15 +444,16 @@ def _read_evidence(
 
 
 def _write_immutable(path: Path, data: bytes) -> None:
-    _validate_evidence_path(path)
-    if path.exists():
-        if not path.is_file() or path.read_bytes() != data:
-            raise ValueError(f"immutable approval evidence changed: {path}")
-        return
-    durable_artifact_write(path, data)
+    run_dir = _validate_evidence_path(path)
+    try:
+        anchored_write_once_bytes(path, data, anchor=run_dir)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            f"immutable approval evidence changed or is unsafe: {path}"
+        ) from error
 
 
-def _validate_evidence_path(path: Path) -> None:
+def _validate_evidence_path(path: Path) -> Path:
     try:
         run_dir = path.parents[4]
         if (
@@ -451,6 +476,7 @@ def _validate_evidence_path(path: Path) -> None:
             raise ValueError(
                 f"approval evidence parent is not a directory: {current}"
             )
+    return run_dir
 
 
 def _canonical(payload: dict) -> bytes:
@@ -459,7 +485,3 @@ def _canonical(payload: dict) -> bytes:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def _fsync_directory(path: Path) -> None:
-    fsync_directory(path)

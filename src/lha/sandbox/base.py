@@ -6,6 +6,7 @@ import math
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -25,6 +26,8 @@ PROCESS_CLEANUP_RETURN_CODE = 126
 _READ_CHUNK_BYTES = 64 * 1024
 _DRAIN_GRACE_S = 1.0
 _PROCESS_GROUP_CLEANUP_S = 2.0
+_PROCESS_TABLE_TIMEOUT_S = 1.0
+_PROCESS_TABLE_OUTPUT_BYTES = 4 * 1024 * 1024
 
 
 def process_group_cleanup_supported() -> bool:
@@ -89,6 +92,190 @@ class ProcessCleanupUnconfirmed(RuntimeError):
         )
 
 
+@dataclass(frozen=True)
+class _ProcessGroupMember:
+    """One kernel process-table row used to disambiguate signal-0 results."""
+
+    pid: int
+    pgid: int
+    uid: int
+    state: str
+
+    @property
+    def is_zombie(self) -> bool:
+        return self.state.startswith("Z")
+
+
+@dataclass(frozen=True)
+class _ProcessGroupCensus:
+    members: tuple[_ProcessGroupMember, ...] = ()
+    error: str | None = None
+
+
+def _read_process_group_census(process_group: int) -> _ProcessGroupCensus:
+    """Read fixed process-table fields without trusting the target environment."""
+    ps = next(
+        (
+            candidate
+            for candidate in (Path("/bin/ps"), Path("/usr/bin/ps"))
+            if candidate.is_file() and os.access(candidate, os.X_OK)
+        ),
+        None,
+    )
+    if ps is None:
+        return _ProcessGroupCensus(error="a fixed system ps executable is unavailable")
+    fields = "pid=,pgid=,uid=,state="
+    if sys.platform == "darwin" or "bsd" in sys.platform:
+        # BSD ps can select the exact process group. GNU ps gives -g different
+        # compatibility meanings, so Linux keeps the portable all-process scan.
+        argv = [str(ps), "-g", str(process_group), "-o", fields]
+    else:
+        argv = [str(ps), "-axo", fields]
+    try:
+        result = run_bounded_process(
+            argv,
+            timeout=_PROCESS_TABLE_TIMEOUT_S,
+            output_bytes=_PROCESS_TABLE_OUTPUT_BYTES,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C",
+                "LC_ALL": "C",
+            },
+        )
+    except OSError as error:
+        return _ProcessGroupCensus(
+            error=f"process-table inspection failed: {type(error).__name__}: {error}"
+        )
+    if result.output_truncated:
+        return _ProcessGroupCensus(
+            error="process-table inspection output exceeded its capture limit"
+        )
+    if result.returncode == 124:
+        return _ProcessGroupCensus(error="process-table inspection timed out")
+    if (
+        result.returncode == 1
+        and not result.stdout.strip()
+        and not result.stderr.strip()
+        and (sys.platform == "darwin" or "bsd" in sys.platform)
+    ):
+        # BSD ps uses exit 1 with no diagnostic when the selected PGID vanished
+        # between the signal-0 probe and this snapshot.
+        return _ProcessGroupCensus()
+    if result.returncode != 0:
+        detail = result.stderr.strip()[-500:]
+        suffix = f": {detail}" if detail else ""
+        return _ProcessGroupCensus(
+            error=f"process-table inspection exited {result.returncode}{suffix}"
+        )
+
+    members: list[_ProcessGroupMember] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) != 4:
+            return _ProcessGroupCensus(
+                error=f"process-table inspection returned a malformed row: {line[:200]!r}"
+            )
+        raw_pid, raw_pgid, raw_uid, state = fields
+        try:
+            pid = int(raw_pid)
+            pgid = int(raw_pgid)
+            uid = int(raw_uid)
+        except ValueError:
+            return _ProcessGroupCensus(
+                error=f"process-table inspection returned a malformed row: {line[:200]!r}"
+            )
+        if pid <= 0 or pgid <= 0 or uid < 0 or not state:
+            return _ProcessGroupCensus(
+                error=f"process-table inspection returned a malformed row: {line[:200]!r}"
+            )
+        if pgid == process_group:
+            members.append(
+                _ProcessGroupMember(
+                    pid=pid,
+                    pgid=pgid,
+                    uid=uid,
+                    state=state,
+                )
+            )
+    return _ProcessGroupCensus(tuple(members))
+
+
+def _confirm_process_group_not_runnable(
+    process: subprocess.Popen[bytes],
+    process_group: int,
+) -> ProcessCleanupResult:
+    """Resolve Darwin's ambiguous signal-0 result through the process table."""
+    census = _read_process_group_census(process_group)
+    if census.error is not None:
+        return ProcessCleanupResult(
+            False,
+            f"process group {process_group} could not be inspected: {census.error}",
+        )
+    if not census.members:
+        # A signal-0 result and an empty table can disagree across a process
+        # exit. Confirm the later observation through the kernel before
+        # accepting absence; persistent EPERM may instead mean hidden members.
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return ProcessCleanupResult(True, "process group is absent")
+        except (PermissionError, OSError) as error:
+            return ProcessCleanupResult(
+                False,
+                (
+                    f"process group {process_group} is absent from the process table "
+                    f"but the kernel probe failed: {error}"
+                ),
+            )
+        return ProcessCleanupResult(
+            False,
+            (
+                f"process group {process_group} is absent from the process table "
+                "but the kernel still reports it present"
+            ),
+        )
+
+    runnable = tuple(member for member in census.members if not member.is_zombie)
+    if not runnable:
+        # Darwin may return EPERM for a group containing only killed zombies.
+        # Zombies cannot execute or produce further side effects; their parent
+        # (often launchd after reparenting) owns the final wait.
+        return ProcessCleanupResult(
+            True,
+            f"process group {process_group} has only zombie members",
+        )
+
+    if process.poll() is not None and any(
+        member.pid == process_group for member in runnable
+    ):
+        # Popen has reaped the original leader. A runnable process now using
+        # that PID must be a later allocation, so the numeric PGID was reused.
+        return ProcessCleanupResult(
+            True,
+            f"process group ID {process_group} was reused after the original leader exited",
+        )
+
+    owned_uids = {os.getuid(), os.geteuid()}
+    owned = tuple(member for member in runnable if member.uid in owned_uids)
+    if owned:
+        pids = ", ".join(str(member.pid) for member in owned[:10])
+        return ProcessCleanupResult(
+            False,
+            f"same-user runnable members remain in process group {process_group}: {pids}",
+        )
+    pids = ", ".join(str(member.pid) for member in runnable[:10])
+    return ProcessCleanupResult(
+        False,
+        (
+            f"runnable members with another effective UID remain in process group "
+            f"{process_group}: {pids}"
+        ),
+    )
+
+
 def terminate_process_group(
     process: subprocess.Popen[bytes],
     *,
@@ -141,17 +328,23 @@ def terminate_process_group(
                 f"could not confirm process group {process_group} cleanup: {error}",
             )
         if time.monotonic() >= deadline:
+            inspected = _confirm_process_group_not_runnable(process, process_group)
+            if inspected.confirmed:
+                return inspected
             if permission_error is not None:
                 return ProcessCleanupResult(
                     False,
                     (
                         f"could not confirm process group {process_group} cleanup: "
-                        f"{permission_error}"
+                        f"{permission_error}; {inspected.detail}"
                     ),
                 )
             return ProcessCleanupResult(
                 False,
-                f"process group {process_group} still exists after cleanup",
+                (
+                    f"process group {process_group} still exists after cleanup; "
+                    f"{inspected.detail}"
+                ),
             )
         time.sleep(0.01)
 

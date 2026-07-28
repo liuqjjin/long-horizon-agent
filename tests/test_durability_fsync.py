@@ -48,9 +48,17 @@ def _reject_directory_sync(
         lambda path: checkpoint._fsync_write(path, "{}"),
         lambda path: transaction._fsync_replace(path, "{}"),
         lambda path: transaction.durable_artifact_write(path, b"{}"),
-        lambda path: replace_repo_artifact(path, "{}"),
-        lambda path: replace_experiment_artifact(path, b"{}"),
-        lambda path: save_backup(Backup(), path),
+        lambda path: replace_repo_artifact(
+            path,
+            "{}",
+            run_dir=path.parent,
+        ),
+        lambda path: replace_experiment_artifact(
+            path,
+            b"{}",
+            run_dir=path.parent,
+        ),
+        lambda path: save_backup(Backup(), path, run_dir=path.parent),
     ],
 )
 def test_atomic_replacements_reject_directory_fsync_failure(
@@ -70,8 +78,11 @@ def test_approval_directory_sync_failure_is_not_ignored(
 ) -> None:
     _reject_directory_sync(monkeypatch)
 
-    with pytest.raises(OSError, match="directory fsync failure"):
-        approval._fsync_directory(tmp_path)
+    gate = approval.HumanApprovalGate(tmp_path)
+    with pytest.raises(ValueError, match="unsafe approval path") as caught:
+        gate._atomic_write(tmp_path / "pending_approval.json", "{}")
+    assert isinstance(caught.value.__cause__, OSError)
+    assert "directory fsync failure" in str(caught.value.__cause__)
 
 
 def test_llm_usage_rejects_directory_fsync_failure(

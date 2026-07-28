@@ -839,6 +839,38 @@ def test_codex_process_receives_only_the_environment_allowlist(tmp_path, monkeyp
     assert "PATH" in captured
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"],
+)
+def test_codex_rejects_proxy_urls_with_embedded_credentials(
+    name, tmp_path, monkeypatch
+):
+    source_home = tmp_path / "real_codex_home"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"token": "only-auth-source"}')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    for candidate in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(candidate, raising=False)
+    secret = "do-not-copy"
+    monkeypatch.setenv(name, f"http://agent:{secret}@proxy.example.test:8080")
+    client = CodexCLIClient(max_retries=0)
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+
+    with pytest.raises(CodexInvocationError, match="embedded credentials") as excinfo:
+        client.complete("SYSTEM", "PROMPT")
+
+    assert secret not in str(excinfo.value)
+    assert client.pending_cleanup_paths == ()
+
+
 def test_protocol_errors_are_not_retried(monkeypatch):
     client = CodexCLIClient(max_retries=3, retry_backoff_s=0)
     calls = 0

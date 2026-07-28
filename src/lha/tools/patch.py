@@ -24,8 +24,9 @@ from pydantic import BaseModel, Field
 
 from ..artifacts import Patch
 from ..durable_io import (
+    anchored_atomic_replace_bytes,
+    anchored_read_bytes,
     atomic_replace_bytes,
-    atomic_replace_text,
     fsync_directory,
     sync_regular_file,
 )
@@ -905,8 +906,13 @@ def _validated_backup(
     )
 
 
-def save_backup(backup: Backup, path: str | Path) -> str:
-    """Persist a checksummed backup so revert survives a cross-process resume."""
+def save_backup(
+    backup: Backup,
+    path: str | Path,
+    *,
+    run_dir: str | Path,
+) -> str:
+    """Persist a checksummed backup below the run-owned directory anchor."""
     path = Path(path)
     backup = _validated_backup(
         backup.originals,
@@ -928,18 +934,37 @@ def save_backup(backup: Backup, path: str | Path) -> str:
         "modes": backup.modes,
         "created_dirs": backup.created_dirs,
     }
-    atomic_replace_text(path, json.dumps(envelope, sort_keys=True))
+    anchored_atomic_replace_bytes(
+        path,
+        json.dumps(envelope, sort_keys=True).encode("utf-8"),
+        anchor=run_dir,
+        mode=0o600,
+    )
     return digest
 
 
-def load_backup(path: str | Path, *, required: bool = False) -> Backup | None:
+def load_backup(
+    path: str | Path,
+    *,
+    run_dir: str | Path,
+    required: bool = False,
+) -> Backup | None:
+    """Load one backup through its run-owned directory anchor."""
     path = Path(path)
-    if not path.exists():
+    try:
+        encoded = anchored_read_bytes(
+            path,
+            anchor=run_dir,
+            missing_ok=True,
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(f"backup path is corrupt: {path}: {error}") from error
+    if encoded is None:
         if required:
             raise ValueError(f"required backup is missing: {path}")
         return None
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(encoded)
         if (
             isinstance(raw, dict)
             and raw.get("schema_version") == 4

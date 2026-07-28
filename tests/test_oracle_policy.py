@@ -21,6 +21,8 @@ from lha.artifacts import Patch
 from lha.config import Config
 from lha.harness import Harness
 from lha.harness.approval import HumanApprovalGate
+from lha.llm.trace import TracedLLM
+from lha.reporting import collect_run
 from lha.tools import policy
 from lha.tools.patch import resolve_patch
 from lha.verifiers.verdict import Verdict
@@ -194,6 +196,9 @@ class _TamperingLLM:
     def plan(self, task, template):
         return None
 
+    def set_trusted_oracle_paths(self, paths) -> None:
+        self.trusted_oracle_paths = tuple(paths)
+
 
 def _cfg(tmp_path: Path, **over) -> Config:
     return Config(
@@ -209,7 +214,7 @@ def _run_with_tampering(tmp_path, harness_cls, **cfg_over):
     task = hermetic_task("data/tasks/fix_average.yaml")
     h = harness_cls(_cfg(tmp_path, **cfg_over))
     inner = getattr(h, "_h", h)  # LangGraphHarness wraps a Harness
-    inner.llm = _TamperingLLM()
+    inner.llm = TracedLLM(_TamperingLLM())
     return h.run(task)
 
 
@@ -238,6 +243,12 @@ def test_tampering_model_fails_under_langgraph_too(tmp_path):
 
     result = _run_with_tampering(tmp_path, LangGraphHarness)
     assert result.status == "FAILED"
+    report = collect_run(tmp_path / "runs", result.state.run_id)
+    assert report.state.status == "FAILED"
+    resumed_harness = LangGraphHarness(_cfg(tmp_path))
+    resumed_harness._h.llm = TracedLLM(_TamperingLLM())
+    resumed = resumed_harness.resume(result.state.run_id)
+    assert resumed.status == "FAILED"
     workdir = Path(result.state.run_dir) / "workdir"
     canonical = Path("data/sample_repo/tests/test_mathutils.py").read_text()
     assert (workdir / "tests/test_mathutils.py").read_text() == canonical

@@ -12,6 +12,7 @@ from lha.agents.experimenter import ExperimentEvidence, ExperimentIntent
 from lha.artifacts import ExperimentResult, Plan, Step
 from lha.clock import now
 from lha.config import Config
+from lha.harness import Harness
 from lha.harness.checkpoint import append_ledger
 from lha.harness.errors import CheckpointCorrupt
 from lha.harness.manifest import sha256_bytes
@@ -19,6 +20,7 @@ from lha.harness.state import RunState, StepRecord
 from lha.live_context.models import ContextBundle, Freshness
 from lha.repo_adapter import (
     RepoCommandResult,
+    RepoIntegrityResult,
     RepoStageEvidence,
     RepoStageIntent,
     RepoStageResult,
@@ -227,6 +229,122 @@ def test_langgraph_repo_stage_alias_cannot_replace_scored_result(
     loaded, _bundle = _load_step_artifacts(state, step)
     assert loaded == result
     assert loaded.status == "not_configured"
+
+
+def test_langgraph_repo_integrity_alias_cannot_replace_scored_result(
+    tmp_path: Path,
+) -> None:
+    from lha.runtime.langgraph_runner import _load_step_artifacts
+
+    step = Step(
+        step_id="integrity",
+        kind="code",
+        action="repo_integrity",
+        goal="integrity",
+        context_requirement="optional",
+    )
+    state = _state(tmp_path, step)
+    attempt_id = state.attempt_id(step)
+    result = RepoIntegrityResult(
+        task_id="fixture",
+        expected_repo_sha256="a" * 64,
+        actual_repo_sha256="a" * 64,
+        expected_task_sha256="b" * 64,
+        actual_task_sha256="b" * 64,
+        expected_adapter_sha256="c" * 64,
+        actual_adapter_sha256="c" * 64,
+        expected_reference_patch_sha256="d" * 64,
+        actual_reference_patch_sha256="d" * 64,
+        expected_reference_touched_files=(),
+        actual_reference_touched_files=(),
+        oracle_files=(),
+        passed=True,
+    )
+    data = result.model_dump_json(indent=2).encode()
+    evidence_ref = f"attempts/{attempt_id}/repo_integrity.json"
+    evidence_path = (
+        Path(state.run_dir) / "steps" / step.step_id / evidence_ref
+    )
+    evidence_path.write_bytes(data)
+    append_ledger(
+        state,
+        StepRecord(
+            seq=state.next_seq(),
+            step_id=step.step_id,
+            phase="execute",
+            artifact_ref=evidence_ref,
+            evidence_sha256=sha256_bytes(data),
+            attempt_id=attempt_id,
+            idempotency_key=f"{attempt_id}:execute",
+        ),
+    )
+    alias = Path(state.run_dir) / "steps" / step.step_id / "repo_integrity.json"
+    alias.write_text("{\"forged\":true}")
+
+    loaded, _bundle = _load_step_artifacts(state, step)
+    assert loaded == result
+    assert loaded.passed
+
+    evidence_path.write_text("{\"changed\":true}")
+    with pytest.raises(CheckpointCorrupt, match="immutable execute evidence changed"):
+        _load_step_artifacts(state, step)
+
+
+def test_loop_repo_integrity_resume_uses_the_bound_attempt_result(
+    tmp_path: Path,
+) -> None:
+    step = Step(
+        step_id="loop-integrity",
+        kind="code",
+        action="repo_integrity",
+        goal="integrity",
+        context_requirement="optional",
+    )
+    state = _state(tmp_path, step)
+    attempt_id = state.attempt_id(step)
+    result = RepoIntegrityResult(
+        task_id="fixture",
+        expected_repo_sha256="a" * 64,
+        actual_repo_sha256=None,
+        expected_task_sha256="b" * 64,
+        actual_task_sha256=None,
+        expected_adapter_sha256="c" * 64,
+        actual_adapter_sha256=None,
+        expected_reference_patch_sha256="d" * 64,
+        actual_reference_patch_sha256=None,
+        expected_reference_touched_files=(),
+        actual_reference_touched_files=(),
+        oracle_files=(),
+        issues=("fixed input was unavailable",),
+        passed=False,
+    )
+    data = result.model_dump_json(indent=2).encode()
+    evidence_ref = f"attempts/{attempt_id}/repo_integrity.json"
+    evidence_path = (
+        Path(state.run_dir) / "steps" / step.step_id / evidence_ref
+    )
+    evidence_path.write_bytes(data)
+    append_ledger(
+        state,
+        StepRecord(
+            seq=state.next_seq(),
+            step_id=step.step_id,
+            phase="execute",
+            artifact_ref=evidence_ref,
+            evidence_sha256=sha256_bytes(data),
+            attempt_id=attempt_id,
+            idempotency_key=f"{attempt_id}:execute",
+        ),
+    )
+
+    loaded = Harness._committed_repo_integrity(
+        state,
+        step,
+        attempt_id,
+    )
+
+    assert loaded == result
+    assert not loaded.passed
 
 
 def test_langgraph_repo_stage_replay_rejects_changed_worktree(

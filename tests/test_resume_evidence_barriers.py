@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -16,6 +18,7 @@ import pytest
 from conftest import hermetic_task
 
 import lha.harness.state as state_module
+from lha.artifacts import Patch
 from lha.clock import now
 from lha.config import Config
 from lha.harness import Harness
@@ -23,6 +26,8 @@ from lha.harness.checkpoint import load_state, save_state
 from lha.harness.errors import CheckpointCorrupt, TransactionCorrupt
 from lha.harness.state import CLIIdentity, RunRuntimeContract, RunState
 from lha.harness.transaction import list_transactions
+from lha.llm.stub import DeterministicStub
+from lha.llm.trace import TracedLLM
 from lha.operation_lease import OperationLeaseStore, OperationRecoveryResult
 from lha.process_result import ProcResult
 from lha.reporting import ReportingError, collect_run, prune_runs
@@ -252,6 +257,247 @@ def test_orphan_immutable_verdict_is_adopted_without_reexecution(
 
 
 @pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_orphan_verdict_rebuilds_missing_display_aliases(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    runner, runtime_module = _runtime(runtime, config)
+    loop_module = importlib.import_module("lha.harness.loop")
+    original_dump = loop_module._dump
+    interrupted = False
+
+    def exit_before_aliases(run_dir, step_id, name, text):
+        nonlocal interrupted
+        if step_id == "s2-fix" and name == "verify.json" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt(
+                "simulated exit before verdict aliases"
+            )
+        return original_dump(run_dir, step_id, name, text)
+
+    monkeypatch.setattr(loop_module, "_dump", exit_before_aliases)
+    with pytest.raises(KeyboardInterrupt):
+        runner.run(
+            hermetic_task("data/tasks/fix_average.yaml"),
+            run_id=f"{runtime}-orphan-verdict-alias",
+        )
+    monkeypatch.setattr(loop_module, "_dump", original_dump)
+
+    def verifier_must_not_repeat(*args: Any, **kwargs: Any):
+        raise AssertionError("immutable orphan verdict was recomputed")
+
+    monkeypatch.setattr(
+        "lha.agents.verifier_agent.VerifierAgent.verify",
+        verifier_must_not_repeat,
+    )
+    resumed, _module = _runtime(runtime, config)
+    result = resumed.resume(f"{runtime}-orphan-verdict-alias")
+
+    assert result.status == "DONE"
+    collect_run(config.runs_dir, result.state.run_id)
+    records = runtime_module.read_ledger(result.state.run_dir)
+    assert sum(
+        record.step_id == "s2-fix" and record.phase == "verify"
+        for record in records
+    ) == 1
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_repair_orphan_verdict_accepts_only_the_prior_bound_alias(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WrongThenCorrect(DeterministicStub):
+        def propose_patch(self, step, bundle, workdir):
+            current = (Path(workdir) / "mathutils.py").read_text()
+            if not step.prior_failures:
+                replacement = current.replace(
+                    "return sum(values) / len(values) - 1",
+                    "return 0",
+                )
+            else:
+                replacement = current.replace(
+                    "return 0",
+                    "return sum(values) / len(values)",
+                )
+            return Patch(
+                step_id=step.step_id,
+                file_contents={"mathutils.py": replacement},
+                based_on_context=bundle.locators(),
+            )
+
+    config = _config(tmp_path)
+    runner, runtime_module = _runtime(runtime, config)
+    inner = getattr(runner, "_h", runner)
+    inner.llm = TracedLLM(WrongThenCorrect())
+    loop_module = importlib.import_module("lha.harness.loop")
+    original_dump = loop_module._dump
+    fix_verdicts = 0
+
+    def exit_before_repair_alias(run_dir, step_id, name, text):
+        nonlocal fix_verdicts
+        if step_id == "s2-fix" and name == "verify.json":
+            fix_verdicts += 1
+            if fix_verdicts == 2:
+                raise KeyboardInterrupt(
+                    "simulated exit before repaired verdict alias"
+                )
+        return original_dump(run_dir, step_id, name, text)
+
+    monkeypatch.setattr(loop_module, "_dump", exit_before_repair_alias)
+    with pytest.raises(KeyboardInterrupt):
+        runner.run(
+            hermetic_task("data/tasks/fix_average.yaml"),
+            run_id=f"{runtime}-repair-orphan-verdict",
+        )
+    monkeypatch.setattr(loop_module, "_dump", original_dump)
+
+    def verifier_must_not_repeat(*args: Any, **kwargs: Any):
+        raise AssertionError("repaired orphan verdict was recomputed")
+
+    monkeypatch.setattr(
+        "lha.agents.verifier_agent.VerifierAgent.verify",
+        verifier_must_not_repeat,
+    )
+    resumed, _module = _runtime(runtime, config)
+    resumed_inner = getattr(resumed, "_h", resumed)
+    resumed_inner.llm = TracedLLM(WrongThenCorrect())
+    result = resumed.resume(f"{runtime}-repair-orphan-verdict")
+
+    assert result.status == "DONE"
+    collect_run(config.runs_dir, result.state.run_id)
+    records = runtime_module.read_ledger(result.state.run_dir)
+    assert sum(
+        record.step_id == "s2-fix" and record.phase == "verify"
+        for record in records
+    ) == 2
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_orphan_initial_plan_is_adopted_without_replanning(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    runner, runtime_module = _runtime(runtime, config)
+    original_replace = runtime_module.anchored_atomic_replace_bytes
+    interrupted = False
+
+    def exit_before_plan_alias(path, data, *, anchor):
+        nonlocal interrupted
+        if Path(path).name == "plan.json" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt(
+                "simulated exit after immutable initial plan"
+            )
+        return original_replace(path, data, anchor=anchor)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "anchored_atomic_replace_bytes",
+        exit_before_plan_alias,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        runner.run(
+            hermetic_task("data/tasks/fix_average.yaml"),
+            run_id=f"{runtime}-orphan-initial-plan",
+        )
+    monkeypatch.setattr(
+        runtime_module,
+        "anchored_atomic_replace_bytes",
+        original_replace,
+    )
+
+    resumed, _module = _runtime(runtime, config)
+    result = resumed.resume(f"{runtime}-orphan-initial-plan")
+
+    assert result.status == "DONE"
+    collect_run(config.runs_dir, result.state.run_id)
+    records = runtime_module.read_ledger(result.state.run_dir)
+    assert sum(record.phase == "plan" for record in records) == 1
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_orphan_plan_failure_is_adopted_without_replanning(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, dynamic_planning=True)
+    runner, _runtime_module = _runtime(runtime, config)
+    loop_module = importlib.import_module("lha.harness.loop")
+    original_append = loop_module.append_ledger
+
+    def fail_planning(*args: Any, **kwargs: Any):
+        raise RuntimeError("planner failed")
+
+    def exit_before_failure_ledger(state: RunState, record) -> None:
+        if (
+            record.phase == "fail"
+            and record.step_id == "-"
+            and record.attempt_id == "plan"
+        ):
+            raise KeyboardInterrupt(
+                "simulated exit after immutable plan failure"
+            )
+        original_append(state, record)
+
+    monkeypatch.setattr(
+        "lha.agents.supervisor.Supervisor.plan",
+        fail_planning,
+    )
+    monkeypatch.setattr(loop_module, "append_ledger", exit_before_failure_ledger)
+    with pytest.raises(KeyboardInterrupt):
+        runner.run(
+            hermetic_task("data/tasks/fix_average.yaml"),
+            run_id=f"{runtime}-orphan-plan-failure",
+        )
+    monkeypatch.undo()
+
+    resumed, _module = _runtime(runtime, config)
+    result = resumed.resume(f"{runtime}-orphan-plan-failure")
+
+    assert result.status == "FAILED"
+    report = collect_run(config.runs_dir, result.state.run_id)
+    assert report.state.plan is None
+    run_dir = Path(result.state.run_dir)
+
+    extra_verdict = run_dir / "steps" / "ghost" / "verify.json"
+    extra_verdict.parent.mkdir(parents=True)
+    extra_verdict.write_text("{}")
+    with pytest.raises(
+        CheckpointCorrupt,
+        match="unexpected steps evidence",
+    ):
+        resumed.resume(result.state.run_id)
+    extra_verdict.unlink()
+    extra_verdict.parent.rmdir()
+    (run_dir / "steps").rmdir()
+
+    transient_approval = run_dir / "pending_approval.json"
+    transient_approval.write_text("{}")
+    with pytest.raises(
+        CheckpointCorrupt,
+        match="transient approval aliases",
+    ):
+        resumed.resume(result.state.run_id)
+    transient_approval.unlink()
+
+    transaction = run_dir / "transactions" / "ghost.json"
+    transaction.parent.mkdir()
+    transaction.write_text("{}")
+    with pytest.raises(
+        (CheckpointCorrupt, TransactionCorrupt),
+        match="transaction|unexpected transactions evidence",
+    ):
+        resumed.resume(result.state.run_id)
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
 def test_stale_resumer_reloads_terminal_state_after_lock_barrier(
     runtime: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -289,12 +535,15 @@ def test_stale_resumer_reloads_terminal_state_after_lock_barrier(
     monkeypatch.setattr(runner, "_drive", stale_drive_must_not_run)
     writer = threading.Thread(target=finish_while_resumer_waits)
     writer.start()
-    result = runner.resume(state.run_id)
+    with pytest.raises(
+        CheckpointCorrupt,
+        match="terminal run evidence is invalid",
+    ):
+        runner.resume(state.run_id)
     writer.join(timeout=5)
 
     assert not writer.is_alive()
     assert not writer_errors
-    assert result.status == "FAILED"
     assert load_state(state.run_dir).status == "FAILED"
 
 
@@ -315,6 +564,220 @@ def test_terminal_resume_validates_redundant_transaction_backups(
 
     with pytest.raises(
         TransactionCorrupt, match="terminal transaction backup is unusable"
+    ):
+        runner.resume(completed.state.run_id)
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_terminal_resume_replays_all_saved_evidence_and_cli_fails_closed(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _config(tmp_path, dynamic_planning=True)
+    runner, _runtime_module = _runtime(runtime, config)
+    completed = runner.run(
+        hermetic_task("data/tasks/fix_average.yaml"),
+        run_id=f"{runtime}-terminal-evidence",
+    )
+    assert completed.status == "DONE"
+    assert runner.resume(completed.state.run_id).status == "DONE"
+
+    run_dir = Path(completed.state.run_dir)
+    final_step = completed.state.completed_steps[-1]
+    attempt_id = completed.state.attempt_ids[final_step]
+    immutable_verdict = (
+        run_dir
+        / "steps"
+        / final_step
+        / "attempts"
+        / attempt_id
+        / "verify.json"
+    )
+    step_alias = run_dir / "steps" / final_step / "verify.json"
+    flat_alias = run_dir / "verify.json"
+    ledger = run_dir / "ledger.jsonl"
+    journal_result = next(
+        (run_dir / "llm_attempts").rglob("result.json")
+    )
+    journal_root = run_dir / "llm_attempts"
+    trace_path = run_dir / "llm_trace.jsonl"
+
+    def refuses(path: Path, damaged: bytes) -> None:
+        original = path.read_bytes()
+        path.write_bytes(damaged)
+        try:
+            with pytest.raises(
+                CheckpointCorrupt,
+                match="terminal run evidence is invalid|ledger",
+            ):
+                runner.resume(completed.state.run_id)
+        finally:
+            path.write_bytes(original)
+
+    refuses(immutable_verdict, immutable_verdict.read_bytes() + b"\n")
+    refuses(step_alias, step_alias.read_bytes() + b"\n")
+    refuses(flat_alias, flat_alias.read_bytes() + b"\n")
+    for alias in (
+        run_dir / "context_bundle.json",
+        run_dir / "steps" / final_step / "context_bundle.json",
+        run_dir / "patch.json",
+        run_dir / "steps" / final_step / "patch.json",
+        run_dir / "patch.diff",
+        run_dir / "steps" / final_step / "patch.diff",
+        run_dir / "manifest.json",
+        run_dir / "steps" / final_step / "manifest.json",
+    ):
+        refuses(alias, alias.read_bytes() + b"\n")
+
+    missing_alias = run_dir / "context_bundle.json"
+    hidden_alias = run_dir / "context_bundle.json.removed"
+    missing_alias.rename(hidden_alias)
+    try:
+        with pytest.raises(
+            CheckpointCorrupt,
+            match="context_bundle.json",
+        ):
+            runner.resume(completed.state.run_id)
+    finally:
+        hidden_alias.rename(missing_alias)
+
+    extra_alias = run_dir / "steps" / "ghost" / "context_bundle.json"
+    extra_alias.parent.mkdir()
+    extra_alias.write_text("{}")
+    try:
+        with pytest.raises(
+            CheckpointCorrupt,
+            match="context_bundle.json",
+        ):
+            runner.resume(completed.state.run_id)
+    finally:
+        extra_alias.unlink()
+        extra_alias.parent.rmdir()
+
+    refuses(ledger, ledger.read_bytes() + b"{}\n")
+    journal = json.loads(journal_result.read_text())
+    journal["schema_version"] = 2
+    refuses(
+        journal_result,
+        json.dumps(journal, sort_keys=True).encode(),
+    )
+    hidden_journal = run_dir / "llm_attempts.removed"
+    hidden_trace = run_dir / "llm_trace.jsonl.removed"
+    journal_root.rename(hidden_journal)
+    trace_path.rename(hidden_trace)
+    try:
+        with pytest.raises(
+            CheckpointCorrupt,
+            match="LLM attempt journal is missing",
+        ):
+            runner.resume(completed.state.run_id)
+    finally:
+        hidden_journal.rename(journal_root)
+        hidden_trace.rename(trace_path)
+
+    plan_attempt = journal_root / "plan" / "plan"
+    hidden_plan_attempt = run_dir / "plan-attempt.removed"
+    original_trace = trace_path.read_bytes()
+    remaining_trace = b"".join(
+        line + b"\n"
+        for line in original_trace.splitlines()
+        if json.loads(line).get("kind") != "plan"
+    )
+    plan_attempt.rename(hidden_plan_attempt)
+    trace_path.write_bytes(remaining_trace)
+    try:
+        with pytest.raises(
+            CheckpointCorrupt,
+            match="logical attempt journal",
+        ):
+            runner.resume(completed.state.run_id)
+    finally:
+        hidden_plan_attempt.rename(plan_attempt)
+        trace_path.write_bytes(original_trace)
+
+    patch_attempt = journal_root / "propose_patch" / attempt_id
+    hidden_patch_attempt = run_dir / "patch-attempt.removed"
+    remaining_trace = b"".join(
+        line + b"\n"
+        for line in original_trace.splitlines()
+        if json.loads(line).get("kind") != "propose_patch"
+    )
+    patch_attempt.rename(hidden_patch_attempt)
+    trace_path.write_bytes(remaining_trace)
+    try:
+        with pytest.raises(
+            CheckpointCorrupt,
+            match="patch attempts|logical attempt journal",
+        ):
+            runner.resume(completed.state.run_id)
+    finally:
+        hidden_patch_attempt.rename(patch_attempt)
+        trace_path.write_bytes(original_trace)
+    assert runner.resume(completed.state.run_id).status == "DONE"
+
+    # Exercise the command boundary too: corrupt aliases must not produce a
+    # machine-readable DONE result that an orchestrator could accept.
+    flat_alias.write_bytes(flat_alias.read_bytes() + b"\n")
+    from lha import cli
+
+    monkeypatch.setattr(cli, "_config", lambda _args: config)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lha",
+            "resume",
+            completed.state.run_id,
+            "--runtime",
+            runtime,
+            "--json",
+        ],
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    captured = capsys.readouterr()
+    assert exit_info.value.code == 1
+    assert "__LHA_RESULT__" not in captured.out
+    assert "CheckpointCorrupt" in captured.err
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_terminal_resume_rejects_damaged_approval_evidence(
+    runtime: str,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    task = hermetic_task("data/tasks/fix_average.yaml")
+    task = task.model_copy(
+        update={
+            "inputs": {
+                **task.inputs,
+                "require_approval": True,
+            }
+        }
+    )
+    if runtime == "langgraph":
+        pytest.importorskip("langgraph")
+        from lha.runtime.langgraph_runner import LangGraphHarness
+
+        runner = LangGraphHarness(config, auto_approve=True)
+    else:
+        runner = Harness(config, auto_approve=True)
+    completed = runner.run(
+        task,
+        run_id=f"{runtime}-terminal-approval",
+    )
+    assert completed.status == "DONE"
+    approval = next(
+        Path(completed.state.run_dir).rglob("approval_decision.json")
+    )
+    approval.write_text("{broken")
+
+    with pytest.raises(
+        CheckpointCorrupt,
+        match="terminal run evidence is invalid.*approval",
     ):
         runner.resume(completed.state.run_id)
 
@@ -895,7 +1358,10 @@ def test_replaced_terminal_verdict_is_refused_by_reporting_and_pruning(
     step_verdict_path.write_text(forged_json)
     (run_dir / "verify.json").write_text(forged_json)
 
-    with pytest.raises(ReportingError, match="verdict is not bound"):
+    with pytest.raises(
+        ReportingError,
+        match="(?:verdict|verify\\.json).*(?:bound|alias changed)",
+    ):
         collect_run(config.runs_dir, completed.state.run_id)
 
     old = time.time() - 30 * 86400

@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,16 @@ _PASSTHROUGH_ENV = (
     "REQUESTS_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
 )
+_PROXY_ENV = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    }
+)
 _PROCESS_TERM_GRACE_S = 0.25
 _PROCESS_KILL_GRACE_S = 2.0
 _SUPPORTED_CLI_VERSION = "codex-cli 0.141.0"
@@ -146,6 +157,8 @@ def _minimal_subprocess_env(*, codex_home: Path, temp_dir: Path) -> dict[str, st
     for name in _PASSTHROUGH_ENV:
         value = os.environ.get(name)
         if value:
+            if name in _PROXY_ENV:
+                _reject_proxy_credentials(value)
             env[name] = value
     home = str(codex_home)
     temporary = str(temp_dir)
@@ -162,6 +175,22 @@ def _minimal_subprocess_env(*, codex_home: Path, temp_dir: Path) -> dict[str, st
         }
     )
     return env
+
+
+def _reject_proxy_credentials(value: str) -> None:
+    """Reject proxy userinfo without copying the secret into an error message."""
+    if "\x00" in value or any(character in value for character in "\r\n"):
+        raise CodexInvocationError("Codex proxy environment contains control characters")
+    try:
+        parsed = urllib.parse.urlsplit(value if "://" in value else f"//{value}")
+        username = parsed.username
+        password = parsed.password
+    except ValueError as error:
+        raise CodexInvocationError("Codex proxy environment is not a valid URL") from error
+    if username is not None or password is not None:
+        raise CodexInvocationError(
+            "Codex proxy environment must not contain embedded credentials"
+        )
 
 
 def _write_private_probe(path: Path, token: str) -> None:

@@ -237,6 +237,13 @@ def test_process_group_cleanup_fails_closed_on_persistent_permission_error(
         raise PermissionError(1, "Operation not permitted")
 
     monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
+    monkeypatch.setattr(
+        sandbox_base,
+        "_read_process_group_census",
+        lambda _pgid: sandbox_base._ProcessGroupCensus(
+            error="process table unavailable"
+        ),
+    )
 
     result = sandbox_base.terminate_process_group(
         Process(),
@@ -246,6 +253,208 @@ def test_process_group_cleanup_fails_closed_on_persistent_permission_error(
     assert result.confirmed is False
     assert "could not confirm process group 4313 cleanup" in result.detail
     assert "Operation not permitted" in result.detail
+
+
+def test_process_group_cleanup_accepts_permission_error_for_zombies_only(
+    monkeypatch,
+):
+    class Process:
+        pid = 4314
+
+        @staticmethod
+        def poll():
+            return -9
+
+    def killpg(_process_group, _sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
+    monkeypatch.setattr(
+        sandbox_base,
+        "_read_process_group_census",
+        lambda pgid: sandbox_base._ProcessGroupCensus(
+            (
+                sandbox_base._ProcessGroupMember(
+                    pid=pgid + 1,
+                    pgid=pgid,
+                    uid=os.geteuid(),
+                    state="Z",
+                ),
+            )
+        ),
+    )
+
+    result = sandbox_base.terminate_process_group(
+        Process(),
+        confirmation_timeout_s=0.0,
+    )
+
+    assert result.confirmed is True
+    assert result.detail == "process group 4314 has only zombie members"
+
+
+def test_process_group_cleanup_rejects_same_user_runnable_member_after_eperm(
+    monkeypatch,
+):
+    class Process:
+        pid = 4315
+
+        @staticmethod
+        def poll():
+            return -9
+
+    def killpg(_process_group, _sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
+    monkeypatch.setattr(
+        sandbox_base,
+        "_read_process_group_census",
+        lambda pgid: sandbox_base._ProcessGroupCensus(
+            (
+                sandbox_base._ProcessGroupMember(
+                    pid=pgid + 1,
+                    pgid=pgid,
+                    uid=os.geteuid(),
+                    state="S",
+                ),
+            )
+        ),
+    )
+
+    result = sandbox_base.terminate_process_group(
+        Process(),
+        confirmation_timeout_s=0.0,
+    )
+
+    assert result.confirmed is False
+    assert "same-user runnable members remain" in result.detail
+    assert "4316" in result.detail
+
+
+def test_process_group_cleanup_accepts_reused_pgid_after_original_leader_exit(
+    monkeypatch,
+):
+    class Process:
+        pid = 4317
+
+        @staticmethod
+        def poll():
+            return -9
+
+    def killpg(_process_group, _sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
+    monkeypatch.setattr(
+        sandbox_base,
+        "_read_process_group_census",
+        lambda pgid: sandbox_base._ProcessGroupCensus(
+            (
+                sandbox_base._ProcessGroupMember(
+                    pid=pgid,
+                    pgid=pgid,
+                    uid=os.geteuid(),
+                    state="R",
+                ),
+            )
+        ),
+    )
+
+    result = sandbox_base.terminate_process_group(
+        Process(),
+        confirmation_timeout_s=0.0,
+    )
+
+    assert result.confirmed is True
+    assert "was reused after the original leader exited" in result.detail
+
+
+def test_process_group_cleanup_rechecks_empty_census_before_accepting_absence(
+    monkeypatch,
+):
+    class Process:
+        pid = 4318
+
+        @staticmethod
+        def poll():
+            return -9
+
+    probes = iter(
+        [
+            PermissionError(1, "Operation not permitted"),
+            ProcessLookupError(3, "No such process"),
+        ]
+    )
+
+    def killpg(_process_group, sig):
+        if sig == 0:
+            raise next(probes)
+
+    monkeypatch.setattr(sandbox_base.os, "killpg", killpg)
+    monkeypatch.setattr(
+        sandbox_base,
+        "_read_process_group_census",
+        lambda _pgid: sandbox_base._ProcessGroupCensus(),
+    )
+
+    result = sandbox_base.terminate_process_group(
+        Process(),
+        confirmation_timeout_s=0.0,
+    )
+
+    assert result.confirmed is True
+    assert result.detail == "process group is absent"
+
+
+def test_darwin_process_group_census_uses_exact_pgid_and_bounded_capture(
+    monkeypatch,
+):
+    observed = {}
+
+    def bounded_ps(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return ProcResult(
+            0,
+            "4319 4319 501 Z\n",
+            "",
+            0.01,
+        )
+
+    monkeypatch.setattr(sandbox_base.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        sandbox_base.Path,
+        "is_file",
+        lambda path: str(path) == "/bin/ps",
+    )
+    monkeypatch.setattr(
+        sandbox_base.os,
+        "access",
+        lambda path, _mode: str(path) == "/bin/ps",
+    )
+    monkeypatch.setattr(sandbox_base, "run_bounded_process", bounded_ps)
+
+    census = sandbox_base._read_process_group_census(4319)
+
+    assert observed["argv"] == [
+        "/bin/ps",
+        "-g",
+        "4319",
+        "-o",
+        "pid=,pgid=,uid=,state=",
+    ]
+    assert observed["kwargs"]["timeout"] == 1.0
+    assert observed["kwargs"]["output_bytes"] == 4 * 1024 * 1024
+    assert census.error is None
+    assert census.members == (
+        sandbox_base._ProcessGroupMember(
+            pid=4319,
+            pgid=4319,
+            uid=501,
+            state="Z",
+        ),
+    )
 
 
 def test_local_backend_uses_exec_launcher_instead_of_preexec(tmp_path, monkeypatch):

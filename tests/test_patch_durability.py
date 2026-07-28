@@ -49,10 +49,16 @@ def test_nested_directory_creation_syncs_each_child_and_parent(
 ) -> None:
     calls: list[Path] = []
 
-    def record(path: str | Path) -> None:
-        calls.append(Path(path))
+    def record(
+        child_fd: int,
+        parent_fd: int,
+        child_path: Path,
+        parent_path: Path,
+    ) -> None:
+        del child_fd, parent_fd
+        calls.extend((child_path, parent_path))
 
-    monkeypatch.setattr(durable_io, "fsync_directory", record)
+    monkeypatch.setattr(durable_io, "_sync_created_directory", record)
     one = tmp_path / "one"
     two = one / "two"
     three = two / "three"
@@ -68,11 +74,17 @@ def test_nested_directory_creation_propagates_parent_sync_failure(
 ) -> None:
     failed_parent = tmp_path / "one"
 
-    def fail(path: str | Path) -> None:
-        if Path(path) == failed_parent:
+    def fail(
+        child_fd: int,
+        parent_fd: int,
+        child_path: Path,
+        parent_path: Path,
+    ) -> None:
+        del child_fd, parent_fd, child_path
+        if parent_path == failed_parent:
             raise OSError("simulated nested-parent fsync failure")
 
-    monkeypatch.setattr(durable_io, "fsync_directory", fail)
+    monkeypatch.setattr(durable_io, "_sync_created_directory", fail)
 
     with pytest.raises(OSError, match="nested-parent fsync failure"):
         durable_io.durable_mkdir_chain(
@@ -138,6 +150,111 @@ def test_real_anchor_mapping_rejects_a_true_escape(tmp_path: Path) -> None:
             tmp_path / "outside" / "evidence",
             anchor=alias_parent / "run",
         )
+
+
+def test_replaced_anchor_never_redirects_directory_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = tmp_path / "anchor"
+    replacement = tmp_path / "replacement"
+    detached = tmp_path / "detached-anchor"
+    anchor.mkdir()
+    replacement.mkdir()
+    real_mkdir = durable_io.os.mkdir
+    raced = False
+
+    def racing_mkdir(path, mode=0o777, *, dir_fd=None):
+        nonlocal raced
+        if Path(path).name == "child" and not raced:
+            raced = True
+            anchor.rename(detached)
+            replacement.rename(anchor)
+        if dir_fd is None:
+            return real_mkdir(path, mode)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(durable_io.os, "mkdir", racing_mkdir)
+
+    with pytest.raises(OSError, match="identity|anchor"):
+        durable_io.durable_mkdir_chain(anchor / "child", anchor=anchor)
+
+    assert raced
+    assert not (anchor / "child").exists()
+    assert (detached / "child").is_dir()
+
+
+def test_replaced_parent_symlink_never_redirects_child_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = tmp_path / "anchor"
+    parent = anchor / "parent"
+    detached = anchor / "detached-parent"
+    outside = tmp_path / "outside"
+    parent.mkdir(parents=True)
+    outside.mkdir()
+    real_mkdir = durable_io.os.mkdir
+    raced = False
+
+    def racing_mkdir(path, mode=0o777, *, dir_fd=None):
+        nonlocal raced
+        if Path(path).name == "child" and not raced:
+            raced = True
+            parent.rename(detached)
+            parent.symlink_to(outside, target_is_directory=True)
+        if dir_fd is None:
+            return real_mkdir(path, mode)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(durable_io.os, "mkdir", racing_mkdir)
+
+    with pytest.raises(OSError):
+        durable_io.durable_mkdir_chain(
+            parent / "child",
+            anchor=anchor,
+        )
+
+    assert raced
+    assert not (outside / "child").exists()
+    assert (detached / "child").is_dir()
+
+
+def test_anchored_atomic_replace_never_follows_a_replaced_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = tmp_path / "anchor"
+    parent = anchor / "parent"
+    detached = anchor / "detached-parent"
+    outside = tmp_path / "outside"
+    parent.mkdir(parents=True)
+    outside.mkdir()
+    external_target = outside / "state.json"
+    external_target.write_bytes(b"outside")
+    real_open = durable_io.os.open
+    raced = False
+
+    def racing_open(path, flags, *args, **kwargs):
+        nonlocal raced
+        if Path(path).name.startswith(".state.json.") and not raced:
+            raced = True
+            parent.rename(detached)
+            parent.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(durable_io.os, "open", racing_open)
+
+    with pytest.raises(OSError):
+        durable_io.atomic_replace_bytes(
+            parent / "state.json",
+            b"inside",
+            anchor=anchor,
+        )
+
+    assert raced
+    assert external_target.read_bytes() == b"outside"
+    assert (detached / "state.json").read_bytes() == b"inside"
 
 
 def _record_patch_barrier(monkeypatch: pytest.MonkeyPatch):
