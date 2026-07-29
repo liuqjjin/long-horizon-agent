@@ -170,6 +170,18 @@
       "witness_remote_name": "formal-witness",
       "witness_remote_url": "https://github.com/liuqjjin/long-horizon-agent.git",
       "registered_at": "2026-07-28T23:55:28.593902+00:00"
+    },
+    {
+      "event": "ABANDONED",
+      "attempt_id": "6f5bb4151e599f8d6377277f1fdb9e318a50371f9dfc1172d00791b8dc775fe7",
+      "recorded_at": "2026-07-29T00:24:57.091893+00:00",
+      "progress_status": "known",
+      "started_cells": 7,
+      "terminal_cells": 6,
+      "reason_code": "codex_usage_limit_reached",
+      "reason": "Codex CLI 在连续 6 个任务的 17 次调用中均未产生事件；独立连通性诊断确认账户已达到用量上限，提示 2026-08-04 11:13 后再试。正式运行已中断，不恢复、不删除失败单元。",
+      "report_sha256": null,
+      "report_fingerprint": null
     }
   ]
 }
