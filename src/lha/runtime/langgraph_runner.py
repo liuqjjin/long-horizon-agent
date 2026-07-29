@@ -68,7 +68,6 @@ from ..harness.loop import (
     _initial_plan_ref,
     _persist_verdict,
     _policy_verdict,
-    _repair_plan_ref,
     _safe_seg,
     _write_immutable,
 )
@@ -751,21 +750,10 @@ class LangGraphHarness:
         non_retryable = any(check.detail.get("non_retryable") for check in verdict.checks)
         limits = state.require_matching_budget_limits(self.config)
         if not non_retryable and state.repairs_for(step) < limits.max_repairs:
-            assert state.plan is not None  # plan set before stepping
-            state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
-            plan_bytes = state.plan.model_dump_json(indent=2).encode("utf-8")
-            attempt_id = state.attempt_id(step)
-            repair_ref = _repair_plan_ref(attempt_id)
-            run_dir = Path(state.run_dir)
-            _write_immutable(
-                run_dir / repair_ref,
-                plan_bytes,
-                run_dir=run_dir,
-            )
-            anchored_atomic_replace_bytes(
-                run_dir / "plan.json",
-                plan_bytes,
-                anchor=run_dir,
+            repair_ref, plan_bytes = self._h._prepare_repair_plan(
+                state,
+                step,
+                verdict,
             )
             self._ledger(
                 state,

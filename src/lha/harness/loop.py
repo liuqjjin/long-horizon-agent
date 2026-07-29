@@ -939,7 +939,11 @@ class Harness:
         # The immutable initial plan plus ledger-bound repair snapshots are the
         # source of truth. Replaying them prevents a consistently edited
         # state.json + plan.json pair from deleting unfinished work.
-        state.plan = initial_plan
+        # Keep the immutable initial plan independent from the mutable replay
+        # cursor. Repair preparation replaces one step in ``state.plan``; an
+        # alias here would rewrite the only in-memory copy of the initial
+        # history and make a crash before the repair ledger append unrecoverable.
+        state.plan = initial_plan.model_copy(deep=True)
         state.cursor = 0
         state.completed_steps = []
         state.failed_steps = []
@@ -947,7 +951,7 @@ class Harness:
         state.attempt_ids = {}
         state.quarantine = None
         state.status = "RUNNING"
-        valid_plan_snapshots = [initial_plan]
+        valid_plan_snapshots = [initial_plan.model_copy(deep=True)]
 
         while not state.is_terminal():
             step = state.next_step()
@@ -1484,6 +1488,71 @@ class Harness:
                 f"repair plan does not match verdict for {record.attempt_id}"
             )
         return disk_plan
+
+    @staticmethod
+    def _prepare_repair_plan(
+        state: RunState,
+        step,
+        verdict: Verdict,
+    ) -> tuple[str, bytes]:
+        """Persist or adopt the one repair plan implied by a failed verdict.
+
+        The immutable plan is authoritative. ``plan.json`` is only a mutable
+        compatibility alias and may legitimately contain either the preceding
+        committed plan or the newly prepared repair plan after a crash. Any
+        third value is unexplained drift and fails closed.
+        """
+        if state.plan is None or not 0 <= state.cursor < len(state.plan.steps):
+            raise CheckpointCorrupt("cannot prepare a repair without a current plan step")
+        if state.plan.steps[state.cursor] != step:
+            raise CheckpointCorrupt(
+                f"repair step {step.step_id} does not match the current plan"
+            )
+
+        prior_bytes = state.plan.model_dump_json(indent=2).encode("utf-8")
+        repaired = state.plan.model_copy(deep=True)
+        repaired.steps[state.cursor] = step.as_repair(verdict.failures)
+        plan_bytes = repaired.model_dump_json(indent=2).encode("utf-8")
+        attempt_id = state.attempt_id(step)
+        repair_ref = _repair_plan_ref(attempt_id)
+        run_dir = Path(state.run_dir)
+        immutable_path = run_dir / repair_ref
+
+        immutable_bytes = _read_run_bytes(
+            run_dir,
+            immutable_path,
+            label="immutable repair plan",
+            missing_ok=True,
+        )
+        if immutable_bytes is not None and immutable_bytes != plan_bytes:
+            raise CheckpointCorrupt(
+                f"immutable repair plan does not match the failed verdict for {attempt_id}"
+            )
+
+        alias_path = run_dir / "plan.json"
+        alias_bytes = _read_run_bytes(
+            run_dir,
+            alias_path,
+            label="repair plan alias",
+            missing_ok=True,
+        )
+        if alias_bytes not in (None, prior_bytes, plan_bytes):
+            raise CheckpointCorrupt(
+                f"repair plan alias has unexplained drift for {attempt_id}"
+            )
+
+        _write_immutable(
+            immutable_path,
+            plan_bytes,
+            run_dir=run_dir,
+        )
+        anchored_atomic_replace_bytes(
+            alias_path,
+            plan_bytes,
+            anchor=run_dir,
+        )
+        state.plan = repaired
+        return repair_ref, plan_bytes
 
     # --- driver -------------------------------------------------------------
     def _drive(self, state: RunState) -> RunResult:
@@ -2164,19 +2233,10 @@ class Harness:
         attempt_id = state.attempt_id(step)
         non_retryable = any(check.detail.get("non_retryable") for check in verdict.checks)
         if not non_retryable and state.repairs_for(step) < budget.max_repairs:
-            assert state.plan is not None  # set before the loop body runs
-            state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
-            plan_bytes = state.plan.model_dump_json(indent=2).encode("utf-8")
-            repair_ref = _repair_plan_ref(attempt_id)
-            _write_immutable(
-                Path(state.run_dir) / repair_ref,
-                plan_bytes,
-                run_dir=Path(state.run_dir),
-            )
-            anchored_atomic_replace_bytes(
-                Path(state.run_dir) / "plan.json",
-                plan_bytes,
-                anchor=Path(state.run_dir),
+            repair_ref, plan_bytes = self._prepare_repair_plan(
+                state,
+                step,
+                verdict,
             )
             append_ledger(
                 state,

@@ -22,7 +22,7 @@ from lha.artifacts import Patch
 from lha.clock import now
 from lha.config import Config
 from lha.harness import Harness
-from lha.harness.checkpoint import load_state, save_state
+from lha.harness.checkpoint import load_state, read_ledger, save_state
 from lha.harness.errors import CheckpointCorrupt, TransactionCorrupt
 from lha.harness.state import CLIIdentity, RunRuntimeContract, RunState
 from lha.harness.transaction import list_transactions
@@ -374,6 +374,129 @@ def test_repair_orphan_verdict_accepts_only_the_prior_bound_alias(
         record.step_id == "s2-fix" and record.phase == "verify"
         for record in records
     ) == 2
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_orphan_repair_plan_is_adopted_from_failed_verdict(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class WrongThenCorrect(DeterministicStub):
+        def propose_patch(self, step, bundle, workdir):
+            current = (Path(workdir) / "mathutils.py").read_text()
+            if not step.prior_failures:
+                replacement = current.replace(
+                    "return sum(values) / len(values) - 1",
+                    "return 0",
+                )
+            else:
+                replacement = current.replace(
+                    "return 0",
+                    "return sum(values) / len(values)",
+                )
+            return Patch(
+                step_id=step.step_id,
+                file_contents={"mathutils.py": replacement},
+                based_on_context=bundle.locators(),
+            )
+
+    class RepairOnly(WrongThenCorrect):
+        def propose_patch(self, step, bundle, workdir):
+            if not step.prior_failures:
+                raise AssertionError("resume repeated the failed first attempt")
+            return super().propose_patch(step, bundle, workdir)
+
+    config = _config(tmp_path)
+    runner, runtime_module = _runtime(runtime, config)
+    inner = getattr(runner, "_h", runner)
+    inner.llm = TracedLLM(WrongThenCorrect())
+    original_append = runtime_module.append_ledger
+    interrupted = False
+
+    def exit_before_repair_ledger(state: RunState, record) -> None:
+        nonlocal interrupted
+        if (
+            not interrupted
+            and record.step_id == "s2-fix"
+            and record.phase == "repair"
+        ):
+            interrupted = True
+            raise KeyboardInterrupt("simulated exit before repair ledger append")
+        original_append(state, record)
+
+    monkeypatch.setattr(runtime_module, "append_ledger", exit_before_repair_ledger)
+    with pytest.raises(KeyboardInterrupt, match="repair ledger"):
+        runner.run(
+            hermetic_task("data/tasks/fix_average.yaml"),
+            run_id=f"{runtime}-orphan-repair-plan",
+        )
+    monkeypatch.setattr(runtime_module, "append_ledger", original_append)
+
+    run_dir = Path(config.runs_dir) / f"{runtime}-orphan-repair-plan"
+    repair_plan = run_dir / "plans" / "s2-fix-r0-repair.json"
+    assert repair_plan.is_file()
+    assert not any(record.phase == "repair" for record in read_ledger(run_dir))
+
+    resumed, _module = _runtime(runtime, config)
+    resumed_inner = getattr(resumed, "_h", resumed)
+    resumed_inner.llm = TracedLLM(RepairOnly())
+    result = resumed.resume(f"{runtime}-orphan-repair-plan")
+
+    assert result.status == "DONE"
+    collect_run(config.runs_dir, result.state.run_id)
+    records = read_ledger(run_dir)
+    assert sum(record.phase == "repair" for record in records) == 1
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_orphan_repair_plan_must_match_failed_verdict(
+    runtime: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AlwaysWrong(DeterministicStub):
+        def propose_patch(self, step, bundle, workdir):
+            current = (Path(workdir) / "mathutils.py").read_text()
+            replacement = current.replace(
+                "return sum(values) / len(values) - 1",
+                "return 0",
+            )
+            return Patch(
+                step_id=step.step_id,
+                file_contents={"mathutils.py": replacement},
+                based_on_context=bundle.locators(),
+            )
+
+    config = _config(tmp_path)
+    runner, runtime_module = _runtime(runtime, config)
+    inner = getattr(runner, "_h", runner)
+    inner.llm = TracedLLM(AlwaysWrong())
+    original_append = runtime_module.append_ledger
+
+    def exit_before_repair_ledger(state: RunState, record) -> None:
+        if record.step_id == "s2-fix" and record.phase == "repair":
+            raise KeyboardInterrupt("simulated exit before repair ledger append")
+        original_append(state, record)
+
+    monkeypatch.setattr(runtime_module, "append_ledger", exit_before_repair_ledger)
+    with pytest.raises(KeyboardInterrupt, match="repair ledger"):
+        runner.run(
+            hermetic_task("data/tasks/fix_average.yaml"),
+            run_id=f"{runtime}-corrupt-orphan-repair-plan",
+        )
+    monkeypatch.setattr(runtime_module, "append_ledger", original_append)
+
+    run_dir = Path(config.runs_dir) / f"{runtime}-corrupt-orphan-repair-plan"
+    repair_plan = run_dir / "plans" / "s2-fix-r0-repair.json"
+    repair_plan.write_text("{}")
+
+    resumed, _module = _runtime(runtime, config)
+    with pytest.raises(
+        CheckpointCorrupt,
+        match="immutable repair plan does not match",
+    ):
+        resumed.resume(f"{runtime}-corrupt-orphan-repair-plan")
 
 
 @pytest.mark.parametrize("runtime", ["loop", "langgraph"])
