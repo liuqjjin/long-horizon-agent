@@ -497,19 +497,71 @@ def _cmd_approve(args, approved: bool) -> int:
     return 0
 
 
+def _delivery_verdict(result):
+    """Return the ledger-bound final verdict only for a deliverable run.
+
+    ``verify.json`` is a mutable last-writer display alias. During a multi-step
+    run it can still describe the preceding completed step while the current
+    patch is awaiting approval. Reuse reporting's terminal replay before
+    exposing a run-level verification claim.
+    """
+    from .reporting import ReportingError, collect_run
+
+    state = result.state
+    if result.status != state.status:
+        raise ReportingError(
+            "result status does not match the persisted run state: "
+            f"{result.status} != {state.status}"
+        )
+    if state.status != "DONE":
+        return None
+
+    run_dir = Path(state.run_dir)
+    report = collect_run(run_dir.parent, state.run_id)
+    if report.run_dir.resolve() != run_dir.resolve():
+        raise ReportingError("result run directory does not match validated evidence")
+    if report.state != state:
+        raise ReportingError("result state does not match the validated checkpoint")
+
+    plan = report.state.plan
+    if plan is None or not plan.steps:
+        raise ReportingError("DONE run has no final plan step")
+    final_step = plan.steps[-1]
+    attempt_id = report.state.attempt_ids.get(final_step.step_id)
+    if attempt_id is None:
+        raise ReportingError("DONE run has no final attempt identity")
+    expected_path = (
+        Path("steps")
+        / final_step.step_id
+        / "attempts"
+        / attempt_id
+        / "verify.json"
+    ).as_posix()
+    matches = [
+        artifact.value
+        for artifact in report.verdicts
+        if artifact.path == expected_path
+    ]
+    if len(matches) != 1:
+        raise ReportingError("DONE run has no unique final attempt verdict")
+    verdict = matches[0]
+    if (
+        not verdict.passed
+        or verdict.step_id != final_step.step_id
+        or verdict.attempt_id != attempt_id
+    ):
+        raise ReportingError("DONE run final verdict is not deliverable")
+    return verdict
+
+
 def _result_dict(result) -> dict:
     run_dir = Path(result.state.run_dir)
-    verified = None
-    vj = run_dir / "verify.json"
-    if vj.exists():
-        from .verifiers.verdict import Verdict
-
-        verified = Verdict.model_validate_json(vj.read_text()).passed
+    verdict = _delivery_verdict(result)
     return {
         "run_id": result.state.run_id,
         "status": result.status,
         "run_dir": str(run_dir),
-        "verified": verified,
+        "verified": verdict.passed if verdict is not None else None,
         "summary": result.state.pr_summary_path,
         "message": result.message,
         "llm_usage": result.state.llm_usage.model_dump(mode="json"),
@@ -552,11 +604,8 @@ def _print_result(result) -> None:
     print(f"run_id : {s.run_id}")
     print(f"status : {result.status}" + (f"  ({result.message})" if result.message else ""))
     print(f"run_dir: {s.run_dir}")
-    verify = Path(s.run_dir) / "verify.json"
-    if verify.exists():
-        from .verifiers.verdict import Verdict
-
-        v = Verdict.model_validate_json(verify.read_text())
+    v = _delivery_verdict(result)
+    if v is not None:
         print(f"verify : passed={v.passed}")
         for c in v.checks:
             print(f"   - {c.name}: passed={c.passed} ({c.detail.get('summary', '')})")

@@ -26,6 +26,7 @@ from lha.llm.codex_cli import (
     CodexProtocolError,
     CodexToolUse,
     CodexTransientError,
+    CodexUsageLimitError,
 )
 from lha.llm.trace import TracedLLM, load_usage_checkpoint
 
@@ -1017,6 +1018,79 @@ def test_only_transient_failures_retry_and_record_audit_metadata(monkeypatch):
     assert client.last_usage is not None
     assert client.last_usage["cli_version"] == "codex-cli 0.141.0"
     assert client.last_usage["retries"] == 1
+
+
+def test_usage_limit_cli_failure_is_not_retried(monkeypatch):
+    client = CodexCLIClient(max_retries=3, retry_backoff_s=0)
+    calls = 0
+
+    def fake_run(argv, *, input, capture_output, text, timeout, env):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            stdout="",
+            stderr="You've hit your usage limit. Try again at Aug 4, 2026.",
+        )
+
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+    monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
+    monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+
+    with pytest.raises(CodexUsageLimitError, match="usage limit exhausted"):
+        client.complete("SYSTEM", "PROMPT")
+
+    assert calls == 1
+    assert client.last_call is not None
+    assert client.last_call["retries"] == 0
+    assert client.last_call["retryable"] is False
+    assert client.last_call["error_type"] == "CodexUsageLimitError"
+
+
+def test_usage_limit_error_event_is_not_retried(monkeypatch):
+    client = CodexCLIClient(max_retries=3, retry_backoff_s=0)
+    calls = 0
+
+    def fake_run(argv, *, input, capture_output, text, timeout, env):
+        nonlocal calls
+        calls += 1
+        stream = "\n".join(
+            (
+                json.dumps(
+                    {"type": "thread.started", "thread_id": "thread-1"}
+                ),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": (
+                            "You've hit your usage limit. "
+                            "Try again at Aug 4, 2026."
+                        ),
+                    }
+                ),
+            )
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=stream + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(client, "_cli_version", lambda: "codex-cli 0.141.0")
+    monkeypatch.setattr(client, "_clean_home", lambda: client._empty_workspace())
+    monkeypatch.setattr("lha.llm.codex_cli._run_isolated_process", fake_run)
+
+    with pytest.raises(CodexUsageLimitError, match="reported a usage limit"):
+        client.complete("SYSTEM", "PROMPT")
+
+    assert calls == 1
+    assert client.last_call is not None
+    assert client.last_call["retries"] == 0
+    assert client.last_call["retryable"] is False
+    assert client.last_call["error_type"] == "CodexUsageLimitError"
 
 
 def test_tracer_counts_each_real_codex_retry_against_the_budget(tmp_path, monkeypatch):

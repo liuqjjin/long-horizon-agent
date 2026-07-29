@@ -268,6 +268,52 @@ def test_approval_cli_refuses_terminal_and_allows_only_one_pending_decision(
     capsys.readouterr()
 
 
+def test_result_summary_does_not_inherit_a_previous_step_verdict(
+    tmp_path, capsys
+):
+    paused = Harness(
+        Config(
+            llm_backend="stub",
+            code_backend="null",
+            runs_dir=tmp_path / "runs",
+            data_dir=tmp_path / "nodata",
+            use_skill_memory=False,
+        )
+    ).run(
+        hermetic_task("data/tasks/fix_average_approval.yaml"),
+        run_id="stale-verdict",
+    )
+    run_dir = Path(paused.state.run_dir)
+    assert paused.status == "AWAITING_APPROVAL"
+    assert Verdict.model_validate_json(
+        (run_dir / "verify.json").read_text()
+    ).passed
+
+    assert cli._result_dict(paused)["verified"] is None
+    cli._print_result(paused)
+    output = capsys.readouterr().out
+    assert "status : AWAITING_APPROVAL" in output
+    assert "verify :" not in output
+
+
+def test_result_summary_uses_the_validated_final_attempt_verdict(tmp_path):
+    completed = Harness(
+        Config(
+            llm_backend="stub",
+            code_backend="null",
+            runs_dir=tmp_path / "runs",
+            data_dir=tmp_path / "nodata",
+            use_skill_memory=False,
+        )
+    ).run(
+        hermetic_task("data/tasks/fix_average.yaml"),
+        run_id="terminal-verdict",
+    )
+
+    assert completed.status == "DONE"
+    assert cli._result_dict(completed)["verified"] is True
+
+
 def test_trace_html_keeps_approval_history_after_transient_files_are_cleared(
     tmp_path, monkeypatch, capsys
 ):

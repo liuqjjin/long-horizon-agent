@@ -79,6 +79,19 @@ _TRANSIENT_MARKERS = (
     "timed out",
     "try again",
 )
+_USAGE_LIMIT_MARKERS = (
+    "usage limit",
+    "usage_limit",
+    "usage quota",
+    "quota exceeded",
+    "quota_exceeded",
+    "exceeded your current quota",
+    "insufficient_quota",
+    "billing hard limit",
+    "credits exhausted",
+    "credit balance is too low",
+    "not enough credits",
+)
 
 # Passing the parent environment through to an agent process would expose every
 # API key, cloud credential, and task-specific secret in that process. Codex
@@ -374,7 +387,12 @@ def _process_group_exists(pgid: int) -> bool:
 
 
 def _terminate_process_group(proc: subprocess.Popen[Any]) -> bool:
-    """Stop the process tree and confirm that its process group is absent."""
+    """Stop and confirm the original process group.
+
+    A process that deliberately creates another group or session cannot be
+    identified without a race after it is reparented. Callers that execute
+    untrusted tools need an outer containment boundary.
+    """
     if os.name == "posix":
         pgid = proc.pid  # start_new_session=True makes the child its group leader.
         if _process_group_exists(pgid):
@@ -390,8 +408,8 @@ def _terminate_process_group(proc: subprocess.Popen[Any]) -> bool:
             proc.poll()
             time.sleep(0.01)
 
-        # The CLI or one of its descendants may ignore SIGTERM. Kill the group,
-        # including descendants left behind after the leader has already exited.
+        # A member may ignore SIGTERM. Kill every process still in the original
+        # group, including members left behind after the leader has exited.
         proc.poll()
         if _process_group_exists(pgid):
             try:
@@ -898,6 +916,10 @@ class CodexTransientError(CodexCLIError):
 
 class CodexInvocationError(CodexCLIError):
     """The local CLI could not be invoked correctly; retrying would not help."""
+
+
+class CodexUsageLimitError(CodexInvocationError):
+    """The account cannot serve another call within this retry window."""
 
 
 class CodexCleanupError(CodexCLIError):
@@ -1832,16 +1854,15 @@ class CodexCLIClient(LLMClient):
                 ) from e
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout)[-400:]
-                error_type = (
-                    CodexTransientError
-                    if proc.returncode == 124 or self._looks_transient(detail)
-                    else CodexInvocationError
-                )
-                category = (
-                    "transient service or transport failure"
-                    if error_type is CodexTransientError
-                    else "invocation failure"
-                )
+                if self._looks_usage_limited(detail):
+                    error_type = CodexUsageLimitError
+                    category = "usage limit exhausted"
+                elif proc.returncode == 124 or self._looks_transient(detail):
+                    error_type = CodexTransientError
+                    category = "transient service or transport failure"
+                else:
+                    error_type = CodexInvocationError
+                    category = "invocation failure"
                 raise error_type(
                     f"codex CLI failed ({proc.returncode}): {category}"
                 )
@@ -2094,11 +2115,20 @@ class CodexCLIClient(LLMClient):
             or event.get("status")
             or "no detail"
         )
+        if cls._looks_usage_limited(detail):
+            return CodexUsageLimitError("codex reported a usage limit")
         if cls._looks_transient(detail):
             return CodexTransientError("codex reported a transient failure")
         return CodexProtocolError("codex reported a non-transient failure")
 
     @staticmethod
+    def _looks_usage_limited(detail: str) -> bool:
+        lowered = detail.lower()
+        return any(marker in lowered for marker in _USAGE_LIMIT_MARKERS)
+
+    @staticmethod
     def _looks_transient(detail: str) -> bool:
         lowered = detail.lower()
+        if any(marker in lowered for marker in _USAGE_LIMIT_MARKERS):
+            return False
         return any(marker in lowered for marker in _TRANSIENT_MARKERS)
