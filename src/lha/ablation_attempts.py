@@ -34,7 +34,7 @@ FORMAL_ABLATION_ATTEMPTS_PATH = PurePosixPath(
     "benchmarks/formal_ablation_attempts.json"
 )
 FORMAL_ABLATION_ATTEMPTS_SCHEMA = 2
-FORMAL_ABLATION_PROTOCOL_SCHEMA = 1
+FORMAL_ABLATION_PROTOCOL_SCHEMA = 2
 MAX_FORMAL_ABLATION_ATTEMPTS_BYTES = 1024 * 1024
 
 _HEX_40_PATTERN = r"^[0-9a-f]{40}$"
@@ -563,13 +563,19 @@ class FormalAblationProtocol(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = FORMAL_ABLATION_PROTOCOL_SCHEMA
+    # Omitted version means the historical schema so existing schema-2
+    # registry events retain their original canonical protocol bytes.
+    schema_version: Literal[1, 2] = 1
     source_commit: str = Field(pattern=_HEX_40_PATTERN)
     source_tree_sha256: str = Field(pattern=_HEX_64_PATTERN)
     manifest_sha256: str = Field(pattern=_HEX_64_PATTERN)
     model: str
     reasoning_effort: str
     docker_image_id: str = Field(pattern=_DOCKER_IMAGE_ID_PATTERN)
+    scorer_runtime_sha256: str | None = Field(
+        default=None,
+        pattern=_HEX_64_PATTERN,
+    )
     codex_cli_version: str
     codex_cli_executable_sha256: str = Field(pattern=_HEX_64_PATTERN)
     codex_client: FormalCodexClientConfig
@@ -582,6 +588,13 @@ class FormalAblationProtocol(BaseModel):
 
     @model_validator(mode="after")
     def _client_digest_matches(self) -> "FormalAblationProtocol":
+        if (self.schema_version == 1) != (
+            self.scorer_runtime_sha256 is None
+        ):
+            raise ValueError(
+                "formal ablation protocol schema 1 omits scorer_runtime_sha256 "
+                "and schema 2 requires it"
+            )
         if self.codex_client_sha256 != formal_codex_client_sha256(
             self.codex_client
         ):
@@ -611,6 +624,13 @@ def formal_ablation_selection_sha256(protocol: FormalAblationProtocol) -> str:
     """
     payload = protocol.model_dump(mode="json", exclude_none=True)
     payload.pop("source_commit")
+    # Schema 1 included the image ID in the experiment selection. Preserve that
+    # identity exactly for historical registry events. Schema 2 records the
+    # image ID as provenance but binds the selection to the committed inputs
+    # that build the scorer runtime, so rebuilding identical inputs cannot
+    # reopen a consumed attempt.
+    if protocol.schema_version >= 2:
+        payload.pop("docker_image_id")
     # Authentication plumbing is provenance-critical but cannot change model
     # output, scorer truth, or the selected corpus.
     payload.pop("witness_credential_helper", None)
@@ -637,6 +657,10 @@ class RegisteredAttempt(BaseModel):
     model: str
     reasoning_effort: str
     docker_image_id: str = Field(pattern=_DOCKER_IMAGE_ID_PATTERN)
+    scorer_runtime_sha256: str | None = Field(
+        default=None,
+        pattern=_HEX_64_PATTERN,
+    )
     codex_cli_version: str
     codex_cli_executable_sha256: str = Field(pattern=_HEX_64_PATTERN)
     codex_client: FormalCodexClientConfig
@@ -661,12 +685,14 @@ class RegisteredAttempt(BaseModel):
 
     def protocol(self) -> FormalAblationProtocol:
         return FormalAblationProtocol(
+            schema_version=(2 if self.scorer_runtime_sha256 is not None else 1),
             source_commit=self.source_commit,
             source_tree_sha256=self.source_tree_sha256,
             manifest_sha256=self.manifest_sha256,
             model=self.model,
             reasoning_effort=self.reasoning_effort,
             docker_image_id=self.docker_image_id,
+            scorer_runtime_sha256=self.scorer_runtime_sha256,
             codex_cli_version=self.codex_cli_version,
             codex_cli_executable_sha256=self.codex_cli_executable_sha256,
             codex_client=self.codex_client,
@@ -797,6 +823,7 @@ class UnregisteredRunRecorded(BaseModel):
 
     def protocol(self) -> FormalAblationProtocol:
         return FormalAblationProtocol(
+            schema_version=1,
             source_commit=self.source_commit,
             source_tree_sha256=self.source_tree_sha256,
             manifest_sha256=self.manifest_sha256,
@@ -993,9 +1020,13 @@ def formal_ablation_attempt_registry_bytes(
     registry: FormalAblationAttemptRegistry,
 ) -> bytes:
     """Return one stable representation suitable for a tracked registry file."""
+    payload = registry.model_dump(mode="json")
+    for event in payload["events"]:
+        if event.get("scorer_runtime_sha256") is None:
+            event.pop("scorer_runtime_sha256", None)
     return (
         json.dumps(
-            registry.model_dump(mode="json"),
+            payload,
             indent=2,
             ensure_ascii=False,
         )

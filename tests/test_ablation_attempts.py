@@ -78,6 +78,7 @@ def _registered(
         model=selected.model,
         reasoning_effort=selected.reasoning_effort,
         docker_image_id=selected.docker_image_id,
+        scorer_runtime_sha256=selected.scorer_runtime_sha256,
         codex_cli_version=selected.codex_cli_version,
         codex_cli_executable_sha256=selected.codex_cli_executable_sha256,
         codex_client=selected.codex_client,
@@ -297,6 +298,89 @@ def test_empty_commit_cannot_change_a_consumed_selection():
                 ),
                 second,
             )
+        )
+
+
+def test_schema_one_protocol_hashes_remain_stable():
+    protocol = _protocol()
+
+    assert protocol.schema_version == 1
+    assert (
+        formal_ablation_protocol_sha256(protocol)
+        == "9dbc2b1c11971b06635634b96479e1ba7cf02b5fc2967ca9c80235dccfc9a30a"
+    )
+    assert (
+        formal_ablation_selection_sha256(protocol)
+        == "a9cc0cfdcd6175fe1974da4be4951b3442b8b7e0676553108595498ddb058205"
+    )
+
+
+def test_schema_two_image_rebuild_does_not_reopen_a_consumed_selection():
+    first = _protocol().model_copy(
+        update={
+            "schema_version": 2,
+            "scorer_runtime_sha256": "6" * 64,
+        }
+    )
+    second = first.model_copy(
+        update={"docker_image_id": "sha256:" + "7" * 64}
+    )
+
+    assert formal_ablation_protocol_sha256(first) != formal_ablation_protocol_sha256(
+        second
+    )
+    assert formal_ablation_selection_sha256(first) == formal_ablation_selection_sha256(
+        second
+    )
+    with pytest.raises(ValidationError, match="consumed.*cannot be registered"):
+        FormalAblationAttemptRegistry(
+            events=(
+                _registered("1" * 64, protocol=first),
+                AbandonedAttempt(
+                    attempt_id="1" * 64,
+                    recorded_at=_TIME,
+                    started_cells=0,
+                    terminal_cells=0,
+                    reason_code="preflight_failed",
+                    reason="预检失败",
+                ),
+                _registered("2" * 64, protocol=second),
+            )
+        )
+
+
+def test_schema_two_runtime_digest_changes_the_selection():
+    first = _protocol().model_copy(
+        update={
+            "schema_version": 2,
+            "scorer_runtime_sha256": "6" * 64,
+        }
+    )
+    second = first.model_copy(
+        update={"scorer_runtime_sha256": "7" * 64}
+    )
+
+    assert formal_ablation_selection_sha256(first) != formal_ablation_selection_sha256(
+        second
+    )
+
+
+def test_protocol_versions_require_the_matching_runtime_digest_shape():
+    protocol = _protocol()
+
+    with pytest.raises(ValidationError, match="schema 1 omits"):
+        FormalAblationProtocol.model_validate(
+            {
+                **protocol.model_dump(mode="python"),
+                "scorer_runtime_sha256": "6" * 64,
+            }
+        )
+    with pytest.raises(ValidationError, match="schema 2 requires"):
+        FormalAblationProtocol.model_validate(
+            {
+                **protocol.model_dump(mode="python"),
+                "schema_version": 2,
+            }
         )
 
 

@@ -5,17 +5,20 @@
 measurements:
 
 1. **Cell level** — how often the same task attempt succeeds under ``trust`` and
-   ``verify``. Its paired unit is one ``(task, repetition)`` cell.
-2. **Episode level** — how often an entire corpus repetition succeeds end to
-   end. Its paired unit is one complete repetition, so ``R`` repetitions are
-   exactly ``R`` independent observed episodes.
+   ``verify``. Outcomes are paired by ``(task, repetition)`` and current
+   inference treats tasks, rather than repeated cells, as exchangeable.
+2. **Complete-corpus repetition aggregate** — groups the measured task cells
+   that share one repetition number and asks whether all of them succeeded.
+   This is a post-run aggregate, not an independently executed episode or a
+   shared-state long task.
 3. **Composition** — the survival curve obtained by inserting empirical
    per-task rates into an independent-step model. It is a descriptive
    projection, not another experiment, and adds zero independent samples.
 
-Cell and episode McNemar tests answer different questions and need not have the
-same p-value: several discordant cells can collapse into one discordant episode.
-The composition has no McNemar test at all.
+The current cell comparison uses an exact task-cluster sign-flip test. The
+complete-corpus aggregate comparison uses exact McNemar over paired repetition
+aggregates. They answer different questions and need not have the same p-value.
+The composition has no paired test at all.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from math import comb
 from pathlib import Path
 from random import Random
 
-from .bench.stats import mcnemar_exact, wilson_interval
+from .bench.stats import mcnemar_exact, paired_cluster_sign_flip_exact, wilson_interval
 from .durable_io import atomic_replace_text, durable_mkdir_chain
 
 # horizon condition -> the ablation condition whose truth it reads
@@ -56,15 +59,18 @@ class Cells:
     outcome: dict[tuple[str, str, int], bool]
     model: str
     source: str
+    # Kept out of generated JSON. It selects the historical renderer for
+    # schema-v1/v2/v3 inputs whose committed bytes remain release evidence.
+    source_schema_version: int = 4
 
     def truth(self, condition: str, task: str, rep: int) -> bool:
         return self.outcome[(condition, task, rep)]
 
     def complete_reps(self, condition: str) -> list[int]:
-        """Reps with a measured outcome for every task — i.e. usable episodes.
+        """Reps with a measured outcome for every task — i.e. usable aggregates.
 
-        A rep missing any task is not a shorter episode, it is an incomplete
-        one; counting it would quietly change the horizon length.
+        A rep missing any task is not a shorter aggregate; counting it would
+        quietly change the number of tasks represented.
         """
         return [
             rep
@@ -75,7 +81,11 @@ class Cells:
 
 @dataclass
 class Episode:
-    """One repetition of the whole corpus, run under one condition."""
+    """Compatibility record for an aggregate of measured cells in one repetition.
+
+    The class name is retained in the JSON-facing schema. The record does not
+    represent an executed episode or a long task with shared state.
+    """
 
     condition: str
     rep: int
@@ -108,6 +118,24 @@ class PairedEstimand:
     mcnemar_p: float
 
 
+@dataclass(frozen=True)
+class ClusteredCellEstimand:
+    """Paired cell outcomes with tasks as the inferential unit."""
+
+    unit: str
+    pairs: int
+    trust_successes: int
+    verify_successes: int
+    # Cell counts are descriptive because repetitions of one task are clustered.
+    # (verify succeeds / trust fails, trust succeeds / verify fails)
+    discordant: tuple[int, int]
+    task_clusters: int
+    nonzero_task_clusters: int
+    # Mean of each task's paired ``verify - trust`` success difference.
+    task_cluster_mean_difference: float
+    task_cluster_sign_flip_p: float
+
+
 @dataclass
 class CompositionEstimand:
     """A model-derived curve; it contributes no additional observations."""
@@ -134,15 +162,19 @@ class HorizonCoverage:
 class HorizonReport:
     tasks: list[str]
     n_steps: int
+    # Compatibility field: this is the number of paired complete-corpus
+    # repetition aggregates, not a count of independent executed episodes.
     independent_episode_count: int
     model: str
     source: str
     coverage: HorizonCoverage
-    cell_estimand: PairedEstimand
+    cell_estimand: PairedEstimand | ClusteredCellEstimand
     episode_estimand: PairedEstimand
     composition_estimand: CompositionEstimand
     episodes: list[Episode]
     alpha: float = _TARGET_ALPHA
+    # Rendering compatibility only; this is deliberately not serialized.
+    source_schema_version: int = 4
 
     # --- rendering ---------------------------------------------------------
     def to_markdown(self) -> str:
@@ -153,13 +185,50 @@ class HorizonReport:
         episode = self.episode_estimand
         cell_b, cell_c = cell.discordant
         episode_b, episode_c = episode.discordant
+        legacy = self.source_schema_version < 4
+        if legacy:
+            if not isinstance(cell, PairedEstimand):
+                raise HorizonDataError("legacy horizon report requires a cell McNemar estimand")
+            cell_result_lines = [
+                f"Discordant cells (verify-only / trust-only): {cell_b}/{cell_c} · "
+                f"exact McNemar p = {_format_p(cell.mcnemar_p)}"
+                + ("" if cell.mcnemar_p < self.alpha else " — **not significant**")
+            ]
+        else:
+            if not isinstance(cell, ClusteredCellEstimand):
+                raise HorizonDataError(
+                    "schema-v4 horizon report requires task-cluster cell inference"
+                )
+            cell_result_lines = [
+                "Discordant cells (verify-only / trust-only): "
+                f"{cell_b}/{cell_c}. These cell counts are descriptive; repeated cells "
+                "from one task do not receive separate inferential weight.",
+                "Task-cluster inference: "
+                f"{cell.nonzero_task_clusters}/{cell.task_clusters} tasks have a "
+                "non-zero paired effect · exact paired sign-flip p = "
+                f"{_format_p(cell.task_cluster_sign_flip_p)}"
+                + (
+                    ""
+                    if cell.task_cluster_sign_flip_p < self.alpha
+                    else " — **not significant**"
+                ),
+            ]
         lines = [
             "# Error compounding over a horizon",
             "",
-            f"corpus: {n} independent subtasks · model: `{self.model or '(backend default)'}` · "
-            f"complete paired repetitions: {self.independent_episode_count} → "
-            f"**{self.independent_episode_count} independent observed episodes** · "
-            f"per-step truth from `{self.source}`",
+            (
+                f"corpus: {n} independent subtasks · "
+                f"model: `{self.model or '(backend default)'}` · "
+                f"complete paired repetitions: {self.independent_episode_count} → "
+                f"**{self.independent_episode_count} independent observed episodes** · "
+                f"per-step truth from `{self.source}`"
+                if legacy
+                else f"corpus: {n} separately measured tasks · "
+                f"model: `{self.model or '(backend default)'}` · "
+                "complete paired repetition aggregates: "
+                f"**{self.independent_episode_count}** · "
+                f"per-step truth from `{self.source}`"
+            ),
             "",
             "Coverage: "
             f"scheduled paired cells **{self.coverage.scheduled_paired_cells}** · "
@@ -170,9 +239,15 @@ class HorizonReport:
             "complete paired repetitions "
             f"**{self.coverage.complete_paired_repetitions}**.",
             "",
-            "This report keeps three estimands separate. The cell and episode tests use "
-            "different paired units; the composition is a descriptive model projection "
-            "and adds no observations.",
+            (
+                "This report keeps three estimands separate. The cell and episode tests "
+                "use different paired units; the composition is a descriptive model "
+                "projection and adds no observations."
+                if legacy
+                else "This report keeps three estimands separate. The cell and "
+                "complete-corpus aggregate tests use different paired units; the "
+                "composition is a descriptive model projection and adds no observations."
+            ),
             "",
             "## Estimand 1 — paired cells",
             "",
@@ -180,19 +255,39 @@ class HorizonReport:
             f"`trust` true success: {cell.trust_successes}/{cell.pairs} · "
             f"`verify` true success: {cell.verify_successes}/{cell.pairs}.",
             "",
-            f"Discordant cells (verify-only / trust-only): {cell_b}/{cell_c} · "
-            f"exact McNemar p = {_format_p(cell.mcnemar_p)}"
-            + ("" if cell.mcnemar_p < self.alpha else " — **not significant**"),
+            *cell_result_lines,
             "",
-            "## Estimand 2 — observed episodes",
+            (
+                "## Estimand 2 — observed episodes"
+                if legacy
+                else "## Estimand 2 — complete-corpus repetition aggregates"
+            ),
             "",
-            "An episode is one complete corpus repetition and is correct only if every "
-            "subtask in that repetition truly succeeded. Multiple failed cells in the "
-            "same repetition still make one failed episode.",
+            (
+                "An episode is one complete corpus repetition and is correct only if every "
+                "subtask in that repetition truly succeeded. Multiple failed cells in the "
+                "same repetition still make one failed episode."
+                if legacy
+                else "An aggregate is correct only if every measured task cell in that "
+                "repetition truly succeeded. Multiple failed cells in the same repetition "
+                "still make one failed aggregate."
+            ),
             "",
-            "| condition | end-to-end correct | first failing subtask(s) |",
+            (
+                "| condition | end-to-end correct | first failing subtask(s) |"
+                if legacy
+                else "| condition | aggregate correct | failing task(s) |"
+            ),
             "|---|---|---|",
         ]
+        if not legacy:
+            lines[8:8] = [
+                "A complete-corpus repetition aggregate is constructed after execution "
+                "from separately measured task cells that share a repetition number. It "
+                "is not an executed shared-state long task: tasks do not share a worktree, "
+                "context, checkpoint, or failure history here.",
+                "",
+            ]
         for name, _src, _blurb in CONDITIONS:
             eps = [e for e in self.episodes if e.condition == name]
             ok = sum(e.end_to_end for e in eps)
@@ -202,23 +297,44 @@ class HorizonReport:
                 f"| `{name}` | {ok}/{len(eps)} ({_pct(lo)}–{_pct(hi)}, Wilson) "
                 f"| {', '.join(f'`{t}`' for t in failing) or '—'} |"
             )
-        lines += [
-            "",
+        aggregate_result = (
             f"Discordant episodes (verify-only / trust-only): {episode_b}/{episode_c} of "
             f"{episode.pairs} paired episodes · exact McNemar p = "
-            f"{_format_p(episode.mcnemar_p)}"
-            + ("" if episode.mcnemar_p < self.alpha else " — **not significant**"),
-            "",
+            if legacy
+            else "Discordant complete-corpus aggregates (verify-only / trust-only): "
+            f"{episode_b}/{episode_c} of {episode.pairs} paired aggregates · "
+            "exact McNemar p = "
+        )
+        aggregate_comparison = (
             "The cell- and episode-level p-values may coincide for a particular dataset, "
             "but equality is not a statistical contract: aggregation changes the paired "
-            "unit and can collapse many cell disagreements into one episode disagreement.",
+            "unit and can collapse many cell disagreements into one episode disagreement."
+            if legacy
+            else "The task-cluster cell test and repetition-aggregate McNemar test answer "
+            "different questions. Their p-values need not match: the former gives each "
+            "task one inferential contribution, while the latter pairs complete-corpus "
+            "aggregates by repetition."
+        )
+        composition_interval = (
+            "to the observed task mix; it is not an episode confidence interval and has no "
+            if legacy
+            else "to the observed task mix; it is not a confidence interval for "
+            "complete-corpus aggregates and has no "
+        )
+        lines += [
+            "",
+            aggregate_result
+            + f"{_format_p(episode.mcnemar_p)}"
+            + ("" if episode.mcnemar_p < self.alpha else " — **not significant**"),
+            "",
+            aggregate_comparison,
             "",
             "## Estimand 3 — descriptive composition",
             "",
             "The curve inserts empirical per-task success rates into an independent-step, "
             "uniform-random-order model. Its task-bootstrap interval describes sensitivity "
-            "to the observed task mix; it is not an episode confidence interval and has no "
-            "McNemar p-value.",
+            + composition_interval
+            + "McNemar p-value.",
             "",
             f"Independent samples added by composition: "
             f"**{self.composition_estimand.independent_samples_added}**.",
@@ -263,13 +379,20 @@ class HorizonReport:
         ]
         for name, _src, blurb in CONDITIONS:
             lines.append(f"- `{name}` — {blurb}.")
-        lines += [
-            "",
-            "Only new complete repetitions increase the episode sample count. Reordering "
-            "or composing the existing cells changes the projected effect size, not the "
-            "number of independent observed episodes.",
-            "",
-        ]
+        lines += ["", *(
+            (
+                "Only new complete repetitions increase the episode sample count. "
+                "Reordering or composing the existing cells changes the projected effect "
+                "size, not the number of independent observed episodes.",
+            )
+            if legacy
+            else (
+                "Only newly measured complete repetitions increase the aggregate count. "
+                "Reordering or composing existing cells changes the projected effect size, "
+                "not the amount of measured evidence, and does not turn the aggregates "
+                "into executed shared-state long tasks.",
+            )
+        ), ""]
         return "\n".join(lines)
 
     def to_json(self) -> str:
@@ -431,6 +554,7 @@ def load_cells(
         outcome=outcome,
         model=model,
         source=source_label or str(path),
+        source_schema_version=schema_version,
     )
 
 
@@ -463,9 +587,9 @@ def compounding_curve(probabilities: list[float]) -> list[float]:
 
     The first k of a uniformly random permutation is a uniformly random
     k-subset, so the answer is the degree-k elementary symmetric polynomial of
-    the per-step probabilities divided by the number of k-subsets. Computed
-    exactly by the standard DP — no sampling, so the curve carries no Monte
-    Carlo noise of its own.
+    the per-step probabilities divided by the number of k-subsets. It is
+    computed exactly by the standard DP, so the curve carries no Monte Carlo
+    noise of its own.
     """
     n = len(probabilities)
     if n == 0:
@@ -488,7 +612,7 @@ def _task_bootstrap_interval(
     so this describes how the projection changes with the observed task mix. It
     does not add episodes or supply an episode-level confidence interval.
     """
-    tasks = list(probabilities_by_task)
+    tasks = sorted(probabilities_by_task)
     steps = len(tasks)
     rng = Random(seed)
     draws: list[list[float]] = []
@@ -505,9 +629,13 @@ def _task_bootstrap_interval(
     return lo, hi
 
 
-# --- observed episodes --------------------------------------------------------
+# --- complete-corpus repetition aggregates -----------------------------------
 def episodes_for(cells: Cells, condition: str, ablation_condition: str) -> list[Episode]:
-    """One episode per complete repetition of the corpus."""
+    """Build one compatibility ``Episode`` record per complete repetition.
+
+    Each record aggregates separately executed task cells after the fact. It is
+    not evidence that the tasks ran as one shared-state episode.
+    """
     out: list[Episode] = []
     n = len(cells.tasks)
     for rep in cells.complete_reps(ablation_condition):
@@ -541,6 +669,30 @@ def _paired_estimand(unit: str, pairs: list[tuple[bool, bool]]) -> PairedEstiman
     )
 
 
+def _clustered_cell_estimand(
+    unit: str,
+    pairs_by_task: dict[str, list[tuple[bool, bool]]],
+) -> ClusteredCellEstimand:
+    """Summarize cells without treating repetitions of one task as independent."""
+    result = paired_cluster_sign_flip_exact(pairs_by_task)
+    pairs = [pair for task in sorted(pairs_by_task) for pair in pairs_by_task[task]]
+    trust_successes = sum(trust for trust, _verify in pairs)
+    verify_successes = sum(verify for _trust, verify in pairs)
+    verify_only = sum(verify and not trust for trust, verify in pairs)
+    trust_only = sum(trust and not verify for trust, verify in pairs)
+    return ClusteredCellEstimand(
+        unit=unit,
+        pairs=len(pairs),
+        trust_successes=trust_successes,
+        verify_successes=verify_successes,
+        discordant=(verify_only, trust_only),
+        task_clusters=result.clusters,
+        nonzero_task_clusters=result.nonzero_clusters,
+        task_cluster_mean_difference=result.mean_difference,
+        task_cluster_sign_flip_p=result.p_value,
+    )
+
+
 def build_report(cells: Cells, *, seed: int = 0, alpha: float = _TARGET_ALPHA) -> HorizonReport:
     curves: list[Curve] = []
     episodes: list[Episode] = []
@@ -562,11 +714,18 @@ def build_report(cells: Cells, *, seed: int = 0, alpha: float = _TARGET_ALPHA) -
         )
         episodes.extend(episodes_for(cells, name, source))
 
+    cell_pairs_by_task: dict[str, list[tuple[bool, bool]]] = {}
+    for task in cells.tasks:
+        task_pairs = [
+            (cells.truth("trust", task, rep), cells.truth("verify", task, rep))
+            for rep in cells.reps
+            if ("trust", task, rep) in cells.outcome
+            and ("verify", task, rep) in cells.outcome
+        ]
+        if task_pairs:
+            cell_pairs_by_task[task] = task_pairs
     cell_pairs = [
-        (cells.truth("trust", task, rep), cells.truth("verify", task, rep))
-        for task in cells.tasks
-        for rep in cells.reps
-        if ("trust", task, rep) in cells.outcome and ("verify", task, rep) in cells.outcome
+        pair for task in sorted(cell_pairs_by_task) for pair in cell_pairs_by_task[task]
     ]
     if not cell_pairs:
         raise HorizonDataError("no paired trust/verify cells")
@@ -581,6 +740,15 @@ def build_report(cells: Cells, *, seed: int = 0, alpha: float = _TARGET_ALPHA) -
     scheduled_cell_pairs = len(cells.tasks) * len(cells.reps)
     usable_cell_pairs = len(cell_pairs)
 
+    cell_estimand: PairedEstimand | ClusteredCellEstimand
+    if cells.source_schema_version < 4:
+        cell_estimand = _paired_estimand("task × repetition cell", cell_pairs)
+    else:
+        cell_estimand = _clustered_cell_estimand(
+            "task × repetition cell (inference clustered by task)",
+            cell_pairs_by_task,
+        )
+
     return HorizonReport(
         tasks=cells.tasks,
         n_steps=len(cells.tasks),
@@ -594,7 +762,7 @@ def build_report(cells: Cells, *, seed: int = 0, alpha: float = _TARGET_ALPHA) -
             scheduled_repetitions=len(cells.reps),
             complete_paired_repetitions=len(paired),
         ),
-        cell_estimand=_paired_estimand("task × repetition cell", cell_pairs),
+        cell_estimand=cell_estimand,
         episode_estimand=_paired_estimand("complete corpus repetition", episode_pairs),
         composition_estimand=CompositionEstimand(
             unit="independent-step projection over empirical per-task rates",
@@ -605,6 +773,7 @@ def build_report(cells: Cells, *, seed: int = 0, alpha: float = _TARGET_ALPHA) -
         ),
         episodes=paired_episodes,
         alpha=alpha,
+        source_schema_version=cells.source_schema_version,
     )
 
 
@@ -700,9 +869,14 @@ def _svg(report: HorizonReport) -> str:
         f'transform="rotate(-90 14 {_PAD_T + plot_h / 2:.1f})" text-anchor="middle">'
         "end-to-end still correct</text>"
     )
+    subtitle = (
+        f"{n} subtasks · descriptive composition · 0 added episodes"
+        if report.source_schema_version < 4
+        else f"{n} tasks · descriptive composition · 0 added observations"
+    )
     parts.append(
         f'<text x="{_PAD_L}" y="{_PAD_T - 10}" font-size="11" fill="#8b949e">'
-        f"{n} subtasks · descriptive composition · 0 added episodes</text>"
+        f"{subtitle}</text>"
     )
     parts.append("</svg>")
     return "\n".join(parts) + "\n"

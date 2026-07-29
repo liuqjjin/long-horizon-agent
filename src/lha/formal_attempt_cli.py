@@ -38,6 +38,7 @@ from .ablation import (
     _read_bounded_bytes,
     _recover_docker_operations,
     _resolve_docker_image_id,
+    _scorer_runtime_digest,
     _source_tree_digest,
     _trusted_control_executable,
     _validate_formal_head_checkout,
@@ -495,6 +496,16 @@ def _register_formal_attempt_locked(
             "working source or formal corpus differs from the trusted HEAD"
         ) from error
     source_tree_sha256 = _source_tree_digest(source_files)
+    try:
+        scorer_runtime_sha256 = _scorer_runtime_digest(
+            repository,
+            git_path=git_path,
+            commit=source_commit,
+        )
+    except RuntimeError as error:
+        raise FormalAttemptCommandError(
+            "formal scorer runtime inputs differ from the trusted HEAD"
+        ) from error
     witness_url = _https_witness_remote(
         repository,
         remote_name=witness_remote_name,
@@ -534,6 +545,7 @@ def _register_formal_attempt_locked(
         "model": model,
         "reasoning_effort": reasoning_effort,
         "docker_image_id": docker_image_id,
+        "scorer_runtime_sha256": scorer_runtime_sha256,
         "codex_cli_version": cli_version,
         "codex_cli_executable_sha256": cli_digest,
         "codex_client": client_config,
@@ -542,7 +554,10 @@ def _register_formal_attempt_locked(
     }
     from .ablation_attempts import FormalAblationProtocol
 
-    protocol = FormalAblationProtocol(**protocol_fields)
+    protocol = FormalAblationProtocol(
+        schema_version=2,
+        **protocol_fields,
+    )
     attempt_id = (attempt_id_factory or (lambda: secrets.token_hex(32)))()
     if _HEX_64.fullmatch(attempt_id) is None:
         raise FormalAttemptCommandError("generated formal attempt ID is invalid")
@@ -598,6 +613,16 @@ def _register_formal_attempt_locked(
             "working source or formal corpus changed during registration"
         ) from error
     final_source_tree_sha256 = _source_tree_digest(final_source_files)
+    try:
+        final_scorer_runtime_sha256 = _scorer_runtime_digest(
+            repository,
+            git_path=git_path,
+            commit=final_head,
+        )
+    except RuntimeError as error:
+        raise FormalAttemptCommandError(
+            "formal scorer runtime inputs changed during registration"
+        ) from error
     final_witness_url = _https_witness_remote(
         repository,
         remote_name=witness_remote_name,
@@ -628,6 +653,7 @@ def _register_formal_attempt_locked(
         )
         or final_manifest_sha256 != manifest_sha256
         or final_source_tree_sha256 != source_tree_sha256
+        or final_scorer_runtime_sha256 != scorer_runtime_sha256
         or final_witness_url != witness_url
         or final_witness_credential_helper != witness_credential_helper
         or final_output_unavailable
@@ -652,6 +678,7 @@ def _register_formal_attempt_locked(
         "witness_remote_name": witness_remote_name,
         "witness_remote_url": witness_url,
         "docker_image_id": docker_image_id,
+        "scorer_runtime_sha256": scorer_runtime_sha256,
     }
 
 
@@ -756,6 +783,18 @@ def _validate_registration_checkout(
         )
         if _source_tree_digest(source_files) != registration.source_tree_sha256:
             raise ValueError("formal source digest differs from the registration")
+        if (
+            registration.scorer_runtime_sha256 is not None
+            and _scorer_runtime_digest(
+                repository,
+                git_path=git_path,
+                commit=registration_head,
+            )
+            != registration.scorer_runtime_sha256
+        ):
+            raise ValueError(
+                "formal scorer runtime digest differs from the registration"
+            )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         if isinstance(error, FormalAttemptCommandError):
             raise

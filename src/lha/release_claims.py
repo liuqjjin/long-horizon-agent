@@ -18,7 +18,7 @@ import math
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -48,6 +48,7 @@ from .ablation import (
     ScoreOutcome,
     ScorerEvidenceBinding,
     _ablation_report_from_raw,
+    _aggregate,
     _canonical_json_object_bytes,
     _frozen_artifact_bytes,
     _git_control_env,
@@ -60,6 +61,7 @@ from .ablation import (
     _repo_digest,
     _report_fingerprint,
     _scorer_evidence_bytes,
+    _scorer_runtime_digest,
     _source_file_digests,
     _source_tree_digest,
     _trusted_control_executable,
@@ -82,7 +84,11 @@ from .ablation_attempts import (
     parse_formal_ablation_attempt_registry,
     registry_has_prefix,
 )
-from .bench.stats import mcnemar_exact, wilson_interval
+from .bench.stats import (
+    mcnemar_exact,
+    paired_cluster_sign_flip_exact,
+    wilson_interval,
+)
 from .bench.terminal_public_evidence import (
     TerminalBenchPublicEvidenceValidation,
     validate_terminal_bench_public_evidence,
@@ -128,6 +134,8 @@ class ReleaseClaimsSummary:
     gate_successes: int
     gate_interceptions: int
     verify_successes: int
+    # Compatibility name. For schema-v4 this is the task-cluster exact paired
+    # sign-flip p-value; historical schemas retain their cell McNemar value.
     headline_mcnemar_p: float
     terminal_bench: TerminalBenchPublicEvidenceValidation | None
 
@@ -531,6 +539,51 @@ def _boundary_interval_problem(
     return None
 
 
+def _derived_stat_value_matches(actual: Any, expected: Any) -> bool:
+    if expected is None:
+        return actual is None
+    if isinstance(expected, float):
+        return _is_close(actual, expected)
+    if isinstance(expected, int):
+        return isinstance(actual, int) and not isinstance(actual, bool) and actual == expected
+    if isinstance(expected, str):
+        return actual == expected
+    if isinstance(expected, tuple):
+        return (
+            isinstance(actual, (list, tuple))
+            and len(actual) == len(expected)
+            and all(
+                _derived_stat_value_matches(observed, wanted)
+                for observed, wanted in zip(actual, expected)
+            )
+        )
+    return actual == expected
+
+
+def _validate_current_derived_stats(
+    by_name: dict[str, dict[str, Any]],
+    records: tuple[RunRecord, ...],
+) -> None:
+    """Recompute every schema-4 ConditionStats field from immutable cell rows."""
+    expected_by_name = {
+        stat.condition: asdict(stat) for stat in _aggregate(list(records))
+    }
+    for condition in _CONDITION_NAMES:
+        observed = by_name[condition]
+        expected = expected_by_name[condition]
+        if set(observed) != set(expected):
+            _fail(
+                f"ablation stats for {condition!r} do not contain exactly "
+                "the generated ConditionStats fields"
+            )
+        for field, wanted in expected.items():
+            if not _derived_stat_value_matches(observed.get(field), wanted):
+                _fail(
+                    f"ablation stats for {condition!r} have stale {field}: "
+                    f"expected {wanted!r}, got {observed.get(field)!r}"
+                )
+
+
 def _validate_condition_stats(raw: dict[str, Any], records: tuple[RunRecord, ...]) -> list[str]:
     schema_version = raw.get("schema_version", 1)
     current_schema = isinstance(schema_version, int) and schema_version >= 4
@@ -628,10 +681,19 @@ def _validate_condition_stats(raw: dict[str, Any], records: tuple[RunRecord, ...
             problem = _boundary_interval_problem(stat, field=field, successes=successes, total=n)
             if problem:
                 boundary_problems.append(problem)
+    if current_schema and not boundary_problems:
+        _validate_current_derived_stats(by_name, records)
     return boundary_problems
 
 
-def _paired_p(records: tuple[RunRecord, ...], left: str, right: str, metric: str) -> float:
+def _paired_p(
+    records: tuple[RunRecord, ...],
+    left: str,
+    right: str,
+    metric: str,
+    *,
+    task_cluster_inference: bool = False,
+) -> float:
     def outcomes(condition: str) -> dict[tuple[str, int], bool]:
         return {
             (record.task, record.rep): bool(getattr(record, metric))
@@ -644,6 +706,16 @@ def _paired_p(records: tuple[RunRecord, ...], left: str, right: str, metric: str
     pairs = set(left_outcomes) & set(right_outcomes)
     if not pairs:
         _fail(f"no paired cells for {left}/{right}")
+    if task_cluster_inference:
+        pairs_by_task: dict[str, list[tuple[bool, bool]]] = {}
+        for task, rep in sorted(pairs):
+            pairs_by_task.setdefault(task, []).append(
+                (
+                    left_outcomes[(task, rep)],
+                    right_outcomes[(task, rep)],
+                )
+            )
+        return paired_cluster_sign_flip_exact(pairs_by_task).p_value
     only_left = sum(left_outcomes[key] and not right_outcomes[key] for key in pairs)
     only_right = sum(right_outcomes[key] and not left_outcomes[key] for key in pairs)
     return mcnemar_exact(only_left, only_right)
@@ -1001,6 +1073,7 @@ def _validate_disclosed_formal_report(
     )
     try:
         protocol = FormalAblationProtocol(
+            schema_version=1,
             source_commit=cast(str, provenance.get("git_commit")),
             source_tree_sha256=cast(str, provenance.get("source_tree_sha256")),
             manifest_sha256=cast(
@@ -1209,7 +1282,22 @@ def _validate_formal_attempt_provenance(
         label="formal ablation report",
     )
     try:
+        scorer_runtime_sha256 = (
+            _scorer_runtime_digest(
+                repo_root,
+                git_path=git_executable,
+                commit=registration.source_commit,
+            )
+            if registration.scorer_runtime_sha256 is not None
+            else None
+        )
+    except RuntimeError as error:
+        _fail(f"formal ablation scorer runtime is invalid: {error}")
+    try:
         protocol = FormalAblationProtocol(
+            schema_version=(
+                2 if registration.scorer_runtime_sha256 is not None else 1
+            ),
             source_commit=registration.source_commit,
             source_tree_sha256=cast(str, provenance["source_tree_sha256"]),
             manifest_sha256=cast(
@@ -1219,6 +1307,7 @@ def _validate_formal_attempt_provenance(
             model=cast(str, provenance["model"]),
             reasoning_effort=effort,
             docker_image_id=cast(str, provenance["scorer_image_id"]),
+            scorer_runtime_sha256=scorer_runtime_sha256,
             codex_cli_version=cli_version,
             codex_cli_executable_sha256=(
                 _codex_executable_sha256_from_provenance(
@@ -1240,6 +1329,7 @@ def _validate_formal_attempt_provenance(
         "model": protocol.model,
         "reasoning_effort": protocol.reasoning_effort,
         "docker_image_id": protocol.docker_image_id,
+        "scorer_runtime_sha256": protocol.scorer_runtime_sha256,
         "codex_cli_version": protocol.codex_cli_version,
         "codex_cli_executable_sha256": protocol.codex_cli_executable_sha256,
         "codex_client": protocol.codex_client,
@@ -1249,6 +1339,8 @@ def _validate_formal_attempt_provenance(
     }
     if (
         protocol_sha256 != measured_protocol_sha256
+        or provenance.get("scorer_runtime_sha256")
+        != registration.scorer_runtime_sha256
         or any(
             getattr(registration, field) != expected
             for field, expected in expected_registration.items()
@@ -2499,7 +2591,13 @@ def _validate_ablation(ablation_json: Path, ablation_md: Path) -> _AblationFacts
             not record.claimed_success and not record.artifact_correct for record in gate
         ),
         verify_successes=sum(record.true_success for record in verify),
-        trust_gate_p=_paired_p(records, "trust", "gate", "false_success"),
+        trust_gate_p=_paired_p(
+            records,
+            "trust",
+            "gate",
+            "false_success",
+            task_cluster_inference=status == "formal",
+        ),
     )
 
 
@@ -2526,6 +2624,7 @@ def _validate_horizon(
         },
         model=ablation.report.model,
         source=expected_source,
+        source_schema_version=ablation.report.schema_version,
     )
     expected = build_report(cells)
     expected_raw = json.loads(expected.to_json())
@@ -2548,21 +2647,41 @@ def _validate_horizon(
         _fail("horizon Markdown was not generated from the committed horizon JSON")
 
     estimands = raw["estimands"]
+    cell_estimand = estimands["cell"]
     if "mcnemar_p" in estimands["composition"]:
         _fail("horizon composition must not report a McNemar p-value")
     if estimands["composition"]["independent_samples_added"] != 0:
         _fail("horizon composition must add zero independent samples")
-    return float(estimands["cell"]["mcnemar_p"])
+    if ablation.status == "formal":
+        if "mcnemar_p" in cell_estimand:
+            _fail("formal horizon cells must not report a cell-level McNemar p-value")
+        cluster_p = cell_estimand.get("task_cluster_sign_flip_p")
+        expected_cluster_p = _paired_p(
+            ablation.records,
+            "trust",
+            "verify",
+            "true_success",
+            task_cluster_inference=True,
+        )
+        if not _is_close(cluster_p, expected_cluster_p):
+            _fail("formal horizon has a stale task-cluster paired sign-flip p-value")
+        return expected_cluster_p
+    if "task_cluster_sign_flip_p" in cell_estimand:
+        _fail("legacy horizon unexpectedly changes its historical cell estimand")
+    mcnemar_p = cell_estimand.get("mcnemar_p")
+    if not isinstance(mcnemar_p, (int, float)) or isinstance(mcnemar_p, bool):
+        _fail("legacy horizon cell McNemar p-value is invalid")
+    return float(mcnemar_p)
 
 
 def _result_section(readme: str) -> str:
     match = re.search(
-        r"^## 已提交的实测结果\s*$\n(?P<body>.*?)(?=^## |\Z)",
+        r"^## (?:已验证结果|已提交的实测结果)\s*$\n(?P<body>.*?)(?=^## |\Z)",
         readme,
         re.MULTILINE | re.DOTALL,
     )
     if match is None:
-        _fail("README is missing the '已提交的实测结果' section")
+        _fail("README is missing the measured-results section")
     return match.group("body")
 
 
@@ -2597,89 +2716,176 @@ def _validate_terminal_evidence(
     return validation
 
 
-def _terminal_claim_value(
-    claim: str,
-    pattern: str,
+def _terminal_claim_scope(text: str) -> str | None:
+    """Return the Terminal-Bench subsection without borrowing nearby claims."""
+    heading = re.search(
+        rf"^(?P<marks>#{{2,6}})[^\n]*{re.escape(_TERMINAL_SUBSET_LABEL)}[^\n]*$",
+        text,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if heading is not None:
+        level = len(heading.group("marks"))
+        end = len(text)
+        for candidate in re.finditer(r"^(?P<marks>#{2,6})\s+", text[heading.end() :], re.MULTILINE):
+            if len(candidate.group("marks")) <= level:
+                end = heading.end() + candidate.start()
+                break
+        return text[heading.start() : end]
+
+    marker = text.find(_TERMINAL_SUBSET_LABEL)
+    if marker < 0:
+        return None
+    return text[marker:]
+
+
+def _claim_values(text: str, patterns: tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            value = next((group for group in match.groups() if group is not None), None)
+            if value is not None:
+                values.append(value)
+    return values
+
+
+def _require_claim_values(
+    values: list[str],
     *,
+    expected: str,
     label: str,
-) -> str:
-    match = re.search(pattern, claim, re.IGNORECASE)
-    if match is None:
-        _fail(f"README Terminal-Bench claim is missing {label}")
-    value = next((group for group in match.groups() if group is not None), None)
-    if value is None:
-        _fail(f"README Terminal-Bench claim is missing {label}")
-    return value
+) -> None:
+    if not values:
+        _fail(f"Terminal-Bench claim is missing {label}")
+    if any(value != expected for value in values):
+        if label in {"passed/20", "PASS count", "FAIL count", "ERROR count"}:
+            _fail("Terminal-Bench counts differ from the committed evidence")
+        _fail(f"Terminal-Bench {label} differs from the committed evidence")
+
+
+def _validate_terminal_counts(
+    claim: str,
+    terminal: TerminalBenchPublicEvidenceValidation,
+) -> None:
+    ratios = _claim_values(claim, (r"(?<!\d)(\d+)\s*/\s*20(?!\d)",))
+    pass_counts = _claim_values(
+        claim,
+        (
+            r"(?:passed|pass|通过)\s*(?:为|[:：=|])?\s*`?(\d+)`?",
+            r"(?<!\d)(\d+)\s*(?:个)?\s*(?:"
+            r"`(?:passed|pass|通过)`(?!/)|(?:passed|pass|通过)(?![/A-Za-z]))",
+        ),
+    )
+    failed_counts = _claim_values(
+        claim,
+        (
+            r"(?:failed|fail|失败)\s*(?:为|[:：=|])?\s*`?(\d+)`?",
+            r"(?<!\d)(\d+)\s*(?:个)?\s*`?(?:failed|fail|失败)`?",
+        ),
+    )
+    error_counts = _claim_values(
+        claim,
+        (
+            r"ERROR\s*(?:为|[:：=|])?\s*`?(\d+)`?",
+            r"(?<!\d)(\d+)\s*(?:个)?\s*`?ERROR`?",
+        ),
+    )
+    _require_claim_values(ratios, expected=str(terminal.passed), label="passed/20")
+    if pass_counts:
+        _require_claim_values(
+            pass_counts,
+            expected=str(terminal.passed),
+            label="PASS count",
+        )
+    _require_claim_values(
+        failed_counts,
+        expected=str(terminal.failed),
+        label="FAIL count",
+    )
+    _require_claim_values(
+        error_counts,
+        expected=str(terminal.errors),
+        label="ERROR count",
+    )
+
+
+def _terminal_paragraphs(text: str) -> tuple[str, ...]:
+    return tuple(
+        paragraph
+        for paragraph in re.split(r"\n[ \t]*\n", text)
+        if re.search(r"Terminal[- ]Bench", paragraph, re.IGNORECASE)
+    )
+
+
+def _validate_terminal_runtime_claims(
+    scopes: tuple[str, ...],
+    terminal: TerminalBenchPublicEvidenceValidation,
+) -> None:
+    expected_labels = (
+        (
+            (r"(?:模型|model)\s*(?:为|[:：=])?\s*`?([A-Za-z0-9][A-Za-z0-9._/+:-]*)`?",),
+            terminal.model,
+            "model",
+        ),
+        (
+            (
+                r"(?:推理强度|reasoning[_ -]?effort)\s*(?:为|[:：=])?\s*"
+                r"`?([A-Za-z0-9._+-]+)`?",
+            ),
+            terminal.reasoning_effort,
+            "reasoning effort",
+        ),
+        (
+            (
+                r"\bHarbor\b(?:\s*版本|\s+version)?\s*(?:为|[:：=])?\s*"
+                r"`?([A-Za-z0-9.+-]+)`?",
+            ),
+            terminal.harbor_version,
+            "Harbor version",
+        ),
+    )
+    for patterns, expected, label in expected_labels:
+        values: list[str] = []
+        for scope in scopes:
+            values.extend(_claim_values(scope, patterns))
+        if not values:
+            _fail(f"Terminal-Bench public documentation is missing {label}")
+        if any(value != expected for value in values):
+            _fail(f"Terminal-Bench {label} differs from the committed evidence")
 
 
 def _validate_terminal_readme(
     readme: str,
     section: str,
     terminal: TerminalBenchPublicEvidenceValidation | None,
+    *,
+    benchmark_docs: str,
 ) -> None:
     if terminal is None:
-        for mention in re.finditer(r"Terminal[- ]Bench", readme, re.IGNORECASE):
-            paragraph_end = readme.find("\n\n", mention.start())
-            if paragraph_end < 0:
-                paragraph_end = len(readme)
-            claim_window = readme[mention.start() : paragraph_end]
-            if _TERMINAL_NUMERIC_CLAIM.search(claim_window):
+        for document in (readme, benchmark_docs):
+            for claim_window in _terminal_paragraphs(document):
+                if not _TERMINAL_NUMERIC_CLAIM.search(claim_window):
+                    continue
                 _fail(
-                    "README cannot publish a Terminal-Bench numeric result "
+                    "public documentation cannot publish a Terminal-Bench numeric result "
                     "without committed public evidence"
                 )
         return
 
-    marker = section.find(_TERMINAL_SUBSET_LABEL)
-    if marker < 0:
+    claim = _terminal_claim_scope(section)
+    if claim is None:
         _fail(f"README measured-results section must name '{_TERMINAL_SUBSET_LABEL}'")
-    claim = section[marker : marker + 1600]
-    passed = _terminal_claim_value(
-        claim,
-        r"(?:passed|pass|通过)\s*(?:为|[:：=])?\s*`?(\d+)\s*/\s*20`?"
-        r"|`?(\d+)\s*/\s*20`?\s*(?:passed|pass|通过)",
-        label="passed/20",
-    )
-    failed = _terminal_claim_value(
-        claim,
-        r"(?:failed|fail|失败)\s*(?:为|[:：=])?\s*`?(\d+)`?",
-        label="failed",
-    )
-    errors = _terminal_claim_value(
-        claim,
-        r"ERROR\s*(?:为|[:：=])?\s*`?(\d+)`?",
-        label="ERROR",
-    )
-    if (
-        passed != str(terminal.passed)
-        or failed != str(terminal.failed)
-        or errors != str(terminal.errors)
-    ):
-        _fail("README Terminal-Bench counts differ from the committed evidence")
+    _validate_terminal_counts(claim, terminal)
 
-    expected_labels = (
-        (
-            r"(?:模型|model)\s*(?:为|[:：=])?\s*`?([A-Za-z0-9._/+:-]+)`?",
-            terminal.model,
-            "model",
-        ),
-        (
-            r"(?:推理强度|reasoning[_ -]?effort)\s*(?:为|[:：=])?\s*"
-            r"`?([A-Za-z0-9._+-]+)`?",
-            terminal.reasoning_effort,
-            "reasoning effort",
-        ),
-        (
-            r"Harbor(?:\s*版本|\s+version)?\s*(?:为|[:：=])?\s*"
-            r"`?([A-Za-z0-9.+-]+)`?",
-            terminal.harbor_version,
-            "Harbor version",
-        ),
+    docs_claim = _terminal_claim_scope(benchmark_docs)
+    if docs_claim is not None and _TERMINAL_NUMERIC_CLAIM.search(docs_claim):
+        _validate_terminal_counts(docs_claim, terminal)
+    runtime_scopes = (
+        claim,
+        *((docs_claim,) if docs_claim is not None else ()),
+        *_terminal_paragraphs(readme),
+        *_terminal_paragraphs(benchmark_docs),
     )
-    for pattern, expected, label in expected_labels:
-        actual = _terminal_claim_value(claim, pattern, label=label)
-        if actual != expected:
-            _fail(f"README Terminal-Bench {label} differs from the committed evidence")
+    _validate_terminal_runtime_claims(runtime_scopes, terminal)
 
 
 def _require_readme_count(
@@ -2746,6 +2952,41 @@ def _validate_formal_readme_coverage(section: str, ablation: _AblationFacts) -> 
     )
 
 
+def _validate_ablation_schedule_claims(
+    section: str,
+    ablation: _AblationFacts,
+) -> None:
+    """Validate concise schedule claims even when legacy outcomes are omitted."""
+    for match in re.finditer(
+        r"(?<!\d)(\d+)\s*(?:个\s*)?(?:(?:固定|预设)\s*)?"
+        r"(?:Python\s*)?(?:缺陷|任务)\s*[×xX*]\s*(\d+)\s*次",
+        section,
+        re.IGNORECASE,
+    ):
+        if match.groups() != (
+            str(len(ablation.report.tasks)),
+            str(ablation.report.reps),
+        ):
+            _fail("README formal ablation task/repetition schedule differs")
+
+
+def _has_legacy_outcome_number(section: str) -> bool:
+    number = r"(?:\d+\s*/\s*\d+|\d+(?:\.\d+)?\s*%|\d+)"
+    outcome = (
+        r"(?:trust|gate|verify|正确|错误(?:交付|补丁)?|拦截|误拒|"
+        r"修复成功|成功率|通过率|交付率|独立评分|success|wrong|intercept|repair)"
+    )
+    return bool(
+        re.search(
+            rf"(?:{number})[^。\n]{{0,48}}{outcome}|"
+            rf"{outcome}[^。\n]{{0,48}}(?:{number})|"
+            r"\bp\s*=\s*\d+(?:\.\d+)?",
+            section,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _validate_readme(
     readme_path: Path,
     ablation: _AblationFacts,
@@ -2753,9 +2994,28 @@ def _validate_readme(
     terminal: TerminalBenchPublicEvidenceValidation | None,
 ) -> None:
     readme = _read_text(readme_path)
+    benchmark_docs_path = readme_path.parent / "docs" / "BENCHMARKS.md"
+    benchmark_docs = (
+        _read_text(benchmark_docs_path)
+        if benchmark_docs_path.exists() and not benchmark_docs_path.is_symlink()
+        else ""
+    )
     section = _result_section(readme)
-    _validate_terminal_readme(readme, section, terminal)
-    pending = bool(re.search(r"204.{0,160}(?:未完成|尚未|只有在|后才)", section, re.DOTALL))
+    _validate_terminal_readme(
+        readme,
+        section,
+        terminal,
+        benchmark_docs=benchmark_docs,
+    )
+    pending = bool(
+        re.search(
+            r"(?:正式[^。\n]{0,80}(?:尚未|未完成|没有)|"
+            r"(?:尚未|未完成)[^。\n]{0,80}(?:正式|COMPLETED)|"
+            r"204.{0,160}(?:未完成|尚未|只有在|后才))",
+            section,
+            re.DOTALL,
+        )
+    )
     if ablation.status == "legacy":
         if _LEGACY_README_MARKER not in section:
             _fail("README must label historical evidence as '历史报告'")
@@ -2771,6 +3031,29 @@ def _validate_readme(
         if ablation.report.model not in section:
             _fail("README formal result section must name the evaluated model")
         _validate_formal_readme_coverage(section, ablation)
+
+    # A concise README may omit legacy outcome counts entirely. If it chooses
+    # to publish them, every count and p-value remains bound to the committed
+    # reports. Formal evidence always requires the complete headline set.
+    ablation_section = re.split(
+        r"Terminal[- ]Bench",
+        section,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    _validate_ablation_schedule_claims(ablation_section, ablation)
+    detailed_legacy_claim = bool(
+        re.search(r"`(?:trust|gate|verify)`|\bp\s*=", ablation_section)
+    )
+    if (
+        ablation.status == "legacy"
+        and _has_legacy_outcome_number(ablation_section)
+        and not detailed_legacy_claim
+    ):
+        _fail("README cannot publish unbound legacy ablation outcome numbers")
+    publishes_ablation_numbers = ablation.status != "legacy" or detailed_legacy_claim
+    if not publishes_ablation_numbers:
+        return
 
     _require_readme_match(
         section,
@@ -2803,7 +3086,8 @@ def _validate_readme(
     )
 
     published_p = re.findall(r"\bp\s*=\s*([0-9]+(?:\.[0-9]+)?)", section)
-    for expected in {ablation.trust_gate_p, horizon_cell_p}:
+    expected_p_values = {ablation.trust_gate_p, horizon_cell_p}
+    for expected in expected_p_values:
         if not any(
             len(value.partition(".")[2]) >= 2
             and math.isclose(
@@ -2814,7 +3098,17 @@ def _validate_readme(
             )
             for value in published_p
         ):
-            _fail(f"README is missing the measured McNemar p-value {expected:.4f}")
+            label = (
+                "task-cluster paired sign-flip"
+                if ablation.status == "formal"
+                else "historical McNemar"
+            )
+            _fail(f"README is missing the measured {label} p-value {expected:.4f}")
+    if ablation.status == "formal" and not (
+        re.search(r"(?:按任务聚类|任务聚类)", section)
+        and re.search(r"(?:符号翻转|sign-flip)", section, re.IGNORECASE)
+    ):
+        _fail("README must identify schema-v4 paired inference as task-cluster sign-flip")
     if not re.search(r"(?:不增加|没有增加).{0,12}(?:样本|观测)", section):
         _fail("README must state that horizon composition adds no samples")
 

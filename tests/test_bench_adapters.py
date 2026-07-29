@@ -25,6 +25,7 @@ from lha.bench import (
     cluster_bootstrap_ci,
     eval_command,
     mcnemar_exact,
+    paired_cluster_sign_flip_exact,
     parse_report,
     write_predictions,
 )
@@ -131,9 +132,53 @@ def test_cluster_bootstrap_ci_degenerate_and_deterministic():
     b = cluster_bootstrap_ci(mixed, n=500, seed=7)
     assert a == b
     assert a is not None and 0.0 <= a[0] <= a[1] <= 1.0
+    assert cluster_bootstrap_ci(dict(reversed(list(mixed.items()))), n=500, seed=7) == a
 
     assert cluster_bootstrap_ci({}) is None
     assert cluster_bootstrap_ci({"t": []}) is None
+
+
+def test_cluster_sign_flip_does_not_treat_repetitions_as_independent():
+    result = paired_cluster_sign_flip_exact(
+        {
+            "repeated_failure": [(False, True)] * 12,
+            "unchanged": [(True, True)] * 12,
+        }
+    )
+
+    assert result.clusters == 2
+    assert result.nonzero_clusters == 1
+    assert result.mean_difference == pytest.approx(0.5)
+    assert result.p_value == 1.0
+    assert mcnemar_exact(12, 0) == pytest.approx(0.00048828125)
+
+
+def test_cluster_sign_flip_uses_task_means_and_is_two_sided():
+    result = paired_cluster_sign_flip_exact(
+        {
+            "large_effect": [(False, True)] * 7 + [(True, True)] * 5,
+            "small_effect": [(False, True)] * 3 + [(True, True)] * 9,
+        }
+    )
+
+    assert result.clusters == 2
+    assert result.nonzero_clusters == 2
+    assert result.mean_difference == pytest.approx(5 / 12)
+    assert result.p_value == 0.5
+
+
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        {},
+        {"": [(False, True)]},
+        {"task": []},
+        {"task": [(0, True)]},
+    ],
+)
+def test_cluster_sign_flip_rejects_invalid_clusters(pairs):
+    with pytest.raises(ValueError):
+        paired_cluster_sign_flip_exact(pairs)
 
 
 # --- Terminal-Bench agent (Harbor stubbed; no model calls) -------------------
@@ -1792,15 +1837,19 @@ def _exported_terminal_public_evidence(
     tmp_path,
     *,
     first_exception_info=None,
+    first_reward=1,
 ):
     protocol, protocol_path, commands = _prepared_scored_results(tmp_path)
-    if first_exception_info is not None:
+    if first_exception_info is not None or first_reward != 1:
         first_job = Path(commands[0].job_dir)
         trial_path = first_job / "trial" / "result.json"
         job_result_path = first_job / "result.json"
         trial = json.loads(trial_path.read_text())
-        trial["verifier_result"] = None
-        trial["exception_info"] = first_exception_info
+        if first_exception_info is not None:
+            trial["verifier_result"] = None
+            trial["exception_info"] = first_exception_info
+        else:
+            trial["verifier_result"]["rewards"]["reward"] = first_reward
         trial_path.write_text(json.dumps(trial))
         job_result = json.loads(job_result_path.read_text())
         job_result["trial_results"] = [trial]
@@ -1939,6 +1988,55 @@ def test_terminal_public_evidence_rederives_records_not_only_file_hashes(tmp_pat
     index_path.write_text(forged_index.model_dump_json(indent=2) + "\n")
 
     with pytest.raises(ValueError, match="official raw results"):
+        tpe.validate_terminal_bench_public_evidence(package)
+
+
+@pytest.mark.parametrize(
+    ("raw_reward", "raw_status"),
+    [(1, "PASS"), (0, "FAIL")],
+)
+def test_terminal_public_evidence_rejects_raw_outcome_downgraded_to_error(
+    tmp_path,
+    raw_reward,
+    raw_status,
+):
+    _protocol, _commands, package, _exported = _exported_terminal_public_evidence(
+        tmp_path,
+        first_reward=raw_reward,
+    )
+    manifest_path = package / "scored_manifest.json"
+    manifest = tb.HarborExecutionManifest.model_validate_json(
+        manifest_path.read_bytes()
+    )
+    first_id = manifest.expected_instance_ids[0]
+    assert manifest.official_status[first_id] == raw_status
+    forged_manifest = manifest.model_copy(
+        update={
+            "official_status": {
+                **manifest.official_status,
+                first_id: "ERROR",
+            },
+            "protocol_errors": {
+                **manifest.protocol_errors,
+                first_id: "forged protocol error",
+            },
+        }
+    )
+    manifest_path.write_bytes(tpe._canonical_model_bytes(forged_manifest))
+
+    index_path = package / "evidence.json"
+    index = tpe.TerminalBenchPublicEvidenceIndex.model_validate_json(
+        index_path.read_bytes()
+    )
+    index_path.write_bytes(
+        tpe._canonical_model_bytes(
+            index.model_copy(
+                update={"scored_manifest_sha256": tb.sha256_file(manifest_path)}
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="official raw result disagrees"):
         tpe.validate_terminal_bench_public_evidence(package)
 
 

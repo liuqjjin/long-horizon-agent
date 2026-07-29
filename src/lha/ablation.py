@@ -134,7 +134,14 @@ _FORMAL_RUN_HEADER_SCHEMA = 1
 _FORMAL_TASK_COUNT = 17
 _FORMAL_REPETITIONS = 12
 _FORMAL_CORPUS_MANIFEST_PATH = Path("benchmarks/formal_ablation_manifest.json")
-_FORMAL_CONTROL_FILES = ("pyproject.toml", "uv.lock", ".python-version")
+_FORMAL_SCORER_RUNTIME_FILES = (
+    "pyproject.toml",
+    "uv.lock",
+    ".python-version",
+    "Dockerfile",
+    ".dockerignore",
+)
+_FORMAL_CONTROL_FILES = _FORMAL_SCORER_RUNTIME_FILES
 _BOOTSTRAP_N = 10_000
 _READ_CHUNK_BYTES = 64 * 1024
 _MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -321,6 +328,7 @@ class AblationProvenance:
     scorer_backend: str = "unknown"
     scorer_image: str | None = None
     scorer_image_id: str | None = None
+    scorer_runtime_sha256: str | None = None
     platform: str | None = None
     python_version: str | None = None
     pytest_version: str | None = None
@@ -407,12 +415,13 @@ class AblationReport:
         gate_lines = _gate_quality_lines(self.stats)
         if gate_lines:
             lines += ["", "Internal gate vs artifact correctness (per attempt):", *gate_lines]
-        mcnemar_lines = _paired_mcnemar_lines(
+        contrast_lines = _paired_contrast_lines(
             self.records,
             precise=self.schema_version >= 4,
+            task_cluster_inference=self.schema_version >= 4,
         )
-        if mcnemar_lines:
-            lines += ["", "Paired contrasts:", *mcnemar_lines]
+        if contrast_lines:
+            lines += ["", "Paired contrasts:", *contrast_lines]
         summary = _summary(self.stats)
         if summary:
             lines += ["", summary]
@@ -2444,6 +2453,7 @@ class _FormalAttemptBinding:
     registry_path: str
     registry_sha256: str
     protocol_sha256: str
+    scorer_runtime_sha256: str | None
     registration_commit: str
     repository_root: Path
     git_path: str
@@ -3090,6 +3100,15 @@ def _bind_formal_attempt(
         raise RuntimeError(
             "formal ablation requires exactly one open REGISTERED attempt"
         )
+    scorer_runtime_sha256 = (
+        _scorer_runtime_digest(
+            repository_root,
+            git_path=git_path,
+            commit=head,
+        )
+        if registration.scorer_runtime_sha256 is not None
+        else None
+    )
 
     _formal_git_output(
         git_path,
@@ -3151,12 +3170,16 @@ def _bind_formal_attempt(
         witness_credential_helper,
     )
     protocol = FormalAblationProtocol(
+        schema_version=(
+            2 if registration.scorer_runtime_sha256 is not None else 1
+        ),
         source_commit=registration.source_commit,
         source_tree_sha256=source_tree_sha256,
         manifest_sha256=formal_corpus.sha256,
         model=model,
         reasoning_effort=reasoning_effort,
         docker_image_id=docker_image_id,
+        scorer_runtime_sha256=registration.scorer_runtime_sha256,
         codex_cli_version=codex_cli_version,
         codex_cli_executable_sha256=codex_cli_executable_sha256,
         codex_client=codex_client,
@@ -3172,6 +3195,7 @@ def _bind_formal_attempt(
         "model": protocol.model,
         "reasoning_effort": protocol.reasoning_effort,
         "docker_image_id": protocol.docker_image_id,
+        "scorer_runtime_sha256": protocol.scorer_runtime_sha256,
         "codex_cli_version": protocol.codex_cli_version,
         "codex_cli_executable_sha256": (
             protocol.codex_cli_executable_sha256
@@ -3184,6 +3208,13 @@ def _bind_formal_attempt(
     if any(getattr(registration, field) != value for field, value in expected.items()):
         raise RuntimeError(
             "open formal ablation registration does not match this run"
+        )
+    if (
+        registration.scorer_runtime_sha256 is not None
+        and registration.scorer_runtime_sha256 != scorer_runtime_sha256
+    ):
+        raise RuntimeError(
+            "formal scorer runtime differs from its registration"
         )
     remote_branch = _formal_anonymous_git_output(
         git_path,
@@ -3205,6 +3236,7 @@ def _bind_formal_attempt(
         registry_path=registry_relative,
         registry_sha256=hashlib.sha256(committed_bytes).hexdigest(),
         protocol_sha256=protocol_sha256,
+        scorer_runtime_sha256=registration.scorer_runtime_sha256,
         registration_commit=head,
         repository_root=repository_root,
         git_path=git_path,
@@ -3517,6 +3549,41 @@ def _trusted_git_blobs(
     )
     _validate_formal_git_tree_modes(repository_root, entries)
     return blobs
+
+
+def _scorer_runtime_digest(
+    repository_root: Path,
+    *,
+    git_path: str,
+    commit: str,
+) -> str:
+    """Hash the committed inputs that build and resolve the scorer runtime."""
+    blobs = _trusted_git_blobs(
+        repository_root,
+        git_path=git_path,
+        commit=commit,
+        paths=list(_FORMAL_SCORER_RUNTIME_FILES),
+    )
+    if set(blobs) != set(_FORMAL_SCORER_RUNTIME_FILES):
+        raise RuntimeError("formal scorer runtime inputs are incomplete")
+    digests: dict[str, str] = {}
+    for relative in _FORMAL_SCORER_RUNTIME_FILES:
+        current_path = _repo_relative_evidence_path(
+            repository_root,
+            relative,
+            kind="scorer runtime input",
+        )[1]
+        current = _read_bounded_bytes(
+            current_path,
+            max_bytes=_MAX_FORMAL_HEAD_BYTES,
+        )
+        committed = blobs[relative]
+        if current != committed:
+            raise RuntimeError(
+                f"formal scorer runtime input {relative!r} differs from HEAD"
+            )
+        digests[relative] = _sha256_bytes(committed)
+    return _canonical_digest(digests)
 
 
 def _formal_tree_file_digests(root: Path) -> dict[str, str]:
@@ -5184,13 +5251,14 @@ def _rate_ci(
     return cluster_bootstrap_ci(by_task, n=n, seed=seed)
 
 
-def _paired_mcnemar_lines(
+def _paired_contrast_lines(
     records: list[RunRecord],
     *,
     precise: bool = False,
+    task_cluster_inference: bool = False,
 ) -> list[str]:
-    """Exact McNemar on the paired (task, rep) cells for the headline contrasts."""
-    from .bench.stats import mcnemar_exact
+    """Render legacy cell tests or task-cluster inference for current reports."""
+    from .bench.stats import mcnemar_exact, paired_cluster_sign_flip_exact
 
     def outcomes(cond: str, metric: str) -> dict[tuple[str, int], bool]:
         return {
@@ -5210,13 +5278,38 @@ def _paired_mcnemar_lines(
             continue
         only_a = sum(oa[k] and not ob[k] for k in pairs)
         only_b = sum(ob[k] and not oa[k] for k in pairs)
-        p = mcnemar_exact(only_a, only_b)
-        p_text = f"{p:.4e}" if precise and 0 < p < 0.0001 else f"{p:.{4 if precise else 2}f}"
-        lines.append(
-            f"- `{a}` vs `{b}` on {metric.replace('_', ' ')}: "
-            f"discordant {only_a}/{only_b} of {len(pairs)} pairs · "
-            f"exact McNemar p = {p_text}"
-        )
+        if task_cluster_inference:
+            pairs_by_task: dict[str, list[tuple[bool, bool]]] = {}
+            for task, rep in pairs:
+                pairs_by_task.setdefault(task, []).append(
+                    (oa[(task, rep)], ob[(task, rep)])
+                )
+            result = paired_cluster_sign_flip_exact(pairs_by_task)
+            p = result.p_value
+            p_text = (
+                f"{p:.4e}"
+                if precise and 0 < p < 0.0001
+                else f"{p:.{4 if precise else 2}f}"
+            )
+            lines.append(
+                f"- `{a}` vs `{b}` on {metric.replace('_', ' ')}: "
+                f"task-cluster exact paired sign-flip p = {p_text} "
+                f"({result.nonzero_clusters}/{result.clusters} tasks have a "
+                "non-zero paired effect) · descriptive cell discordance "
+                f"{only_a}/{only_b} of {len(pairs)}; no cell-level inferential p-value"
+            )
+        else:
+            p = mcnemar_exact(only_a, only_b)
+            p_text = (
+                f"{p:.4e}"
+                if precise and 0 < p < 0.0001
+                else f"{p:.{4 if precise else 2}f}"
+            )
+            lines.append(
+                f"- `{a}` vs `{b}` on {metric.replace('_', ' ')}: "
+                f"discordant {only_a}/{only_b} of {len(pairs)} pairs · "
+                f"exact McNemar p = {p_text}"
+            )
     return lines
 
 
@@ -6036,6 +6129,11 @@ def _run_ablation_with_binding(
         ),
         scorer_image_id=(
             scorer_runtime["image_id"] if isinstance(scorer_runtime["image_id"], str) else None
+        ),
+        scorer_runtime_sha256=(
+            formal_attempt_binding.scorer_runtime_sha256
+            if formal_attempt_binding is not None
+            else None
         ),
         platform=platform.platform(),
         python_version=platform.python_version(),

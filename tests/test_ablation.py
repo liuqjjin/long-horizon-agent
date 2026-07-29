@@ -159,6 +159,7 @@ def _formal_attempt_repository(
     event: str,
     output_path: str,
     tracked: bool = True,
+    runtime_digest_override: str | None = None,
 ):
     import lha.ablation as abl
     from lha.ablation_attempts import (
@@ -194,6 +195,11 @@ def _formal_attempt_repository(
     )
     (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     (root / ".python-version").write_text("3.11\n", encoding="utf-8")
+    (root / "Dockerfile").write_text(
+        "FROM python:3.11-slim\n",
+        encoding="utf-8",
+    )
+    (root / ".dockerignore").write_text(".git\n", encoding="utf-8")
     manifest_entries = []
     for index in range(17):
         name = f"task_{index:02d}"
@@ -265,6 +271,7 @@ def _formal_attempt_repository(
         command=f"!{helper_path} auth git-credential",
     )
     protocol = FormalAblationProtocol(
+        schema_version=(2 if event == "REGISTERED" else 1),
         source_commit=source_commit,
         source_tree_sha256=abl._source_tree_digest(
             abl._source_file_digests(root / "src" / "lha")
@@ -273,6 +280,18 @@ def _formal_attempt_repository(
         model="model-x",
         reasoning_effort="medium",
         docker_image_id="sha256:" + "c" * 64,
+        scorer_runtime_sha256=(
+            runtime_digest_override
+            or abl._scorer_runtime_digest(
+                root,
+                git_path=str(
+                    Path(shutil.which("git") or "git").resolve()
+                ),
+                commit=source_commit,
+            )
+            if event == "REGISTERED"
+            else None
+        ),
         codex_cli_version="codex-cli 0.141.0",
         codex_cli_executable_sha256="9" * 64,
         codex_client=client_config,
@@ -303,6 +322,7 @@ def _formal_attempt_repository(
     if event == "REGISTERED":
         attempt_event = event_type(
             **common,
+            scorer_runtime_sha256=protocol.scorer_runtime_sha256,
             witness_credential_helper=credential_helper,
             witness_remote_name="formal-witness",
             witness_remote_url=witness_url,
@@ -1152,6 +1172,71 @@ def test_formal_evidence_path_rejects_intermediate_symlink(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "runtime_file",
+    [
+        "pyproject.toml",
+        "uv.lock",
+        ".python-version",
+        "Dockerfile",
+        ".dockerignore",
+    ],
+)
+def test_scorer_runtime_digest_ignores_readme_and_binds_build_inputs(
+    tmp_path,
+    runtime_file,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "config", "user.email", "test@example.com")
+    contents = {
+        "pyproject.toml": "[project]\nname='lha-test'\n",
+        "uv.lock": "version = 1\n",
+        ".python-version": "3.11\n",
+        "Dockerfile": "FROM python:3.11-slim\n",
+        ".dockerignore": ".git\n",
+    }
+    for relative, content in contents.items():
+        (repo / relative).write_text(content, encoding="utf-8")
+    (repo / "README.md").write_text("first\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "initial")
+    git_path = str(Path(shutil.which("git") or "git").resolve())
+    first = abl._scorer_runtime_digest(
+        repo,
+        git_path=git_path,
+        commit=_git(repo, "rev-parse", "HEAD"),
+    )
+
+    (repo / "README.md").write_text("second\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-qm", "docs")
+    after_readme = abl._scorer_runtime_digest(
+        repo,
+        git_path=git_path,
+        commit=_git(repo, "rev-parse", "HEAD"),
+    )
+    assert after_readme == first
+
+    target = repo / runtime_file
+    target.write_text(
+        target.read_text(encoding="utf-8") + "# changed\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", runtime_file)
+    _git(repo, "commit", "-qm", "runtime")
+    changed = abl._scorer_runtime_digest(
+        repo,
+        git_path=git_path,
+        commit=_git(repo, "rev-parse", "HEAD"),
+    )
+    assert changed != first
+
+
 def test_formal_attempt_binding_accepts_committed_matching_registration(
     tmp_path,
     monkeypatch,
@@ -1187,6 +1272,69 @@ def test_formal_attempt_binding_accepts_committed_matching_registration(
     assert attempt_binding.protocol_sha256 == formal_ablation_protocol_sha256(
         protocol
     )
+
+
+def test_formal_attempt_binding_recomputes_registered_runtime_digest(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.ablation as abl
+
+    repo = tmp_path / "repo"
+    output_path = f"runs/formal_ablation/{'a' * 64}"
+    corpus_binding, protocol, _registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=output_path,
+        runtime_digest_override="f" * 64,
+    )
+    monkeypatch.setattr(abl, "_project_root", lambda: repo)
+
+    with (
+        abl._formal_ablation_lock(repo / output_path) as output_lease,
+        pytest.raises(RuntimeError, match="runtime differs"),
+    ):
+        abl._bind_formal_attempt(
+            formal_corpus=corpus_binding,
+            formal_output_lease=output_lease,
+            model=protocol.model,
+            reasoning_effort=protocol.reasoning_effort,
+            docker_image_id=protocol.docker_image_id,
+            source_tree_sha256=protocol.source_tree_sha256,
+            codex_cli_version=protocol.codex_cli_version,
+            codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
+            codex_client=protocol.codex_client,
+        )
+
+
+def test_formal_completion_recomputes_registered_runtime_digest(
+    tmp_path,
+):
+    import lha.formal_attempt_cli as commands
+    from lha.ablation_attempts import parse_formal_ablation_attempt_registry
+
+    repo = tmp_path / "repo"
+    binding, _protocol, registry_path = _formal_attempt_repository(
+        repo,
+        event="REGISTERED",
+        output_path=f"runs/formal_ablation/{'a' * 64}",
+        runtime_digest_override="f" * 64,
+    )
+    registry = parse_formal_ablation_attempt_registry(
+        registry_path.read_bytes()
+    )
+    registration = registry.open_registration()
+    assert registration is not None
+
+    with pytest.raises(
+        commands.FormalAttemptCommandError,
+        match="changed before completion",
+    ):
+        commands._validate_registration_checkout(
+            repo,
+            registration_head=binding.preregistration_commit,
+            registration=registration,
+        )
 
 
 @pytest.mark.parametrize(
@@ -3231,7 +3379,7 @@ def test_aggregate_and_markdown():
     assert "Verification ablation" in md and "false success" in md and "false-pass" in md
 
 
-def test_formal_markdown_does_not_round_nonzero_mcnemar_p_to_zero():
+def test_formal_markdown_uses_tasks_not_repetitions_for_inference():
     records: list[RunRecord] = []
     for rep in range(12):
         records.extend(
@@ -3253,8 +3401,11 @@ def test_formal_markdown_does_not_round_nonzero_mcnemar_p_to_zero():
 
     markdown = report.to_markdown()
 
-    assert "exact McNemar p = 0.0005" in markdown
-    assert "exact McNemar p = 0.00\n" not in markdown
+    assert "task-cluster exact paired sign-flip p = 1.0000" in markdown
+    assert "1/1 tasks have a non-zero paired effect" in markdown
+    assert "descriptive cell discordance 12/0 of 12" in markdown
+    assert "no cell-level inferential p-value" in markdown
+    assert "exact McNemar p = 0.0005" not in markdown
 
 
 def test_formal_markdown_names_attempt_registration():

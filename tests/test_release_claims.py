@@ -257,6 +257,158 @@ def test_readme_numeric_drift_is_rejected(tmp_path, monkeypatch):
         validate_release_claims(root)
 
 
+def test_legacy_readme_may_omit_historical_outcome_numbers(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    _write_legacy_report(root, monkeypatch)
+    (root / "README.md").write_text(
+        """# Project
+
+## 已验证结果
+
+历史报告只作为旧实验记录。正式复测尚未产生 `COMPLETED` 记录，
+因此首页不发布内部消融数字。
+
+## 其他
+"""
+    )
+
+    summary = validate_release_claims(root)
+
+    assert summary.status == "legacy"
+
+
+def test_concise_legacy_readme_rejects_schedule_drift(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    _write_legacy_report(root, monkeypatch)
+    (root / "README.md").write_text(
+        """# Project
+
+## 已验证结果
+
+历史报告只作为旧实验记录。正式的 99 任务 × 99 次复测尚未产生
+`COMPLETED` 记录，因此首页不发布内部消融数字。
+
+## 其他
+"""
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="schedule differs"):
+        validate_release_claims(root)
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    (
+        "修复成功 999/999。",
+        "错误交付 0 个，拦截错误补丁 999 个。",
+        "当前通过率为 100%。",
+    ),
+)
+def test_concise_legacy_readme_rejects_unbound_outcomes(
+    tmp_path,
+    monkeypatch,
+    unsupported,
+):
+    root = tmp_path / "repo"
+    _write_legacy_report(root, monkeypatch)
+    (root / "README.md").write_text(
+        f"""# Project
+
+## 已验证结果
+
+历史报告只作为旧实验记录。正式复测尚未产生 `COMPLETED` 记录。
+{unsupported}
+
+## 其他
+"""
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="unbound legacy"):
+        validate_release_claims(root)
+
+
+def test_terminal_readme_may_omit_runtime_details_when_docs_bind_them(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    (root / "benchmarks/terminal_bench_2_1").mkdir()
+    monkeypatch.setattr(
+        claims,
+        "validate_terminal_bench_public_evidence",
+        lambda _path: _terminal_validation(),
+    )
+    _append_terminal_claim(
+        root,
+        "Terminal-Bench 2.1 固定 20 题子集：12/20，"
+        "5 个 `FAIL`，3 个 `ERROR`。",
+    )
+    docs = root / "docs"
+    docs.mkdir()
+    (docs / "BENCHMARKS.md").write_text(
+        """# Benchmarks
+
+## Terminal-Bench 2.1 固定 20 题子集
+
+模型为 `gpt-5.5`，推理强度为 `xhigh`，Harbor 版本为 `0.20.0`。
+"""
+    )
+
+    summary = validate_release_claims(root)
+
+    assert summary.terminal_bench == _terminal_validation()
+
+
+def test_terminal_conflicting_counts_are_rejected(tmp_path, monkeypatch):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    (root / "benchmarks/terminal_bench_2_1").mkdir()
+    monkeypatch.setattr(
+        claims,
+        "validate_terminal_bench_public_evidence",
+        lambda _path: _terminal_validation(),
+    )
+    _append_terminal_claim(
+        root,
+        "Terminal-Bench 2.1 固定 20 题子集：12/20，"
+        "5 个 `FAIL`，3 个 `ERROR`；模型为 `gpt-5.5`，"
+        "推理强度为 `xhigh`，Harbor 版本为 `0.20.0`。\n\n"
+        + "x" * 1700
+        + "\n\n另一个汇总为 20/20、0 个 `FAIL`、0 个 `ERROR`。",
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="differ"):
+        validate_release_claims(root)
+
+
+def test_terminal_runtime_claim_before_heading_is_still_checked(tmp_path, monkeypatch):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    (root / "benchmarks/terminal_bench_2_1").mkdir()
+    monkeypatch.setattr(
+        claims,
+        "validate_terminal_bench_public_evidence",
+        lambda _path: _terminal_validation(),
+    )
+    _append_terminal_claim(
+        root,
+        "Terminal-Bench 模型为 `wrong-model`。\n\n"
+        "Terminal-Bench 2.1 固定 20 题子集：12/20，"
+        "5 个 `FAIL`，3 个 `ERROR`；模型为 `gpt-5.5`，"
+        "推理强度为 `xhigh`，Harbor 版本为 `0.20.0`。",
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="model differs"):
+        validate_release_claims(root)
+
+
 def test_ablation_markdown_numeric_drift_is_rejected(tmp_path, monkeypatch):
     root = tmp_path / "repo"
     _write_legacy_report(root, monkeypatch)
@@ -829,7 +981,7 @@ def _write_formal_report(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 | `gate` | 首轮补丁必须通过测试 | 接受 2 个正确补丁，拦截 1 个错误补丁 |
 | `verify` | 失败后允许修复 | 4/4 通过独立评分 |
 
-精确 McNemar 检验为 `p = 1.00`。
+按任务聚类的精确配对符号翻转检验为 `p = 1.00`。
 Horizon 曲线是描述性组合，不增加样本。
 
 ## 其他
@@ -2034,6 +2186,15 @@ def _formal_attempt_release_fixture(
     witness_url = f"https://github.com/example/{root.name}-formal-witness.git"
     _git(root, "init", "--bare", "-q", str(witness_remote))
     _git(root, "remote", "add", "formal-witness", witness_url)
+    runtime_inputs = {
+        "pyproject.toml": "[project]\nname='formal-release-test'\n",
+        "uv.lock": "version = 1\n",
+        ".python-version": "3.11\n",
+        "Dockerfile": "FROM python:3.11-slim\n",
+        ".dockerignore": ".git\n",
+    }
+    for relative, content in runtime_inputs.items():
+        (root / relative).write_text(content, encoding="utf-8")
     original_git_success = claims._git_success
 
     def mapped_git_success(repo_root, arguments, **kwargs):
@@ -2047,6 +2208,12 @@ def _formal_attempt_release_fixture(
     _git(root, "add", ".")
     _git(root, "commit", "-qm", "source for formal attempt")
     source_commit = _git(root, "rev-parse", "HEAD")
+    git_executable = str(claims._trusted_control_executable("git")["path"])
+    scorer_runtime_sha256 = claims._scorer_runtime_digest(
+        root,
+        git_path=git_executable,
+        commit=source_commit,
+    )
 
     attempt_id = "1" * 64
     manifest_sha256 = "2" * 64
@@ -2056,12 +2223,14 @@ def _formal_attempt_release_fixture(
         retry_backoff_s=1.0,
     )
     protocol = FormalAblationProtocol(
+        schema_version=2,
         source_commit=source_commit,
         source_tree_sha256=raw["provenance"]["source_tree_sha256"],
         manifest_sha256=manifest_sha256,
         model=raw["model"],
         reasoning_effort=raw["provenance"]["reasoning_effort"],
         docker_image_id=raw["provenance"]["scorer_image_id"],
+        scorer_runtime_sha256=scorer_runtime_sha256,
         codex_cli_version=raw["provenance"]["cli_version"],
         codex_cli_executable_sha256=raw["provenance"][
             "cli_executable_sha256"
@@ -2081,6 +2250,7 @@ def _formal_attempt_release_fixture(
         model=protocol.model,
         reasoning_effort=protocol.reasoning_effort,
         docker_image_id=protocol.docker_image_id,
+        scorer_runtime_sha256=protocol.scorer_runtime_sha256,
         codex_cli_version=protocol.codex_cli_version,
         codex_cli_executable_sha256=protocol.codex_cli_executable_sha256,
         codex_client=protocol.codex_client,
@@ -2150,6 +2320,7 @@ def _formal_attempt_release_fixture(
             "formal_attempt_witness_remote_url": witness_url,
             "formal_attempt_witness_ref": witness_ref,
             "formal_attempt_witness_commit": witness_commit,
+            "scorer_runtime_sha256": scorer_runtime_sha256,
         }
     )
     raw["fingerprint"] = ""
@@ -2192,7 +2363,7 @@ def _formal_attempt_release_fixture(
         "witness_ref": witness_ref,
         "witness_commit": witness_commit,
         "head": head,
-        "git_executable": str(claims._trusted_control_executable("git")["path"]),
+        "git_executable": git_executable,
     }
 
 
@@ -2285,6 +2456,31 @@ def test_formal_attempt_release_binding_accepts_registered_then_completed(
         git_executable=facts["git_executable"],
         head=facts["head"],
     )
+
+
+def test_formal_attempt_release_recomputes_scorer_runtime_inputs(
+    tmp_path,
+    monkeypatch,
+):
+    import lha.release_claims as claims
+
+    root = tmp_path / "repo"
+    facts = _formal_attempt_release_fixture(root, monkeypatch)
+    (root / "Dockerfile").write_text(
+        "FROM python:3.12-slim\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ReleaseClaimsError,
+        match="scorer runtime is invalid",
+    ):
+        claims._validate_formal_attempt_provenance(
+            facts["raw"],
+            root,
+            git_executable=facts["git_executable"],
+            head=facts["head"],
+        )
 
 
 @pytest.mark.parametrize("attack", ["delete", "change"])
@@ -2451,6 +2647,7 @@ def test_formal_attempt_release_rejects_a_second_completed_protocol(
         model=first.model,
         reasoning_effort=first.reasoning_effort,
         docker_image_id=first.docker_image_id,
+        scorer_runtime_sha256=first.scorer_runtime_sha256,
         codex_cli_version=first.codex_cli_version,
         codex_cli_executable_sha256=first.codex_cli_executable_sha256,
         codex_client=first.codex_client,
@@ -2658,6 +2855,113 @@ def test_formal_report_rejects_degenerate_boundary_interval(tmp_path, monkeypatc
     path.write_text(json.dumps(raw))
 
     with pytest.raises(ReleaseClaimsError, match="Wilson"):
+        validate_release_claims(root)
+
+
+@pytest.mark.parametrize(
+    ("condition", "field", "forged"),
+    [
+        ("gate", "artifact_ci", [-999.0, 999.0]),
+        ("gate", "true_ci", [-999.0, 999.0]),
+        ("trust", "false_ci", [-999.0, 999.0]),
+        ("gate", "precision", 0.123456),
+        ("gate", "recall", 0.123456),
+        ("gate", "fpr", 0.123456),
+        ("gate", "fnr", 0.123456),
+        ("trust", "tp", 0),
+    ],
+)
+def test_formal_report_recomputes_every_derived_condition_stat(
+    tmp_path,
+    monkeypatch,
+    condition,
+    field,
+    forged,
+):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    path = root / "benchmarks/ablation_report.json"
+    raw = json.loads(path.read_text())
+    stat = next(item for item in raw["stats"] if item["condition"] == condition)
+    stat[field] = forged
+    raw["fingerprint"] = _report_fingerprint(raw)
+    path.write_text(json.dumps(raw, indent=2))
+    (root / "benchmarks" / "ablation_report.md").write_text(
+        load_ablation_report(path).to_markdown()
+    )
+
+    with pytest.raises(ReleaseClaimsError, match=rf"stale {field}"):
+        validate_release_claims(root)
+
+
+def test_formal_headline_p_uses_task_clusters_not_repeated_cells():
+    import lha.release_claims as claims
+
+    records: list[RunRecord] = []
+    for task in ("repeated_failure", "unchanged"):
+        for rep in range(12):
+            false_success = task == "repeated_failure"
+            records.extend(
+                [
+                    RunRecord(
+                        task,
+                        "trust",
+                        rep,
+                        "DONE",
+                        True,
+                        not false_success,
+                        not false_success,
+                        false_success,
+                        0,
+                    ),
+                    RunRecord(
+                        task,
+                        "gate",
+                        rep,
+                        "FAILED" if false_success else "DONE",
+                        not false_success,
+                        not false_success,
+                        not false_success,
+                        False,
+                        0,
+                    ),
+                ]
+            )
+
+    measured = tuple(records)
+    assert (
+        claims._paired_p(
+            measured,
+            "trust",
+            "gate",
+            "false_success",
+        )
+        == pytest.approx(0.00048828125)
+    )
+    assert (
+        claims._paired_p(
+            measured,
+            "trust",
+            "gate",
+            "false_success",
+            task_cluster_inference=True,
+        )
+        == 1.0
+    )
+
+
+def test_formal_readme_must_name_task_cluster_inference(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    _write_formal_report(root, monkeypatch)
+    readme = root / "README.md"
+    readme.write_text(
+        readme.read_text().replace(
+            "按任务聚类的精确配对符号翻转检验",
+            "精确 McNemar 检验",
+        )
+    )
+
+    with pytest.raises(ReleaseClaimsError, match="task-cluster sign-flip"):
         validate_release_claims(root)
 
 

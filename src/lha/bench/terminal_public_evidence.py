@@ -991,19 +991,30 @@ def validate_terminal_bench_public_evidence(
 
         manifest_status = scored_manifest.official_status[instance_id]
         manifest_error = scored_manifest.protocol_errors[instance_id]
-        if manifest_status != "ERROR":
+        if has_public_trial:
             if (
-                not has_public_trial
-                or raw_status != manifest_status
-                or raw_correct is not (manifest_status == "PASS")
-                or raw_error is not None
+                raw_status != manifest_status
+                or raw_correct
+                is not {
+                    "PASS": True,
+                    "FAIL": False,
+                    "ERROR": None,
+                }[manifest_status]
             ):
                 raise ValueError(
                     f"official raw result disagrees with {instance_id} status"
                 )
-        elif raw_status == "ERROR" and raw_error != manifest_error:
+            if raw_error != manifest_error:
+                if raw_status == manifest_status == "ERROR":
+                    raise ValueError(
+                        f"official raw ERROR explanation changed for {instance_id}"
+                    )
+                raise ValueError(
+                    f"official raw result disagrees with {instance_id} status"
+                )
+        elif manifest_status != "ERROR":
             raise ValueError(
-                f"official raw ERROR explanation changed for {instance_id}"
+                f"official raw result is missing for {instance_id} status"
             )
 
         derived_records.append(

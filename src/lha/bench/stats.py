@@ -1,19 +1,31 @@
 """Statistics for paired benchmark comparisons.
 
-All three helpers are exact or deterministic: McNemar uses the exact binomial
-(no chi-square approximation), the bootstrap is seeded and resamples task
-clusters — repetitions of one task are correlated, so tasks, not cells, are the
-exchangeable unit — and the Wilson interval covers the boundary proportions
-where a percentile bootstrap degenerates.
+The paired tests are exact, the bootstrap is deterministic for a fixed seed
+and resamples task clusters, and the Wilson interval covers boundary
+proportions where a percentile bootstrap degenerates. Repetitions of one task
+are correlated, so current cell-level inference treats tasks, not cells, as the
+exchangeable unit.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from fractions import Fraction
 from math import comb, sqrt
 from random import Random
 
 # Two-sided normal quantile for 95% coverage.
 _Z95 = 1.959963984540054
+
+
+@dataclass(frozen=True)
+class ClusterSignFlipResult:
+    """Exact paired sign-flip result with clusters as the exchangeable unit."""
+
+    clusters: int
+    nonzero_clusters: int
+    mean_difference: float
+    p_value: float
 
 
 def mcnemar_exact(b: int, c: int) -> float:
@@ -34,6 +46,56 @@ def mcnemar_exact(b: int, c: int) -> float:
     return min(1.0, 2.0 * tail)
 
 
+def paired_cluster_sign_flip_exact(
+    pairs_by_cluster: dict[str, list[tuple[bool, bool]]],
+) -> ClusterSignFlipResult:
+    """Compare paired binary outcomes without treating repeated cells as independent.
+
+    Each cluster contributes its mean paired difference, so a task with twelve
+    repetitions has the same inferential weight as every other task. Under the
+    paired randomization null, independently flipping the sign of every non-zero
+    task effect gives the exact two-sided reference distribution.
+    """
+    if not pairs_by_cluster:
+        raise ValueError("paired cluster test requires at least one cluster")
+
+    effects: list[Fraction] = []
+    for cluster, pairs in sorted(pairs_by_cluster.items()):
+        if not cluster or not pairs:
+            raise ValueError("paired cluster test requires named, non-empty clusters")
+        if any(type(left) is not bool or type(right) is not bool for left, right in pairs):
+            raise ValueError("paired cluster outcomes must be booleans")
+        effects.append(
+            Fraction(
+                sum(int(right) - int(left) for left, right in pairs),
+                len(pairs),
+            )
+        )
+
+    nonzero = [effect for effect in effects if effect]
+    observed = abs(sum(nonzero))
+    if not nonzero:
+        p_value = 1.0
+    else:
+        # The formal corpus has 17 task clusters. Exact rational sums prevent
+        # a floating-point tie from changing whether a permutation is extreme.
+        distribution = [Fraction(0)]
+        for effect in nonzero:
+            distribution = [
+                *(value + effect for value in distribution),
+                *(value - effect for value in distribution),
+            ]
+        extreme = sum(abs(value) >= observed for value in distribution)
+        p_value = extreme / len(distribution)
+
+    return ClusterSignFlipResult(
+        clusters=len(effects),
+        nonzero_clusters=len(nonzero),
+        mean_difference=float(sum(effects) / len(effects)),
+        p_value=p_value,
+    )
+
+
 def cluster_bootstrap_ci(
     values_by_cluster: dict[str, list[float]],
     *,
@@ -45,7 +107,11 @@ def cluster_bootstrap_ci(
 
     Returns None when there are no clusters or no values.
     """
-    clusters = [v for v in values_by_cluster.values() if v]
+    # A fixed seed must describe the data, not the insertion order used by a
+    # JSON producer. Sorting cluster names makes the finite bootstrap exactly
+    # reproducible after an otherwise harmless record reorder.
+    clusters = [values_by_cluster[name] for name in sorted(values_by_cluster)]
+    clusters = [values for values in clusters if values]
     if not clusters:
         return None
     rng = Random(seed)

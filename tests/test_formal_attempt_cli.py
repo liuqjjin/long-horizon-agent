@@ -366,6 +366,15 @@ def test_register_resolves_and_atomically_appends_every_input(
         "_source_tree_digest",
         lambda _files: protocol.source_tree_sha256,
     )
+    scorer_runtime_sha256 = "7" * 64
+    runtime_checks = 0
+
+    def scorer_runtime(*_args, **_kwargs):
+        nonlocal runtime_checks
+        runtime_checks += 1
+        return scorer_runtime_sha256
+
+    monkeypatch.setattr(commands, "_scorer_runtime_digest", scorer_runtime)
     monkeypatch.setattr(
         commands,
         "_codex_protocol",
@@ -392,9 +401,12 @@ def test_register_resolves_and_atomically_appends_every_input(
     assert registration is not None
     assert registration.attempt_id == "1" * 64
     assert registration.docker_image_id == image_id
+    assert registration.scorer_runtime_sha256 == scorer_runtime_sha256
+    assert registration.protocol().schema_version == 2
     assert registration.witness_remote_url.startswith("https://")
     assert result["registration_registry_sha256"] == hashlib.sha256(updated).hexdigest()
     assert trusted_head_checks == 2
+    assert runtime_checks == 2
     assert helper_checks == 2
 
 
