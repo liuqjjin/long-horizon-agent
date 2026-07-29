@@ -1,0 +1,68 @@
+{
+  "schema_version": 8,
+  "fingerprint": "acdf98749140b2eea4f5e3c229adf8fa6fc5f374809ffc57404781f489e2c50c",
+  "terminal_error": false,
+  "records": [
+    {
+      "task": "bench_slugify",
+      "condition": "trust",
+      "rep": 10,
+      "status": "DONE",
+      "claimed_success": true,
+      "artifact_correct": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass with complete control-plane evidence",
+      "gate_prediction": null,
+      "artifact_sha256": "954d8789f5177f55bfa6bf93db19ba2faddd5788c9671ea4ee84c4bccf37b5ba",
+      "scorer_outcome": "PASS",
+      "scorer_evidence_sha256": "c7df4d1e10aa6a1020ae3879cda293c2282314d2de4fefae505247cb89e2dd63",
+      "scorer_expected_tests": 10,
+      "scorer_passed_tests": 10
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "gate",
+      "rep": 10,
+      "status": "DONE",
+      "claimed_success": true,
+      "artifact_correct": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass with complete control-plane evidence",
+      "gate_prediction": true,
+      "artifact_sha256": "954d8789f5177f55bfa6bf93db19ba2faddd5788c9671ea4ee84c4bccf37b5ba",
+      "scorer_outcome": "PASS",
+      "scorer_evidence_sha256": "c7df4d1e10aa6a1020ae3879cda293c2282314d2de4fefae505247cb89e2dd63",
+      "scorer_expected_tests": 10,
+      "scorer_passed_tests": 10
+    },
+    {
+      "task": "bench_slugify",
+      "condition": "verify",
+      "rep": 10,
+      "status": "DONE",
+      "claimed_success": true,
+      "artifact_correct": true,
+      "true_success": true,
+      "false_success": false,
+      "repairs": 0,
+      "detail": "scorer: tests pass with complete control-plane evidence",
+      "gate_prediction": true,
+      "artifact_sha256": "954d8789f5177f55bfa6bf93db19ba2faddd5788c9671ea4ee84c4bccf37b5ba",
+      "scorer_outcome": "PASS",
+      "scorer_evidence_sha256": "42622f984bea0beaa2a509ab328b0020c7ff3029994acc2141065b446eadcdb0",
+      "scorer_expected_tests": 10,
+      "scorer_passed_tests": 10
+    }
+  ],
+  "formal_attempt_id": "56fed4eb17d7e43fbb3d73e21b8ab464489bc19e1ae05731137e7e157ad5f00f",
+  "formal_registration_registry_sha256": "e767bce4d28139215a5a8f61ada9ce9ceffaa40e4330cd0baadad87b41e15a77",
+  "formal_protocol_sha256": "032eafdebf65b6f190f28b7edc6753372f73b0eb2d5e79c48ef5f5f15be1b797",
+  "formal_outcome_key": "5f2f51f00c8a6f80796342820423754101492ee29758cb170c3b922bab94d631",
+  "llm_call_receipts": [
+    "05be4b6a82f7cd2b58bcc8780bc2093334f232cad917b147aee529399cf6e0d3"
+  ]
+}

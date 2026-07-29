@@ -1,0 +1,10 @@
+kind: issue_to_pr
+title: "median() is wrong for even-length inputs"
+description: >
+  median([1,2,3,4]) returns 2 but should return 2.5. Odd-length inputs look fine; even-length inputs are off.
+target_repo: data/bench/median
+inputs:
+  context_query: "median average middle"
+success:
+  - "pytest passes"
+  - "ruff clean"

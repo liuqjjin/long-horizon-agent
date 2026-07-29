@@ -1,0 +1,10 @@
+kind: issue_to_pr
+title: "to_base() returns digits reversed and mishandles zero"
+description: >
+  to_base(6, 2) returns "011" but should be "110"; to_base(0, 2) returns "" but should be "0".
+target_repo: data/bench/basen
+inputs:
+  context_query: "integer to base conversion digits"
+success:
+  - "pytest passes"
+  - "ruff clean"

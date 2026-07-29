@@ -49,16 +49,35 @@ Inspect a run with `lha runs show <run-id>` or `lha trace <run-id> --html`.
 
 ## Evaluation
 
+### Formal schema-v4 verification ablation
+
+The formal report evaluated `gpt-5.3-codex-spark` on 17 preregistered defects
+with 12 repetitions each: 204 scheduled paired cells, 204 usable cells, and
+0 ERROR cells. Rates use the 204 usable cells.
+
+| condition | behavior | independently scored outcome |
+|---|---|---|
+| `trust` | deliver the first patch | 201 delivered-correct; 3 delivered-wrong |
+| `gate` | deliver only after the checks | 201 delivered-correct; 3 wrong patches intercepted; 0 delivered-wrong; 0 correct patches rejected |
+| `verify` | allow bounded repair after a failed check | 204/204 delivered-correct; 0 delivered-wrong; 0 not delivered |
+
+The task-cluster exact paired sign-flip p-values are 0.2500 for `trust`
+versus `gate` on delivered-wrong outcomes and 0.2500 for `trust` versus
+`verify` on delivered-correct outcomes. The horizon composition is a
+descriptive projection over measured task rates. It adds no observations and
+is not an executed shared-state long task.
+
+The report, frozen patches, scorer evidence, model-call receipts, and all cell
+results are under [`benchmarks/`](../benchmarks/).
+
+### Terminal-Bench 2.1
+
 The preregistered Terminal-Bench 2.1 fixed 20-task subset produced **7 PASS,
 9 FAIL, and 4 ERROR**, reported as **7/20**. Every task ran once and all errors
 remain in the denominator. This is not a full-dataset or leaderboard score.
 
 That adapter calls Codex directly inside Harbor. It does not use LHA's gate or
 repair loop, so the result does not measure interception or repair behavior.
-
-The repository also retains a historical schema-v2 verification ablation.
-There is currently no formal schema-v4 `COMPLETED` result. An `ABANDONED`
-attempt is not a result, and partial cells are not quoted or combined.
 
 See [BENCHMARKS.md](BENCHMARKS.md), [ABLATION.md](ABLATION.md), and
 [HORIZON.md](HORIZON.md) for protocols and evidence boundaries.

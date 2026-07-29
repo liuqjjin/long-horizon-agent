@@ -219,6 +219,15 @@
       "witness_remote_name": "formal-witness",
       "witness_remote_url": "https://github.com/liuqjjin/long-horizon-agent.git",
       "registered_at": "2026-07-29T02:21:04.408209+00:00"
+    },
+    {
+      "event": "COMPLETED",
+      "attempt_id": "56fed4eb17d7e43fbb3d73e21b8ab464489bc19e1ae05731137e7e157ad5f00f",
+      "protocol_sha256": "032eafdebf65b6f190f28b7edc6753372f73b0eb2d5e79c48ef5f5f15be1b797",
+      "registration_registry_sha256": "e767bce4d28139215a5a8f61ada9ce9ceffaa40e4330cd0baadad87b41e15a77",
+      "recorded_at": "2026-07-29T03:59:37.673175+00:00",
+      "report_sha256": "1b06a6608c9b4c532d3e74ebe251057ec142d2994341a0b18a5b95c01aad954c",
+      "report_fingerprint": "d21b7258dc1c22c05c3e05d322228b5eb80f65f34525e6f611ecacd20c58884a"
     }
   ]
 }

@@ -1,0 +1,12 @@
+kind: issue_to_pr
+title: "parse_line() splits inside quoted CSV fields"
+description: >
+  parse_line('a,"b,c",d') returns ['a', '"b', 'c"', 'd'] — the quoted field is
+  torn apart at its comma and the quotes leak into the values. It should return
+  ['a', 'b,c', 'd'].
+target_repo: data/bench/csvlite
+inputs:
+  context_query: "CSV parse quoted field comma"
+success:
+  - "pytest passes"
+  - "ruff clean"

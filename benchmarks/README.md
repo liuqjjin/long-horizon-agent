@@ -7,25 +7,47 @@
 
 | 评测 | 状态 | 可公开结论 |
 |---|---|---|
-| 早期内部消融 | 历史记录 | 仅用于核对旧协议，不代表当前实现 |
+| 当前正式 schema-v4 内部消融 | `COMPLETED` | 计划 204 组，204 组可用，0 组 ERROR |
+| 早期内部消融 | Git 历史记录 | 仅用于追溯旧协议，不参与当前结果 |
 | 两次未登记的 schema-v4 运行 | 已披露 | 缺少事前登记和一次性远端 Git 开始记录，不是正式结果 |
-| 两次正式 schema-v4 尝试 | `ABANDONED` | 均无可发布的消融结果 |
+| 两次已放弃的正式尝试 | `ABANDONED` | 保留失败原因，不参与当前结果 |
 | Terminal-Bench 2.1 固定子集 | 已完成 | 7/20：7 `PASS`、9 `FAIL`、4 `ERROR` |
-
-正式内部消融只有在登记状态为 `COMPLETED`、完整报告和原始证据同时提交后，
-才会成为当前项目结果。现在尚无满足这些条件的内部消融报告。
 
 ## 内部消融证据
 
-### 历史 schema-v2 报告
+### 当前正式 schema-v4 报告
 
-- [`ablation_report.json`](ablation_report.json)：早期消融的机器可读记录。
-- [`ablation_report.md`](ablation_report.md)：由该 JSON 生成的文本报告。
-- [`horizon_report.json`](horizon_report.json)：早期任务单元、完整重复和组合推演记录。
-- [`horizon_report.md`](horizon_report.md) 与
-  [`horizon_curve.svg`](horizon_curve.svg)：对应的文本和图形。
+当前结果对应正式尝试
+`56fed4eb17d7e43fbb3d73e21b8ab464489bc19e1ae05731137e7e157ad5f00f`，
+模型为 `gpt-5.3-codex-spark`，推理强度为 `high`。评测源码提交为
+`4c7452776b9e12322f15df95f236ce6daf455de7`，登记提交为
+`95cc1a109c6a4b479e3390a95f437d31d94060f8`。
 
-这些文件使用旧评分边界保留历史运行，不能作为当前 README 或简历中的实验数字。
+17 个固定缺陷各重复 12 次，共 204 个配对单元，全部可用且没有 `ERROR`：
+
+- `trust` 直接交付 201 个正确补丁和 3 个错误补丁；
+- `gate` 接受 201 个正确补丁，拦截 3 个错误补丁，没有误放或误拒；
+- `verify` 在 3 个单元中各修复 1 次，最终 204/204 正确交付。
+
+登记簿中的 `COMPLETED` 事件通过报告摘要
+`1b06a6608c9b4c532d3e74ebe251057ec142d2994341a0b18a5b95c01aad954c`
+和指纹
+`d21b7258dc1c22c05c3e05d322228b5eb80f65f34525e6f611ecacd20c58884a`
+绑定这次结果。
+
+主要文件：
+
+- [`ablation_report.json`](ablation_report.json)：机器可读报告和 612 条条件记录。
+- [`ablation_report.md`](ablation_report.md)：由 JSON 生成的统计报告。
+- [`formal_run.json`](formal_run.json)：运行头和正式协议绑定。
+- [`input_snapshots/`](input_snapshots/)：17 个任务的固定输入快照。
+- [`artifacts/`](artifacts/)：评分使用的内容寻址补丁。
+- [`scorer_evidence/`](scorer_evidence/)：独立 Docker 评分器证据。
+- [`llm_call_receipts/`](llm_call_receipts/)：207 份模型调用回执。
+- [`results/`](results/)：204 个开始记录和 204 个终态单元。
+- [`horizon_report.json`](horizon_report.json)、
+  [`horizon_report.md`](horizon_report.md) 和
+  [`horizon_curve.svg`](horizon_curve.svg)：任务聚类、完整重复聚合和组合推演。
 
 ### 未登记的 schema-v4 运行
 
@@ -33,18 +55,18 @@
 它们产生在正式尝试登记和一次性远端 Git 开始记录建立之前，登记簿将其记为
 `UNREGISTERED_RUN_RECORDED`。保留这些文件是为了披露历史，不把它们转成正式结果。
 
-### 正式尝试登记
+### 登记历史
 
 [`formal_ablation_attempts.json`](formal_ablation_attempts.json) 是正式尝试登记簿，
 [`formal_ablation_manifest.json`](formal_ablation_manifest.json) 固定 17 个任务及其语料摘要。
 
-登记簿目前包含两次 `REGISTERED → ABANDONED`：
+登记簿保留两次 `REGISTERED → ABANDONED`：
 
 1. 第一次尝试在创建一次性远端 Git 引用时被 GitHub 规则阻止，未进入模型评测。
 2. 第二次尝试在 Codex 用量耗尽后中止；按协议保留已有文件，不恢复也不把部分输出发布为结果。
 
-两次尝试都没有 `COMPLETED` 事件。后续正式运行必须使用新的登记和输出目录，
-并继续保留这两条失败记录。
+第三次尝试使用新的模型、源码和协议登记，完整执行后写入 `COMPLETED`。失败记录继续
+保留，但没有拼接进本次 204 个单元。
 
 内部消融中，`trust` 与 `gate` 对同一份首轮补丁评分；内部检查只负责决定是否放行，
 独立评分器在新的仓库副本中运行固定测试。方法和错误处理见

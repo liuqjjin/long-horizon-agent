@@ -1,0 +1,11 @@
+kind: issue_to_pr
+title: "join_url() doubles slashes at segment boundaries"
+description: >
+  join_url("https://api.example.com/", "/v1") returns
+  "https://api.example.com///v1" instead of "https://api.example.com/v1".
+target_repo: data/bench/urljoin
+inputs:
+  context_query: "join url path slashes"
+success:
+  - "pytest passes"
+  - "ruff clean"

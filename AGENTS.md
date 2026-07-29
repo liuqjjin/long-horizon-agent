@@ -177,10 +177,9 @@ backends, failed indexes, stale data, and partial availability.
 
 `lha ablate` shares the first attempt across `trust`, `gate`, and `verify`.
 Ground truth comes from a frozen source change applied to a fresh repository and
-scored through a separate backend. The committed schema-v2 report is a historical
-record; a current result requires a complete schema-v4 report and its evidence.
-Read historical numbers from `benchmarks/ablation_report.json` instead of
-reconstructing them from prose.
+scored through a separate backend. The current schema-v4 report and its public
+evidence are under `benchmarks/`; older or abandoned attempts remain disclosure
+records and are not combined with it.
 
 A formal 17-task × 12-repetition run requires a committed `REGISTERED` event
 that fixes the source tree, corpus manifest, model, Codex CLI identity, client
@@ -190,6 +189,14 @@ Before the first cell, the runner creates a new remote witness ref bound to the
 registration and run header. Formal cells never read cache and a formal run
 cannot resume. Interruption consumes the attempt: record `ABANDONED` and do not
 repeat the same outcome-affecting selection.
+
+The formal internal run is complete: 17 tasks × 12 repetitions, 204 usable
+paired cells, and 0 `ERROR`. `trust` delivered 201 correct and 3 wrong patches;
+`gate` delivered 201 correct patches and intercepted all 3 wrong patches;
+`verify` delivered 204/204 correct patches after 3 repair rounds. The model was
+`gpt-5.3-codex-spark` at `high` effort. The evaluated source commit is
+`4c7452776b9e12322f15df95f236ce6daf455de7`; the registration commit is
+`95cc1a109c6a4b479e3390a95f437d31d94060f8`. Do not rerun this formal attempt.
 
 `lha horizon` keeps paired cells, complete-corpus repetitions, and descriptive
 composition separate. Cell and episode tests can differ. Composition adds no

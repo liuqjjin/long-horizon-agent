@@ -71,37 +71,44 @@ schema v1–v3 的历史文件继续保留 `estimands.cell.mcnemar_p` 和原有�
 已提交证据可以按原字节复现。schema v4 的 `estimands.cell` 改为记录任务数、非零任务
 数和 `task_cluster_sign_flip_p`，不会同时发布单元级 McNemar p 值。
 
-## 当前状态
+## 当前正式结果
 
-当前仓库没有可发布的 schema v4 `COMPLETED` 消融报告，因此也没有当前版本的单元级、
-完整语料重复聚合或组合曲线数字。`ABANDONED` 尝试不是结果，不能作为 `lha horizon` 的正式
-输入。
+当前 Horizon 由 `gpt-5.3-codex-spark` 的 schema-v4 正式报告生成。计划 204 个
+配对单元，204 个可用，0 个 `ERROR`；12 次重复都形成完整语料聚合。
 
-仓库保留的旧 horizon 文件来自历史 schema v2 报告。旧协议曾把某些未交付的正确产物
-计入成功，这些文件只能用于追溯，不能作为当前链条成功率：
+单元级 `trust` 和 `verify` 正确交付分别为 201/204 与 204/204，描述性
+discordance 为 3/0。按任务聚类后，3/17 个任务具有非零配对差异，精确符号翻转检验
+p = 0.2500。
+
+完整语料重复聚合中，`trust-chain` 和 `verify-chain` 分别有 10/12 与 12/12 个聚合
+全部成功，discordance 为 2/0，聚合级 McNemar 检验 p = 0.5000。
+
+组合曲线没有执行新任务，`independent_samples_added` 为 0；它只说明现有任务成功率
+在不同组合长度下的推演结果。正式文件为：
 
 - [`benchmarks/horizon_report.json`](../benchmarks/horizon_report.json)
 - [`benchmarks/horizon_report.md`](../benchmarks/horizon_report.md)
+- [`benchmarks/horizon_curve.svg`](../benchmarks/horizon_curve.svg)
 
 `data/long_tasks/` 下的五个多文件流程是实际执行的恢复测试，但它们不是这里的统计单元，
 也不会增加 horizon 样本。反过来，完整语料重复聚合也不能替代这些真实流程测试。
 
 ## 生成报告
 
-只有完整、已校验且对应 `COMPLETED` 事件的 schema v4 报告才能生成正式 horizon：
+完整、已校验且对应 `COMPLETED` 事件的 schema-v4 报告可以复现正式 Horizon：
 
 ```bash
 uv run lha horizon \
-  --from-report runs/formal_ablation/<attempt-id>/ablation_report.json \
-  --out runs/horizon
+  --from-report benchmarks/ablation_report.json \
+  --out benchmarks
 ```
 
 输出包括：
 
 ```text
-runs/horizon/horizon_report.json
-runs/horizon/horizon_report.md
-runs/horizon/horizon_curve.svg
+benchmarks/horizon_report.json
+benchmarks/horizon_report.md
+benchmarks/horizon_curve.svg
 ```
 
 引用结果前，应确认模型和运行环境与登记协议一致，所有 `ERROR` 都已计入覆盖情况，

@@ -1,0 +1,10 @@
+kind: issue_to_pr
+title: "merge() does not merge touching intervals"
+description: >
+  merge([[1,2],[2,3]]) returns [[1,2],[2,3]] but the intervals touch and should become [[1,3]].
+target_repo: data/bench/merge_intervals
+inputs:
+  context_query: "merge intervals overlap"
+success:
+  - "pytest passes"
+  - "ruff clean"

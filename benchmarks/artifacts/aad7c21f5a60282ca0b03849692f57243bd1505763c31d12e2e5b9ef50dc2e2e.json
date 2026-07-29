@@ -1,0 +1,1 @@
+{"files":{"window.py":"\"\"\"Sliding-window helpers.\"\"\"\n\n\ndef moving_average(nums, k):\n    averages = []\n    for i in range(len(nums) - k + 1):\n        window = nums[i:i + k]\n        averages.append(sum(window) / k)\n    return averages\n"},"schema_version":1}

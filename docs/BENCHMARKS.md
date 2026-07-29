@@ -23,14 +23,25 @@ LHA_RUNS_DIR=runs/_eval uv run lha eval
 消融实验让 `trust`、`gate` 和 `verify` 共用同一个初始补丁，再由独立评分器把固化后的
 源码改动应用到干净仓库并运行原始测试。评分器不复用内部门禁结论。
 
-仓库保存了一份旧 schema v2 报告，供历史追溯：
+当前正式 schema-v4 报告使用 `gpt-5.3-codex-spark`，对 17 个预设缺陷各重复
+12 次。计划 204 个配对单元，204 个可用，0 个 `ERROR`：
+
+- `trust` 直接交付 201 个正确补丁和 3 个错误补丁；
+- `gate` 接受 201 个正确补丁，拦截全部 3 个错误补丁；
+- `verify` 在 3 次有限修复后实现 204/204 正确交付。
+
+报告、输入快照、固化补丁、独立评分证据、模型回执和逐单元终态已经随
+`COMPLETED` 事件一并提交：
 
 - [`benchmarks/ablation_report.json`](../benchmarks/ablation_report.json)
 - [`benchmarks/ablation_report.md`](../benchmarks/ablation_report.md)
+- [`benchmarks/formal_ablation_attempts.json`](../benchmarks/formal_ablation_attempts.json)
+- [`benchmarks/results/`](../benchmarks/results/)
+- [`benchmarks/scorer_evidence/`](../benchmarks/scorer_evidence/)
+- [`benchmarks/llm_call_receipts/`](../benchmarks/llm_call_receipts/)
 
-当前正式登记历史尚无完整的 schema v4 `COMPLETED` 证据。已经终止的尝试都是
-`ABANDONED`，不构成结果，不能拼接、续跑或引用其中的局部数字。只有完整日程、原始
-证据、一次性远端 Git 开始记录和 `COMPLETED` 事件一起通过校验后，才能发布当前结果。
+登记簿中两次 `ABANDONED` 尝试和两份未登记运行仍保留用于披露，但不构成结果，
+也没有与本次 204 个单元拼接。
 
 具体协议见 [校验消融](ABLATION.md)，任务级和组合统计见
 [长链统计](HORIZON.md)。

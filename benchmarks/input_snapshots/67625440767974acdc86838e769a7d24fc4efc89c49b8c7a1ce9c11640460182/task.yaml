@@ -1,0 +1,10 @@
+kind: issue_to_pr
+title: "is_balanced() accepts unbalanced input"
+description: >
+  is_balanced('(]') returns True and is_balanced('(((') returns True; both should be False.
+target_repo: data/bench/brackets
+inputs:
+  context_query: "balanced brackets stack"
+success:
+  - "pytest passes"
+  - "ruff clean"

@@ -133,11 +133,21 @@ schema v4 中，只有“所有有界的首次调用都未产生补丁”可以�
 
 ## 当前证据状态
 
-仓库中的 `benchmarks/ablation_report.json` 是旧 schema v2 协议留下的历史记录。
-当前登记历史尚没有带完整证据的 schema v4 `COMPLETED` 事件；已经终止的正式尝试均
-为 `ABANDONED`，不能合并、续跑或当作正式结果。
+当前正式 schema-v4 尝试已经完成。模型为 `gpt-5.3-codex-spark`，推理强度为
+`high`；17 个固定任务各重复 12 次，计划 204 个配对单元，204 个可用，0 个
+`ERROR`。
 
-因此，公开文档不得从未完成目录抄写任何 schema v4 数字。正式结果必须一次性提交：
+同一首轮补丁在三种条件下得到：
+
+- `trust`：201 个正确交付，3 个错误交付；
+- `gate`：201 个正确交付，3 个错误补丁全部拦截，误放和误拒均为 0；
+- `verify`：3 个失败单元各修复 1 次，最终 204/204 正确交付。
+
+`trust` 与 `gate` 的错误交付、`gate` 与 `verify` 的正确交付差异，按任务聚类的精确
+配对符号翻转检验均为 p = 0.2500。该 p 值反映只有 3/17 个任务出现非零配对差异，
+不能只根据 204 个重复单元解释显著性。
+
+正式结果一次性提交：
 
 - JSON 报告及其 Markdown 渲染；
 - 输入快照、补丁、评分证据和模型调用回执；
@@ -186,7 +196,7 @@ uv run lha ablation-attempt complete
 
 该命令会校验全部证据并生成 `COMPLETED` 事件；不能手工拼接报告或直接修改登记文件。
 
-历史文件：
+当前正式文件：
 
 - [`benchmarks/ablation_report.json`](../benchmarks/ablation_report.json)
 - [`benchmarks/ablation_report.md`](../benchmarks/ablation_report.md)
