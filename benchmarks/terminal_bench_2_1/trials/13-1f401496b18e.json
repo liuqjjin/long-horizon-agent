@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "terminal-bench-error-redaction",
+  "source_sha256": "6644bc2f2071f82c38ff66affa27bd4bae646010c70dc9e9456377503585dd66",
+  "task_name": "terminal-bench/make-doom-for-mips",
+  "task_checksum": "8ecf7ffa820c3c76e07d06ad5042fb5661f3371c24f6c0ee710c36596b802549",
+  "raw_status": "ERROR",
+  "raw_correct": null,
+  "raw_protocol_error": "Harbor trial exception: CodexReportedError",
+  "exception_type": "CodexReportedError",
+  "duration_s": 1284.190496,
+  "infrastructure_retries": null
+}

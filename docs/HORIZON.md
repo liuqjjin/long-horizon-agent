@@ -1,151 +1,116 @@
-# Error compounding over a horizon
+# 长链统计
 
-`lha horizon` reads measured truth labels from an `ablation_report.json` and
-reports three different quantities. Keeping them separate prevents a descriptive
-curve from being presented as additional experimental evidence.
+`lha horizon` 从消融报告读取“是否正确交付”的标签，并分别计算单元级结果、完整语料
+重复聚合和组合推演。三者的统计单位不同，不能混成一个样本量。
 
-## The three units
+## 配对单元
 
-### Paired cell
+一个单元是同一 `(任务, 重复序号)` 下的 `trust` 与 `verify` 配对结果。schema v4 的
+`true_success` 要求系统实际交付了产物，而且独立评分器判定产物正确。
 
-A cell is one `(task, repetition)` pair for which both `trust` and `verify` have
-an independent-scorer result. The cell-level McNemar test asks whether those two
-conditions disagree on the same task attempt.
+同一任务的多次重复不能当成互相独立的推断样本。schema v4 先计算每个任务内
+`verify - trust` 的平均配对差，再以任务为单位做双侧精确符号翻转检验。每个任务只有
+一份推断权重；原始单元的 discordance 仍会列出，但只作描述，不再给出单元级 McNemar
+p 值。
 
-If an ablation has `T` tasks and `R` complete repetitions, it can contribute up
-to `T × R` paired cells. A cell recorded as `ERROR` has no truth label and is not
-silently converted to success or failure.
+`ERROR` 没有真值标签，既不改写成成功，也不改写成失败；报告会分开列出计划单元、
+可用单元和错误单元。
 
-### Observed episode
+## 完整语料重复聚合
 
-An episode is one complete repetition of the entire corpus. It succeeds only if
-every task in that repetition succeeds. `R` complete repetitions therefore
-provide exactly `R` paired episodes, not `T × R`.
+消融实验会分别执行每个 `(任务, 重复序号, 条件)` 单元。`horizon` 在这些执行结束后，
+把相同重复序号下的任务标签汇总成一个“完整语料重复聚合”。只有该重复序号下每个任务
+都成功，聚合结果才算成功；一个重复中出现多个失败单元，也只形成一个失败聚合。
 
-Several failed cells in one repetition collapse into one failed episode. The
-episode-level McNemar test consequently uses a different unit from the cell
-test, and the two p-values can differ. Neither is substituted for the other.
+这个聚合不是实际执行的共享状态长任务。各任务没有共享工作目录、上下文、检查点或前序
+任务产生的状态，任务之间也没有在一次运行中顺序传递错误。它只能回答“同一重复序号下，
+整套任务是否全部成功”，不能证明系统完成了一条真实长任务链。
 
-### Descriptive composition
+聚合级比较以完整重复为配对单位，使用双侧精确 McNemar 检验。它和任务聚类的单元级
+检验回答的问题不同，p 值没有必须相等的关系。若某次重复含有 `ERROR` 或缺失任务，
+该重复不进入完整语料聚合比较。
 
-The composition inserts each task's empirical success rate into an
-independent-step, uniformly random ordering model. For a horizon of `k`, the
-projected survival probability is the degree-`k` elementary symmetric polynomial
-of the per-task rates divided by `C(T, k)`.
+## 组合推演
 
-`src/lha/horizon.py::compounding_curve` evaluates this expression exactly. The
-task bootstrap around the curve describes sensitivity to the observed task mix.
-It is not an episode confidence interval.
+组合曲线把各任务的实测成功率代入独立步骤模型，估算长度为 `k` 时所有步骤都成功的
+概率。`src/lha/horizon.py::compounding_curve` 会对大小为 `k` 的任务子集均匀取平均，
+并用任务 bootstrap 表示结果对当前任务构成的敏感程度。
 
-Composition adds **zero** independent samples and has no McNemar p-value.
-Reordering the same measured cells can change the displayed effect size, not the
-amount of evidence.
+当某个任务因 `ERROR` 少了一次观测，报告会保留它的实际样本数，不会假设每个任务的
+分母相同。
 
-## Conditions
+这条曲线有三个明确边界：
 
-| horizon condition | source condition | meaning |
+- 它没有执行新的长任务；
+- 它不增加独立样本；
+- 它没有 McNemar p 值。
+
+因此，组合曲线只能称为基于实测单元的推演，不能当作新增实验结果。
+
+## 标签和区间
+
+| 条件 | 使用的字段 | 含义 |
 |---|---|---|
-| `trust-chain` | `trust` | a wrong step is accepted and the chain is already incorrect |
-| `verify-chain` | `verify` | each step uses the gate and bounded repair |
+| `trust-chain` | `trust.true_success` | 任一步错误交付都会使链条失败 |
+| `verify-chain` | `verify.true_success` | 检查失败后允许在预算内修复 |
 
-Both read the `true_success` label supplied by the independent scorer. Internal
-gate acceptance is not treated as truth.
+链条不使用单独的 `artifact_correct`。正确产物若被系统拒绝，就没有被交付，该步仍是
+`true_success=false`。
 
-## Intervals and paired tests
+全零或全一的完整语料聚合比例使用 Wilson 区间。边界样本若直接使用百分位 bootstrap，会
+得到误导性的零宽区间。
 
-Boundary episode rates use Wilson score intervals. A percentile bootstrap over
-an all-zero or all-one sample would produce a misleading zero-width interval.
+## JSON 兼容字段
 
-The generated report includes:
+为避免破坏已有读取工具，JSON 目前保留 `independent_episode_count`、
+`estimands.episode` 和 `episodes` 这些旧字段名。它们表示完整语料重复聚合及其数量，
+不表示相互独立执行的 episode，也不表示实际共享状态长任务。新文档和报告展示统一使用
+“完整语料重复聚合”。
 
-- cell pair count, success counts, discordant directions, and exact McNemar
-  p-value;
-- complete episode count, end-to-end outcomes, Wilson intervals, discordant
-  directions, and exact McNemar p-value;
-- the composition curve with task-bootstrap intervals and an explicit
-  `independent_samples_added: 0`.
+schema v1–v3 的历史文件继续保留 `estimands.cell.mcnemar_p` 和原有文本，目的是保证
+已提交证据可以按原字节复现。schema v4 的 `estimands.cell` 改为记录任务数、非零任务
+数和 `task_cluster_sign_flip_p`，不会同时发布单元级 McNemar p 值。
 
-Regression tests include a case where multiple discordant cells fall inside one
-episode, proving that cell- and episode-level p-values are allowed to differ.
+## 当前正式结果
 
-## Committed schema-v2 result
+当前 Horizon 由 `gpt-5.3-codex-spark` 的 schema-v4 正式报告生成。计划 204 个
+配对单元，204 个可用，0 个 `ERROR`；12 次重复都形成完整语料聚合。
 
-The current input is the Docker-scored ablation produced with Codex CLI 0.141.0,
-`gpt-5.4-mini`, low reasoning effort, and read-only mode. It contains 17 tasks
-× 12 repetitions and no `ERROR` cells. The generated report keeps the three
-estimands separate:
+单元级 `trust` 和 `verify` 正确交付分别为 201/204 与 204/204，描述性
+discordance 为 3/0。按任务聚类后，3/17 个任务具有非零配对差异，精确符号翻转检验
+p = 0.2500。
 
-| estimand | paired units | `trust` success | `verify` success | discordant | exact McNemar |
-|---|---:|---:|---:|---:|---:|
-| measured cell | 204 | 194 | 204 | 10 / 0 | 0.001953125 |
-| observed whole-corpus episode | 12 | 2 | 12 | 10 / 0 | 0.001953125 |
-| descriptive composition | 0 new samples | — | — | — | none |
+完整语料重复聚合中，`trust-chain` 和 `verify-chain` 分别有 10/12 与 12/12 个聚合
+全部成功，discordance 为 2/0，聚合级 McNemar 检验 p = 0.5000。
 
-The equal p-values in this particular report follow from its observed
-discordant counts; the two tests use different units and are not required to
-agree. In prose, the measured comparison is reported as `p = 0.00195`.
+组合曲线没有执行新任务，`independent_samples_added` 为 0；它只说明现有任务成功率
+在不同组合长度下的推演结果。正式文件为：
 
-The composition curve is a model-based projection over the 204 measured cells.
-It does not turn task orderings, bootstrap draws, or horizon points into new
-experiments.
+- [`benchmarks/horizon_report.json`](../benchmarks/horizon_report.json)
+- [`benchmarks/horizon_report.md`](../benchmarks/horizon_report.md)
+- [`benchmarks/horizon_curve.svg`](../benchmarks/horizon_curve.svg)
 
-## Relation to the executed long tasks
+`data/long_tasks/` 下的五个多文件流程是实际执行的恢复测试，但它们不是这里的统计单元，
+也不会增加 horizon 样本。反过来，完整语料重复聚合也不能替代这些真实流程测试。
 
-The horizon composition and the long-task fixtures answer different questions.
+## 生成报告
 
-- `lha horizon` projects how measured, independent ablation tasks compound.
-- `data/long_tasks/` executes five stateful 10-step repository plans covering
-  integrity, baseline reproduction, approved editing, targeted/full checks,
-  lint, build, repair, and interruption recovery.
-
-The 10-step runs demonstrate state transitions and recovery. They do not increase
-the ablation's cell or episode sample count, and the composed curve is not
-reported as their measured success rate.
-
-## Generate a report
-
-Compose the committed ablation input without model calls:
+完整、已校验且对应 `COMPLETED` 事件的 schema-v4 报告可以复现正式 Horizon：
 
 ```bash
 uv run lha horizon \
   --from-report benchmarks/ablation_report.json \
-  --out runs/horizon
+  --out benchmarks
 ```
 
-Or use a newly generated ablation report:
-
-```bash
-uv run lha horizon \
-  --from-report runs/ablation/ablation_report.json \
-  --out runs/horizon
-```
-
-The command writes:
+输出包括：
 
 ```text
-runs/horizon/horizon_report.json
-runs/horizon/horizon_report.md
-runs/horizon/horizon_curve.svg
+benchmarks/horizon_report.json
+benchmarks/horizon_report.md
+benchmarks/horizon_curve.svg
 ```
 
-The JSON contains the three estimands as separate objects. The Markdown and SVG
-are renderings of the same data.
-
-## Result policy
-
-The summary above mirrors the current generated report. Full-precision results
-belong in the generated files under `benchmarks/`, together with their source
-report, model, backend, repetitions, and fingerprint. When a release measurement
-changes, regenerate both ablation and horizon artifacts before updating this
-summary; do not edit a percentage or p-value in isolation.
-
-Before citing a result, verify that:
-
-1. the ablation report has no unaccounted `ERROR` cells;
-2. the model and CLI provenance match the intended protocol;
-3. cell and episode units are labelled separately;
-4. composition still reports zero added samples;
-5. every cited number appears in the committed generated report.
-
-Hermetic coverage for the calculations and input validation is in
-`tests/test_horizon.py`.
+引用结果前，应确认模型和运行环境与登记协议一致，所有 `ERROR` 都已计入覆盖情况，
+单元推断按任务聚类，完整语料重复聚合使用自己的配对单位，并且组合部分仍明确写着
+新增样本数为零。

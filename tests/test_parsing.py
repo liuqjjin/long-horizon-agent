@@ -6,16 +6,26 @@ LLM factory — real logic that was previously only exercised end-to-end (or not
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from lha.artifacts import Step
 from lha.clock import now
 from lha.config import Config
 from lha.live_context.backends.ccc_backend import _extract_results, _result_to_codehit
-from lha.live_context.models import CodeHit, ContextBundle, Freshness
+from lha.live_context.models import CodeHit, ContextBundle, ContextItem, Freshness, Provenance
 from lha.llm import DeterministicStub, get_llm
-from lha.llm.base import LLMClient, _touched_from_diff, extract_file_blocks, extract_unified_diff
+from lha.llm.base import (
+    _MAX_IMPLEMENTATION_PROMPT_BYTES,
+    _MAX_SOURCE_FILE_BYTES,
+    LLMClient,
+    _touched_from_diff,
+    extract_file_blocks,
+    extract_unified_diff,
+)
 
 
 # --- ccc MCP result parsing -------------------------------------------------
@@ -84,6 +94,17 @@ class _Echo(LLMClient):
         return ""
 
 
+class _PromptCapture(LLMClient):
+    name = "capture"
+
+    def __init__(self):
+        self.prompts: list[str] = []
+
+    def complete(self, system: str, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return ""
+
+
 def _bundle() -> ContextBundle:
     return ContextBundle(query="q", freshness=Freshness(index_version="v", indexed_at=now()))
 
@@ -120,6 +141,12 @@ def test_patch_from_response_skips_unchanged(tmp_path):
     assert patch.is_empty()
 
 
+def test_patch_from_response_accepts_new_file_under_new_directory(tmp_path):
+    resp = "### pkg/new.py\n```python\nvalue = 1\n```\n"
+    patch = _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+    assert patch.file_contents == {"pkg/new.py": "value = 1\n"}
+
+
 def test_patch_from_response_single_block_fallback(tmp_path):
     # No '### path', but exactly one non-test source file -> map the lone block to it.
     (tmp_path / "only.py").write_text("v = 0\n")
@@ -135,6 +162,208 @@ def test_patch_from_response_rejects_path_escape(tmp_path):
     patch = _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
     assert patch.is_empty()
     assert not (tmp_path.parent / "evil.py").exists()
+
+
+def test_repo_prompt_rejects_python_symlink(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not reach the model")
+    (tmp_path / "leak.py").symlink_to(secret)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        _Echo._read_repo_python(tmp_path)
+
+
+def test_repo_prompt_rejects_python_hardlink(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not reach the model")
+    os.link(secret, tmp_path / "leak.py")
+
+    with pytest.raises(ValueError, match="standalone regular file"):
+        _Echo._read_repo_python(tmp_path)
+
+
+def test_patch_from_response_rejects_symlinked_target(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not be overwritten")
+    (tmp_path / "leak.py").symlink_to(secret)
+    resp = "### leak.py\n```python\nvalue = 1\n```\n"
+
+    with pytest.raises(ValueError, match="link"):
+        _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+
+
+def test_patch_from_response_rejects_hardlinked_target(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not be overwritten")
+    os.link(secret, tmp_path / "leak.py")
+    resp = "### leak.py\n```python\nvalue = 1\n```\n"
+
+    with pytest.raises(ValueError, match="standalone regular file"):
+        _Echo()._patch_from_response(_step(), _bundle(), tmp_path, resp)
+
+
+def test_single_block_fallback_rejects_symlinked_source(tmp_path):
+    secret = tmp_path.parent / "host-secret"
+    secret.write_text("must not be selected")
+    (tmp_path / "only.py").symlink_to(secret)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        _Echo._single_block_fallback(tmp_path, "```python\nvalue = 1\n```")
+
+
+def test_prompt_selects_explicit_target_after_first_twelve_files(tmp_path):
+    for ordinal in range(13):
+        (tmp_path / f"a{ordinal:02}.py").write_text(f"VALUE = {ordinal}\n")
+    (tmp_path / "z_target.py").write_text("TARGET = 'included whole'\n")
+    client = _PromptCapture()
+    step = Step(
+        step_id="s",
+        kind="code",
+        action="edit_code",
+        goal="Fix the retrieved regression.",
+    )
+    bundle = ContextBundle(
+        query="regression",
+        freshness=Freshness(index_version="v", indexed_at=now()),
+        items=[
+            ContextItem(
+                text="TARGET is wrong",
+                provenance=Provenance(source_kind="code", locator="z_target.py:1"),
+            )
+        ],
+    )
+
+    client.propose_patch(step, bundle, tmp_path)
+
+    prompt = client.prompts[0]
+    assert "### z_target.py\nTARGET = 'included whole'\n" in prompt
+    assert prompt.index("### z_target.py") < prompt.index("### a00.py")
+
+
+def test_prompt_rejects_referenced_source_that_cannot_fit_whole(tmp_path):
+    (tmp_path / "large.py").write_text("x" * (_MAX_SOURCE_FILE_BYTES + 1))
+    client = _PromptCapture()
+    step = Step(
+        step_id="s",
+        kind="code",
+        action="edit_code",
+        goal="Fix large.py without changing its public API.",
+    )
+
+    with pytest.raises(ValueError, match="whole-file prompt limit: large.py"):
+        client.propose_patch(step, _bundle(), tmp_path)
+
+    assert client.prompts == []
+
+
+def test_prompt_omits_oversize_unreferenced_source_instead_of_truncating(tmp_path):
+    (tmp_path / "target.py").write_text("VALUE = 'complete-target'\n")
+    (tmp_path / "unrelated.py").write_text("SECRET_TAIL_" + "x" * _MAX_SOURCE_FILE_BYTES)
+    client = _PromptCapture()
+    step = Step(
+        step_id="s",
+        kind="code",
+        action="edit_code",
+        goal="Fix target.py.",
+    )
+
+    client.propose_patch(step, _bundle(), tmp_path)
+
+    prompt = client.prompts[0]
+    assert "### target.py\nVALUE = 'complete-target'\n" in prompt
+    assert "### unrelated.py" not in prompt
+    assert "SECRET_TAIL_" not in prompt
+
+
+def test_prompt_path_references_ignore_escape_absolute_and_missing_files(tmp_path):
+    (tmp_path / "valid.py").write_text("VALUE = 1\n")
+    (tmp_path / "other.py").write_text("OTHER = 1\n")
+    outside = tmp_path.parent / "outside.py"
+    outside.write_text("HOST_SECRET = 1\n")
+    step = Step(
+        step_id="s",
+        kind="code",
+        action="edit_code",
+        goal="Fix ../outside.py, /tmp/host.py, missing.py, and valid.py.",
+    )
+
+    referenced = _Echo._referenced_repo_python(tmp_path, step, _bundle())
+
+    assert referenced == ["valid.py"]
+    client = _PromptCapture()
+    client.propose_patch(step, _bundle(), tmp_path)
+    assert "HOST_SECRET" not in client.prompts[0]
+
+
+def test_prompt_selection_is_deterministic_across_creation_order(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    files = {
+        "pkg/target.py": "TARGET = 1\n",
+        "pkg/helper.py": "HELPER = 1\n",
+        "small.py": "SMALL = 1\n",
+        "larger.py": "LARGER = '" + "x" * 100 + "'\n",
+    }
+    for root, names in ((first, list(files)), (second, list(reversed(files)))):
+        for name in names:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(files[name])
+    step = Step(
+        step_id="s",
+        kind="code",
+        action="edit_code",
+        goal="Fix pkg/target.py.",
+    )
+    prompts = []
+    for root in (first, second):
+        client = _PromptCapture()
+        client.propose_patch(step, _bundle(), root)
+        prompts.append(client.prompts[0])
+
+    assert prompts[0] == prompts[1]
+    assert prompts[0].index("### pkg/target.py") < prompts[0].index("### pkg/helper.py")
+    assert prompts[0].index("### pkg/helper.py") < prompts[0].index("### small.py")
+
+
+def test_implementation_prompt_has_hard_utf8_byte_budget(tmp_path):
+    (tmp_path / "target.py").write_text("TARGET = 'complete'\n")
+    for ordinal in range(30):
+        (tmp_path / f"module_{ordinal:02}.py").write_text(
+            f"VALUE_{ordinal} = '" + "数" * 2500 + "'\n"
+        )
+    item = ContextItem(
+        text="检索" * 50_000,
+        provenance=Provenance(
+            source_kind="code",
+            locator="target.py:1",
+            indexed_at=now(),
+        ),
+    )
+    bundle = ContextBundle(
+        query="q",
+        freshness=Freshness(index_version="v", indexed_at=now()),
+        items=[item],
+    )
+    step = Step(
+        step_id="s",
+        kind="code",
+        action="edit_code",
+        goal="Fix target.py. " + "问题" * 20_000,
+        prior_failures=["失败" * 30_000],
+    )
+    client = _PromptCapture()
+
+    client.propose_patch(step, bundle, tmp_path)
+
+    prompt = client.prompts[0]
+    assert len(prompt.encode("utf-8")) <= _MAX_IMPLEMENTATION_PROMPT_BYTES
+    assert "### target.py\nTARGET = 'complete'\n" in prompt
+    assert "[issue text truncated to fixed prompt budget]" in prompt
+    assert "[prior failures truncated to fixed prompt budget]" in prompt
+    assert "[retrieved snippet truncated to fixed prompt budget]" in prompt
 
 
 # --- LLM factory ------------------------------------------------------------

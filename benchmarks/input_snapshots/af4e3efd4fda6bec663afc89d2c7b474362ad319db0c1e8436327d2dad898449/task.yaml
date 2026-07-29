@@ -1,0 +1,12 @@
+kind: issue_to_pr
+title: "flatten() explodes strings into characters"
+description: >
+  flatten([1, ['ab', 2]]) should return [1, 'ab', 2], but strings are treated as
+  nested sequences and recursed into (a multi-character string even blows the
+  recursion stack). Strings (and bytes) should be atomic, not flattened.
+target_repo: data/bench/flatten
+inputs:
+  context_query: "flatten nested list strings atomic"
+success:
+  - "pytest passes"
+  - "ruff clean"

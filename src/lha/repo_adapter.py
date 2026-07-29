@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import stat
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, Self, TypeVar
@@ -20,7 +18,12 @@ from typing import Literal, Self, TypeVar
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .sandbox.base import ExecutionBackend
+from .durable_io import (
+    anchored_atomic_replace_bytes,
+    anchored_read_bytes,
+    durable_mkdir_chain,
+)
+from .sandbox.base import ExecutionBackend, ProcessCleanupUnconfirmed
 from .step_ids import canonical_artifact_segment
 
 RepoStage = Literal[
@@ -45,14 +48,14 @@ _STAGES: tuple[RepoStage, ...] = (
     "build",
     "cleanup",
 )
-_INFRASTRUCTURE_FAILURE_CODES = frozenset({124, 126, 127})
+_INFRASTRUCTURE_FAILURE_CODES = frozenset({124, 125, 126, 127})
 _SHELL_TOOLS = frozenset({"bash", "cmd", "powershell", "pwsh", "sh", "zsh"})
 
 
 class RepoCommand(BaseModel):
     """One fixed argv command in a repository lifecycle stage."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     tool: str = Field(pattern=r"^[a-zA-Z0-9_.+-]+$")
@@ -93,7 +96,7 @@ class RepoCommand(BaseModel):
 class RepoAdapterSpec(BaseModel):
     """The complete, immutable command surface for one repository."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal[1] = 1
     allowed_tools: frozenset[str] = Field(min_length=1)
@@ -236,12 +239,26 @@ class RepoCommandResult(BaseModel):
     stdout: str
     stderr: str
     duration_s: float = Field(ge=0.0)
+    output_truncated: bool = False
+    cleanup_unconfirmed: bool = False
+    cleanup_detail: str = ""
     passed: bool
 
     @model_validator(mode="after")
     def _passed_matches_returncode(self) -> Self:
-        if self.passed != (self.returncode in self.expected_returncodes):
-            raise ValueError("passed must match expected_returncodes")
+        if self.cleanup_unconfirmed and self.returncode != 126:
+            raise ValueError(
+                "cleanup_unconfirmed requires the process cleanup return code"
+            )
+        expected = (
+            self.returncode in self.expected_returncodes
+            and not self.output_truncated
+            and not self.cleanup_unconfirmed
+        )
+        if self.passed != expected:
+            raise ValueError(
+                "passed must match expected_returncodes and complete output"
+            )
         return self
 
 
@@ -330,7 +347,13 @@ class RepoAdapter:
         for command in commands:
             result = self._run_command(request.stage, command)
             results.append(result)
-            if request.stop_on_failure and not result.passed:
+            # A process whose cleanup is unconfirmed may still mutate the
+            # repository. Never start another stage command across that
+            # boundary, even when ordinary command failures were configured to
+            # continue.
+            if result.cleanup_unconfirmed or (
+                request.stop_on_failure and not result.passed
+            ):
                 break
         status: StageStatus = "passed" if all(result.passed for result in results) else "failed"
         return RepoStageResult(stage=request.stage, status=status, commands=tuple(results))
@@ -372,7 +395,14 @@ class RepoAdapter:
             stdout=proc.stdout,
             stderr=proc.stderr,
             duration_s=proc.duration_s,
-            passed=proc.returncode in command.expected_returncodes,
+            output_truncated=proc.output_truncated,
+            cleanup_unconfirmed=proc.cleanup_unconfirmed,
+            cleanup_detail=proc.cleanup_detail[-1000:],
+            passed=(
+                proc.returncode in command.expected_returncodes
+                and not proc.output_truncated
+                and not proc.cleanup_unconfirmed
+            ),
         )
 
     def _safe_cwd(self, relative: str) -> Path:
@@ -583,7 +613,12 @@ def execute_repo_stage_once(
     safe_step = _safe_segment(step_id)
     safe_attempt = _safe_segment(attempt_id)
     attempt_dir = run_root / "steps" / safe_step / "attempts" / safe_attempt
-    attempt_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        durable_mkdir_chain(attempt_dir, anchor=run_root)
+    except (OSError, ValueError) as error:
+        raise RepoStageAmbiguous(
+            f"stage attempt path is unsafe for {step_id}/{attempt_id}: {error}"
+        ) from error
     intent_path = attempt_dir / "repo_stage_intent.json"
     evidence_path = attempt_dir / "repo_stage_evidence.json"
     spec_payload = json.dumps(
@@ -598,10 +633,24 @@ def execute_repo_stage_once(
         spec_sha256=hashlib.sha256(spec_payload).hexdigest(),
     )
 
-    if evidence_path.exists():
+    try:
+        evidence = _read_checksummed_model(
+            evidence_path,
+            RepoStageEvidence,
+            run_dir=run_root,
+            missing_ok=True,
+        )
+    except Exception as error:
+        raise RepoStageAmbiguous(
+            f"persisted stage evidence is invalid for {step_id}/{attempt_id}: {error}"
+        ) from error
+    if evidence is not None:
         try:
-            persisted_intent = _read_checksummed_model(intent_path, RepoStageIntent)
-            evidence = _read_checksummed_model(evidence_path, RepoStageEvidence)
+            persisted_intent = _read_checksummed_model(
+                intent_path,
+                RepoStageIntent,
+                run_dir=run_root,
+            )
         except Exception as error:
             raise RepoStageAmbiguous(
                 f"persisted stage evidence is invalid for {step_id}/{attempt_id}: {error}"
@@ -618,13 +667,18 @@ def execute_repo_stage_once(
         _publish_stage_result(run_root, safe_step, evidence.result)
         return evidence.result
 
-    if intent_path.exists():
-        try:
-            persisted_intent = _read_checksummed_model(intent_path, RepoStageIntent)
-        except Exception as error:
-            raise RepoStageAmbiguous(
-                f"prepared stage intent is invalid for {step_id}/{attempt_id}: {error}"
-            ) from error
+    try:
+        persisted_intent = _read_checksummed_model(
+            intent_path,
+            RepoStageIntent,
+            run_dir=run_root,
+            missing_ok=True,
+        )
+    except Exception as error:
+        raise RepoStageAmbiguous(
+            f"prepared stage intent is invalid for {step_id}/{attempt_id}: {error}"
+        ) from error
+    if persisted_intent is not None:
         if persisted_intent != intent:
             raise RepoStageAmbiguous(
                 f"prepared stage intent changed for {step_id}/{attempt_id}"
@@ -634,14 +688,39 @@ def execute_repo_stage_once(
             "refusing to duplicate its side effects"
         )
 
-    _write_checksummed_model(intent_path, intent)
+    try:
+        _write_checksummed_model(intent_path, intent, run_dir=run_root)
+    except Exception as error:
+        raise RepoStageAmbiguous(
+            f"stage intent could not be persisted for "
+            f"{step_id}/{attempt_id}: {error}"
+        ) from error
     result = RepoAdapter(root, spec, backend).run_stage(RepoStageRequest(stage=stage))
+    cleanup_failures = [
+        command for command in result.commands if command.cleanup_unconfirmed
+    ]
+    if cleanup_failures:
+        command = cleanup_failures[0]
+        # Do not hash, publish, or otherwise inspect the repository after this
+        # boundary. The Harness catches this typed signal and durably pauses the
+        # run before transaction recovery or another step can touch the tree.
+        raise ProcessCleanupUnconfirmed(
+            command.cleanup_detail
+            or command.stderr[-1000:]
+            or f"repository command {command.command_id!r} cleanup was not confirmed"
+        )
     evidence = RepoStageEvidence(
         intent=intent,
         worktree_sha256=repository_tree_sha256(root),
         result=result,
     )
-    _write_checksummed_model(evidence_path, evidence)
+    try:
+        _write_checksummed_model(evidence_path, evidence, run_dir=run_root)
+    except Exception as error:
+        raise RepoStageAmbiguous(
+            f"stage evidence could not be persisted for "
+            f"{step_id}/{attempt_id}: {error}"
+        ) from error
     _publish_stage_result(run_root, safe_step, result)
     return result
 
@@ -660,33 +739,45 @@ def _safe_segment(value: str) -> str:
 def _publish_stage_result(run_dir: Path, safe_step: str, result: RepoStageResult) -> None:
     payload = result.model_dump_json(indent=2)
     step_path = run_dir / "steps" / safe_step / "repo_stage.json"
-    step_path.parent.mkdir(parents=True, exist_ok=True)
-    _durable_replace(step_path, payload)
-    _durable_replace(run_dir / "repo_stage.json", payload)
+    _durable_replace(step_path, payload, run_dir=run_dir)
+    _durable_replace(run_dir / "repo_stage.json", payload, run_dir=run_dir)
 
 
 def _canonical_payload(payload: dict[str, object]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 
 
-def _write_checksummed_model(path: Path, model: BaseModel) -> None:
+def _write_checksummed_model(
+    path: Path,
+    model: BaseModel,
+    *,
+    run_dir: Path,
+) -> None:
     payload = model.model_dump(mode="json")
     envelope = {
         "schema_version": 1,
         "sha256": hashlib.sha256(_canonical_payload(payload)).hexdigest(),
         "payload": payload,
     }
-    _durable_replace(path, json.dumps(envelope, indent=2))
+    _durable_replace(
+        path,
+        json.dumps(envelope, indent=2),
+        run_dir=run_dir,
+    )
 
 
 def _read_checksummed_model(
     path: Path,
     model_type: type[_EnvelopeModel],
-) -> _EnvelopeModel:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"artifact path is missing or unsafe: {path}")
+    *,
+    run_dir: Path,
+    missing_ok: bool = False,
+) -> _EnvelopeModel | None:
+    data = anchored_read_bytes(path, anchor=run_dir, missing_ok=missing_ok)
+    if data is None:
+        return None
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(data)
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"artifact is unreadable: {error}") from error
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "sha256", "payload"}:
@@ -706,33 +797,8 @@ def _read_checksummed_model(
     return model_type.model_validate(payload)
 
 
-def _durable_replace(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise ValueError(f"artifact path is unsafe: {path}")
-    descriptor, temp_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        text=True,
-    )
-    temp = Path(temp_name)
-    try:
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp, path)
-    finally:
-        temp.unlink(missing_ok=True)
-    try:
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError:  # pragma: no cover - platforms without directory fsync
-        pass
+def _durable_replace(path: Path, text: str, *, run_dir: Path) -> None:
+    anchored_atomic_replace_bytes(path, text.encode("utf-8"), anchor=run_dir)
 
 
 __all__ = [

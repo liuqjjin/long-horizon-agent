@@ -6,8 +6,12 @@ import math
 from pathlib import Path
 from typing import Any
 
-from ...array_evidence import safe_artifact_path
-from ..verdict import Check, VerifierFamily
+from ...array_evidence import load_bounded_npy, safe_artifact_path
+from ..verdict import (
+    Check,
+    VerifierFamily,
+    process_cleanup_failure_detail,
+)
 
 
 def is_finite(x: Any) -> bool:
@@ -90,30 +94,66 @@ def precheck(artifact: Any, name: str, family: VerifierFamily = "experiment") ->
     verifier should pass regardless of what files were left behind.
     """
     rc = getattr(artifact, "returncode", 0)
-    if rc != 0:
+    cleanup_unconfirmed = bool(
+        getattr(artifact, "cleanup_unconfirmed", False)
+    )
+    if cleanup_unconfirmed:
+        detail = {
+            "summary": "experiment process cleanup could not be confirmed"
+        }
+        detail.update(
+            process_cleanup_failure_detail(
+                returncode=rc,
+                cleanup_unconfirmed=cleanup_unconfirmed,
+                detail=str(getattr(artifact, "stdout_tail", ""))[-500:],
+            )
+        )
         return Check(
             name=name,
             family=family,
             passed=False,
-            detail={"summary": f"experiment command failed (returncode={rc})"},
+            detail=detail,
+        )
+    if getattr(artifact, "output_truncated", False):
+        return Check(
+            name=name,
+            family=family,
+            passed=False,
+            detail={
+                "summary": (
+                    "experiment command output exceeded the capture limit; "
+                    "evidence is incomplete"
+                )
+            },
+        )
+    if rc != 0:
+        detail = {"summary": f"experiment command failed (returncode={rc})"}
+        detail.update(
+            process_cleanup_failure_detail(
+                returncode=rc,
+                cleanup_unconfirmed=cleanup_unconfirmed,
+                detail=str(getattr(artifact, "stdout_tail", ""))[-500:],
+            )
+        )
+        return Check(
+            name=name,
+            family=family,
+            passed=False,
+            detail=detail,
         )
     return None
 
 
 def load_arrays(artifact: Any, workdir: str | Path):
     """Load (reference, prediction) numpy arrays from an ExperimentResult, or (None, None)."""
-    import numpy as np
-
     rp = getattr(artifact, "reference_path", None)
     pp = getattr(artifact, "prediction_path", None)
     if not rp or not pp:
         return None, None
     try:
-        # allow_pickle=False (numpy's default since 2.x) keeps a malicious .npy from
-        # executing pickle on load — make it explicit so it can't drift.
         return (
-            np.load(safe_artifact_path(workdir, rp), allow_pickle=False),
-            np.load(safe_artifact_path(workdir, pp), allow_pickle=False),
+            load_bounded_npy(safe_artifact_path(workdir, rp)),
+            load_bounded_npy(safe_artifact_path(workdir, pp)),
         )
-    except (OSError, ValueError):
+    except (MemoryError, OSError, OverflowError, ValueError):
         return None, None

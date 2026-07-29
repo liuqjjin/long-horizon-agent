@@ -1,0 +1,13 @@
+kind: issue_to_pr
+title: "OnlineStats.variance goes negative for nearly-constant data"
+description: >
+  Feeding 1e9+0.001, 1e9+0.002, 1e9+0.003 into OnlineStats yields a variance of
+  128.0 — nine orders of magnitude off (the true variance is about 6.7e-07).
+  With samples 1e9+1, 1e9+2, 1e9+3 it returns 0.0 instead of 0.667. Adding a
+  large common offset to every sample must not change the variance.
+target_repo: data/bench/runstats
+inputs:
+  context_query: "online variance numerical stability"
+success:
+  - "pytest passes"
+  - "ruff clean"

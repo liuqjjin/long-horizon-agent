@@ -51,6 +51,7 @@ from .harness.transaction import (
     state_for_paths,
     transaction_log_path,
     transaction_path,
+    validate_terminal_transaction_state,
     validate_transaction_journals,
 )
 from .live_context.models import ContextBundle
@@ -444,7 +445,7 @@ def render_html(report: RunReport) -> str:
 <body>
 <main>
   <header>
-    <div class="label">Verification-first run trace</div>
+    <div class="label">Validated run trace</div>
     <h1>{_h(report.state.task.title)}</h1>
     <p class="muted">{_h(report.state.run_id)} · updated {_h(report.updated_at.isoformat())}</p>
   </header>
@@ -785,7 +786,66 @@ def validate_terminal_evidence(
     ledger: list[StepRecord],
 ) -> None:
     """Prove that a terminal label is supported before reporting or deletion."""
-    if state.plan is None or not state.plan.steps:
+    if state.plan is None:
+        if (
+            state.status != "FAILED"
+            or state.cursor != 0
+            or state.completed_steps
+            or state.failed_steps
+            or state.repairs
+            or len(ledger) != 1
+            or state.seq != ledger[0].seq
+        ):
+            raise ReportingError("pre-plan failure checkpoint is inconsistent")
+        event = ledger[0]
+        failure_ref = "plans/failure.json"
+        failure_path = _regular_file(run_dir / failure_ref, required=True)
+        failure_bytes = failure_path.read_bytes()
+        try:
+            failure = json.loads(failure_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ReportingError("plan failure evidence is invalid") from error
+        if (
+            event.step_id != "-"
+            or event.phase != "fail"
+            or event.attempt_id != "plan"
+            or event.idempotency_key != f"{state.run_id}:plan-fail"
+            or event.artifact_ref != failure_ref
+            or event.evidence_sha256 != sha256_bytes(failure_bytes)
+            or not isinstance(failure, dict)
+            or set(failure) != {"schema_version", "phase", "error_type"}
+            or failure.get("schema_version") != 1
+            or failure.get("phase") != "plan"
+            or not isinstance(failure.get("error_type"), str)
+            or not failure["error_type"]
+            or event.notes != f"error: {failure['error_type']}"
+        ):
+            raise ReportingError("plan failure evidence identity is invalid")
+        canonical = json.dumps(
+            failure,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if failure_bytes != canonical:
+            raise ReportingError("plan failure evidence is not canonical")
+        if any(
+            path.exists() or path.is_symlink()
+            for path in (
+                run_dir / "plan.json",
+                run_dir / "plan.md",
+                run_dir / "plans" / "initial.json",
+            )
+        ):
+            raise ReportingError(
+                "pre-plan failure conflicts with successful plan evidence"
+            )
+        actual_plan_files = set((run_dir / "plans").glob("*.json"))
+        if actual_plan_files != {failure_path}:
+            raise ReportingError("pre-plan failure has unexpected plan artifacts")
+        _validate_preplan_terminal_evidence_absent(run_dir)
+        _validate_terminal_display_aliases(run_dir, ledger)
+        return
+    if not state.plan.steps:
         raise ReportingError("terminal run has no verifiable plan")
     step_ids = [step.step_id for step in state.plan.steps]
     if len(step_ids) != len(set(step_ids)) or any(
@@ -804,6 +864,7 @@ def validate_terminal_evidence(
     if not any(record.phase == "plan" for record in ledger):
         raise ReportingError("terminal ledger has no plan event")
     verdicts = _validate_plan_and_verdict_history(run_dir, state, ledger)
+    _validate_terminal_display_aliases(run_dir, ledger)
 
     completed = state.completed_steps
     if len(completed) != len(set(completed)):
@@ -920,17 +981,19 @@ def validate_terminal_evidence(
         unfinished = [
             transaction
             for transaction in transactions
-            if transaction.status != "VERIFIED"
+            if transaction.status in ("PREPARED", "APPLIED")
         ]
         if unfinished:
             raise ReportingError(
-                "DONE run contains a patch transaction that is not VERIFIED"
+                "DONE run contains an unresolved patch transaction"
             )
         # A verdict proves what was checked at completion time. Retention must
         # also prove those bytes still exist now: for a path touched by several
         # attempts or steps, the last VERIFIED transaction is authoritative.
         expected_worktree = {}
         for transaction in transactions:
+            if transaction.status != "VERIFIED":
+                continue
             for relative in transaction.resolved_paths:
                 expected_worktree[relative] = transaction.applied_state[relative]
         if expected_worktree:
@@ -965,6 +1028,214 @@ def validate_terminal_evidence(
             raise ReportingError(
                 "FAILED run contains an applied or prepared patch transaction"
             )
+    terminal_status: Literal["DONE", "FAILED"] = (
+        "DONE" if state.status == "DONE" else "FAILED"
+    )
+    try:
+        validate_terminal_transaction_state(
+            run_dir,
+            run_dir / "workdir",
+            terminal_status,
+        )
+    except Exception as error:
+        raise ReportingError(str(error)) from error
+
+
+def validate_terminal_resume_evidence(
+    run_dir: Path,
+    state: RunState,
+    ledger: list[StepRecord],
+) -> None:
+    """Validate every saved terminal boundary without changing run state.
+
+    Terminal resume uses this narrower entry point instead of report collection:
+    it does not render, repair, prune, or rewrite aliases. Any missing or
+    unverifiable evidence raises ``ReportingError``.
+    """
+    if state.status not in _TERMINAL:
+        raise ReportingError(
+            f"terminal evidence validation requires DONE or FAILED, got {state.status}"
+        )
+    _collect_approval_artifacts(run_dir, state)
+    validate_recovery_evidence(run_dir, state=state)
+    validate_terminal_evidence(run_dir, state, ledger)
+    validate_llm_attempt_evidence(
+        run_dir,
+        state,
+        ledger,
+        _load_jsonl(run_dir / "llm_trace.jsonl"),
+    )
+
+
+def _validate_preplan_terminal_evidence_absent(run_dir: Path) -> None:
+    """A failure before planning cannot own step, approval, or transaction data."""
+    for directory_name in ("steps", "transactions"):
+        root = run_dir / directory_name
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            raise ReportingError(
+                f"pre-plan failure has an unsafe {directory_name} path"
+            )
+        if root.exists() and any(root.iterdir()):
+            raise ReportingError(
+                f"pre-plan failure has unexpected {directory_name} evidence"
+            )
+
+
+def _validate_terminal_display_aliases(
+    run_dir: Path,
+    ledger: list[StepRecord],
+) -> None:
+    """Bind mutable JSON/review aliases to immutable, ordered attempt evidence."""
+    families: dict[str, list[tuple[int, str, Path]]] = {
+        "context_bundle.json": [],
+        "verify.json": [],
+        "patch.json": [],
+        "patch.diff": [],
+        "manifest.json": [],
+    }
+    attempt_order: dict[tuple[str, str], int] = {}
+    for record in ledger:
+        if record.attempt_id:
+            key = (record.step_id, record.attempt_id)
+            attempt_order[key] = max(attempt_order.get(key, 0), record.seq)
+        if record.phase == "context":
+            if record.artifact_ref is None or record.evidence_sha256 is None:
+                raise ReportingError(
+                    f"terminal context event has no immutable evidence: {record.step_id}"
+                )
+            path = _regular_file(
+                _safe_run_relative(
+                    run_dir,
+                    (
+                        Path("steps")
+                        / record.step_id
+                        / record.artifact_ref
+                    ).as_posix(),
+                ),
+                required=True,
+            )
+            if sha256_bytes(path.read_bytes()) != record.evidence_sha256:
+                raise ReportingError(
+                    f"terminal context alias source is not ledger-bound: {record.step_id}"
+                )
+            families["context_bundle.json"].append(
+                (record.seq, record.step_id, path)
+            )
+        if record.phase == "verify":
+            if record.verdict_ref is None or record.evidence_sha256 is None:
+                raise ReportingError(
+                    f"terminal verify event has no immutable verdict: {record.step_id}"
+                )
+            path = _regular_file(
+                _safe_run_relative(
+                    run_dir,
+                    (
+                        Path("steps")
+                        / record.step_id
+                        / record.verdict_ref
+                    ).as_posix(),
+                ),
+                required=True,
+            )
+            if sha256_bytes(path.read_bytes()) != record.evidence_sha256:
+                raise ReportingError(
+                    f"terminal verdict alias source is not ledger-bound: {record.step_id}"
+                )
+            families["verify.json"].append((record.seq, record.step_id, path))
+
+    steps_root = run_dir / "steps"
+    if steps_root.is_symlink() or (
+        steps_root.exists() and not steps_root.is_dir()
+    ):
+        raise ReportingError(f"terminal steps path is unsafe: {steps_root}")
+    if steps_root.exists():
+        artifact_names = {
+            "patch.json": "patch.json",
+            "patch.diff": "review.diff",
+            "manifest.json": "manifest.json",
+        }
+        for alias_name, artifact_name in artifact_names.items():
+            for path in steps_root.glob(
+                f"*/attempts/*/{artifact_name}"
+            ):
+                path = _regular_file(path, required=True)
+                relative = path.relative_to(steps_root)
+                if (
+                    len(relative.parts) != 4
+                    or relative.parts[1] != "attempts"
+                ):
+                    raise ReportingError(
+                        f"terminal attempt artifact path is invalid: {path}"
+                    )
+                step_id, _attempts, attempt_id, _name = relative.parts
+                sequence = attempt_order.get((step_id, attempt_id))
+                if sequence is None:
+                    raise ReportingError(
+                        "terminal display artifact has no ledger attempt: "
+                        f"{step_id}/{attempt_id}/{artifact_name}"
+                    )
+                families[alias_name].append((sequence, step_id, path))
+
+    for alias_name, candidates in families.items():
+        _validate_terminal_alias_family(
+            run_dir,
+            alias_name=alias_name,
+            candidates=candidates,
+        )
+
+
+def _validate_terminal_alias_family(
+    run_dir: Path,
+    *,
+    alias_name: str,
+    candidates: list[tuple[int, str, Path]],
+) -> None:
+    """Require exactly one latest alias per step and one global last-writer alias."""
+    latest_by_step: dict[str, tuple[int, Path]] = {}
+    for sequence, step_id, authority in candidates:
+        current = latest_by_step.get(step_id)
+        if current is None or sequence > current[0]:
+            latest_by_step[step_id] = (sequence, authority)
+
+    expected_step_aliases = {
+        run_dir / "steps" / step_id / alias_name
+        for step_id in latest_by_step
+    }
+    steps_root = run_dir / "steps"
+    actual_step_aliases: set[Path] = set()
+    if steps_root.exists():
+        for step_dir in steps_root.iterdir():
+            candidate = step_dir / alias_name
+            if candidate.exists() or candidate.is_symlink():
+                actual_step_aliases.add(candidate)
+    if actual_step_aliases != expected_step_aliases:
+        raise ReportingError(
+            f"terminal {alias_name} step aliases do not match immutable history"
+        )
+    for step_id, (_sequence, authority) in latest_by_step.items():
+        alias = _regular_file(
+            run_dir / "steps" / step_id / alias_name,
+            required=True,
+        )
+        if alias.read_bytes() != authority.read_bytes():
+            raise ReportingError(
+                f"terminal step {alias_name} alias changed: {step_id}"
+            )
+
+    root_alias = run_dir / alias_name
+    if not candidates:
+        if root_alias.exists() or root_alias.is_symlink():
+            raise ReportingError(
+                f"terminal run has an unexpected {alias_name} alias"
+            )
+        return
+    _sequence, _step_id, authority = max(
+        candidates,
+        key=lambda item: item[0],
+    )
+    alias = _regular_file(root_alias, required=True)
+    if alias.read_bytes() != authority.read_bytes():
+        raise ReportingError(f"terminal flat {alias_name} alias changed")
 
 
 def _validate_approval_record(
@@ -1323,7 +1594,14 @@ def _validate_plan_and_verdict_history(
             cursor += 1
             continue
         if record.phase == "fail" and current is not None:
-            if record.step_id != current.step_id:
+            expected_attempt = (
+                f"{current.step_id}-r{repairs.get(current.step_id, 0)}"
+            )
+            if (
+                record.step_id != current.step_id
+                or record.attempt_id != expected_attempt
+                or record.idempotency_key != f"{expected_attempt}:fail"
+            ):
                 raise ReportingError("fail event does not match the current plan step")
             if failed:
                 raise ReportingError("ledger contains multiple run failures")
@@ -1332,7 +1610,12 @@ def _validate_plan_and_verdict_history(
                 if verdict is not None and verdict.passed:
                     raise ReportingError("passing verdict is followed by fail")
                 decision = approvals.get(record.attempt_id)
-                if verdict is None and decision is not None and decision.approved:
+                if (
+                    verdict is None
+                    and decision is not None
+                    and decision.approved
+                    and not (record.notes or "").startswith("error:")
+                ):
                     raise ReportingError(
                         "approved attempt failed without a verifier verdict"
                     )
@@ -1425,8 +1708,38 @@ def validate_llm_attempt_evidence(
         for record in trace
         if record.get("kind") in {"plan", "propose_patch"}
     ]
+    expected_journal_attempts: set[tuple[str, str]] = set()
+    edit_step_ids = {
+        step.step_id
+        for step in (state.plan.steps if state.plan is not None else [])
+        if step.action == "edit_code"
+    }
+    expected_journal_attempts.update(
+        ("propose_patch", record.attempt_id)
+        for record in ledger
+        if record.phase == "context"
+        and record.step_id in edit_step_ids
+        and record.attempt_id is not None
+    )
+    expected_journal_attempts.update(
+        ("propose_patch", path.parent.name)
+        for path in attempt_patch_paths
+    )
+    contract = state.runtime_contract
+    dynamic_planning = bool(
+        contract is not None and contract.dynamic_planning
+    )
+    long_task = bool(state.task.inputs.get("repo_adapter")) and bool(
+        state.task.inputs.get("reference_manifest")
+    )
+    if (
+        dynamic_planning
+        and not long_task
+        and (state.plan is not None or expected_calls > 0)
+    ):
+        expected_journal_attempts.add(("plan", "plan"))
     if not root.exists() and not root.is_symlink():
-        if attempt_patch_paths or trace_kinds:
+        if expected_journal_attempts or trace_kinds:
             raise ReportingError(
                 "model-authored evidence exists but the LLM attempt journal is missing"
             )
@@ -1448,12 +1761,10 @@ def validate_llm_attempt_evidence(
         for kind_dir in kind_dirs
         for attempt in kind_dir.iterdir()
     )
-    if len(attempt_dirs) > expected_calls:
-        raise ReportingError(
-            "LLM attempt journal exceeds the recorded call count"
-        )
     completed_kinds: list[str] = []
+    incomplete_kinds: list[str] = []
     journaled_patch_paths: set[Path] = set()
+    actual_journal_attempts: set[tuple[str, str]] = set()
     seen_plan = 0
     ledger_attempts = {
         record.attempt_id for record in ledger if record.attempt_id
@@ -1492,6 +1803,7 @@ def validate_llm_attempt_evidence(
             or not isinstance(input_payload, dict)
         ):
             raise ReportingError(f"LLM intent identity is invalid: {intent_path}")
+        actual_journal_attempts.add((kind, logical_attempt))
         context = input_payload.get("context")
         if (
             not isinstance(context, dict)
@@ -1510,6 +1822,7 @@ def validate_llm_attempt_evidence(
                 raise ReportingError(
                     f"non-failed run has an ambiguous LLM call: {directory}"
                 )
+            incomplete_kinds.append(kind)
             continue
         result_path = _regular_file(result_path, required=True)
         try:
@@ -1606,16 +1919,42 @@ def validate_llm_attempt_evidence(
 
     # Tracing is intentionally best-effort, but any rows that did persist must
     # not claim more completed plan/patch calls than the durable journals.
-    remaining = list(completed_kinds)
-    for kind in trace_kinds:
-        if kind not in remaining:
+    remaining_completed = list(completed_kinds)
+    remaining_incomplete = list(incomplete_kinds)
+    relevant_trace = [
+        record
+        for record in trace
+        if record.get("kind") in {"plan", "propose_patch"}
+    ]
+    for record in relevant_trace:
+        kind = record["kind"]
+        outcome = record.get("outcome")
+        if outcome == "error":
+            error_type = record.get("error_type")
+            if (
+                not isinstance(error_type, str)
+                or not error_type
+                or kind not in remaining_incomplete
+            ):
+                raise ReportingError(
+                    "failed LLM trace does not match an incomplete durable intent"
+                )
+            remaining_incomplete.remove(kind)
+            continue
+        if outcome not in {None, "success"} or record.get("error_type") is not None:
+            raise ReportingError("LLM trace has an invalid call outcome")
+        if kind not in remaining_completed:
             raise ReportingError(
                 "LLM trace contains a call absent from the durable journal"
             )
-        remaining.remove(kind)
+        remaining_completed.remove(kind)
     if journaled_patch_paths != attempt_patch_paths:
         raise ReportingError(
             "model-authored patch attempts do not match the LLM journal"
+        )
+    if actual_journal_attempts != expected_journal_attempts:
+        raise ReportingError(
+            "LLM logical attempt journal does not match the run protocol and artifacts"
         )
 
 
@@ -1841,16 +2180,20 @@ def _read_enveloped_model(path: Path, model_type):
         ) from error
 
 
-def validate_recovery_evidence(run_dir: Path) -> None:
+def validate_recovery_evidence(
+    run_dir: Path,
+    *,
+    state: RunState | None = None,
+) -> None:
     """Validate transaction, backup, and manifest evidence before retention."""
-    state = load_state(run_dir)
+    state = state or load_state(run_dir)
     try:
         validate_transaction_journals(run_dir)
     except Exception as error:
         raise ReportingError(str(error)) from error
     transaction_root = run_dir / "transactions"
     expected_logs: set[Path] = set()
-    latest_reviews: dict[str, tuple[str, bytes]] = {}
+    latest_reviews: dict[str, tuple[int, bytes]] = {}
     if transaction_root.exists() or transaction_root.is_symlink():
         if transaction_root.is_symlink() or not transaction_root.is_dir():
             raise ReportingError(f"transaction directory is unsafe: {transaction_root}")
@@ -1906,7 +2249,11 @@ def validate_recovery_evidence(run_dir: Path) -> None:
             for reference in (transaction.backup_ref, transaction.backup_mirror_ref):
                 backup_path = _safe_run_relative(run_dir, reference)
                 try:
-                    backup = load_backup(backup_path, required=True)
+                    backup = load_backup(
+                        backup_path,
+                        run_dir=run_dir,
+                        required=True,
+                    )
                     assert backup is not None
                 except Exception as error:
                     raise ReportingError(str(error)) from error
@@ -1964,12 +2311,13 @@ def validate_recovery_evidence(run_dir: Path) -> None:
                     f"review diff does not match transaction: {review_path}"
                 )
             current_review = latest_reviews.get(transaction.step_id)
+            transaction_sequence = int(transaction.sequence or 0)
             if (
                 current_review is None
-                or transaction.created_at >= current_review[0]
+                or transaction_sequence > current_review[0]
             ):
                 latest_reviews[transaction.step_id] = (
-                    transaction.created_at,
+                    transaction_sequence,
                     expected_review,
                 )
             if (
@@ -2008,7 +2356,7 @@ def validate_recovery_evidence(run_dir: Path) -> None:
             raise ReportingError(
                 f"orphaned transaction log: {sorted(orphaned)[0]}"
             )
-        for step_id, (_created_at, expected_review) in latest_reviews.items():
+        for step_id, (_sequence, expected_review) in latest_reviews.items():
             alias = _regular_file(
                 run_dir / "steps" / step_id / "patch.diff",
                 required=True,
@@ -2030,7 +2378,11 @@ def validate_recovery_evidence(run_dir: Path) -> None:
             if descendant.suffix != ".json":
                 raise ReportingError(f"unknown backup evidence: {descendant}")
             try:
-                load_backup(descendant, required=True)
+                load_backup(
+                    descendant,
+                    run_dir=run_dir,
+                    required=True,
+                )
             except Exception as error:
                 raise ReportingError(str(error)) from error
 

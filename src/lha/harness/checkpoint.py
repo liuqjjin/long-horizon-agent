@@ -22,11 +22,18 @@ import json
 import logging
 import os
 import re
-import stat
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from ..durable_io import (
+    anchored_atomic_replace_bytes,
+    anchored_file_exists,
+    anchored_open_lock_file,
+    anchored_read_bytes,
+    anchored_update_bytes,
+    durable_mkdir_chain,
+)
 from .errors import CheckpointCorrupt, RunLocked
 from .state import RunState, StepRecord
 
@@ -43,26 +50,16 @@ def _canonical(payload: dict) -> str:
 
 
 def _fsync_write(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    # fsync the directory so the rename itself is durable
-    try:
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:  # pragma: no cover - platform without dir fsync
-        pass
+    anchored_atomic_replace_bytes(
+        path,
+        text.encode("utf-8"),
+        anchor=path.parent,
+    )
 
 
 def save_state(state: RunState) -> None:
     run_dir = Path(state.run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    durable_mkdir_chain(run_dir)
     payload = state.model_dump(mode="json")
     envelope = {
         "schema_version": _ENVELOPE_VERSION,
@@ -73,9 +70,12 @@ def save_state(state: RunState) -> None:
 
 
 def load_state(run_dir: str | Path) -> RunState:
-    path = Path(run_dir) / STATE_FILE
+    root = Path(run_dir)
+    path = root / STATE_FILE
     try:
-        raw = json.loads(path.read_text())
+        checkpoint = anchored_read_bytes(path, anchor=root)
+        assert checkpoint is not None
+        raw = json.loads(checkpoint)
     except (OSError, json.JSONDecodeError) as e:
         raise CheckpointCorrupt(f"unreadable checkpoint {path}: {e}") from e
 
@@ -151,76 +151,73 @@ def _ledger_sha256(record: StepRecord) -> str:
 
 
 def append_ledger(state: RunState, record: StepRecord) -> None:
-    path = Path(state.run_dir) / LEDGER_FILE
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise CheckpointCorrupt(f"ledger path is unsafe: {path}")
+    root = Path(state.run_dir)
+    path = root / LEDGER_FILE
+    durable_mkdir_chain(path.parent)
     # A crash can leave a torn final line. Appending after it would merge two
     # records into one corrupt mid-file line (which read_ledger rightly refuses),
     # so drop the fragment first — it was never durable, and read_ledger already
     # treats it as lost.
-    if path.exists():
-        raw = path.read_bytes()
-        if raw and not raw.endswith(b"\n"):
-            durable_end = raw.rfind(b"\n") + 1
-            with open(path, "rb+") as f:
-                f.truncate(durable_end)
-                f.flush()
-                os.fsync(f.fileno())
-            raw = raw[:durable_end]
-        existing = read_ledger(path.parent)
-        for current in existing:
+    try:
+        raw = anchored_read_bytes(path, anchor=root, missing_ok=True)
+    except OSError as error:
+        raise CheckpointCorrupt(f"ledger path is unsafe: {path}: {error}") from error
+    expected_raw = raw or b""
+    existing = _parse_ledger_bytes(path, expected_raw)
+    for current in existing:
+        if (
+            record.idempotency_key
+            and current.idempotency_key == record.idempotency_key
+        ):
             if (
-                record.idempotency_key
-                and current.idempotency_key == record.idempotency_key
+                current.step_id,
+                current.phase,
+                current.attempt_id,
+                current.artifact_ref,
+                current.verdict_ref,
+                current.evidence_sha256,
+            ) != (
+                record.step_id,
+                record.phase,
+                record.attempt_id,
+                record.artifact_ref,
+                record.verdict_ref,
+                record.evidence_sha256,
             ):
-                if (
-                    current.step_id,
-                    current.phase,
-                    current.attempt_id,
-                    current.artifact_ref,
-                    current.verdict_ref,
-                    current.evidence_sha256,
-                ) != (
-                    record.step_id,
-                    record.phase,
-                    record.attempt_id,
-                    record.artifact_ref,
-                    record.verdict_ref,
-                    record.evidence_sha256,
-                ):
-                    raise CheckpointCorrupt(
-                        f"ledger idempotency key {record.idempotency_key!r} "
-                        "was reused for a different event"
-                    )
-                return
-    else:
-        existing = []
+                raise CheckpointCorrupt(
+                    f"ledger idempotency key {record.idempotency_key!r} "
+                    "was reused for a different event"
+                )
+            return
     previous = _ledger_sha256(existing[-1]) if existing else None
     record = record.model_copy(update={"prev_event_sha256": previous})
-    with open(path, "a") as f:
-        f.write(record.model_dump_json() + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    line = (record.model_dump_json() + "\n").encode()
+
+    def append(current: bytes | None) -> bytes:
+        current = current or b""
+        if current != expected_raw:
+            raise CheckpointCorrupt(f"ledger changed while appending: {path}")
+        if current and not current.endswith(b"\n"):
+            current = current[: current.rfind(b"\n") + 1]
+        return current + line
+
     try:
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except OSError:  # pragma: no cover - platform without directory fsync
-        pass
+        anchored_update_bytes(path, append, anchor=root)
+    except OSError as error:
+        raise CheckpointCorrupt(f"ledger path is unsafe: {path}: {error}") from error
 
 
 def read_ledger(run_dir: str | Path) -> list[StepRecord]:
-    path = Path(run_dir) / LEDGER_FILE
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise CheckpointCorrupt(f"ledger path is unsafe: {path}")
-    if not path.exists():
-        return []
+    root = Path(run_dir)
+    path = root / LEDGER_FILE
     try:
-        raw = path.read_bytes()
+        value = anchored_read_bytes(path, anchor=root, missing_ok=True)
     except OSError as error:
-        raise CheckpointCorrupt(f"unreadable ledger {path}: {error}") from error
+        raise CheckpointCorrupt(f"ledger path is unsafe: {path}: {error}") from error
+    return _parse_ledger_bytes(path, value or b"")
+
+
+def _parse_ledger_bytes(path: Path, raw: bytes) -> list[StepRecord]:
     if raw and not raw.endswith(b"\n"):
         logger.warning("dropping torn final ledger line in %s", path)
         raw = raw[: raw.rfind(b"\n") + 1]
@@ -272,8 +269,15 @@ class FileCheckpointer:
 
     def get_tuple(self, thread_id: str) -> RunState | None:
         validate_run_id(thread_id)
-        path = self.runs_dir / thread_id / STATE_FILE
-        if not path.exists():
+        run_dir = self.runs_dir / thread_id
+        path = run_dir / STATE_FILE
+        try:
+            exists = anchored_file_exists(path, anchor=run_dir)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise CheckpointCorrupt(f"checkpoint path is unsafe: {path}: {error}") from error
+        if not exists:
             return None
         return load_state_by_id(self.runs_dir, thread_id)
 
@@ -289,18 +293,11 @@ def run_lock(run_dir: str | Path) -> Iterator[None]:
     released automatically on process exit.
     """
     path = Path(run_dir) / ".run.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise CheckpointCorrupt(f"run lock path is unsafe: {path}")
-    flags = os.O_RDWR | os.O_CREAT
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    durable_mkdir_chain(path.parent)
     try:
-        fd = os.open(path, flags, 0o600)
+        fd = anchored_open_lock_file(path, anchor=path.parent)
     except OSError as error:
-        raise CheckpointCorrupt(f"cannot open run lock safely: {path}: {error}") from error
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-        os.close(fd)
-        raise CheckpointCorrupt(f"run lock path is not a regular file: {path}")
+        raise CheckpointCorrupt(f"run lock path is unsafe: {path}: {error}") from error
     try:
         try:
             import fcntl
@@ -308,9 +305,6 @@ def run_lock(run_dir: str | Path) -> Iterator[None]:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (BlockingIOError, OSError) as e:
             raise RunLocked(f"run is already active: {Path(run_dir).name}") from e
-        os.ftruncate(fd, 0)
-        os.write(fd, f"pid={os.getpid()}\n".encode())
-        os.fsync(fd)
         yield
     finally:
         try:

@@ -20,7 +20,11 @@ from conftest import hermetic_task
 from lha.artifacts import Patch
 from lha.config import Config
 from lha.harness import Harness
+from lha.harness.approval import HumanApprovalGate
+from lha.llm.trace import TracedLLM
+from lha.reporting import collect_run
 from lha.tools import policy
+from lha.tools.patch import resolve_patch
 from lha.verifiers.verdict import Verdict
 
 
@@ -34,12 +38,22 @@ from lha.verifiers.verdict import Verdict
         "pkg/module_test.py",
         "conftest.py",
         "src/pkg/conftest.py",
+        "pytest.py",
+        "src/pkg/PyTest.py",
+        "pytest/__main__.py",
+        "_pytest/config.py",
+        "pytest_jsonreport/plugin.py",
+        "sitecustomize.py",
+        "src/pkg/usercustomize.py",
         "pyproject.toml",
         "setup.py",
         "setup.cfg",
         "tox.ini",
         "noxfile.py",
         "pytest.ini",
+        ".pytest.ini",
+        "pytest.toml",
+        ".pytest.toml",
         "ruff.toml",
         "uv.lock",
         "requirements-dev.txt",
@@ -95,6 +109,73 @@ def test_strip_protected_removes_only_protected():
     assert stripped.touched_files == ["src/app.py"]
 
 
+def test_custom_pytest_collection_paths_are_protected(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n"
+        'testpaths = ["quality"]\n'
+        'python_files = ["checks_*.py"]\n'
+    )
+    (tmp_path / "quality").mkdir()
+    (tmp_path / "quality" / "checks_behavior.py").write_text(
+        "def test_behavior():\n    assert False\n"
+    )
+    (tmp_path / "quality" / "helper.py").write_text("VALUE = 1\n")
+
+    discovered = policy.discover_pytest_oracle_paths(tmp_path)
+
+    assert discovered == ["quality/checks_behavior.py"]
+    resolved = resolve_patch(
+        Patch(
+            step_id="s",
+            file_contents={"quality/checks_behavior.py": "def test_behavior(): pass\n"},
+        )
+    )
+    assert policy.check_resolved(
+        resolved,
+        additional_protected_files=discovered,
+    ) == ["quality/checks_behavior.py"]
+
+
+class _CustomCollectorTamperingLLM:
+    name = "custom-collector-tampering"
+
+    def propose_patch(self, step, bundle, workdir):
+        return Patch(
+            step_id=step.step_id,
+            file_contents={
+                "quality/checks_behavior.py": "def test_behavior():\n    assert True\n"
+            },
+            touched_files=["quality/checks_behavior.py"],
+        )
+
+    def plan(self, task, template):
+        return None
+
+
+def test_harness_refuses_patch_to_custom_collected_test(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n"
+        'testpaths = ["quality"]\n'
+        'python_files = ["checks_*.py"]\n'
+    )
+    (repo / "quality").mkdir()
+    oracle = repo / "quality" / "checks_behavior.py"
+    oracle.write_text("def test_behavior():\n    assert False\n")
+    task = hermetic_task("data/tasks/fix_average.yaml").model_copy(
+        update={"target_repo": str(repo)}
+    )
+    harness = Harness(_cfg(tmp_path))
+    harness.llm = _CustomCollectorTamperingLLM()
+
+    result = harness.run(task)
+
+    assert result.status == "FAILED"
+    run_oracle = Path(result.state.workdir) / "quality" / "checks_behavior.py"
+    assert run_oracle.read_text() == oracle.read_text()
+
+
 # --- end to end: tampering cannot produce DONE --------------------------------
 class _TamperingLLM:
     """A 'model' that always cheats: it rewrites the test to pass instead of
@@ -115,6 +196,9 @@ class _TamperingLLM:
     def plan(self, task, template):
         return None
 
+    def set_trusted_oracle_paths(self, paths) -> None:
+        self.trusted_oracle_paths = tuple(paths)
+
 
 def _cfg(tmp_path: Path, **over) -> Config:
     return Config(
@@ -130,7 +214,7 @@ def _run_with_tampering(tmp_path, harness_cls, **cfg_over):
     task = hermetic_task("data/tasks/fix_average.yaml")
     h = harness_cls(_cfg(tmp_path, **cfg_over))
     inner = getattr(h, "_h", h)  # LangGraphHarness wraps a Harness
-    inner.llm = _TamperingLLM()
+    inner.llm = TracedLLM(_TamperingLLM())
     return h.run(task)
 
 
@@ -159,6 +243,12 @@ def test_tampering_model_fails_under_langgraph_too(tmp_path):
 
     result = _run_with_tampering(tmp_path, LangGraphHarness)
     assert result.status == "FAILED"
+    report = collect_run(tmp_path / "runs", result.state.run_id)
+    assert report.state.status == "FAILED"
+    resumed_harness = LangGraphHarness(_cfg(tmp_path))
+    resumed_harness._h.llm = TracedLLM(_TamperingLLM())
+    resumed = resumed_harness.resume(result.state.run_id)
+    assert resumed.status == "FAILED"
     workdir = Path(result.state.run_dir) / "workdir"
     canonical = Path("data/sample_repo/tests/test_mathutils.py").read_text()
     assert (workdir / "tests/test_mathutils.py").read_text() == canonical
@@ -180,3 +270,47 @@ def test_task_manifest_can_authorize_protected_paths(tmp_path):
     # explicitly authorized: the patch applies and the (rewritten) suite passes.
     # This is the manifest's job — an auditable, per-task decision.
     assert result.status == "DONE"
+
+
+@pytest.mark.parametrize("runtime", ["loop", "langgraph"])
+def test_authorized_test_change_survives_approval_resume(
+    runtime: str,
+    tmp_path: Path,
+) -> None:
+    config = _cfg(tmp_path)
+    if runtime == "langgraph":
+        pytest.importorskip("langgraph")
+        from lha.runtime.langgraph_runner import LangGraphHarness
+
+        harness = LangGraphHarness(config)
+    else:
+        harness = Harness(config)
+    inner = getattr(harness, "_h", harness)
+    inner.llm = _TamperingLLM()
+    task = hermetic_task(
+        "data/tasks/fix_average_approval.yaml"
+    ).model_copy(
+        update={
+            "allowed_protected_files": [
+                "tests/test_mathutils.py",
+            ]
+        }
+    )
+
+    paused = harness.run(task)
+
+    assert paused.status == "AWAITING_APPROVAL"
+    HumanApprovalGate(paused.state.run_dir).resolve(
+        approved=True,
+        note="authorized test change",
+    )
+    if runtime == "langgraph":
+        resumed = LangGraphHarness(config).resume(paused.state.run_id)
+    else:
+        resumed = Harness(config).resume(paused.state.run_id)
+
+    assert resumed.status == "DONE", resumed.message
+    changed = (
+        Path(resumed.state.workdir) / "tests" / "test_mathutils.py"
+    ).read_text()
+    assert changed == "def test_average():\n    assert True\n"

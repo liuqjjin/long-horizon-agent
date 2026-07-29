@@ -1,349 +1,167 @@
 # Changelog
 
-All notable changes to this project are documented here. The format is based on
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project aims to
-follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Notable changes are listed here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
 ### Added
-- **Durable patch transactions.** `ResolvedPatch` derives one write set from the
-  actual patch, and `PatchTransaction` records
-  `PREPARED`/`APPLIED`/`VERIFIED`/`REVERTED` with a checksummed journal,
-  per-attempt artifacts, and redundant backups. Backups preserve original bytes,
-  file modes, and directories created by a patch.
-- **Run-state schema v2.** Checkpoints now persist stable attempt IDs, cumulative
-  model usage, and the original step, repair, deadline, and model-call limits.
-  Resume rejects any configuration drift in those limits. A per-run lock rejects
-  concurrent resume, while ledger idempotency keys prevent duplicate approval
-  and completion events. Schema-v1 runs remain inspectable but are not resumed
-  unsafely.
-- **Five fixed 10-step repository tasks** under `data/long_tasks/`, covering
-  configuration parsing, SQLite migration, concurrency, CLI contracts, and
-  experiment reproducibility. Their integration protocol includes a rejected
-  first patch, repair, two approvals, a process interruption, and comparison
-  with an uninterrupted terminal state.
-- **Typed `RepoAdapter` stages** for integrity, setup, baseline, reproduction,
-  targeted tests, full tests, lint, build, and cleanup. Stage intent is written
-  before execution; ambiguous completion fails closed rather than replaying a
-  possible side effect.
-- **Validated run reporting.** `lha trace --html` writes a self-contained static
-  report; `lha runs list|show|prune` inspects evidence and performs dry-run-first
-  retention. Locked, active, or corrupt runs cannot be pruned.
+
+- Added `ResolvedPatch` and `PatchTransaction`. The write set now comes from the
+  actual patch, and every attempt records `PREPARED`, `APPLIED`, `VERIFIED`, or
+  `REVERTED` with manifests and redundant backups.
+- Added run-state schema v2 with stable attempt IDs, saved budgets, cumulative
+  model usage, run locks, and ledger idempotency keys. Schema-v1 runs remain
+  readable but cannot be resumed as schema v2.
+- Added five fixed 10-stage repository fixtures covering configuration parsing,
+  SQLite migration, concurrency, CLI contracts, and experiment reproduction.
+- Added typed repository stages with intent and completion records. Recovery
+  does not repeat a stage that may already have produced a side effect.
+- Added validated run inspection, self-contained HTML traces, and dry-run-first
+  pruning through `lha runs`.
+- Added a Terminal-Bench 2.1 adapter for Harbor 0.20.
+- Fixed the 20-task evaluation protocol before the scored run. The committed
+  schema-v4 package contains its manifests, source and wheel attestation,
+  summary, and public trial evidence.
+- Added CI checks that rebuild the exact wheel used by Terminal-Bench from its
+  recorded Git commit and reject a release that no longer contains that commit.
 
 ### Changed
-- **Codex CLI isolation and protocol validation** now use an attempt-local home,
-  credential copy, workspace, temporary directory, minimal environment, and a
-  dedicated process group. Malformed or incomplete JSONL, unknown events, error
-  events, and unfinished/disallowed tool use fail closed. Secret-free
-  provenance records CLI version, model, reasoning effort, event summary, usage,
-  and outcome.
-- **Experiment evidence** binds input/output arrays with hashes, shapes, dtypes,
-  and finite-value checks. Reproducibility uses a fresh rerun directory and
-  refuses stale, missing, or mismatched artifacts.
-- **Context evidence** records requested kinds, source digests, partial
-  availability, and failure reasons instead of conflating empty results with an
-  unavailable or damaged index.
-- **Horizon statistics** now report paired cells, observed complete-corpus
-  episodes, and descriptive composition as three separate estimands. Cell- and
-  episode-level McNemar tests may differ; composition adds no samples and has no
-  McNemar p-value.
-- **Boundary-rate intervals use Wilson scores.** Interior rates retain the
-  task-cluster bootstrap; an all-zero or all-one sample no longer receives a
-  misleading zero-width percentile interval.
-- Packaged CocoIndex flows moved under `src/lha/live_context/flows/`, and release
-  checks now build and install both wheel and source distribution from empty
-  directories.
-- Public documentation was updated for the transaction, long-task, reporting,
-  packaging, and statistical contracts. The root README remains Chinese; the
-  compact English overview is `docs/README.en.md`.
 
-### Measurement
-- The frozen schema-v2 ablation contains 17 tasks × 12 repetitions = 204 paired
-  cells, scored independently in Docker with 0 `ERROR` cells. With Codex CLI
-  0.141.0, `gpt-5.4-mini`, low reasoning effort, and read-only mode, `trust`
-  produced 194 correct and 10 incorrect deliveries. `gate` accepted the 194
-  correct attempts and rejected all 10 incorrect attempts; bounded repair then
-  brought `verify` to 204/204 correct. The exact two-sided McNemar result for
-  `trust` versus `verify` is `p = 0.00195`.
-- Across the 12 observed whole-corpus episodes, `trust` completed 2/12 and
-  `verify` completed 12/12. The separate horizon composition adds zero
-  independent samples and is reported only as a model-based projection.
-- The release gate produced `523 passed, 3 skipped`, 83% statement coverage,
-  and `lha eval` at 6/6. Generated files under `benchmarks/` remain the
-  authoritative source for experiment numbers.
-- Terminal-Bench and SWE-bench adapters do not imply a score. No public
-  benchmark result is claimed in this release section.
+- Codex CLI calls now use temporary homes, workspaces, credential copies, a
+  restricted environment, and a separate process group. Malformed or incomplete
+  JSONL and unfinished or disallowed tool use fail the call.
+- Experiment records now bind arrays by path, shape, data type, digest, and
+  input digest. Reproduction runs in a new directory and rejects missing,
+  stale, non-finite, or mismatched data.
+- Context records now distinguish no result, unavailable backend, failed index,
+  stale source, and partial availability.
+- Horizon reports now separate paired cells, complete-corpus repetition
+  aggregates, and descriptive composition. Schema-v4 paired inference uses the
+  task-cluster sign-flip test; cell discordance is descriptive, and composition
+  adds no samples.
+- Boundary proportions use Wilson score intervals. Interior rates continue to
+  use a task-cluster bootstrap.
+- Packaged context flows moved under `src/lha/live_context/flows/`. Release
+  checks install both wheel and source distribution outside the checkout.
+- Public documentation was shortened and reorganized around commands,
+  implementation, evaluation status, and known limits.
+- The application image now bundles a pinned `all-MiniLM-L6-v2` snapshot and
+  loads it offline, so container self-eval does not download model files.
+- Host, Codex, and Claude subprocesses now bound output, reject invalid timeout
+  values, terminate their original process groups on handled exit paths, and
+  fail when that group cleanup cannot be confirmed.
+
+### Evaluation record
+
+- The schema-v2 ablation files are retained as records of the earlier protocol.
+  The scoring boundary, error classification, and evidence format have since
+  changed, so those files are not the current project result. New ablation
+  numbers require a complete schema-v4 rerun.
+- The preregistered Terminal-Bench 2.1 fixed 20-task subset produced 7 `PASS`,
+  9 `FAIL`, and 4 `ERROR`; all errors remain in the denominator. This is a
+  fixed-subset result, not a full-dataset or leaderboard score.
+- No SWE-bench score is published.
 
 ## [0.4.1] — 2026-07-25
 
 ### Fixed
-- **`lha eval` now asserts the same thing in every environment.** The first CI run
-  this repository ever executed scored `3/5`, not `5/5`: `data/tasks/fix_average.yaml`
-  carries the fail-closed default `context_requirement: required`, and a runner
-  without `cocoindex-code` has no code-search backend, so the issue-to-PR and resume
-  cases failed closed. The harness was right and the claim was wrong — the
-  documented "`5/5` from a clean checkout" quietly depended on `ccc` being installed
-  on the developer's machine, and CI had never run before because the project had no
-  remote.
 
-  Rather than relax the assertion, the two loop cases now declare retrieval optional
-  (their oracle is the real `pytest` run, the same judgement `tests/conftest.py`
-  already makes for the unit suite) and fail-closed context became **a case of its
-  own** that forces the backend dark instead of depending on the machine. Net
-  coverage goes up, not down: the self-eval is now `6/6`, verified both with a code
-  backend available and with `LHA_CODE_BACKEND=null`.
-
-### Added
-- CI badge, and a `fail-closed context` dimension in the self-eval
-  (`required_context_unavailable`) that passes only when the run fails **and** the
-  verdict names the unavailable context — a failure for the right reason.
+- Made the repository self-eval independent of whether `ccc` is installed.
+  Code-fix and resume cases now declare retrieval optional because their oracle
+  is Pytest. A separate case forces the context backend unavailable and passes
+  only when the run fails for that reason.
+- Added the CI badge and the fail-closed context case.
 
 ## [0.4.0] — 2026-07-25
 
 ### Added
-- **Horizon analysis** (`lha horizon`, `src/lha/horizon.py`): carries the measured
-  per-step effect onto the axis the thesis argues about. An *episode* is `k`
-  independent subtasks and is correct through step `k` only if all of `1..k`
-  truly succeeded, as graded by the ablation's independent scorer. The curve is
-  the compounding model evaluated at the measured per-task `p`, computed exactly
-  (elementary symmetric polynomial over random orderings, no sampling noise) with
-  a task-cluster bootstrap interval. The v0.4.0 generated output is historical;
-  its assumption that cell- and episode-level paired tests must agree was
-  corrected under Unreleased. Current results come only from regenerated
-  `benchmarks/horizon_report.*`.
-- `bench.stats.wilson_interval`: a score interval for boundary proportions, where a
-  percentile bootstrap degenerates to a zero-width `0%–0%` artifact.
-- **Execution backends** (`lha.sandbox`): a single seam for everywhere
-  target/model-influenced code runs. `trusted-local` (scrubbed environment,
-  process-group kill, opt-in rlimits) for this repo's own dev loop;
-  `docker` (`--network none`, empty env, memory/pids caps, read-only source
-  mounts) for external code. Selected via `LHA_EXEC_BACKEND`/`LHA_EXEC_IMAGE`;
-  verifiers, the experimenter, and the ablation scorer all run through it.
-- **Independent final scorer in `lha ablate`**: the internal gate is now only a
-  *prediction*; the *truth* comes from applying the frozen source diff (SHA-256
-  recorded) to a fresh canonical copy and running the canonical tests on a
-  separate backend. Reports gained a per-condition confusion matrix
-  (TP/FP/TN/FN, precision/recall), task-cluster bootstrap 95% CIs (10k
-  resamples), a provenance fingerprint that also keys the resume cache, and an
-  explicit ERROR column (transient cells are shown, excluded from rates, and
-  never cached).
-- **Six harder corpus tasks** (`data/bench/{lru,csvlite,spans,slugify,runstats,
-  urljoin}`): the issue names one symptom, the docstring pins the contract, the
-  oracle enforces edge cases a symptom-only fix misses. Authored and calibrated
-  (planted bug fails, hand-written reference fix passes) before any model saw
-  them. Corpus is now 17 tasks.
-- **Public-benchmark adapters** (`lha.bench`): SWE-bench Verified predictions
-  writer + official invocation + report parser (errors stay in the
-  denominator), a Harbor `BaseInstalledAgent` for Terminal-Bench 2 that only
-  copies verified (`DONE`) workdirs onto the graded filesystem, and exact
-  McNemar + cluster-bootstrap statistics. Contract tests only — no runs, no
-  claimed numbers. `[bench]` extra.
-- **Durable checkpoints**: `state.json` is a checksummed, fsynced envelope;
-  loading verifies integrity and semantic bounds and refuses to resume from
-  damage (`CheckpointCorrupt`). Ledger records carry unique `event_id`s and are
-  fsynced; a torn final line is dropped as a crash artifact, mid-file
-  corruption raises. Crash-injection tests cover kills during
-  context/execute/verify, tampered/truncated state, and duplicate-side-effect
-  freedom on resume.
-- **LLM call accounting** (`TracedLLM`): per-call `llm_trace.jsonl` (duration,
-  tokens, cost from the claude CLI's JSON output), an `LHA_MAX_LLM_CALLS`
-  budget that pauses the run instead of looping on a broken backend, and
-  `llm_usage` totals in `lha run --json`. `LHA_CLAUDE_MODEL` pins a model
-  snapshot.
-- **Artifact-bound approvals**: an approval now binds to the SHA-256 of the
-  exact patch bytes (recorded in a per-step manifest with pre-apply file
-  hashes and verifier/policy config). On resume, a decision whose hash no
-  longer matches is treated as tamper evidence: the change is reverted and the
-  run fails closed. The LangGraph runner splits prepare/gate/verify into
-  separate nodes so the reviewed artifact is checkpointed before the
-  interrupt.
-- **Oracle protection in normal runs** (`lha.tools.policy`): a patch that
-  touches test files, `conftest.py`, or build/CI config is refused before it
-  reaches the sandbox and the refusal is fed to the repair loop; a task
-  manifest may allowlist specific protected paths.
+
+- Added `lha horizon` for cell, complete-repetition, and composition analysis.
+  The first generated report incorrectly required cell and episode McNemar
+  values to match; the current report removes that assumption.
+- Added `trusted-local` and Docker execution backends for target- or
+  model-influenced commands.
+- Added a separate ablation scoring path. It applies frozen source changes to new
+  canonical repositories and runs original tests through a separate backend.
+- Expanded the internal defect corpus from 11 to 17 tasks.
+- Added SWE-bench Verified and Terminal-Bench adapters with contract tests.
+  This release did not publish public benchmark results.
+- Added checksummed checkpoints, append-only ledger validation, crash-injection
+  tests, and persistent model-call accounting.
+- Bound approvals to the saved patch digest and protected tests, build files,
+  and CI configuration from unapproved edits.
 
 ### Changed
-- **Context failures now fail closed.** Bundles carry a status
-  (`ok`/`empty`/`backend_unavailable`/`index_failed`); search backends raise
-  `BackendUnavailable` instead of returning an empty list; reindex returns a
-  structured result and a failed refresh keeps the stale flag set. Steps
-  declare `context_requirement` (default `required`) and the freshness/citation
-  verifiers fail a required step with no usable context.
-- **Repair steps re-gather context from the run sandbox** (workdir overlay),
-  so the second attempt reasons over the failing state, not the pristine index.
-- The **reproducibility verifier requires an input digest**
-  (`input_sha256`/`inputs`) and, in a git checkout, a commit; a re-run must
-  reproduce the same input digest, so matching metrics on different data no
-  longer count as reproduction.
-- **cocoindex/sentence-transformers moved to the `[context]` extra.** Without
-  it the vector backends report "unavailable" (fail-closed for required
-  context) with an install hint; the dev group still installs both.
-- The ablation headline was re-measured under the new independent-scorer method.
-  Those v0.4.0 measurements and the earlier gate-graded headline are historical
-  and superseded; current numbers come only from the regenerated report named in
-  the Unreleased section.
-- Reworded documentation and code comments for a plainer, more consistent voice, and
-  renamed the self-eval suite (previously "ResearchAgentBench-Lite") to "self-eval".
-  No behavior change.
-- `lha ablate` report output is now a plain table plus a one-line factual summary,
-  without the editorial header line or emoji status legend.
-- Skill notes record provenance: the SHA-256 of the verdict that justified
-  them and the harness version.
+
+- Required context now fails when the backend or index is unavailable.
+- Repair attempts reload code from the current run workspace.
+- Reproducibility checks require an input digest and, in Git repositories, a
+  commit identifier.
+- Context dependencies moved to the optional `context` extra.
+- Ablation results were regenerated with the separate scoring path. These
+  schema-v2 results are now retained as historical protocol records.
+- Renamed the old self-eval label to `self-eval`.
+- Ablation reports now use a plain table and retain explicit `ERROR` cells.
 
 ### Fixed
-- **`Verdict.from_checks` now fails an empty check list closed.** It returned
-  `passed=True`, so the harness's first rule — a check that cannot run fails —
-  held for the parts but not for the aggregate. Every call site already guarded
-  it, so no run ever passed vacuously, but the guard was a convention rather than
-  a property of the type. Pinned by `tests/test_verdict_failclosed.py`.
-- Documentation drift caught by re-running the gate: ablation and coverage
-  numbers no longer matched their generated output, `docs/demo.md` embedded a
-  file that did not exist, and `.env.example` omitted supported variables.
-- Untracked `.coverage`, a local artifact that had been committed.
+
+- `Verdict.from_checks` now rejects an empty list.
+- Removed a committed local coverage file and corrected stale documentation.
 
 ## [0.3.0] — 2026-06-28
 
 ### Added
-- **Verification ablation** (`lha ablate`): measures the project's central claim
-  against a real LLM. A paired design draws one first attempt per task and scores the
-  same attempt under `trust` (apply and accept), `gate` (apply, run the test gate,
-  refuse on failure), and `verify` (gate plus repair loop), reporting claimed vs true
-  vs false success. It is leak-free (single-shot implementer with file tools denied,
-  shown only non-test source), oracle-protected (patches may edit source only; the test
-  oracle and config stay canonical), and excludes transient backend errors (retried,
-  then recorded as ERROR, never counted). A weaker implementer `--model` calibrates
-  difficulty. See [docs/ABLATION.md](docs/ABLATION.md).
-- **Bug-fix benchmark corpus**: 11 small, self-contained Python repos
-  (`data/bench/*`, `data/tasks/bench_*.yaml`), each a planted bug with a pytest oracle,
-  spanning arithmetic/strings/recursion/stack/search/parsing. Each was screened so the
-  bug is real, the oracle catches a naive fix, and the issue stays symptom-level.
 
-### Changed
-- **Whole-file rewrites in the LLM implementer.** Real backends now return the full
-  corrected file (`file_contents`, a direct write) rather than a unified diff, which
-  `git apply` often rejects on minor context drift even when the fix is correct. A
-  display diff is still recorded for the artifact.
-- The **pytest verifier surfaces the failing assertion messages** (compact, ACI-style)
-  so the repair loop fixes the real defect instead of guessing from "tests failed".
-- The **implementer no longer dumps test files into the prompt** — a fix is reasoned
-  from the issue and structured failure feedback, not transcribed from the oracle.
-- `ClaudeCLIClient` gained `--model` and a `no_tools` (single-shot, tools-denied) mode.
+- Added `lha ablate` with paired `trust`, `gate`, and `verify` conditions.
+- Added 11 fixed Python defect repositories with Pytest oracles.
+- Added whole-file model patches while retaining a display diff.
+- Added compact Pytest failure output for repair prompts.
 
 ### Fixed
-- The **pytest verifier clears stale `__pycache__`** before running: a repair that
-  rewrites a file to the same byte-size within the same mtime-second could otherwise
-  be graded against cached bytecode, so the repair loop could never converge.
-- **Path-traversal hardening** in the whole-file parser: a `### ../escape` header (and
-  absolute paths) are refused, and a header naming a directory/binary file is skipped
-  rather than crashing the step.
 
-### CI
-- The CI now **builds the Docker image** (`docker` job), so the Docker build is checked
-  on every change.
+- Cleared stale Python bytecode before verification.
+- Rejected absolute paths, parent traversal, directories, and binary targets in
+  whole-file patch parsing.
+- Added Docker image builds to CI.
 
 ## [0.2.0] — 2026-06-22
 
 ### Added
-- **Dynamic LLM planning** (opt-in: `Config.dynamic_planning` / `LHA_DYNAMIC_PLANNING`,
-  default off). A real backend can decompose a task into a verifiable plan; the
-  candidate is validated (registered verifiers, path-safe step ids) and falls back to
-  the deterministic template on any failure, so the stub/`lha eval` path stays
-  reproducible.
-- **Per-step artifacts** under `runs/<id>/steps/<step_id>/` (verify/patch/experiment/
-  context), so a multi-step plan keeps every step's provenance; the PR/experiment
-  finalizers report the step that produced the result rather than whichever file wrote
-  last.
+
+- Added optional model-generated planning with typed validation and a
+  deterministic fallback.
+- Added per-step artifacts under `runs/<id>/steps/`.
 
 ### Changed
-- The **LangGraph runtime now enforces `deadline_s`** in addition to `max_steps`.
-- The **default-loop approval gate reuses the exact patch the human approved** on resume
-  rather than regenerating it (artifact-binding; see SECURITY.md for the LangGraph caveat).
+
+- Applied the saved deadline across LangGraph resume.
+- Reused the exact approved patch after resume instead of generating it again.
 
 ### Security
-- Step ids used as filesystem paths (per-step artifacts, backups) are sanitized to a
-  single safe segment, and dynamic plans carrying an unsafe step id are rejected — a
-  defense-in-depth guard now that plans can be model-generated.
+
+- Restricted step IDs used in filesystem paths to a safe single segment.
 
 ## [0.1.0] — 2026-06-22
 
-### Fixed — verification correctness
-
-- **ruff verifier gated on exit code.** A ruff invocation that *failed to run* (config
-  error, timeout, non-JSON output) silently passed; it now fails, upholding the
-  "a check that can't run must fail" rule (`pytest` already enforced it).
-- **LangGraph runtime reverts unverified/rejected patches**, matching the default loop —
-  a change that fails verification (or is rejected) no longer survives in the sandbox.
-- **Budget bounds the whole run across pause/resume.** `max_steps`/`deadline_s` were
-  per-process; cumulative `steps_used`/`elapsed_s` are now persisted and re-seeded on
-  resume (check-before-increment, so a pause is exact). `LHA_DEADLINE_S` now reaches the
-  loop and rejects non-finite/negative values.
-- **Anthropic backend fails closed** on `stop_reason` `max_tokens`/`refusal` instead of
-  returning a silently truncated/empty completion; default `max_tokens` 16000 (was a
-  truncating 4096) with adaptive thinking + high effort for `claude-opus-4-8`.
-- **A step that verified nothing no longer passes** (empty verifier list fails closed).
-- **Citations are checked on any provenance-bearing artifact** (e.g. experiments), not
-  only patches.
-- **Human rejection reverts the change**, and stale approval decisions can no longer be
-  misattributed to a later step (decisions carry a `step_id`).
-
-### Fixed — robustness
-
-- The loop **fails closed on an unexpected mid-step fault** (reverts, ledgers, checkpoints)
-  instead of wedging at `RUNNING` with a half-applied sandbox.
-- The orchestrator **survives a per-task spawn failure** (broadened beyond `TimeoutExpired`)
-  so one bad worker can't discard the whole batch; `lha eval` **isolates each case** so one
-  crash doesn't zero the report.
-- The skill-memory note is **re-indexed after recording**, closing the retrieval loop for
-  `issue_to_pr` runs.
-- The `claude_cli` backend **pipes the prompt via stdin** (avoids `E2BIG` on large repos).
-
-### Added — observability & deployability
-
-- `lha trace <run_id>` renders a run's ledger timeline; `-v/--verbose` enables logging.
-- **Containerization:** multi-stage `Dockerfile` (uv, non-root, layer-cached, HF cache),
-  `.dockerignore`, and `docs/DEPLOY.md`.
-- Packaging: `py.typed` marker, single-sourced `__version__`, MIT `LICENSE`, and PEP 639
-  license/keyword/classifier metadata.
-- Pinning tests for all of the above (`tests/test_hardening.py`, `tests/test_deployability.py`).
-
----
-
-Documentation & engineering-rigor pass (no behavior change unless noted):
-
 ### Added
-- README (tagline, error-compounding intro, mermaid diagram, `lha eval` table) and a
-  `docs/` set: `ARCHITECTURE`, `BENCHMARKS`, `VERIFICATION_FIRST` (why verification
-  comes first), and `demo` (GIF recording script).
-- GitHub Actions CI mirroring the local gate (ruff, pyright, facade-isolation grep,
-  pytest, `lha eval`) with embedding-model caching.
-- `pyright` type-checking of `src/lha` (0 errors) as part of the gate and CI.
-- Governance: `CONTRIBUTING`, `SECURITY`, `CODE_OF_CONDUCT`, and issue/PR templates.
 
-### Changed
-- Type-only hardening to reach a clean `pyright` run: explicit `None`-guards, Literal
-  narrowing, and a few targeted casts for third-party stub gaps. No logic changes;
-  `lha eval` remains 5/5.
+- Added the state-machine loop, checkpoint/resume, approval, and bounded repair.
+- Added code, experiment, and context verifier families.
+- Added the indexed-context facade and isolated CocoIndex and `ccc` behind it.
+- Added typed planning and execution components, batch execution, and an
+  optional LangGraph runtime.
+- Added run tracing, container packaging, type checking, CI, and project
+  governance files.
 
-### The initial feature-complete harness
+### Fixed
 
-### Added
-- **Verification loop:** `context → execute → verify → repair →
-  checkpoint → repeat`, with max-steps, durable checkpoint/resume, and a
-  human-approval gate. State is an atomic `state.json` plus an append-only
-  `ledger.jsonl`.
-- **Three verifier families behind one interface:** code (`pytest`, `ruff`),
-  experiment (`psnr`, `ssim`, `reproducibility` — metrics recomputed from output),
-  and context (`freshness`, `citation`). A check that can't run *fails*.
-- **Live-context facade** (`search_code` / `search_papers` / `search_experiments` /
-  `search_skills` / `get_fresh_context` / `reject_stale`) with CocoIndex and the
-  `ccc` code indexer fully isolated behind it (enforced by a grep).
-- **Agents** emitting structured artifacts (Supervisor, Context Engineer, Implementer,
-  Experimenter, Verifier) and a process-isolated batch **orchestrator** (`lha batch`).
-- **Opt-in LangGraph durable runtime** (`--runtime langgraph`): a `StateGraph`
-  checkpointed by `SqliteSaver` with `interrupt()`-based human approval.
-- **Skill memory:** verified successes recorded and retrieved as
-  context for future tasks.
-- **Self-eval** (`lha eval`): self-evaluation across issue-to-PR,
-  paper-to-experiment, resume, freshness, and verification-ablation (currently 5/5).
-- **CLI:** `lha run|resume|batch|eval|trace|index|index-docs|ask|approve|reject`.
+- Made Ruff configuration errors, timeouts, and invalid output fail the check.
+- Reverted rejected or unverified patches in both runtimes.
+- Persisted step and deadline budgets across resume.
+- Rejected truncated and refused Anthropic responses.
+- Rejected empty verifier sets.
+- Reverted a mid-step failure before saving terminal state.
+- Made batch and self-eval isolate per-task failures.
+- Piped Claude CLI prompts through standard input to avoid argument limits.

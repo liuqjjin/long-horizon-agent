@@ -62,6 +62,36 @@ def test_docker_context_excludes_local_credentials_and_build_outputs():
     assert "!.env.example" in patterns
 
 
+def test_application_image_pins_and_bundles_the_context_model():
+    root = Path(__file__).resolve().parents[1]
+    dockerfile = (root / "Dockerfile").read_text()
+
+    assert (
+        "ghcr.io/astral-sh/uv:0.11.16"
+        "@sha256:440fd6477af86a2f1b38080c539f1672cd22acb1b1a47e321dba5158ab08864d"
+        in dockerfile
+    )
+    assert (
+        "python:3.11-slim"
+        "@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93"
+        in dockerfile
+    )
+    assert (
+        "EMBEDDER_REVISION=1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+        in dockerfile
+    )
+    assert dockerfile.count("ARG EMBEDDER_REVISION") == 2
+    assert dockerfile.count("ARG EMBEDDER_REPOSITORY") == 2
+    assert "snapshot_download" in dockerfile
+    assert "allow_patterns=" in dockerfile
+    assert dockerfile.index("snapshot_download") < dockerfile.index("COPY . .")
+    assert "COPY --from=builder --chown=lha:lha /opt/lha/models /opt/lha/models" in dockerfile
+    assert "HF_HUB_OFFLINE=1" in dockerfile
+    assert "TRANSFORMERS_OFFLINE=1" in dockerfile
+    assert "COCOINDEX_DISABLE_USAGE_TRACKING=1" in dockerfile
+    assert "LHA_EMBEDDER_MODEL=/opt/lha/models/all-MiniLM-L6-v2" in dockerfile
+
+
 def test_cli_unexpected_error_has_a_stable_nonzero_exit_without_traceback(
     monkeypatch, capsys
 ):
@@ -132,7 +162,7 @@ def test_orchestrator_survives_spawn_failure(monkeypatch):
     def boom(*a, **k):
         raise OSError("EMFILE: too many open files")
 
-    monkeypatch.setattr(orchestrator.subprocess, "run", boom)
+    monkeypatch.setattr(orchestrator, "run_bounded_process", boom)
     outs = orchestrator.run_tasks(["a.yaml", "b.yaml"], max_workers=2)
     assert len(outs) == 2  # one bad spawn did not discard the whole batch
     assert all(o.status == "ERROR" for o in outs)
@@ -160,9 +190,11 @@ def test_loop_fails_closed_on_midstep_exception(tmp_path, monkeypatch):
     # run() must return a clean FAILED, not propagate the exception or wedge at RUNNING.
     result = Harness(_cfg(tmp_path)).run(hermetic_task("data/tasks/fix_average.yaml"))
     assert result.status == "FAILED"
-    # the fault is ledgered as a fail (not silently dropped).
+    # The fault type is durable, while backend-controlled exception text is
+    # returned to the caller but never copied into long-lived run evidence.
     ledger = (Path(result.state.run_dir) / "ledger.jsonl").read_text()
-    assert '"phase":"fail"' in ledger and "execute boom" in ledger
+    assert '"phase":"fail"' in ledger and "error: RuntimeError" in ledger
+    assert "execute boom" not in ledger
 
 
 def test_loop_reverts_applied_patch_on_midstep_fault(tmp_path, monkeypatch):

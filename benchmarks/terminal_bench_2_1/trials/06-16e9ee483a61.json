@@ -1,0 +1,172 @@
+{
+    "id": "aeab9942-a2bc-4a39-8bc3-a6d5b629021a",
+    "task_name": "terminal-bench/torch-tensor-parallelism",
+    "trial_name": "torch-tensor-parallelism__nsA4YLw",
+    "trial_uri": "file:///private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-06-16e9ee483a/torch-tensor-parallelism__nsA4YLw",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "torch-tensor-parallelism",
+        "ref": "sha256:f32ce74a5aeb6638480247ab799fe46127bbee631acdd0921b0f394ec49b3684"
+    },
+    "source": "terminal-bench/terminal-bench-2-1",
+    "task_checksum": "d0160c1fe523063419b445f7b2974b64ff72a842ad5dc2b970d256e7629f0426",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/torch-tensor-parallelism",
+            "ref": "sha256:f32ce74a5aeb6638480247ab799fe46127bbee631acdd0921b0f394ec49b3684",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2-1"
+        },
+        "trial_name": "torch-tensor-parallelism__nsA4YLw",
+        "trials_dir": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-06-16e9ee483a",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": 4.0,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "lha.bench.terminal_bench:LhaAgent",
+            "import_path": null,
+            "model_name": "gpt-5.5",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {
+                "wheel_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/lha-0.4.2.dev0-py3-none-any.whl",
+                "codex_binary_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/codex-x86_64-unknown-linux-musl",
+                "protocol_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/protocol.json",
+                "reasoning_effort": "xhigh",
+                "instance_id": "terminal-bench/torch-tensor-parallelism",
+                "run_kind": "scored",
+                "attempt_id": "32ef890b38b34763eacf22804669fd4b764b3c374da286300dfb7d54cd667a5a"
+            },
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "09a51a27-cd20-4f0a-a67b-04f8058fabec"
+    },
+    "agent_info": {
+        "name": "lha",
+        "version": "0.4.2.dev0",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": null
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 172349,
+        "n_cache_tokens": 125696,
+        "n_output_tokens": 11027,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": {
+            "dataset": "terminal-bench/terminal-bench-2-1",
+            "evaluation_id": "d88c314c61adf99a4315983a55287924",
+            "attempt_id": "32ef890b38b34763eacf22804669fd4b764b3c374da286300dfb7d54cd667a5a",
+            "dataset_version": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+            "agent_import_path": "lha.bench.terminal_bench:LhaAgent",
+            "instance_id": "terminal-bench/torch-tensor-parallelism",
+            "run_kind": "scored",
+            "model": "gpt-5.5",
+            "reasoning_effort": "xhigh",
+            "harbor_version": "0.20.0",
+            "codex_cli_version": "codex-cli 0.141.0",
+            "codex_binary_sha256": "1f37cb63f6c8c3e5e9dddb247a822706f153c00e553efe8c0b05f62d0e4f1cab",
+            "wheel_sha256": "d34e0569943102c73b8ac4d6209bf5a3a061fada285f7e00c6f70c107f10fac0",
+            "protocol_sha256": "02e63fe754d3254a761153220325e33a88809ec9e3e8a03459abc6c8926893a2",
+            "task_content_digest": "sha256:f32ce74a5aeb6638480247ab799fe46127bbee631acdd0921b0f394ec49b3684",
+            "task_image_digest": "sha256:c50ac169e11465f41b49749fe87e4487f24d31a0c39c0906cd3242cc5499c690",
+            "container_id": "c439ca5f9c621d316b591ebe08d7ea8fc80d650de9e1c1205ba651c2117ec966",
+            "container_image_id": "sha256:c50ac169e11465f41b49749fe87e4487f24d31a0c39c0906cd3242cc5499c690",
+            "container_configured_image": "alexgshaw/torch-tensor-parallelism:20251031",
+            "container_repo_digests": [
+                "alexgshaw/torch-tensor-parallelism@sha256:c50ac169e11465f41b49749fe87e4487f24d31a0c39c0906cd3242cc5499c690"
+            ],
+            "container_compose_project": "torch-tensor-parallelism__nsa4ylw__env",
+            "container_network_name": "torch-tensor-parallelism__nsa4ylw__env_default",
+            "post_quiescence_container_id": "c439ca5f9c621d316b591ebe08d7ea8fc80d650de9e1c1205ba651c2117ec966",
+            "broker_image_id": "sha256:82dbd69b53aec0323878ff4eaf4d0dff59b044aa0a8c77a53e94b9cdd113c603",
+            "broker_receipt_sha256": "644833d49d5eb8bdca3ef54571eb6d824a50b34034b788fa4cb4113f7afdcded",
+            "broker_accepted_requests": 10,
+            "broker_revoked": true,
+            "terminal_record_sha256": "cf88cee9a7f7ac17215a8275143c3c4d1b81daa68a603d23bfc3d27dea043adb",
+            "codex_events_sha256": "44db8729287fced75b0d9e8661075de46864fbaa9c8496936ca4229818119979",
+            "codex_event_counts": {
+                "item.completed": 23,
+                "item.started": 14,
+                "thread.started": 1,
+                "turn.completed": 1,
+                "turn.started": 1
+            },
+            "codex_item_counts": {
+                "agent_message": 9,
+                "command_execution": 24,
+                "file_change": 4
+            },
+            "codex_tool_calls": 14,
+            "codex_reconnect_notices": 0,
+            "codex_reasoning_output_tokens": 8174,
+            "infrastructure_retries_used": 0,
+            "smoke_seal_sha256": "9640b0c413c65c6267407d46c0c1790f2d3aad8d68a138f445d10d21198d2bab"
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 0.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-07-27T20:17:09.968592Z",
+    "finished_at": "2026-07-27T20:23:31.097667Z",
+    "environment_setup": {
+        "started_at": "2026-07-27T20:17:09.988651Z",
+        "finished_at": "2026-07-27T20:17:10.901302Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-07-27T20:17:10.901376Z",
+        "finished_at": "2026-07-27T20:17:14.594790Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-07-27T20:17:14.595022Z",
+        "finished_at": "2026-07-27T20:21:18.856048Z"
+    },
+    "verifier": {
+        "started_at": "2026-07-27T20:21:19.218534Z",
+        "finished_at": "2026-07-27T20:23:20.387494Z"
+    },
+    "step_results": null
+}

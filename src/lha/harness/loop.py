@@ -8,6 +8,7 @@ state is a JSON checkpoint + a step ledger, shaped so LangGraph drops in later.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -29,15 +30,31 @@ from ..agents.experimenter import execute_experiment_once
 from ..artifacts import ExperimentResult, ExperimentSummary, Patch, Plan, PRSummary
 from ..clock import now
 from ..config import Config
+from ..durable_io import (
+    anchored_atomic_replace_bytes,
+    anchored_read_bytes,
+    anchored_write_once_bytes,
+    atomic_replace_text,
+    durable_mkdir_chain,
+    fsync_directory,
+)
 from ..live_context.models import ContextBundle
 from ..llm import get_llm
+from ..oracle_inventory import (
+    OracleInventoryError,
+    build_pytest_oracle_inventory,
+    validate_pytest_oracle_inventory,
+)
+from ..oracle_models import PytestOracleInventory
 from ..repo_adapter import (
     RepoAdapterSpec,
+    RepoIntegrityResult,
     RepoReferenceManifest,
     RepoStageRequest,
     execute_repo_stage_once,
     inspect_repo_integrity,
 )
+from ..sandbox import ProcessCleanupUnconfirmed
 from ..step_ids import canonical_artifact_segment
 from ..tasks.spec import TaskSpec
 from ..tools import policy
@@ -54,7 +71,12 @@ from ..tools.patch import (
     snapshot_paths,
 )
 from ..verifiers import VerifyContext
-from ..verifiers.verdict import Check, Verdict
+from ..verifiers.verdict import (
+    PROCESS_CLEANUP_UNCONFIRMED,
+    Check,
+    Verdict,
+    verdict_requires_process_quarantine,
+)
 from .approval import (
     ApprovalDecision,
     HumanApprovalGate,
@@ -78,18 +100,25 @@ from .errors import (
     TransactionCorrupt,
 )
 from .manifest import ArtifactManifest, build_manifest, saved_file_state, sha256_bytes
-from .state import RUN_STATE_SCHEMA, LLMUsageState, RunState, StepRecord
+from .state import (
+    RUN_STATE_SCHEMA,
+    LLMUsageState,
+    RunQuarantine,
+    RunState,
+    StepRecord,
+)
 from .transaction import (
     PatchTransaction,
     attempt_artifact_dir,
     build_transaction,
-    durable_artifact_write,
     list_transactions,
     load_transaction,
+    recover_transaction_journals,
     resolve_transaction_evidence,
     save_transaction,
     state_for_paths,
     validate_applied_state,
+    validate_terminal_transaction_state,
     validate_transaction_journals,
 )
 
@@ -128,21 +157,67 @@ def _dump(run_dir: Path, step_id: str, name: str, text: str) -> None:
     """Write an artifact both flat (back-compat / last-writer) and per-step under
     ``steps/<step_id>/`` so a multi-step plan keeps every step's provenance."""
     segment = _safe_seg(step_id)
-    (run_dir / name).write_text(text)
     step_dir = run_dir / "steps" / segment
-    step_dir.mkdir(parents=True, exist_ok=True)
-    (step_dir / name).write_text(text)
+    durable_mkdir_chain(step_dir, anchor=run_dir)
+    atomic_replace_text(run_dir / name, text, anchor=run_dir)
+    atomic_replace_text(step_dir / name, text, anchor=run_dir)
 
 
-def _write_immutable(path: Path, data: bytes) -> None:
+def _read_run_bytes(
+    run_dir: Path,
+    path: Path,
+    *,
+    label: str,
+    missing_ok: bool = False,
+) -> bytes | None:
+    """Read run-owned evidence without following links or accepting hardlinks."""
+    try:
+        return anchored_read_bytes(
+            path,
+            anchor=run_dir,
+            missing_ok=missing_ok,
+        )
+    except (OSError, ValueError) as error:
+        raise CheckpointCorrupt(f"{label} is missing or unsafe: {path}") from error
+
+
+def _write_immutable(
+    path: Path,
+    data: bytes,
+    *,
+    run_dir: Path,
+) -> None:
     """Create one attempt artifact once; a replay may only present identical bytes."""
-    if path.is_symlink():
-        raise CheckpointCorrupt(f"immutable artifact path is a symlink: {path}")
-    if path.exists():
-        if not path.is_file() or path.read_bytes() != data:
-            raise CheckpointCorrupt(f"immutable artifact changed: {path}")
-        return
-    durable_artifact_write(path, data)
+    try:
+        anchored_write_once_bytes(path, data, anchor=run_dir)
+    except (OSError, ValueError) as error:
+        raise CheckpointCorrupt(
+            f"immutable artifact changed or is unsafe: {path}"
+        ) from error
+
+
+def _validate_optional_aliases(
+    run_dir: Path,
+    authoritative: bytes,
+    aliases: list[Path],
+    *,
+    label: str,
+) -> None:
+    """Treat compatibility files as diagnostics, never as recovery authority."""
+    for alias in aliases:
+        alias_bytes = _read_run_bytes(
+            run_dir,
+            alias,
+            label=f"{label} alias",
+            missing_ok=True,
+        )
+        if alias_bytes is None:
+            continue
+        if alias_bytes != authoritative:
+            raise CheckpointCorrupt(
+                f"{label} alias does not match immutable attempt evidence "
+                f"(hash mismatch): {alias}"
+            )
 
 
 def _verdict_ref(attempt_id: str) -> str:
@@ -155,6 +230,22 @@ def _attempt_ref(attempt_id: str, name: str) -> str:
 
 def _initial_plan_ref() -> str:
     return (Path("plans") / "initial.json").as_posix()
+
+
+def _plan_failure_ref() -> str:
+    return (Path("plans") / "failure.json").as_posix()
+
+
+def _plan_failure_bytes(error_type: str) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "phase": "plan",
+            "error_type": error_type,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _repair_plan_ref(attempt_id: str) -> str:
@@ -171,7 +262,7 @@ def _persist_verdict(
 ) -> str:
     reference = _verdict_ref(attempt_id)
     path = run_dir / "steps" / _safe_seg(step_id) / reference
-    _write_immutable(path, verdict_json.encode("utf-8"))
+    _write_immutable(path, verdict_json.encode("utf-8"), run_dir=run_dir)
     _dump(run_dir, step_id, "verify.json", verdict_json)
     return reference
 
@@ -183,14 +274,25 @@ def _gen_run_id(task: TaskSpec) -> str:
 def _claim_run_dir(runs_dir: str | Path, run_id: str) -> Path:
     """Atomically reserve a run id before copying or checkpointing anything."""
     validate_run_id(run_id)
-    root = Path(runs_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    root = durable_mkdir_chain(runs_dir)
     run_dir = root / run_id
     try:
         run_dir.mkdir()
     except FileExistsError as error:
         raise FileExistsError(f"run already exists: {run_id}") from error
+    fsync_directory(run_dir)
+    fsync_directory(root)
     return run_dir
+
+
+def _discard_uninitialized_run_dir(run_dir: Path) -> None:
+    """Remove a reservation that never reached its first durable checkpoint."""
+    if (run_dir / "state.json").exists():
+        return
+    try:
+        shutil.rmtree(run_dir)
+    except FileNotFoundError:
+        pass
 
 
 def _policy_verdict(step_id: str, e: PolicyViolation) -> Verdict:
@@ -239,22 +341,243 @@ class Harness:
             return make_backend("docker", image=config.exec_image)
         return make_backend(config.exec_backend)
 
+    def _bind_execution_backend(self, run_dir: str | Path) -> None:
+        """Bind subprocess recovery to the run, independent of command cwd."""
+        expected = Path(run_dir).resolve()
+        bound = self.exec.bind_operation_lease_dir(run_dir)
+        if bound != expected:
+            raise CheckpointCorrupt(
+                "execution backend did not bind the requested operation lease directory"
+            )
+
+    @staticmethod
+    def _validate_terminal_resume(
+        state: RunState,
+        records: list[StepRecord],
+    ) -> None:
+        """Fail closed before returning a terminal checkpoint to a caller."""
+        from ..reporting import (
+            ReportingError,
+            validate_terminal_resume_evidence,
+        )
+
+        try:
+            validate_terminal_resume_evidence(
+                Path(state.run_dir),
+                state,
+                records,
+            )
+        except ReportingError as error:
+            raise CheckpointCorrupt(
+                f"terminal run evidence is invalid: {error}"
+            ) from error
+
+    def _resume_preflight(self, state: RunState) -> RunResult | None:
+        """Reap old commands and validate baseline tests before recovery mutates state."""
+        try:
+            recovery_backend = self.exec
+            recorded = state.runtime_contract
+            if recorded is not None:
+                recorded.verify_recorded_docker_control()
+            if recorded is not None and (
+                recorded.exec_backend == "docker"
+                or recorded.exec_backend != getattr(self.exec, "name", None)
+            ):
+                from ..sandbox import make_backend
+
+                if recorded.exec_backend == "docker":
+                    recovery_backend = make_backend(
+                        "docker",
+                        image=recorded.exec_image_id or recorded.exec_image,
+                    )
+                else:
+                    recovery_backend = make_backend(recorded.exec_backend)
+            if (
+                recorded is not None
+                and recorded.exec_backend == "docker"
+                and recorded.docker_cli is not None
+            ):
+                setattr(recovery_backend, "docker", recorded.docker_cli.path)
+            recovery = recovery_backend.recover_active_operations(state.run_dir)
+        except Exception as error:
+            detail = (
+                "active-operation recovery failed closed: "
+                f"{type(error).__name__}: {error}"
+            )
+            state.quarantine = RunQuarantine(
+                kind="active_operation_recovery_unconfirmed",
+                step_id="-",
+                attempt_id="resume",
+                detail=detail,
+            )
+            state.status = "PAUSED"
+            save_state(state)
+            return RunResult(state, "PAUSED", detail)
+        if recovery.requires_quarantine:
+            detail = recovery.detail or (
+                "one or more active operations could not be confirmed stopped"
+            )
+            state.quarantine = RunQuarantine(
+                kind="active_operation_recovery_unconfirmed",
+                step_id="-",
+                attempt_id="resume",
+                detail=detail[-1000:],
+            )
+            state.status = "PAUSED"
+            save_state(state)
+            return RunResult(state, "PAUSED", detail)
+        try:
+            self._validate_pytest_oracle_inventories(state)
+        except (OSError, OracleInventoryError, CheckpointCorrupt) as error:
+            detail = f"pytest oracle inventory is invalid: {error}"
+            state.quarantine = RunQuarantine(
+                kind="pytest_oracle_inventory_invalid",
+                step_id="-",
+                attempt_id="resume",
+                detail=detail[-1000:],
+            )
+            state.status = "PAUSED"
+            save_state(state)
+            return RunResult(state, "PAUSED", detail)
+        return None
+
+    @staticmethod
+    def _oracle_inventory_ref(step_id: str) -> Path:
+        return Path("oracle_inventories") / f"{_safe_seg(step_id)}.json"
+
+    def _validate_pytest_oracle_inventories(
+        self,
+        state: RunState,
+    ) -> None:
+        run_dir = Path(state.run_dir)
+        inventory_dir = run_dir / "oracle_inventories"
+        expected_names = {
+            self._oracle_inventory_ref(step_id).name
+            for step_id in state.pytest_oracle_inventories
+        }
+        if inventory_dir.is_symlink() or (
+            inventory_dir.exists() and not inventory_dir.is_dir()
+        ):
+            raise CheckpointCorrupt(
+                f"pytest oracle inventory directory is unsafe: {inventory_dir}"
+            )
+        if inventory_dir.exists():
+            actual_names = {
+                path.name
+                for path in inventory_dir.iterdir()
+                if path.is_file() or path.is_symlink()
+            }
+            if actual_names != expected_names:
+                raise CheckpointCorrupt(
+                    "pytest oracle inventory files do not match RunState"
+                )
+        elif expected_names:
+            raise CheckpointCorrupt("pytest oracle inventory directory is missing")
+        for step_id, inventory in state.pytest_oracle_inventories.items():
+            path = run_dir / self._oracle_inventory_ref(step_id)
+            expected = inventory.model_dump_json(indent=2).encode("utf-8")
+            actual = _read_run_bytes(
+                run_dir,
+                path,
+                label="pytest oracle inventory",
+                missing_ok=True,
+            )
+            if actual != expected:
+                raise CheckpointCorrupt(
+                    f"immutable pytest oracle inventory changed for {step_id}"
+                )
+            validate_pytest_oracle_inventory(
+                state.workdir,
+                inventory,
+                allowed_changes=tuple(
+                    state.task.allowed_protected_files
+                ),
+            )
+
+    def _pytest_oracle_inventory(
+        self,
+        state: RunState,
+        step,
+        *,
+        allow_build: bool,
+    ) -> PytestOracleInventory | None:
+        if "pytest" not in step.verifiers:
+            return None
+        inventory = state.pytest_oracle_inventories.get(step.step_id)
+        if inventory is None:
+            if not allow_build:
+                raise CheckpointCorrupt(
+                    f"pytest oracle inventory is missing for {step.step_id}"
+                )
+            inventory = build_pytest_oracle_inventory(
+                state.workdir,
+                self.exec,
+                timeout=float(step.params.get("timeout", 300.0)),
+            )
+            path = (
+                Path(state.run_dir)
+                / self._oracle_inventory_ref(step.step_id)
+            )
+            data = inventory.model_dump_json(indent=2).encode("utf-8")
+            _write_immutable(path, data, run_dir=Path(state.run_dir))
+            state.pytest_oracle_inventories[step.step_id] = inventory
+            # This checkpoint precedes every implementation-model call.
+            self._save(state)
+        else:
+            validate_pytest_oracle_inventory(
+                state.workdir,
+                inventory,
+                allowed_changes=tuple(
+                    state.task.allowed_protected_files
+                ),
+            )
+            path = (
+                Path(state.run_dir)
+                / self._oracle_inventory_ref(step.step_id)
+            )
+            actual = _read_run_bytes(
+                Path(state.run_dir),
+                path,
+                label="pytest oracle inventory",
+                missing_ok=True,
+            )
+            if actual != inventory.model_dump_json(indent=2).encode("utf-8"):
+                raise CheckpointCorrupt(
+                    f"immutable pytest oracle inventory changed for {step.step_id}"
+                )
+        set_trusted_oracle_paths = getattr(
+            self.llm,
+            "set_trusted_oracle_paths",
+            None,
+        )
+        if callable(set_trusted_oracle_paths):
+            set_trusted_oracle_paths(inventory)
+        return inventory
+
     # --- public entry points ------------------------------------------------
     def run(self, task: TaskSpec, *, run_id: str | None = None) -> RunResult:
         run_id = run_id or _gen_run_id(task)
         run_dir = _claim_run_dir(self.config.runs_dir, run_id)
-        with run_lock(run_dir):
-            workdir = run_dir / "workdir"
-            self._prepare_workdir(task, workdir)
-            state = RunState.new(
-                task,
-                run_id,
-                str(run_dir),
-                str(workdir),
-                config=self.config,
-            )
-            save_state(state)
-            return self._drive(state)
+        try:
+            with run_lock(run_dir):
+                self._bind_execution_backend(run_dir)
+                workdir = run_dir / "workdir"
+                self._prepare_workdir(task, workdir)
+                state = RunState.new(
+                    task,
+                    run_id,
+                    str(run_dir),
+                    str(workdir),
+                    config=self.config,
+                    runtime="loop",
+                    exec_backend=self.exec,
+                    llm=self.llm,
+                )
+                save_state(state)
+                return self._drive(state)
+        except BaseException:
+            _discard_uninitialized_run_dir(run_dir)
+            raise
 
     def resume(self, run_id: str) -> RunResult:
         validate_run_id(run_id)
@@ -270,26 +593,61 @@ class Harness:
                     f"run {run_id} uses state schema {state.schema_version}; "
                     f"schema {RUN_STATE_SCHEMA} is required for safe resume"
                 )
+            self._bind_execution_backend(run_dir)
+            blocked = self._resume_preflight(state)
+            if blocked is not None:
+                return blocked
+            state.require_matching_runtime_contract(
+                self.config,
+                runtime="loop",
+                exec_backend=self.exec,
+                llm=self.llm,
+            )
             limits = state.require_matching_budget_limits(self.config)
-            if state.status in ("DONE", "FAILED"):
-                return RunResult(state, state.status, "run already terminal")
-            state.recover_active_elapsed()
+            if state.quarantine is not None:
+                state.status = "PAUSED"
+                save_state(state)
+                return RunResult(
+                    state,
+                    "PAUSED",
+                    state.quarantine.detail,
+                )
             records = read_ledger(state.run_dir)
-            if records:
-                state.seq = max(state.seq, *(record.seq for record in records))
             try:
+                recover_transaction_journals(Path(state.run_dir))
                 validate_transaction_journals(Path(state.run_dir))
+                if state.status in ("DONE", "FAILED"):
+                    validate_terminal_transaction_state(
+                        Path(state.run_dir),
+                        Path(state.workdir),
+                        state.status,
+                    )
             except TransactionCorrupt as error:
                 raise TransactionCorrupt(
                     f"run recovery evidence is invalid: {error}"
                 ) from error
+            if state.status in ("DONE", "FAILED"):
+                self._validate_terminal_resume(state, records)
+                return RunResult(state, state.status, "run already terminal")
+            state.recover_active_elapsed()
+            if records:
+                state.seq = max(state.seq, *(record.seq for record in records))
             records = self._reconcile_durable_ledger(state, records)
             if records:
                 # A ledger append is durable before the following state save.
                 # Preserve its sequence number after a crash so replayed work
                 # cannot create a second event with an already-used sequence.
                 state.seq = max(state.seq, *(record.seq for record in records))
+            if state.quarantine is not None:
+                state.status = "PAUSED"
+                save_state(state)
+                return RunResult(
+                    state,
+                    "PAUSED",
+                    state.quarantine.detail,
+                )
             if state.is_terminal():
+                self._validate_terminal_resume(state, records)
                 save_state(state)
                 return RunResult(
                     state,
@@ -311,6 +669,39 @@ class Harness:
             save_state(state)
             return self._drive(state)
 
+    def _record_plan_failure(
+        self,
+        state: RunState,
+        error_type: str,
+    ) -> None:
+        run_dir = Path(state.run_dir)
+        payload = _plan_failure_bytes(error_type)
+        failure_ref = _plan_failure_ref()
+        _write_immutable(
+            run_dir / failure_ref,
+            payload,
+            run_dir=run_dir,
+        )
+        fail_key = f"{state.run_id}:plan-fail"
+        if not any(
+            record.idempotency_key == fail_key
+            for record in read_ledger(run_dir)
+        ):
+            append_ledger(
+                state,
+                StepRecord(
+                    seq=state.next_seq(),
+                    step_id="-",
+                    phase="fail",
+                    artifact_ref=failure_ref,
+                    evidence_sha256=sha256_bytes(payload),
+                    notes=f"error: {error_type}",
+                    attempt_id="plan",
+                    idempotency_key=fail_key,
+                ),
+            )
+        state.status = "FAILED"
+
     def _reconcile_durable_ledger(
         self,
         state: RunState,
@@ -325,8 +716,182 @@ class Harness:
         run_dir = Path(state.run_dir)
         plan_path = run_dir / "plan.json"
         plan_events = [record for record in records if record.phase == "plan"]
+        plan_failure_events = [
+            record
+            for record in records
+            if record.phase == "fail"
+            and record.step_id == "-"
+            and record.attempt_id == "plan"
+        ]
         initial_path = run_dir / _initial_plan_ref()
         if not plan_events:
+            if plan_failure_events:
+                if len(plan_failure_events) != 1:
+                    raise CheckpointCorrupt(
+                        "ledger contains multiple plan failure events"
+                    )
+                event = plan_failure_events[0]
+                failure_path = run_dir / _plan_failure_ref()
+                failure_bytes = _read_run_bytes(
+                    run_dir,
+                    failure_path,
+                    label="immutable plan failure",
+                    missing_ok=True,
+                )
+                if (
+                    event.artifact_ref != _plan_failure_ref()
+                    or event.evidence_sha256 is None
+                    or event.idempotency_key != f"{state.run_id}:plan-fail"
+                    or failure_bytes is None
+                    or sha256_bytes(failure_bytes) != event.evidence_sha256
+                ):
+                    raise CheckpointCorrupt(
+                        "plan failure event is not bound to immutable evidence"
+                    )
+                try:
+                    failure = json.loads(failure_bytes)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise CheckpointCorrupt(
+                        "immutable plan failure is invalid"
+                    ) from error
+                if (
+                    not isinstance(failure, dict)
+                    or set(failure) != {
+                        "schema_version",
+                        "phase",
+                        "error_type",
+                    }
+                    or failure.get("schema_version") != 1
+                    or failure.get("phase") != "plan"
+                    or not isinstance(failure.get("error_type"), str)
+                    or not failure["error_type"]
+                    or event.notes != f"error: {failure['error_type']}"
+                ):
+                    raise CheckpointCorrupt(
+                        "immutable plan failure identity is invalid"
+                    )
+                if (
+                    state.plan is not None
+                    or plan_path.exists()
+                    or plan_path.is_symlink()
+                    or initial_path.exists()
+                    or initial_path.is_symlink()
+                ):
+                    raise CheckpointCorrupt(
+                        "plan failure conflicts with successful plan evidence"
+                    )
+                state.status = "FAILED"
+                state.active_since = None
+                state.seq = max(state.seq, event.seq)
+                return records
+            orphan_failure_path = run_dir / _plan_failure_ref()
+            orphan_failure_bytes = _read_run_bytes(
+                run_dir,
+                orphan_failure_path,
+                label="orphan immutable plan failure",
+                missing_ok=True,
+            )
+            if orphan_failure_bytes is not None:
+                if (
+                    records
+                    or state.plan is not None
+                    or plan_path.exists()
+                    or plan_path.is_symlink()
+                    or initial_path.exists()
+                    or initial_path.is_symlink()
+                ):
+                    raise CheckpointCorrupt(
+                        "orphan plan failure conflicts with other plan evidence"
+                    )
+                try:
+                    failure = json.loads(orphan_failure_bytes)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise CheckpointCorrupt(
+                        "orphan plan failure is invalid"
+                    ) from error
+                if (
+                    not isinstance(failure, dict)
+                    or set(failure) != {
+                        "schema_version",
+                        "phase",
+                        "error_type",
+                    }
+                    or failure.get("schema_version") != 1
+                    or failure.get("phase") != "plan"
+                    or not isinstance(failure.get("error_type"), str)
+                    or not failure["error_type"]
+                    or orphan_failure_bytes
+                    != _plan_failure_bytes(failure["error_type"])
+                ):
+                    raise CheckpointCorrupt(
+                        "orphan plan failure identity is invalid"
+                    )
+                self._record_plan_failure(
+                    state,
+                    failure["error_type"],
+                )
+                return self._reconcile_durable_ledger(
+                    state,
+                    read_ledger(run_dir),
+                )
+            initial_bytes = _read_run_bytes(
+                run_dir,
+                initial_path,
+                label="orphan immutable initial plan",
+                missing_ok=True,
+            )
+            if initial_bytes is not None:
+                if records:
+                    raise CheckpointCorrupt(
+                        "orphan initial plan conflicts with other ledger events"
+                    )
+                try:
+                    initial_plan = Plan.model_validate_json(initial_bytes)
+                except Exception as error:
+                    raise CheckpointCorrupt(
+                        f"orphan initial plan is invalid: {error}"
+                    ) from error
+                if state.plan is not None and state.plan != initial_plan:
+                    raise CheckpointCorrupt(
+                        "checkpoint plan differs from orphan initial plan"
+                    )
+                alias_bytes = _read_run_bytes(
+                    run_dir,
+                    plan_path,
+                    label="orphan initial plan alias",
+                    missing_ok=True,
+                )
+                if alias_bytes is not None and alias_bytes != initial_bytes:
+                    raise CheckpointCorrupt(
+                        "orphan initial plan alias changed before recovery"
+                    )
+                if alias_bytes is None:
+                    anchored_atomic_replace_bytes(
+                        plan_path,
+                        initial_bytes,
+                        anchor=run_dir,
+                    )
+                state.plan = initial_plan
+                atomic_replace_text(
+                    run_dir / "plan.md",
+                    self._plan_md(state),
+                    anchor=run_dir,
+                )
+                append_ledger(
+                    state,
+                    StepRecord(
+                        seq=state.next_seq(),
+                        step_id="-",
+                        phase="plan",
+                        artifact_ref=_initial_plan_ref(),
+                        evidence_sha256=sha256_bytes(initial_bytes),
+                        idempotency_key=f"{state.run_id}:plan",
+                    ),
+                )
+                return self._reconcile_durable_ledger(
+                    state,
+                    read_ledger(run_dir),
+                )
             if (
                 state.plan is not None
                 or plan_path.exists()
@@ -341,18 +906,23 @@ class Harness:
         if len(plan_events) != 1:
             raise CheckpointCorrupt("ledger contains multiple plan events")
         event = plan_events[0]
+        initial_bytes = _read_run_bytes(
+            run_dir,
+            initial_path,
+            label="immutable initial plan",
+            missing_ok=True,
+        )
         if (
             event.artifact_ref != _initial_plan_ref()
             or event.evidence_sha256 is None
-            or initial_path.is_symlink()
-            or not initial_path.is_file()
-            or sha256_bytes(initial_path.read_bytes()) != event.evidence_sha256
+            or initial_bytes is None
+            or sha256_bytes(initial_bytes) != event.evidence_sha256
         ):
             raise CheckpointCorrupt(
                 "durable plan event is not bound to the immutable initial plan"
             )
         try:
-            initial_plan = Plan.model_validate_json(initial_path.read_bytes())
+            initial_plan = Plan.model_validate_json(initial_bytes)
         except Exception as error:
             raise CheckpointCorrupt(
                 f"durable initial plan is invalid: {error}"
@@ -364,18 +934,24 @@ class Harness:
         checkpoint_failed = list(state.failed_steps)
         checkpoint_repairs = dict(state.repairs)
         checkpoint_attempts = dict(state.attempt_ids)
+        checkpoint_quarantine = state.quarantine
 
         # The immutable initial plan plus ledger-bound repair snapshots are the
         # source of truth. Replaying them prevents a consistently edited
         # state.json + plan.json pair from deleting unfinished work.
-        state.plan = initial_plan
+        # Keep the immutable initial plan independent from the mutable replay
+        # cursor. Repair preparation replaces one step in ``state.plan``; an
+        # alias here would rewrite the only in-memory copy of the initial
+        # history and make a crash before the repair ledger append unrecoverable.
+        state.plan = initial_plan.model_copy(deep=True)
         state.cursor = 0
         state.completed_steps = []
         state.failed_steps = []
         state.repairs = {}
         state.attempt_ids = {}
+        state.quarantine = None
         state.status = "RUNNING"
-        valid_plan_snapshots = [initial_plan]
+        valid_plan_snapshots = [initial_plan.model_copy(deep=True)]
 
         while not state.is_terminal():
             step = state.next_step()
@@ -477,10 +1053,12 @@ class Harness:
                     / _verdict_ref(attempt_id)
                 )
                 if orphan_path.exists() or orphan_path.is_symlink():
-                    if orphan_path.is_symlink() or not orphan_path.is_file():
-                        raise CheckpointCorrupt(
-                            f"orphan verdict path is unsafe: {orphan_path}"
-                        )
+                    verdict_bytes = _read_run_bytes(
+                        run_dir,
+                        orphan_path,
+                        label="orphan verdict",
+                    )
+                    assert verdict_bytes is not None
                     if not any(
                         record.phase == "context"
                         for record in attempt_records
@@ -489,9 +1067,7 @@ class Harness:
                             f"orphan verdict has no prepared attempt: {attempt_id}"
                         )
                     try:
-                        orphan = Verdict.model_validate_json(
-                            orphan_path.read_bytes()
-                        )
+                        orphan = Verdict.model_validate_json(verdict_bytes)
                     except Exception as error:
                         raise CheckpointCorrupt(
                             f"orphan verdict is invalid for {attempt_id}: {error}"
@@ -512,7 +1088,6 @@ class Harness:
                         raise CheckpointCorrupt(
                             f"orphan verdict checks do not match {attempt_id}"
                         )
-                    verdict_bytes = orphan_path.read_bytes()
                     recovered_record = StepRecord(
                         seq=state.next_seq(),
                         step_id=step.step_id,
@@ -536,14 +1111,63 @@ class Harness:
                         / _safe_seg(step.step_id)
                         / "verify.json"
                     )
-                    if (
-                        alias.is_symlink()
-                        or not alias.is_file()
-                        or alias.read_bytes() != verdict_bytes
-                    ):
-                        raise CheckpointCorrupt(
-                            f"orphan verdict alias changed for {attempt_id}"
+                    alias_bytes = _read_run_bytes(
+                        run_dir,
+                        alias,
+                        label="orphan verdict alias",
+                        missing_ok=True,
+                    )
+                    if alias_bytes not in (None, verdict_bytes):
+                        prior_records = sorted(
+                            (
+                                record
+                                for record in records
+                                if record.phase == "verify"
+                                and record.step_id == step.step_id
+                                and record.attempt_id != attempt_id
+                                and record.verdict_ref is not None
+                            ),
+                            key=lambda record: record.seq,
                         )
+                        prior_bytes = None
+                        if prior_records:
+                            prior = prior_records[-1]
+                            prior_ref = prior.verdict_ref
+                            assert prior_ref is not None
+                            prior_path = (
+                                run_dir
+                                / "steps"
+                                / _safe_seg(step.step_id)
+                                / prior_ref
+                            )
+                            prior_bytes = _read_run_bytes(
+                                run_dir,
+                                prior_path,
+                                label="prior immutable verdict",
+                            )
+                            if (
+                                prior.evidence_sha256 is None
+                                or prior_bytes is None
+                                or sha256_bytes(prior_bytes)
+                                != prior.evidence_sha256
+                            ):
+                                raise CheckpointCorrupt(
+                                    "prior verdict is not bound to its ledger event"
+                                )
+                        if alias_bytes != prior_bytes:
+                            raise CheckpointCorrupt(
+                                f"orphan verdict alias changed for {attempt_id}"
+                            )
+                    anchored_atomic_replace_bytes(
+                        alias,
+                        verdict_bytes,
+                        anchor=run_dir,
+                    )
+                    anchored_atomic_replace_bytes(
+                        run_dir / "verify.json",
+                        verdict_bytes,
+                        anchor=run_dir,
+                    )
                     append_ledger(state, recovered_record)
                     records = read_ledger(run_dir)
                     continue
@@ -556,6 +1180,14 @@ class Harness:
                 state, step, attempt_id, verify_records[0]
             )
             terminal = terminal_records[0] if terminal_records else None
+            if verdict_requires_process_quarantine(verdict):
+                if terminal is not None:
+                    raise CheckpointCorrupt(
+                        f"cleanup-failure attempt {attempt_id} has an unsafe "
+                        f"{terminal.phase} transition"
+                    )
+                self._quarantine_process_failure(state, step, verdict)
+                break
             if terminal is None:
                 if verdict.passed:
                     self._mark_step_verified(state, step, Path(state.workdir))
@@ -581,6 +1213,8 @@ class Harness:
                         ),
                         Path(state.workdir),
                     )
+                    if state.quarantine is not None:
+                        break
                 records = read_ledger(run_dir)
                 continue
 
@@ -621,6 +1255,14 @@ class Harness:
                     )
                 state.fail_current(step)
 
+        if (
+            checkpoint_quarantine is not None
+            and checkpoint_quarantine != state.quarantine
+        ):
+            raise CheckpointCorrupt(
+                "checkpoint quarantine is not bound to a cleanup-failure verdict"
+            )
+
         if checkpoint_plan is not None and not any(
             checkpoint_plan == snapshot for snapshot in valid_plan_snapshots
         ):
@@ -655,10 +1297,16 @@ class Harness:
                     f"checkpoint attempt identity is invalid for {step_id}"
                 )
 
-        if plan_path.is_symlink() or not plan_path.is_file():
+        plan_bytes = _read_run_bytes(
+            run_dir,
+            plan_path,
+            label="plan history alias",
+            missing_ok=True,
+        )
+        if plan_bytes is None:
             raise CheckpointCorrupt("checksummed plan history has no safe plan.json")
         try:
-            disk_plan = Plan.model_validate_json(plan_path.read_bytes())
+            disk_plan = Plan.model_validate_json(plan_bytes)
         except Exception as error:
             raise CheckpointCorrupt(f"plan.json is invalid: {error}") from error
         if disk_plan != state.plan:
@@ -692,11 +1340,17 @@ class Harness:
                     )
                     / "patch.json"
                 )
-                if patch_path.is_symlink() or not patch_path.is_file():
+                patch_bytes = _read_run_bytes(
+                    Path(state.run_dir),
+                    patch_path,
+                    label="reviewed attempt patch",
+                    missing_ok=True,
+                )
+                if patch_bytes is None:
                     raise ValueError(
                         "reviewed attempt patch is missing or unsafe"
                     )
-                artifact_sha256 = sha256_bytes(patch_path.read_bytes())
+                artifact_sha256 = sha256_bytes(patch_bytes)
             validate_decision_binding(
                 request=request,
                 decision=decision,
@@ -727,20 +1381,26 @@ class Harness:
         record: StepRecord,
     ) -> Verdict:
         step_dir = Path(state.run_dir) / "steps" / _safe_seg(step.step_id)
+        run_dir = Path(state.run_dir)
         expected_ref = _verdict_ref(attempt_id)
         path = step_dir / expected_ref
+        verdict_bytes = _read_run_bytes(
+            run_dir,
+            path,
+            label="durable verdict",
+            missing_ok=True,
+        )
         if (
             record.verdict_ref != expected_ref
             or record.evidence_sha256 is None
-            or path.is_symlink()
-            or not path.is_file()
-            or sha256_bytes(path.read_bytes()) != record.evidence_sha256
+            or verdict_bytes is None
+            or sha256_bytes(verdict_bytes) != record.evidence_sha256
         ):
             raise CheckpointCorrupt(
                 f"durable verdict is missing or changed for {attempt_id}"
             )
         try:
-            verdict = Verdict.model_validate_json(path.read_bytes())
+            verdict = Verdict.model_validate_json(verdict_bytes)
         except Exception as error:
             raise CheckpointCorrupt(
                 f"durable verdict is invalid for {attempt_id}: {error}"
@@ -774,12 +1434,16 @@ class Harness:
                 f"durable verdict artifact reference is unsafe for {attempt_id}"
             )
         artifact_path = step_dir / expected_artifact_ref
+        artifact_bytes = _read_run_bytes(
+            run_dir,
+            artifact_path,
+            label="durable verdict artifact",
+            missing_ok=True,
+        )
         if (
             verdict.artifact_sha256 is None
-            or artifact_path.is_symlink()
-            or not artifact_path.is_file()
-            or sha256_bytes(artifact_path.read_bytes())
-            != verdict.artifact_sha256
+            or artifact_bytes is None
+            or sha256_bytes(artifact_bytes) != verdict.artifact_sha256
         ):
             raise CheckpointCorrupt(
                 f"durable verdict artifact changed for {attempt_id}"
@@ -794,20 +1458,26 @@ class Harness:
         record: StepRecord,
     ) -> Plan:
         expected_ref = _repair_plan_ref(record.attempt_id or "")
-        path = Path(state.run_dir) / expected_ref
+        run_dir = Path(state.run_dir)
+        path = run_dir / expected_ref
+        plan_bytes = _read_run_bytes(
+            run_dir,
+            path,
+            label="immutable repair plan",
+            missing_ok=True,
+        )
         if (
             record.artifact_ref != expected_ref
             or record.evidence_sha256 is None
-            or path.is_symlink()
-            or not path.is_file()
-            or sha256_bytes(path.read_bytes()) != record.evidence_sha256
+            or plan_bytes is None
+            or sha256_bytes(plan_bytes) != record.evidence_sha256
         ):
             raise CheckpointCorrupt(
                 "repair event is not bound to its immutable plan for "
                 f"{record.attempt_id}"
             )
         try:
-            disk_plan = Plan.model_validate_json(path.read_bytes())
+            disk_plan = Plan.model_validate_json(plan_bytes)
         except Exception as error:
             raise CheckpointCorrupt(f"repair plan is invalid: {error}") from error
         assert state.plan is not None
@@ -819,20 +1489,86 @@ class Harness:
             )
         return disk_plan
 
+    @staticmethod
+    def _prepare_repair_plan(
+        state: RunState,
+        step,
+        verdict: Verdict,
+    ) -> tuple[str, bytes]:
+        """Persist or adopt the one repair plan implied by a failed verdict.
+
+        The immutable plan is authoritative. ``plan.json`` is only a mutable
+        compatibility alias and may legitimately contain either the preceding
+        committed plan or the newly prepared repair plan after a crash. Any
+        third value is unexplained drift and fails closed.
+        """
+        if state.plan is None or not 0 <= state.cursor < len(state.plan.steps):
+            raise CheckpointCorrupt("cannot prepare a repair without a current plan step")
+        if state.plan.steps[state.cursor] != step:
+            raise CheckpointCorrupt(
+                f"repair step {step.step_id} does not match the current plan"
+            )
+
+        prior_bytes = state.plan.model_dump_json(indent=2).encode("utf-8")
+        repaired = state.plan.model_copy(deep=True)
+        repaired.steps[state.cursor] = step.as_repair(verdict.failures)
+        plan_bytes = repaired.model_dump_json(indent=2).encode("utf-8")
+        attempt_id = state.attempt_id(step)
+        repair_ref = _repair_plan_ref(attempt_id)
+        run_dir = Path(state.run_dir)
+        immutable_path = run_dir / repair_ref
+
+        immutable_bytes = _read_run_bytes(
+            run_dir,
+            immutable_path,
+            label="immutable repair plan",
+            missing_ok=True,
+        )
+        if immutable_bytes is not None and immutable_bytes != plan_bytes:
+            raise CheckpointCorrupt(
+                f"immutable repair plan does not match the failed verdict for {attempt_id}"
+            )
+
+        alias_path = run_dir / "plan.json"
+        alias_bytes = _read_run_bytes(
+            run_dir,
+            alias_path,
+            label="repair plan alias",
+            missing_ok=True,
+        )
+        if alias_bytes not in (None, prior_bytes, plan_bytes):
+            raise CheckpointCorrupt(
+                f"repair plan alias has unexplained drift for {attempt_id}"
+            )
+
+        _write_immutable(
+            immutable_path,
+            plan_bytes,
+            run_dir=run_dir,
+        )
+        anchored_atomic_replace_bytes(
+            alias_path,
+            plan_bytes,
+            anchor=run_dir,
+        )
+        state.plan = repaired
+        return repair_ref, plan_bytes
+
     # --- driver -------------------------------------------------------------
     def _drive(self, state: RunState) -> RunResult:
         run_dir = Path(state.run_dir)
         workdir = Path(state.workdir)
+        self._bind_execution_backend(run_dir)
         from ..llm.trace import TracedLLM
 
         if isinstance(self.llm, TracedLLM):
             self.llm.bind(run_dir)  # per-call records land in llm_trace.jsonl
             self.llm.restore_totals(state.llm_usage)
 
-        # Point code context at the stable target repo (indexed once, reused across
-        # runs) rather than the ephemeral per-run workdir — the latter churns the
-        # ccc daemon with throwaway projects. Edits/verification still hit workdir.
-        code_root = state.task.target_repo or str(workdir)
+        # A run's context is isolated from later edits to the source repository.
+        # Never point an index at the enclosing run directory: it also contains
+        # approvals, model traces, backups, and other non-code evidence.
+        code_root = str(workdir)
         live_context.configure(code_root=code_root, config=self.config)
         try:
             live_context.index_code(code_root)
@@ -872,9 +1608,21 @@ class Harness:
                 state.plan = Supervisor(self.config, self.llm).plan(state.task)
                 plan_bytes = state.plan.model_dump_json(indent=2).encode("utf-8")
                 initial_ref = _initial_plan_ref()
-                _write_immutable(run_dir / initial_ref, plan_bytes)
-                durable_artifact_write(run_dir / "plan.json", plan_bytes)
-                (run_dir / "plan.md").write_text(self._plan_md(state))
+                _write_immutable(
+                    run_dir / initial_ref,
+                    plan_bytes,
+                    run_dir=run_dir,
+                )
+                anchored_atomic_replace_bytes(
+                    run_dir / "plan.json",
+                    plan_bytes,
+                    anchor=run_dir,
+                )
+                atomic_replace_text(
+                    run_dir / "plan.md",
+                    self._plan_md(state),
+                    anchor=run_dir,
+                )
                 append_ledger(
                     state,
                     StepRecord(
@@ -888,6 +1636,7 @@ class Harness:
                 )
                 state.active_since = None
                 state.elapsed_s = budget.elapsed()
+                budget.check_deadline()
                 self._save(state)
 
             while not state.is_terminal():
@@ -909,9 +1658,24 @@ class Harness:
                 self._save(state)
                 self._run_step(state, step, budget)
                 in_flight = None  # finished cleanly (cursor may have advanced)
+                if state.quarantine is not None:
+                    state.active_since = None
+                    state.elapsed_s = budget.elapsed()
+                    state.status = "PAUSED"
+                    self._save(state)
+                    return RunResult(
+                        state,
+                        "PAUSED",
+                        state.quarantine.detail,
+                    )
+                # A last step may consume the remaining wall-clock budget. Check
+                # before committing a terminal status, not only before the next
+                # iteration that may never exist.
+                budget.check_deadline()
                 state.active_since = None
                 state.elapsed_s = budget.elapsed()
                 self._save(state)
+            budget.check_deadline()
         except BudgetExceeded as e:
             state.steps_used = budget.steps_used
             state.elapsed_s = budget.elapsed()
@@ -919,6 +1683,14 @@ class Harness:
             state.status = "PAUSED"
             self._save(state)
             return RunResult(state, "PAUSED", str(e))
+        except ProcessCleanupUnconfirmed as error:
+            state.steps_used = budget.steps_used
+            state.elapsed_s = budget.elapsed()
+            state.active_since = None
+            step = in_flight or state.next_step()
+            self._quarantine_cleanup_interruption(state, step, error)
+            self._save(state)
+            return RunResult(state, "PAUSED", str(error))
         except ApprovalPending as e:
             state.elapsed_s = budget.elapsed()
             state.active_since = None
@@ -927,6 +1699,27 @@ class Harness:
         except ApprovalRejected as e:
             state.elapsed_s = budget.elapsed()
             state.active_since = None
+            rollback_error: Exception | None = None
+            if (
+                in_flight is not None
+                and in_flight.step_id not in state.completed_steps
+            ):
+                try:
+                    self._revert_step(in_flight, workdir)
+                except Exception as error:
+                    rollback_error = error
+                    logger.exception(
+                        "revert failed for step %s", in_flight.step_id
+                    )
+            if rollback_error is not None:
+                state.status = "PAUSED"
+                self._save(state)
+                return RunResult(
+                    state,
+                    "PAUSED",
+                    f"{type(e).__name__}: {e}; rollback incomplete: "
+                    f"{type(rollback_error).__name__}: {rollback_error}",
+                )
             state.status = "FAILED"
             self._save(state)
             return RunResult(state, "FAILED", str(e))
@@ -935,24 +1728,43 @@ class Harness:
             # crashing tool) must not leave the run wedged at RUNNING with a
             # half-applied sandbox: revert the in-flight step, fail closed, checkpoint.
             if in_flight is not None and in_flight.step_id not in state.completed_steps:
+                rollback_error: Exception | None = None
                 try:
                     self._revert_step(in_flight, workdir)
-                except Exception:  # a revert failure must not abort the fail-closed path
+                except Exception as error:
+                    rollback_error = error
                     logger.exception("revert failed for step %s", in_flight.step_id)
+                if rollback_error is not None:
+                    state.elapsed_s = budget.elapsed()
+                    state.active_since = None
+                    state.status = "PAUSED"
+                    self._save(state)
+                    return RunResult(
+                        state,
+                        "PAUSED",
+                        f"{type(e).__name__}: {e}; rollback incomplete: "
+                        f"{type(rollback_error).__name__}: {rollback_error}",
+                    )
+                attempt_id = state.attempt_id(in_flight)
                 append_ledger(
                     state,
                     StepRecord(
                         seq=state.next_seq(),
                         step_id=in_flight.step_id,
                         phase="fail",
-                        notes=f"error: {type(e).__name__}: {e}"[:300],
+                        notes=f"error: {type(e).__name__}",
+                        attempt_id=attempt_id,
+                        idempotency_key=f"{attempt_id}:fail",
                     ),
                 )
                 state.fail_current(in_flight)
             else:
                 # No step in flight, or the step itself completed and only its
                 # bookkeeping failed — never revert verified work.
-                state.status = "FAILED"
+                if state.plan is None:
+                    self._record_plan_failure(state, type(e).__name__)
+                else:
+                    state.status = "FAILED"
             state.elapsed_s = budget.elapsed()
             state.active_since = None
             self._save(state)
@@ -996,8 +1808,21 @@ class Harness:
         )
 
         # 2/3. EXECUTE (dispatch by action)
+        committed_integrity = (
+            self._committed_repo_integrity(
+                state,
+                step,
+                attempt_id,
+            )
+            if step.action == "repo_integrity"
+            else None
+        )
         try:
-            artifact, artifact_ref = self._execute(state, step, bundle)
+            if committed_integrity is None:
+                artifact, artifact_ref = self._execute(state, step, bundle)
+            else:
+                artifact = committed_integrity
+                artifact_ref = "repo_integrity.json"
         except PolicyViolation as e:
             # The patch never reached the sandbox. Record a failing verdict so
             # the repair loop is told exactly why, instead of aborting the run.
@@ -1008,6 +1833,7 @@ class Harness:
                 step,
                 artifact_ref="patch.json",
                 attempt_id=attempt_id,
+                require_transaction=False,
             )
             verdict_json = verdict.model_dump_json(indent=2)
             verdict_sha = sha256_bytes(verdict_json.encode("utf-8"))
@@ -1030,21 +1856,23 @@ class Harness:
             self._repair_or_fail(state, step, verdict, budget, workdir)
             self._save(state)
             return
-        execute_ref, execute_sha = self._execution_ledger_binding(
-            state, step, attempt_id, artifact_ref
-        )
-        append_ledger(
-            state,
-            StepRecord(
-                seq=state.next_seq(),
-                step_id=step.step_id,
-                phase="execute",
-                artifact_ref=execute_ref,
-                evidence_sha256=execute_sha,
-                attempt_id=attempt_id,
-                idempotency_key=f"{attempt_id}:execute",
-            ),
-        )
+        replayed_execute = committed_integrity is not None
+        if not replayed_execute:
+            execute_ref, execute_sha = self._execution_ledger_binding(
+                state, step, attempt_id, artifact_ref
+            )
+            append_ledger(
+                state,
+                StepRecord(
+                    seq=state.next_seq(),
+                    step_id=step.step_id,
+                    phase="execute",
+                    artifact_ref=execute_ref,
+                    evidence_sha256=execute_sha,
+                    attempt_id=attempt_id,
+                    idempotency_key=f"{attempt_id}:execute",
+                ),
+            )
 
         # HUMAN-APPROVAL GATE (before verify / irreversible boundary)
         if step.requires_approval:
@@ -1060,6 +1888,12 @@ class Harness:
                 bundle=bundle,
                 exec=self.exec,
                 attempt_id=attempt_id,
+                pytest_oracle_inventory=state.pytest_oracle_inventories.get(
+                    step.step_id
+                ),
+                allowed_oracle_changes=tuple(
+                    state.task.allowed_protected_files
+                ),
             ),
         )
         verdict = self._bind_verdict(
@@ -1131,12 +1965,18 @@ class Harness:
             raise CheckpointCorrupt(
                 f"attempt {attempt_id} has multiple context events"
             )
-        if records or path.exists() or path.is_symlink():
-            if path.is_symlink() or not path.is_file():
+        existing = _read_run_bytes(
+            run_dir,
+            path,
+            label="context evidence",
+            missing_ok=True,
+        )
+        if records or existing is not None:
+            if existing is None:
                 raise CheckpointCorrupt(
                     f"context evidence is missing or unsafe: {path}"
                 )
-            data = path.read_bytes()
+            data = existing
             digest = sha256_bytes(data)
             try:
                 bundle = ContextBundle.model_validate_json(data)
@@ -1175,9 +2015,16 @@ class Harness:
             )
             return bundle
 
+        # Refresh the exact per-run code root for each new context attempt.
+        # The enclosing runs/<id> directory is intentionally never indexed.
+        live_context.configure(code_root=workdir, config=self.config)
+        try:
+            live_context.index_code(workdir)
+        except Exception:
+            logger.debug("index_code(%s) failed", workdir, exc_info=True)
         bundle = ContextEngineer(self.config).gather(step, workdir=workdir)
         data = bundle.model_dump_json(indent=2).encode("utf-8")
-        _write_immutable(path, data)
+        _write_immutable(path, data, run_dir=run_dir)
         _dump(
             run_dir,
             step.step_id,
@@ -1197,6 +2044,78 @@ class Harness:
             ),
         )
         return bundle
+
+    @staticmethod
+    def _committed_repo_integrity(
+        state: RunState,
+        step,
+        attempt_id: str,
+    ) -> RepoIntegrityResult | None:
+        run_dir = Path(state.run_dir)
+        reference = _attempt_ref(attempt_id, "repo_integrity.json")
+        path = (
+            run_dir
+            / "steps"
+            / _safe_seg(step.step_id)
+            / reference
+        )
+        records = [
+            record
+            for record in read_ledger(run_dir)
+            if record.phase == "execute"
+            and record.step_id == step.step_id
+            and record.attempt_id == attempt_id
+        ]
+        if len(records) > 1:
+            raise CheckpointCorrupt(
+                f"attempt {attempt_id} has multiple execute events"
+            )
+        data = _read_run_bytes(
+            run_dir,
+            path,
+            label="immutable repository integrity evidence",
+            missing_ok=True,
+        )
+        if not records and data is None:
+            return None
+        if data is None:
+            raise CheckpointCorrupt(
+                f"repository integrity evidence is missing for {attempt_id}"
+            )
+        digest = sha256_bytes(data)
+        if records:
+            record = records[0]
+            if (
+                record.artifact_ref != reference
+                or record.evidence_sha256 != digest
+                or record.idempotency_key != f"{attempt_id}:execute"
+            ):
+                raise CheckpointCorrupt(
+                    f"repository integrity execute event is invalid for {attempt_id}"
+                )
+        else:
+            append_ledger(
+                state,
+                StepRecord(
+                    seq=state.next_seq(),
+                    step_id=step.step_id,
+                    phase="execute",
+                    artifact_ref=reference,
+                    evidence_sha256=digest,
+                    attempt_id=attempt_id,
+                    idempotency_key=f"{attempt_id}:execute",
+                    notes=(
+                        "recovered repository integrity evidence after "
+                        "interrupted ledger append"
+                    ),
+                ),
+            )
+        try:
+            return RepoIntegrityResult.model_validate_json(data)
+        except Exception as error:
+            raise CheckpointCorrupt(
+                f"repository integrity evidence is invalid for {attempt_id}"
+            ) from error
 
     @staticmethod
     def _execution_ledger_binding(
@@ -1220,19 +2139,33 @@ class Harness:
             / _safe_seg(step.step_id)
             / reference
         )
-        if path.is_symlink() or not path.is_file():
+        run_dir = Path(state.run_dir)
+        path_data = _read_run_bytes(
+            run_dir,
+            path,
+            label="completed action evidence",
+            missing_ok=True,
+        )
+        if path_data is None:
             alias = (
-                Path(state.run_dir)
+                run_dir
                 / "steps"
                 / _safe_seg(step.step_id)
                 / artifact_ref
             )
-            if alias.is_symlink() or not alias.is_file():
+            alias_data = _read_run_bytes(
+                run_dir,
+                alias,
+                label="completed action alias",
+                missing_ok=True,
+            )
+            if alias_data is None:
                 raise CheckpointCorrupt(
                     f"completed action evidence is missing: {path}"
                 )
-            _write_immutable(path, alias.read_bytes())
-        return reference, sha256_bytes(path.read_bytes())
+            _write_immutable(path, alias_data, run_dir=run_dir)
+            path_data = alias_data
+        return reference, sha256_bytes(path_data)
 
     @staticmethod
     def _bind_verdict(
@@ -1242,6 +2175,7 @@ class Harness:
         *,
         artifact_ref: str,
         attempt_id: str,
+        require_transaction: bool = True,
     ) -> Verdict:
         stored_ref = {
             "edit_code": _attempt_ref(attempt_id, "patch.json"),
@@ -1258,34 +2192,51 @@ class Harness:
             / _safe_seg(step.step_id)
             / stored_ref
         )
-        if path.is_symlink() or not path.is_file():
+        artifact_bytes = _read_run_bytes(
+            Path(state.run_dir),
+            path,
+            label="verdict artifact",
+            missing_ok=True,
+        )
+        if artifact_bytes is None:
             raise TransactionCorrupt(
                 f"cannot bind verdict to missing artifact: {path}"
             )
+        artifact_sha256 = sha256_bytes(artifact_bytes)
+        if step.action == "edit_code" and require_transaction:
+            tx = load_transaction(
+                Path(state.run_dir), step.step_id, attempt_id
+            )
+            if tx is None:
+                raise TransactionCorrupt(
+                    f"cannot bind verdict without a patch transaction: "
+                    f"{step.step_id}/{attempt_id}"
+                )
+            if artifact_sha256 != tx.patch_sha256:
+                raise TransactionCorrupt(
+                    f"verdict artifact hash does not match the patch transaction: "
+                    f"{step.step_id}/{attempt_id}"
+                )
         return verdict.model_copy(
             update={
                 "artifact_ref": stored_ref,
-                "artifact_sha256": sha256_bytes(path.read_bytes()),
+                "artifact_sha256": artifact_sha256,
                 "attempt_id": attempt_id,
             }
         )
 
     def _repair_or_fail(self, state: RunState, step, verdict: Verdict, budget, workdir) -> None:
         """Re-issue the step as a repair with the verdict's failures, or fail the run."""
+        if verdict_requires_process_quarantine(verdict):
+            self._quarantine_process_failure(state, step, verdict)
+            return
         attempt_id = state.attempt_id(step)
         non_retryable = any(check.detail.get("non_retryable") for check in verdict.checks)
         if not non_retryable and state.repairs_for(step) < budget.max_repairs:
-            assert state.plan is not None  # set before the loop body runs
-            state.plan.steps[state.cursor] = step.as_repair(verdict.failures)
-            plan_bytes = state.plan.model_dump_json(indent=2).encode("utf-8")
-            repair_ref = _repair_plan_ref(attempt_id)
-            _write_immutable(
-                Path(state.run_dir) / repair_ref,
-                plan_bytes,
-            )
-            durable_artifact_write(
-                Path(state.run_dir) / "plan.json",
-                plan_bytes,
+            repair_ref, plan_bytes = self._prepare_repair_plan(
+                state,
+                step,
+                verdict,
             )
             append_ledger(
                 state,
@@ -1315,6 +2266,54 @@ class Harness:
                 ),
             )
 
+    @staticmethod
+    def _quarantine_process_failure(
+        state: RunState,
+        step,
+        verdict: Verdict,
+    ) -> None:
+        check = next(
+            check
+            for check in verdict.checks
+            if check.detail.get(PROCESS_CLEANUP_UNCONFIRMED) is True
+        )
+        cleanup = check.detail.get("process_cleanup")
+        cleanup_detail = (
+            cleanup.get("detail") if isinstance(cleanup, dict) else None
+        )
+        detail = (
+            cleanup_detail
+            if isinstance(cleanup_detail, str)
+            else str(
+                check.detail.get("summary")
+                or "process cleanup was not confirmed"
+            )
+        )
+        state.quarantine = RunQuarantine(
+            step_id=step.step_id,
+            attempt_id=state.attempt_id(step),
+            detail=detail,
+        )
+        state.status = "PAUSED"
+        state.active_since = None
+
+    @staticmethod
+    def _quarantine_cleanup_interruption(
+        state: RunState,
+        step,
+        error: ProcessCleanupUnconfirmed,
+    ) -> None:
+        step_id = step.step_id if step is not None else "-"
+        attempt_id = state.attempt_id(step) if step is not None else "plan"
+        state.quarantine = RunQuarantine(
+            kind="process_cleanup_interrupted",
+            step_id=step_id,
+            attempt_id=attempt_id,
+            detail=error.detail[-1000:],
+        )
+        state.status = "PAUSED"
+        state.active_since = None
+
     # --- execute dispatch ---------------------------------------------------
     def _execute(self, state: RunState, step, bundle) -> tuple[Any, str]:
         run_dir = Path(state.run_dir)
@@ -1322,7 +2321,11 @@ class Harness:
 
         if step.action in ("gather_context", "answer_query"):
             if bundle.answer:
-                (run_dir / "answer.md").write_text(bundle.answer)
+                atomic_replace_text(
+                    run_dir / "answer.md",
+                    bundle.answer,
+                    anchor=run_dir,
+                )
             return bundle, "context_bundle.json"
 
         if step.action == "edit_code":
@@ -1392,13 +2395,27 @@ class Harness:
         attempt_id = state.attempt_id(step)
         artifact_dir = attempt_artifact_dir(run_dir, step.step_id, attempt_id)
         tx = load_transaction(run_dir, step.step_id, attempt_id)
+        inventory = self._pytest_oracle_inventory(
+            state,
+            step,
+            allow_build=(
+                tx is None
+                and not (artifact_dir / "patch.json").exists()
+                and not (artifact_dir / "patch.json").is_symlink()
+            ),
+        )
 
         if tx is not None:
             data = self._patch_bytes(state, step)
             attempt_path = artifact_dir / "patch.json"
             try:
-                attempt_data = attempt_path.read_bytes()
-            except OSError as e:
+                attempt_data = _read_run_bytes(
+                    run_dir,
+                    attempt_path,
+                    label="persisted patch",
+                )
+                assert attempt_data is not None
+            except (OSError, CheckpointCorrupt) as e:
                 raise TransactionCorrupt(
                     f"persisted patch is missing for {step.step_id}/{attempt_id}"
                 ) from e
@@ -1472,8 +2489,12 @@ class Harness:
         patch = Implementer(self.llm).implement(step, bundle, workdir)
         patch_json = patch.model_dump_json(indent=2)
         patch_bytes = patch_json.encode("utf-8")
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        _write_immutable(artifact_dir / "patch.json", patch_bytes)
+        durable_mkdir_chain(artifact_dir, anchor=run_dir)
+        _write_immutable(
+            artifact_dir / "patch.json",
+            patch_bytes,
+            run_dir=run_dir,
+        )
         _dump(run_dir, step.step_id, "patch.json", patch_json)
         if patch.step_id != step.step_id:
             raise PolicyViolation(
@@ -1484,10 +2505,16 @@ class Harness:
         backup = snapshot_paths(resolved.paths, workdir)
         review_diff = render_review_diff(patch, resolved, backup)
         _write_immutable(
-            artifact_dir / "review.diff", review_diff.encode("utf-8")
+            artifact_dir / "review.diff",
+            review_diff.encode("utf-8"),
+            run_dir=run_dir,
         )
         _dump(run_dir, step.step_id, "patch.diff", review_diff)
-        violations = policy.check_resolved(resolved, state.task.allowed_protected_files)
+        violations = policy.check_resolved(
+            resolved,
+            state.task.allowed_protected_files,
+            additional_protected_files=inventory or (),
+        )
         if violations:
             # Persist the refused proposal for audit, but do not create a
             # transaction because the sandbox was never touched.
@@ -1496,7 +2523,7 @@ class Harness:
         backup_path = (
             run_dir / "backups" / _safe_seg(step.step_id) / f"{_safe_seg(attempt_id)}.json"
         )
-        backup_digest = save_backup(backup, backup_path)
+        backup_digest = save_backup(backup, backup_path, run_dir=run_dir)
         tx = build_transaction(
             run_dir=run_dir,
             step_id=step.step_id,
@@ -1504,7 +2531,11 @@ class Harness:
             resolved=resolved,
             backup_sha256=backup_digest,
         )
-        save_backup(backup, run_dir / tx.backup_mirror_ref)
+        save_backup(
+            backup,
+            run_dir / tx.backup_mirror_ref,
+            run_dir=run_dir,
+        )
 
         manifest = build_manifest(
             step=step,
@@ -1515,8 +2546,10 @@ class Harness:
             resolved=resolved,
         )
         manifest_json = manifest.model_dump_json(indent=2)
-        durable_artifact_write(
-            artifact_dir / "manifest.json", manifest_json.encode("utf-8")
+        _write_immutable(
+            artifact_dir / "manifest.json",
+            manifest_json.encode("utf-8"),
+            run_dir=run_dir,
         )
         _dump(run_dir, step.step_id, "manifest.json", manifest_json)
 
@@ -1542,27 +2575,38 @@ class Harness:
         backup: Backup,
     ) -> None:
         """Bind recovery to the reviewed patch, base state, and policy."""
+        run_dir = Path(state.run_dir)
         path = artifact_dir / "manifest.json"
-        if path.is_symlink() or not path.is_file():
-            raise TransactionCorrupt(
-                f"persisted manifest is missing for {tx.step_id}/{tx.attempt_id}"
-            )
         try:
-            manifest = ArtifactManifest.model_validate_json(path.read_bytes())
+            manifest_bytes = _read_run_bytes(
+                run_dir,
+                path,
+                label="persisted manifest",
+            )
+            assert manifest_bytes is not None
+            manifest = ArtifactManifest.model_validate_json(manifest_bytes)
             expected_review = render_review_diff(
                 patch, resolved, backup
             ).encode("utf-8")
-            review_paths = [
-                artifact_dir / "review.diff",
-                artifact_dir.parents[1] / "patch.diff",
-            ]
-            for review_path in review_paths:
-                if review_path.is_symlink() or not review_path.is_file():
-                    raise ValueError(f"review artifact is missing: {review_path}")
-                if review_path.read_bytes() != expected_review:
-                    raise ValueError(
-                        f"review artifact does not match executable patch: {review_path}"
-                    )
+            review_path = artifact_dir / "review.diff"
+            review_bytes = _read_run_bytes(
+                run_dir,
+                review_path,
+                label="review artifact",
+            )
+            if review_bytes != expected_review:
+                raise ValueError(
+                    f"review artifact does not match executable patch: {review_path}"
+                )
+            _validate_optional_aliases(
+                run_dir,
+                expected_review,
+                [
+                    artifact_dir.parents[1] / "patch.diff",
+                    artifact_dir.parents[3] / "patch.diff",
+                ],
+                label="review artifact",
+            )
             expected_base = {
                 rel: saved_file_state(backup.originals[rel], backup.modes[rel])
                 for rel in tx.resolved_paths
@@ -1600,6 +2644,7 @@ class Harness:
         try:
             backup = load_backup(
                 resolve_transaction_evidence(run_dir, tx.backup_ref),
+                run_dir=run_dir,
                 required=True,
             )
             assert backup is not None
@@ -1611,6 +2656,7 @@ class Harness:
         try:
             mirror = load_backup(
                 resolve_transaction_evidence(run_dir, tx.backup_mirror_ref),
+                run_dir=run_dir,
                 required=True,
             )
             assert mirror is not None
@@ -1655,7 +2701,10 @@ class Harness:
         if not transactions:
             backup = self._backups.pop(step.step_id, None)
             if backup is None:
-                backup = load_backup(run_dir / "backups" / f"{_safe_seg(step.step_id)}.json")
+                backup = load_backup(
+                    run_dir / "backups" / f"{_safe_seg(step.step_id)}.json",
+                    run_dir=run_dir,
+                )
             if backup is not None:
                 revert_patch(backup, workdir)
 
@@ -1676,18 +2725,31 @@ class Harness:
         return bool(transactions)
 
     def _patch_bytes(self, state: RunState, step) -> bytes | None:
-        """The persisted patch.json bytes for this step (per-step file first)."""
-        candidates = [
-            Path(state.run_dir) / "steps" / _safe_seg(step.step_id) / "patch.json",
-            Path(state.run_dir) / "patch.json",
-        ]
-        for path in candidates:
-            if path.exists():
-                try:
-                    return path.read_bytes()
-                except OSError:
-                    return None
-        return None
+        """Read immutable attempt bytes and only cross-check compatibility aliases."""
+        run_dir = Path(state.run_dir)
+        attempt_id = state.attempt_id(step)
+        authoritative_path = (
+            attempt_artifact_dir(run_dir, step.step_id, attempt_id)
+            / "patch.json"
+        )
+        data = _read_run_bytes(
+            run_dir,
+            authoritative_path,
+            label="immutable patch artifact",
+            missing_ok=True,
+        )
+        if data is None:
+            return None
+        _validate_optional_aliases(
+            run_dir,
+            data,
+            [
+                run_dir / "steps" / _safe_seg(step.step_id) / "patch.json",
+                run_dir / "patch.json",
+            ],
+            label="patch",
+        )
+        return data
 
     def _artifact_sha(self, state: RunState, step) -> str | None:
         """The reviewable artifact hash for an approval — patches only.
@@ -1892,11 +2954,18 @@ class Harness:
         per_step = [run_dir / "steps" / _safe_seg(step_id) / name] if step_id else []
         candidates = per_step + [run_dir / name]
         for path in candidates:
-            if path.exists():
-                try:
-                    return model.model_validate_json(path.read_text())
-                except Exception:
-                    continue
+            data = _read_run_bytes(
+                run_dir,
+                path,
+                label=f"{name} summary source",
+                missing_ok=True,
+            )
+            if data is None:
+                continue
+            try:
+                return model.model_validate_json(data)
+            except Exception:
+                continue
         return None
 
     def _finalize_pr(self, state: RunState) -> None:
@@ -1939,7 +3008,7 @@ class Harness:
             provenance=patch.based_on_context,
         )
         path = run_dir / "pr_summary.md"
-        path.write_text(pr.to_markdown())
+        atomic_replace_text(path, pr.to_markdown(), anchor=run_dir)
         state.pr_summary_path = str(path)
 
     def _finalize_experiment(self, state: RunState) -> None:
@@ -1973,7 +3042,7 @@ class Harness:
             provenance=result.based_on_context,
         )
         path = run_dir / "experiment_summary.md"
-        path.write_text(summary.to_markdown())
+        atomic_replace_text(path, summary.to_markdown(), anchor=run_dir)
         state.pr_summary_path = str(path)
 
     # --- helpers ------------------------------------------------------------
@@ -1995,7 +3064,7 @@ class Harness:
                 shutil.rmtree(workdir)
                 raise
         else:
-            workdir.mkdir(parents=True, exist_ok=True)
+            durable_mkdir_chain(workdir, anchor=workdir.parent)
 
     @staticmethod
     def _reject_repo_symlinks(root: Path) -> None:

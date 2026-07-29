@@ -1,8 +1,8 @@
-"""Apply / revert Implementer patches inside a run sandbox.
+"""Apply or revert patches inside a run worktree.
 
-A Patch may carry explicit ``file_contents`` (preferred — robust) or a
-``unified_diff`` (applied with ``git apply``, which works on a plain directory).
-Originals are snapshotted so a failed verification can be reverted.
+A patch may carry complete ``file_contents`` or a ``unified_diff`` applied with
+``git apply``. Originals are snapshotted so a failed verification can be
+reverted.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import stat
+import tempfile
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,7 +23,17 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from ..artifacts import Patch
-from .shell import run
+from ..durable_io import (
+    anchored_atomic_replace_bytes,
+    anchored_read_bytes,
+    atomic_replace_bytes,
+    fsync_directory,
+    sync_regular_file,
+)
+from .shell import ProcResult
+
+_PATCH_APPLY_TIMEOUT_S = 60.0
+_PATCH_APPLY_OUTPUT_BYTES = 1024 * 1024
 
 
 class ResolvedPatch(BaseModel):
@@ -30,7 +41,8 @@ class ResolvedPatch(BaseModel):
 
     ``Patch.touched_files`` is model-authored metadata and is intentionally not
     trusted. Whole-file patches write exactly ``file_contents``; unified diffs
-    write exactly the paths parsed from their headers.
+    mutate exactly the paths parsed from their headers, including both sides of
+    a deletion or rename.
     """
 
     step_id: str
@@ -59,7 +71,23 @@ def resolve_patch(patch: Patch, *, patch_bytes: bytes | None = None) -> Resolved
         from .policy import diff_paths
 
         mode = "diff"
-        raw_paths = diff_paths(patch.unified_diff)
+        try:
+            # Keep the stricter redundant-header checks for ordinary paths.
+            # The legacy parser cannot tokenize Git's valid unquoted spaces,
+            # so exact machine output remains authoritative for those headers.
+            diff_paths(patch.unified_diff)
+        except ValueError as error:
+            message = str(error)
+            space_tokenization_errors = (
+                "malformed diff --git header:",
+                "malformed rename from header:",
+                "malformed rename to header:",
+                "malformed copy from header:",
+                "malformed copy to header:",
+            )
+            if not message.startswith(space_tokenization_errors):
+                raise
+        raw_paths = _git_machine_diff_paths(patch.unified_diff)
         if not raw_paths:
             raise ValueError("unified diff has no parseable file paths")
     else:
@@ -77,6 +105,16 @@ def resolve_patch(patch: Patch, *, patch_bytes: bytes | None = None) -> Resolved
         if rel not in paths:
             paths.append(rel)
     paths.sort()
+    ordered_aliases = sorted((alias, rel) for alias, rel in seen.items())
+    for index, (parent_alias, parent_rel) in enumerate(ordered_aliases):
+        prefix = f"{parent_alias}/"
+        for child_alias, child_rel in ordered_aliases[index + 1 :]:
+            if child_alias.startswith(prefix):
+                raise ValueError(
+                    f"patch contains parent/child paths: {parent_rel!r} and {child_rel!r}"
+                )
+            if child_alias > prefix and not child_alias.startswith(parent_alias):
+                break
 
     encoded = patch_bytes if patch_bytes is not None else patch.model_dump_json().encode("utf-8")
     return ResolvedPatch(
@@ -85,6 +123,149 @@ def resolve_patch(patch: Patch, *, patch_bytes: bytes | None = None) -> Resolved
         paths=paths,
         patch_sha256=hashlib.sha256(encoded).hexdigest(),
     )
+
+
+def _decode_git_c_path(value: str) -> str:
+    """Decode one whole Git pathname without splitting on human whitespace."""
+    if not value:
+        raise ValueError("empty Git path")
+    if not value.startswith('"'):
+        return value
+    if len(value) < 2 or not value.endswith('"'):
+        raise ValueError(f"malformed quoted Git path: {value!r}")
+    encoded = value[1:-1]
+    decoded = bytearray()
+    escapes = {
+        "a": b"\a",
+        "b": b"\b",
+        "t": b"\t",
+        "n": b"\n",
+        "v": b"\v",
+        "f": b"\f",
+        "r": b"\r",
+        '"': b'"',
+        "\\": b"\\",
+    }
+    index = 0
+    while index < len(encoded):
+        char = encoded[index]
+        if char != "\\":
+            decoded.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(encoded):
+            raise ValueError("trailing backslash in a quoted Git path")
+        escaped = encoded[index]
+        if escaped in escapes:
+            decoded.extend(escapes[escaped])
+            index += 1
+            continue
+        if escaped in "01234567":
+            end = index + 1
+            while end < min(index + 3, len(encoded)) and encoded[end] in "01234567":
+                end += 1
+            decoded.append(int(encoded[index:end], 8))
+            index = end
+            continue
+        raise ValueError(f"unsupported escape in a quoted Git path: \\{escaped}")
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("quoted Git path is not valid UTF-8") from error
+
+
+def _extended_git_paths(unified_diff: str, machine_paths: set[str]) -> set[str]:
+    """Add rename/copy sources that ``git apply --numstat`` does not emit."""
+    paths: set[str] = set()
+    current: dict[str, str] | None = None
+
+    def finish() -> None:
+        nonlocal current
+        if current is None:
+            return
+        rename = ("rename_from", "rename_to")
+        copy = ("copy_from", "copy_to")
+        for source_key, destination_key in (rename, copy):
+            source = current.get(source_key)
+            destination = current.get(destination_key)
+            if (source is None) != (destination is None):
+                raise ValueError("unified diff has an incomplete rename/copy header pair")
+            if source is None or destination is None:
+                continue
+            if destination not in machine_paths:
+                raise ValueError(
+                    "Git machine output disagrees with rename/copy destination: "
+                    f"{destination!r}"
+                )
+            paths.update((source, destination))
+        if all(key in current for key in (*rename, *copy)):
+            raise ValueError("unified diff cannot mix rename and copy headers")
+        current = None
+
+    prefixes = (
+        ("rename from ", "rename_from"),
+        ("rename to ", "rename_to"),
+        ("copy from ", "copy_from"),
+        ("copy to ", "copy_to"),
+    )
+    for line in unified_diff.splitlines():
+        if line.startswith("diff --git "):
+            finish()
+            current = {}
+            continue
+        for prefix, key in prefixes:
+            if not line.startswith(prefix):
+                continue
+            if current is None:
+                raise ValueError(f"{prefix.rstrip()} appears outside diff --git")
+            if key in current:
+                raise ValueError(f"duplicate {prefix.rstrip()} header")
+            decoded = _decode_git_c_path(line[len(prefix) :])
+            if decoded == "/dev/null":
+                raise ValueError(f"{prefix.rstrip()} cannot name /dev/null")
+            current[key] = decoded
+            break
+    finish()
+    return paths
+
+
+def _parse_git_numstat(output: str) -> list[str]:
+    if "\ufffd" in output or not output.endswith("\x00"):
+        raise ValueError("Git numstat output is not lossless NUL-delimited UTF-8")
+    paths: list[str] = []
+    for record in output[:-1].split("\x00"):
+        added, separator, remainder = record.partition("\t")
+        removed, second_separator, path = remainder.partition("\t")
+        if (
+            not separator
+            or not second_separator
+            or not path
+            or not (added == "-" or added.isdecimal())
+            or not (removed == "-" or removed.isdecimal())
+        ):
+            raise ValueError("malformed Git numstat record")
+        paths.append(path)
+    return paths
+
+
+def _git_machine_diff_paths(unified_diff: str) -> list[str]:
+    """Ask Git for exact NUL-delimited target names, then add operation sources."""
+    with tempfile.TemporaryDirectory(prefix="lha-diff-paths-") as temporary:
+        result = _run_git_control(
+            unified_diff,
+            Path(temporary),
+            options=("-p1", "--numstat", "-z"),
+        )
+    if not result.ok:
+        raise ValueError(
+            "Git could not parse unified diff paths: "
+            f"{result.stderr or result.stdout}"
+        )
+    primary = _parse_git_numstat(result.stdout)
+    paths = set(primary)
+    paths.update(_extended_git_paths(unified_diff, paths))
+    return sorted(paths)
 
 
 def _safe_target(
@@ -119,6 +300,81 @@ def _safe_target(
     return target
 
 
+def _worktree_inode_aliases(
+    workdir: Path,
+    *,
+    device: int,
+    inode: int,
+) -> list[str]:
+    """Find regular-file names for one inode without following directory links."""
+    root = workdir.resolve()
+    aliases: list[str] = []
+
+    def ignore_error(_error: OSError) -> None:
+        # The target's link count is already sufficient to reject the patch.
+        # Alias discovery only makes the diagnostic more useful.
+        return None
+
+    for directory, dirnames, filenames in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+        onerror=ignore_error,
+    ):
+        base = Path(directory)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not (base / name).is_symlink()
+        ]
+        for name in filenames:
+            candidate = base / name
+            try:
+                info = candidate.lstat()
+            except OSError:
+                continue
+            if (
+                stat.S_ISREG(info.st_mode)
+                and info.st_dev == device
+                and info.st_ino == inode
+            ):
+                aliases.append(candidate.relative_to(root).as_posix())
+    return sorted(aliases)
+
+
+def _validate_patch_targets(paths: list[str], workdir: Path) -> None:
+    """Reject links and non-files before any patch bytes can be applied."""
+    root = workdir.resolve()
+    write_set = set(paths)
+    for rel in paths:
+        target = _safe_target(root, rel)
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ValueError(f"cannot inspect patch target {rel!r}: {error}") from error
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"patch target is not a regular file: {rel!r}")
+        if info.st_nlink == 1:
+            continue
+
+        aliases = _worktree_inode_aliases(
+            root,
+            device=info.st_dev,
+            inode=info.st_ino,
+        )
+        unauthorized = [alias for alias in aliases if alias not in write_set]
+        detail = (
+            f"; same-inode path outside the write set: {unauthorized[0]!r}"
+            if unauthorized
+            else ""
+        )
+        raise ValueError(
+            f"refusing patch target with {info.st_nlink} hard links: {rel!r}{detail}"
+        )
+
+
 def make_unified_diff(original: str, updated: str, relpath: str) -> str:
     diff = difflib.unified_diff(
         original.splitlines(keepends=True),
@@ -144,6 +400,7 @@ class Backup:
 def snapshot_paths(paths: list[str], workdir: str | Path) -> Backup:
     """Capture the exact pre-apply state of a resolved write set."""
     root = Path(workdir)
+    _validate_patch_targets(paths, root)
     backup = Backup()
     created_dirs: set[str] = set()
     for rel in paths:
@@ -198,6 +455,242 @@ def render_review_diff(
     return "".join(rendered) or "(no diff)\n"
 
 
+def _run_git_control(
+    diff: str,
+    workdir: Path,
+    *,
+    options: tuple[str, ...],
+):
+    """Run one fixed Git control-plane command without shell interpretation."""
+    from ..sandbox.base import (
+        PROCESS_CLEANUP_RETURN_CODE,
+        ProcessCleanupUnconfirmed,
+        process_group_cleanup_supported,
+        run_bounded_process,
+        scrub_env,
+        terminate_process_group,
+    )
+    from .shell import sanitized_absolute_path, trusted_executable
+
+    if not process_group_cleanup_supported():
+        result = ProcResult(
+            PROCESS_CLEANUP_RETURN_CODE,
+            "",
+            (
+                "git apply requires POSIX process-group cleanup; "
+                "use Linux, macOS, or WSL2"
+            ),
+            0.0,
+            cleanup_confirmed=False,
+            cleanup_detail=(
+                "git apply requires POSIX process-group cleanup; "
+                "use Linux, macOS, or WSL2"
+            ),
+        )
+        raise ProcessCleanupUnconfirmed(result.cleanup_detail)
+    git = trusted_executable("git", require_unwritable=True)
+    if git is None:
+        return ProcResult(
+            127,
+            "",
+            "no trusted absolute git executable is available",
+            0.0,
+        )
+    safe_path = sanitized_absolute_path(require_unwritable=True)
+    environment = scrub_env(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+            "PATH": safe_path,
+        }
+    )
+    argv = [git, "apply", "--whitespace=nowarn", *options]
+    argv.append("-")
+    result = run_bounded_process(
+        argv,
+        cwd=workdir,
+        timeout=_PATCH_APPLY_TIMEOUT_S,
+        output_bytes=_PATCH_APPLY_OUTPUT_BYTES,
+        env=environment,
+        input=diff,
+        start_new_session=True,
+        on_exit=terminate_process_group,
+    )
+    if result.cleanup_unconfirmed:
+        raise ProcessCleanupUnconfirmed(
+            result.cleanup_detail or result.stderr[-1000:]
+        )
+    return result
+
+
+def _run_git_apply(
+    diff: str,
+    workdir: Path,
+    *,
+    check: bool = False,
+    reverse: bool = False,
+):
+    options = ["-p1"]
+    if check:
+        options.append("--check")
+    if reverse:
+        options.append("--reverse")
+    return _run_git_control(diff, workdir, options=tuple(options))
+
+
+def _worktree_file_state(workdir: Path) -> dict[str, tuple[str, int, str]]:
+    """Hash non-directory entries without following links."""
+    root = workdir.resolve()
+    result: dict[str, tuple[str, int, str]] = {}
+
+    def record(path: Path) -> None:
+        try:
+            info = path.lstat()
+            rel = path.relative_to(root).as_posix()
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISREG(info.st_mode):
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                result[rel] = ("file", mode, digest.hexdigest())
+            elif stat.S_ISLNK(info.st_mode):
+                result[rel] = ("symlink", mode, os.readlink(path))
+            else:
+                result[rel] = ("other", mode, str(stat.S_IFMT(info.st_mode)))
+        except OSError as error:
+            raise ValueError(f"cannot inspect worktree entry {path}: {error}") from error
+
+    def walk_error(error: OSError) -> None:
+        raise ValueError(f"cannot inspect worktree: {error}") from error
+
+    for directory, dirnames, filenames in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+        onerror=walk_error,
+    ):
+        base = Path(directory)
+        linked_dirs = [name for name in dirnames if (base / name).is_symlink()]
+        dirnames[:] = [name for name in dirnames if name not in linked_dirs]
+        for name in linked_dirs:
+            record(base / name)
+        for name in filenames:
+            record(base / name)
+    return result
+
+
+def _changed_paths(
+    before: dict[str, tuple[str, int, str]],
+    after: dict[str, tuple[str, int, str]],
+) -> set[str]:
+    return {
+        path
+        for path in before.keys() | after.keys()
+        if before.get(path) != after.get(path)
+    }
+
+
+def _expected_diff_state(
+    *,
+    patch: Patch,
+    resolved: ResolvedPatch,
+    backup: Backup,
+) -> dict[str, tuple[str, int, str]]:
+    """Apply once to a minimal copy to derive the exact expected end state."""
+    if set(backup.originals) != set(resolved.paths):
+        raise ValueError("patch backup does not match the resolved write set")
+    with tempfile.TemporaryDirectory(prefix="lha-patch-check-") as temporary:
+        root = Path(temporary)
+        for rel in resolved.paths:
+            original = backup.originals[rel]
+            if original is None:
+                continue
+            target = _safe_target(root, rel)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(original)
+            mode = backup.modes.get(rel)
+            if mode is None:
+                raise ValueError(f"existing backup target has no mode: {rel!r}")
+            target.chmod(mode)
+        before = _worktree_file_state(root)
+        result = _run_git_apply(patch.unified_diff, root)
+        if not result.ok:
+            raise RuntimeError(
+                "git apply failed against snapshotted inputs: "
+                f"{result.stderr or result.stdout}"
+            )
+        after = _worktree_file_state(root)
+        unexpected = sorted(_changed_paths(before, after) - set(resolved.paths))
+        if unexpected:
+            raise ValueError(
+                "git apply would change a path outside the resolved write set: "
+                f"{unexpected[0]!r}"
+            )
+        return after
+
+
+def _restore_failed_diff(
+    *,
+    patch: Patch,
+    backup: Backup,
+    workdir: Path,
+    before: dict[str, tuple[str, int, str]],
+) -> None:
+    """Best-effort reverse plus authoritative backups, then prove restoration."""
+    _run_git_apply(patch.unified_diff, workdir, reverse=True)
+    revert_patch(backup, workdir)
+    restored = _worktree_file_state(workdir)
+    if restored != before:
+        remaining = sorted(_changed_paths(before, restored))
+        preview = ", ".join(repr(path) for path in remaining[:3])
+        raise RuntimeError(f"failed patch rollback left changed paths: {preview}")
+
+
+def _sync_patch_paths(workdir: Path, paths: list[str]) -> None:
+    """Persist the complete file and directory state named by a resolved patch."""
+    root = workdir.resolve()
+    directories: set[Path] = {root}
+    for rel in paths:
+        target = _safe_target(root, rel)
+        try:
+            metadata = target.lstat()
+        except FileNotFoundError:
+            metadata = None
+        if metadata is not None:
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+            ):
+                raise ValueError(f"patch durability target is unsafe: {rel!r}")
+            sync_regular_file(target)
+
+        parent = target.parent
+        while True:
+            directories.add(parent)
+            if parent == root:
+                break
+            parent = parent.parent
+
+    # Deepest-first persists file entries before the directory entries that
+    # make their containing directories reachable.
+    for directory in sorted(
+        directories,
+        key=lambda value: len(value.relative_to(root).parts),
+        reverse=True,
+    ):
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"patch durability directory is unsafe: {directory}")
+        fsync_directory(directory)
+
+
 def apply_patch(
     patch: Patch,
     workdir: str | Path,
@@ -206,7 +699,12 @@ def apply_patch(
     backup: Backup | None = None,
 ) -> tuple[list[str], Backup]:
     workdir = Path(workdir)
-    resolved = resolved or resolve_patch(patch)
+    actual = resolve_patch(patch)
+    if resolved is None:
+        resolved = actual
+    elif resolved.mode != actual.mode or resolved.paths != actual.paths:
+        raise ValueError("resolved patch does not match the executable payload")
+    _validate_patch_targets(resolved.paths, workdir)
     backup = backup or snapshot_paths(resolved.paths, workdir)
     touched: list[str] = []
 
@@ -218,33 +716,76 @@ def apply_patch(
             for rel in resolved.paths:
                 content = contents_by_path[rel]
                 target = _safe_target(workdir, rel)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content)
+                encoded = content.encode("utf-8")
+                mode = backup.modes.get(rel)
+                atomic_replace_bytes(
+                    target,
+                    encoded,
+                    anchor=workdir,
+                    mode=mode if mode is not None else 0o644,
+                )
+                if target.read_bytes() != encoded:
+                    raise ValueError(f"whole-file patch content mismatch: {rel!r}")
+                info = target.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError(f"whole-file patch produced an unsafe target: {rel!r}")
                 touched.append(rel)
+            _sync_patch_paths(workdir, resolved.paths)
         except Exception:
             revert_patch(backup, workdir)
             raise
         return touched, backup
 
     if resolved.mode == "diff":
+        before = _worktree_file_state(workdir)
+        expected = _expected_diff_state(
+            patch=patch,
+            resolved=resolved,
+            backup=backup,
+        )
         # Pipe the diff via stdin (no temp file to leak). Duplicate application
         # is an error: the transaction journal, not a heuristic reverse-check,
         # decides whether a persisted attempt should be replayed. A reverse
         # check can misclassify mode-only patches as already applied.
-        res = run(
-            ["git", "apply", "--whitespace=nowarn", "-p1", "-"],
-            cwd=workdir,
-            input=patch.unified_diff,
-        )
+        res = _run_git_apply(patch.unified_diff, workdir)
         if not res.ok:
             raise RuntimeError(f"git apply failed: {res.stderr or res.stdout}")
         try:
+            after = _worktree_file_state(workdir)
+            unexpected = sorted(_changed_paths(before, after) - set(resolved.paths))
+            if unexpected:
+                raise ValueError(
+                    f"git apply changed a path outside the resolved write set: "
+                    f"{unexpected[0]!r}"
+                )
+            mismatched = [
+                rel
+                for rel in resolved.paths
+                if after.get(rel) != expected.get(rel)
+            ]
+            if mismatched:
+                raise ValueError(
+                    "applied file contents do not match the unified diff: "
+                    f"{mismatched[0]!r}"
+                )
             for rel in resolved.paths:
                 target = _safe_target(workdir, rel)
-                if not target.exists() or not target.is_file():
-                    raise ValueError(f"patch produced a non-regular file: {rel!r}")
+                # Missing is a valid terminal state for a deletion or the source
+                # side of a rename. Symlinks and other file types remain invalid.
+                try:
+                    info = target.lstat()
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError(f"patch produced an unsafe file: {rel!r}")
+            _sync_patch_paths(workdir, resolved.paths)
         except Exception:
-            revert_patch(backup, workdir)
+            _restore_failed_diff(
+                patch=patch,
+                backup=backup,
+                workdir=workdir,
+                before=before,
+            )
             raise
         return list(resolved.paths), backup
 
@@ -252,19 +793,28 @@ def apply_patch(
 
 
 def revert_patch(backup: Backup, workdir: str | Path) -> None:
-    workdir = Path(workdir)
+    workdir = Path(workdir).resolve()
     for rel, original in backup.originals.items():
         target = _safe_target(workdir, rel, allow_leaf_symlink=True)
         if original is None:
-            target.unlink(missing_ok=True)
+            try:
+                target.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                target.unlink()
         else:
             if target.is_symlink():
                 target.unlink()
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(original)
             mode = backup.modes.get(rel)
-            if mode is not None:
-                target.chmod(mode)
+            if mode is None:
+                raise ValueError(f"existing backup target has no mode: {rel!r}")
+            atomic_replace_bytes(
+                target,
+                original,
+                anchor=workdir,
+                mode=mode,
+            )
     for rel in sorted(
         backup.created_dirs,
         key=lambda value: (len(Path(value).parts), value),
@@ -275,6 +825,7 @@ def revert_patch(backup: Backup, workdir: str | Path) -> None:
             if not directory.is_dir():
                 raise ValueError(f"cannot remove created directory path {rel!r}")
             directory.rmdir()
+    _sync_patch_paths(workdir, sorted(backup.originals))
 
 
 def _backup_payload(backup: Backup) -> str:
@@ -355,10 +906,14 @@ def _validated_backup(
     )
 
 
-def save_backup(backup: Backup, path: str | Path) -> str:
-    """Persist a checksummed backup so revert survives a cross-process resume."""
+def save_backup(
+    backup: Backup,
+    path: str | Path,
+    *,
+    run_dir: str | Path,
+) -> str:
+    """Persist a checksummed backup below the run-owned directory anchor."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     backup = _validated_backup(
         backup.originals,
         backup.modes,
@@ -379,31 +934,37 @@ def save_backup(backup: Backup, path: str | Path) -> str:
         "modes": backup.modes,
         "created_dirs": backup.created_dirs,
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(envelope, f, sort_keys=True)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    try:
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError:  # pragma: no cover - platform without directory fsync
-        pass
+    anchored_atomic_replace_bytes(
+        path,
+        json.dumps(envelope, sort_keys=True).encode("utf-8"),
+        anchor=run_dir,
+        mode=0o600,
+    )
     return digest
 
 
-def load_backup(path: str | Path, *, required: bool = False) -> Backup | None:
+def load_backup(
+    path: str | Path,
+    *,
+    run_dir: str | Path,
+    required: bool = False,
+) -> Backup | None:
+    """Load one backup through its run-owned directory anchor."""
     path = Path(path)
-    if not path.exists():
+    try:
+        encoded = anchored_read_bytes(
+            path,
+            anchor=run_dir,
+            missing_ok=True,
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(f"backup path is corrupt: {path}: {error}") from error
+    if encoded is None:
         if required:
             raise ValueError(f"required backup is missing: {path}")
         return None
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(encoded)
         if (
             isinstance(raw, dict)
             and raw.get("schema_version") == 4

@@ -9,23 +9,29 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import stat
 import sys
-import tempfile
 from pathlib import Path
-from typing import Literal, Self
+from typing import Literal, Self, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..array_evidence import (
     array_summary,
+    load_bounded_npy,
     output_sha256,
     raw_array_sha256,
     safe_artifact_path,
 )
 from ..artifacts import ExperimentResult, Step
+from ..durable_io import (
+    anchored_atomic_replace_bytes,
+    anchored_read_bytes,
+    atomic_replace_text,
+    durable_mkdir_chain,
+    fsync_directory,
+)
 from ..live_context.models import ContextBundle
 from ..sandbox import ExecutionBackend, TrustedLocalBackend
 
@@ -36,7 +42,6 @@ _LEGACY_OUTPUT_FILES = {
     "reference.npy",
     "repro.json",
 }
-
 
 class ExperimentIntent(BaseModel):
     """Durable declaration written before an experiment command can run."""
@@ -73,6 +78,9 @@ class ExperimentAmbiguous(RuntimeError):
     """The command may have run, but no durable completed result exists."""
 
 
+_ChecksummedModel = TypeVar("_ChecksummedModel", bound=BaseModel)
+
+
 class Experimenter:
     def __init__(self, exec_backend: ExecutionBackend | None = None):
         self.exec = exec_backend or TrustedLocalBackend()
@@ -92,6 +100,22 @@ class Experimenter:
                 based_on_context=bundle.locators(),
             )
         res = self.exec.run(cmd, cwd=workdir, timeout=float(step.params.get("timeout", 600)))
+        if res.cleanup_unconfirmed:
+            # Do not inspect output paths while a surviving process may still
+            # be replacing them. The verifier will quarantine this attempt.
+            return ExperimentResult(
+                step_id=step.step_id,
+                out_dir=out_dir,
+                command=cmd,
+                returncode=res.returncode,
+                stdout_tail=(res.cleanup_detail or res.stderr or res.stdout)[
+                    -1000:
+                ],
+                output_truncated=res.output_truncated,
+                cleanup_unconfirmed=True,
+                cleanup_detail=res.cleanup_detail[-1000:],
+                based_on_context=bundle.locators(),
+            )
 
         # Re-resolve after target code exits. A command that replaced the output
         # directory or one of its files with a symlink must not supply evidence.
@@ -131,6 +155,7 @@ class Experimenter:
             repro=repro or {},
             returncode=res.returncode,
             stdout_tail=(res.stdout or res.stderr)[-1000:],
+            output_truncated=res.output_truncated,
             based_on_context=bundle.locators(),
         )
 
@@ -154,13 +179,12 @@ def execute_experiment_once(
         / "attempts"
         / _safe_segment(attempt_id)
     )
-    if attempt_dir.is_symlink() or (
-        attempt_dir.exists() and not attempt_dir.is_dir()
-    ):
+    try:
+        durable_mkdir_chain(attempt_dir, anchor=run_root)
+    except (OSError, ValueError) as error:
         raise ExperimentAmbiguous(
             f"experiment attempt path is unsafe: {attempt_dir}"
-        )
-    attempt_dir.mkdir(parents=True, exist_ok=True)
+        ) from error
     intent_path = attempt_dir / "experiment_intent.json"
     evidence_path = attempt_dir / "experiment_evidence.json"
     params = json.dumps(
@@ -175,13 +199,24 @@ def execute_experiment_once(
         context_sha256=hashlib.sha256(context).hexdigest(),
     )
 
-    if evidence_path.exists() or evidence_path.is_symlink():
+    try:
+        evidence = _read_checksummed_model(
+            evidence_path,
+            ExperimentEvidence,
+            run_dir=run_root,
+            missing_ok=True,
+        )
+    except Exception as error:
+        raise ExperimentAmbiguous(
+            "persisted experiment evidence is invalid for "
+            f"{step.step_id}/{attempt_id}: {error}"
+        ) from error
+    if evidence is not None:
         try:
             persisted_intent = _read_checksummed_model(
-                intent_path, ExperimentIntent
-            )
-            evidence = _read_checksummed_model(
-                evidence_path, ExperimentEvidence
+                intent_path,
+                ExperimentIntent,
+                run_dir=run_root,
             )
         except Exception as error:
             raise ExperimentAmbiguous(
@@ -195,16 +230,19 @@ def execute_experiment_once(
         validate_experiment_result(root, evidence.result)
         return evidence.result
 
-    if intent_path.exists() or intent_path.is_symlink():
-        try:
-            persisted_intent = _read_checksummed_model(
-                intent_path, ExperimentIntent
-            )
-        except Exception as error:
-            raise ExperimentAmbiguous(
-                "prepared experiment intent is invalid for "
-                f"{step.step_id}/{attempt_id}: {error}"
-            ) from error
+    try:
+        persisted_intent = _read_checksummed_model(
+            intent_path,
+            ExperimentIntent,
+            run_dir=run_root,
+            missing_ok=True,
+        )
+    except Exception as error:
+        raise ExperimentAmbiguous(
+            "prepared experiment intent is invalid for "
+            f"{step.step_id}/{attempt_id}: {error}"
+        ) from error
+    if persisted_intent is not None:
         if persisted_intent != intent:
             raise ExperimentAmbiguous(
                 f"prepared experiment intent changed for {step.step_id}/{attempt_id}"
@@ -214,13 +252,26 @@ def execute_experiment_once(
             "refusing to duplicate its side effects"
         )
 
-    _write_checksummed_model(intent_path, intent)
+    try:
+        _write_checksummed_model(intent_path, intent, run_dir=run_root)
+    except Exception as error:
+        raise ExperimentAmbiguous(
+            f"experiment intent could not be persisted for "
+            f"{step.step_id}/{attempt_id}: {error}"
+        ) from error
     result = Experimenter(backend).run(step, bundle, root)
     validate_experiment_result(root, result)
-    _write_checksummed_model(
-        evidence_path,
-        ExperimentEvidence(intent=intent, result=result),
-    )
+    try:
+        _write_checksummed_model(
+            evidence_path,
+            ExperimentEvidence(intent=intent, result=result),
+            run_dir=run_root,
+        )
+    except Exception as error:
+        raise ExperimentAmbiguous(
+            f"experiment evidence could not be persisted for "
+            f"{step.step_id}/{attempt_id}: {error}"
+        ) from error
     return result
 
 
@@ -289,8 +340,13 @@ def _prepare_output_dir(workdir: Path, out_dir: str) -> Path:
         # ``safe_artifact_path`` rejected a symlink at every path component,
         # and the content check ruled out a mistyped source directory.
         shutil.rmtree(out_path)
-    out_path.mkdir(parents=True, exist_ok=False)
-    (out_path / _OUTPUT_OWNER).write_text("LHA experiment output\n")
+        fsync_directory(out_path.parent)
+    durable_mkdir_chain(out_path, anchor=workdir)
+    atomic_replace_text(
+        out_path / _OUTPUT_OWNER,
+        "LHA experiment output\n",
+        anchor=workdir,
+    )
     checked = safe_artifact_path(workdir, out_dir)
     if checked != out_path or not checked.is_dir():
         raise ValueError(f"experiment output directory could not be prepared: {out_dir}")
@@ -346,9 +402,9 @@ def _collect_array_evidence(
     if reference_path is None or prediction_path is None:
         return None
     try:
-        reference = np.load(reference_path, allow_pickle=False)
-        prediction = np.load(prediction_path, allow_pickle=False)
-    except (OSError, ValueError):
+        reference = load_bounded_npy(reference_path)
+        prediction = load_bounded_npy(prediction_path)
+    except (MemoryError, OSError, OverflowError, ValueError):
         return None
     if (
         reference.size == 0
@@ -392,20 +448,36 @@ def _canonical_payload(payload: dict) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 
 
-def _write_checksummed_model(path: Path, model: BaseModel) -> None:
+def _write_checksummed_model(
+    path: Path,
+    model: BaseModel,
+    *,
+    run_dir: Path,
+) -> None:
     payload = model.model_dump(mode="json")
     envelope = {
         "schema_version": 1,
         "sha256": hashlib.sha256(_canonical_payload(payload)).hexdigest(),
         "payload": payload,
     }
-    _durable_replace(path, json.dumps(envelope, sort_keys=True).encode())
+    _durable_replace(
+        path,
+        json.dumps(envelope, sort_keys=True).encode(),
+        run_dir=run_dir,
+    )
 
 
-def _read_checksummed_model(path: Path, model_type):
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"artifact path is missing or unsafe: {path}")
-    raw = json.loads(path.read_text())
+def _read_checksummed_model(
+    path: Path,
+    model_type: type[_ChecksummedModel],
+    *,
+    run_dir: Path,
+    missing_ok: bool = False,
+) -> _ChecksummedModel | None:
+    data = anchored_read_bytes(path, anchor=run_dir, missing_ok=missing_ok)
+    if data is None:
+        return None
+    raw = json.loads(data)
     payload = raw["payload"]
     if (
         raw.get("schema_version") != 1
@@ -416,27 +488,5 @@ def _read_checksummed_model(path: Path, model_type):
     return model_type.model_validate(payload)
 
 
-def _durable_replace(path: Path, data: bytes) -> None:
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise ValueError(f"artifact path is unsafe: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        try:
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        except OSError:  # pragma: no cover
-            pass
-    finally:
-        temporary.unlink(missing_ok=True)
+def _durable_replace(path: Path, data: bytes, *, run_dir: Path) -> None:
+    anchored_atomic_replace_bytes(path, data, anchor=run_dir)

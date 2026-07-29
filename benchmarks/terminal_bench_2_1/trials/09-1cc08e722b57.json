@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "terminal-bench-error-redaction",
+  "source_sha256": "cac6e27f149a3d657b301bf9c1889f9243d2be1abf12b2170472871b68d8c9f7",
+  "task_name": "terminal-bench/configure-git-webserver",
+  "task_checksum": "84d7c2fd653dad4307c7d2e9dd4f937ecbcd7ad4d1acf5d2b74c35166634178e",
+  "raw_status": "ERROR",
+  "raw_correct": null,
+  "raw_protocol_error": "Harbor trial exception: CodexReportedError",
+  "exception_type": "CodexReportedError",
+  "duration_s": 664.666049,
+  "infrastructure_retries": null
+}

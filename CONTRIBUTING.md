@@ -1,10 +1,7 @@
 # Contributing
 
-The project has one rule:
-
-> **No claim without a runnable check.** Any documented behavior, benchmark
-> number, test count, or coverage value must come from a command run on the
-> commit that contains the claim.
+Any documented behavior, benchmark number, test count, or coverage value must
+come from a command run on the commit that contains the claim.
 
 ## Development setup
 
@@ -44,19 +41,26 @@ fi
 For a release candidate, also run:
 
 ```bash
-uv build
+uv run python -m lha.release_claims
+uv run python tools/verify_terminal_source_build.py \
+  --root . \
+  --evidence benchmarks/terminal_bench_2_1
+uv build --clear
 docker build -t lha:release .
 LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
   uv run pytest tests/test_sandbox.py -q
 docker run --rm lha:release lha --version
+docker run --network none --rm lha:release lha eval
 ```
 
 Follow [docs/DEPLOY.md](docs/DEPLOY.md) to install both the wheel and source
 distribution from empty scratch directories and verify that packaged context
 flows are present.
 
-`lha eval` may download the configured embedding model on its first run. A
-download or Docker-daemon failure is not a successful check.
+Host-side `lha eval` may download the configured embedding model on its first
+run. The application image includes a pinned model snapshot and must complete
+the command without network access. A download or Docker-daemon failure is not
+a successful check.
 
 ## Coverage
 
@@ -97,10 +101,14 @@ properties:
 - `PatchTransaction` transitions remain
   `PREPARED → APPLIED → VERIFIED`, with rollback to `REVERTED`;
 - a transaction has durable patch, manifest, journal, and redundant backups;
-- state and ledger corruption fail closed;
+- state corruption and an invalid ledger event chain fail closed;
 - schema-v1 state is not resumed as schema v2;
 - concurrent resume is rejected by the run lock;
-- ledger attempt IDs and idempotency keys do not duplicate side effects;
+- the ledger grows logically by event; its implementation validates and
+  atomically replaces the complete file rather than using `O_APPEND`;
+- ledger attempt IDs and idempotency keys do not duplicate approval, failure,
+  or completion events; uncertain external side effects require a durable
+  intent and recovery check;
 - unverified work never survives failure, rejection, or exhausted repair.
 
 Add adversarial tests for the crash windows you change. Relevant suites include:
@@ -126,6 +134,10 @@ Do not change a repository, oracle, reference patch, or digest after reading
 model results. New cases must be authored and frozen before a scored run, and
 must demonstrate baseline failure plus reference-patch success.
 
+Repository adapters define setup and check stages. Adding an adapter does not
+create a benchmark result; a result also needs a fixed protocol, raw evidence,
+provenance, and a committed summary.
+
 ## Ablation and statistics
 
 Do not use the internal gate as truth. The final scorer must grade a fresh
@@ -133,13 +145,16 @@ canonical repository through a separate backend instance.
 
 Keep these units distinct:
 
-- one paired task/repetition cell;
-- one complete-corpus episode per repetition;
+- one paired task/repetition cell, with repetitions nested inside a task;
+- one complete-corpus repetition aggregate built after execution;
 - a descriptive horizon composition that adds zero observations.
 
-Cell and episode McNemar p-values may differ. Use Wilson intervals at all-zero or
-all-one boundaries; a percentile bootstrap there produces a misleading
-zero-width interval.
+For schema-v4 reports, use the task as the exchangeable unit: the paired
+inferential contrast is the exact task-cluster sign-flip test, while raw cell
+discordance is descriptive. The complete-corpus aggregate has a separate
+repetition-level McNemar result; it is not an independently executed,
+shared-state long task. Use Wilson intervals at all-zero or all-one boundaries;
+a percentile bootstrap there produces a misleading zero-width interval.
 
 Changes affecting prompts, patch application, policy, scoring, aggregation, or
 runtime provenance must invalidate the ablation cache fingerprint.
@@ -148,6 +163,16 @@ Never edit `benchmarks/*.json` or copied result numbers by hand. Regenerate the
 report and update all public citations in the same change. Planned repetitions
 and unfinished public-benchmark runs are not results.
 
+Formal ablation does not use the exploratory cache and cannot resume. Before it
+starts, append and commit a `REGISTERED` event that fixes the source, corpus,
+model, CLI and client settings, immutable Docker image ID, scorer-runtime
+digest, output path, and a one-time remote Git start record. The runtime digest
+covers
+`pyproject.toml`, `uv.lock`, `.python-version`, `Dockerfile`, and
+`.dockerignore`. The runner must create the registered one-time remote ref before
+the first cell. If preflight or any cell is interrupted, record `ABANDONED`; do
+not delete the output and repeat the same outcome-affecting selection.
+
 ## Codex changes
 
 The Codex backend must:
@@ -155,12 +180,19 @@ The Codex backend must:
 - pass a minimal subprocess environment;
 - use an attempt-local `HOME`, `CODEX_HOME`, workspace, and temp directory;
 - copy authentication without logging it;
-- start a separate process group and stop descendants before cleanup;
+- start a separate process group and confirm that the original group stopped
+  before cleanup;
 - fail on malformed or incomplete JSONL, unknown events, and disallowed tool use;
 - distinguish deterministic protocol failure from bounded transient retry;
 - record secret-free CLI/model/event/outcome provenance.
 
 Add protocol and cleanup tests without requiring live authentication.
+Cleanup guarantees apply to normal return, failure, timeout, and handled
+interruption. `SIGKILL`, a kernel crash, or power loss can leave a
+mode-protected temporary directory and requires manual inspection.
+Do not claim that host process-group cleanup covers a tool process that
+deliberately creates another group or session; untrusted tools require an outer
+containment boundary.
 
 ## Documentation and pull requests
 

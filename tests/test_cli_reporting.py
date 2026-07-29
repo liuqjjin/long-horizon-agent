@@ -13,7 +13,7 @@ import pytest
 from conftest import hermetic_task
 
 import lha.cli as cli
-from lha.artifacts import Patch, Plan, Step
+from lha.artifacts import Plan, Step
 from lha.clock import now
 from lha.config import Config
 from lha.harness import Harness
@@ -100,6 +100,9 @@ def _make_run(runs_dir: Path, run_id: str, status: RunStatus = "DONE") -> Path:
         )
         attempt_artifact = attempt_dir / "context_bundle.json"
         attempt_artifact.write_bytes(artifact_path.read_bytes())
+        (run_dir / "context_bundle.json").write_bytes(
+            attempt_artifact.read_bytes()
+        )
         artifact_sha256 = hashlib.sha256(
             attempt_artifact.read_bytes()
         ).hexdigest()
@@ -167,6 +170,7 @@ def _make_run(runs_dir: Path, run_id: str, status: RunStatus = "DONE") -> Path:
                     step_id="s1",
                     phase="fail",
                     attempt_id=attempt_id,
+                    idempotency_key=f"{attempt_id}:fail",
                 ),
             )
     save_state(state)
@@ -183,28 +187,6 @@ def _add_report_artifacts(run_dir: Path) -> None:
         cost_usd=0.01,
     )
     save_state(state)
-    (run_dir / "patch.json").write_text(
-        Patch(
-            step_id="s1",
-            unified_diff=("--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+<script>new</script>\n"),
-            touched_files=["x.py"],
-            rationale="remove the bug",
-        ).model_dump_json(indent=2)
-    )
-    verdict = Verdict.from_checks(
-        "s1",
-        [
-            Check(
-                name="pytest",
-                family="code",
-                passed=True,
-                detail={"summary": "2 passed"},
-                duration_s=0.2,
-            )
-        ],
-        artifact_ref="patch.json",
-    )
-    (run_dir / "verify.json").write_text(verdict.model_dump_json(indent=2))
     (run_dir / "llm_trace.jsonl").write_text(
         json.dumps(
             {
@@ -284,6 +266,52 @@ def test_approval_cli_refuses_terminal_and_allows_only_one_pending_decision(
     assert decision.artifact_sha256
     assert not (runs_dir / "pending" / "pending_approval.json").exists()
     capsys.readouterr()
+
+
+def test_result_summary_does_not_inherit_a_previous_step_verdict(
+    tmp_path, capsys
+):
+    paused = Harness(
+        Config(
+            llm_backend="stub",
+            code_backend="null",
+            runs_dir=tmp_path / "runs",
+            data_dir=tmp_path / "nodata",
+            use_skill_memory=False,
+        )
+    ).run(
+        hermetic_task("data/tasks/fix_average_approval.yaml"),
+        run_id="stale-verdict",
+    )
+    run_dir = Path(paused.state.run_dir)
+    assert paused.status == "AWAITING_APPROVAL"
+    assert Verdict.model_validate_json(
+        (run_dir / "verify.json").read_text()
+    ).passed
+
+    assert cli._result_dict(paused)["verified"] is None
+    cli._print_result(paused)
+    output = capsys.readouterr().out
+    assert "status : AWAITING_APPROVAL" in output
+    assert "verify :" not in output
+
+
+def test_result_summary_uses_the_validated_final_attempt_verdict(tmp_path):
+    completed = Harness(
+        Config(
+            llm_backend="stub",
+            code_backend="null",
+            runs_dir=tmp_path / "runs",
+            data_dir=tmp_path / "nodata",
+            use_skill_memory=False,
+        )
+    ).run(
+        hermetic_task("data/tasks/fix_average.yaml"),
+        run_id="terminal-verdict",
+    )
+
+    assert completed.status == "DONE"
+    assert cli._result_dict(completed)["verified"] is True
 
 
 def test_trace_html_keeps_approval_history_after_transient_files_are_cleared(

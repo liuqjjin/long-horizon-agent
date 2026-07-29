@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 
 import numpy as np
 import pytest
+from numpy.lib import format as npy_format
 
-from lha.agents.experimenter import Experimenter
+from lha.agents.experimenter import Experimenter, load_bounded_npy
 from lha.agents.supervisor import Supervisor
 from lha.artifacts import Step
 from lha.clock import now
 from lha.config import Config
 from lha.live_context.models import ContextBundle, Freshness
 from lha.llm.base import LLMClient
+from lha.sandbox.base import ExecutionBackend
 from lha.tasks.spec import TaskSpec
+from lha.tools.shell import ProcResult
 
 _EXPERIMENT_TASK = Path("data/tasks/run_sr_experiment.yaml")
 
@@ -70,6 +74,36 @@ def _write_array_script(path: Path) -> None:
         "np.save(out / 'reference.npy', reference)\n"
         "np.save(out / 'prediction.npy', reference + 0.5)\n"
     )
+
+
+class _TruncatedBackend(ExecutionBackend):
+    name = "truncated"
+
+    def run(self, cmd, *, cwd, timeout=300.0, input=None, limits=None):
+        return ProcResult(
+            125,
+            "partial",
+            "output exceeded capture limit",
+            0.01,
+            output_truncated=True,
+        )
+
+    def python(self) -> str:
+        return "python"
+
+    def tool(self, name: str) -> str:
+        return name
+
+
+def test_experiment_records_incomplete_subprocess_output(tmp_path: Path) -> None:
+    result = Experimenter(_TruncatedBackend()).run(
+        _command_step(["python", "experiment.py"]),
+        _bundle(),
+        tmp_path,
+    )
+
+    assert result.returncode == 125
+    assert result.output_truncated is True
 
 
 def test_successful_true_command_cannot_reuse_stale_arrays(tmp_path: Path) -> None:
@@ -171,6 +205,85 @@ def test_symlink_array_is_not_collected_as_invocation_evidence(tmp_path: Path) -
     assert "collected" not in result.repro
 
 
+def test_bounded_npy_rejects_large_shape_before_allocating(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifact = tmp_path / "large-shape.npy"
+    with artifact.open("wb") as stream:
+        npy_format.write_array_header_1_0(
+            stream,
+            {
+                "descr": "<f8",
+                "fortran_order": False,
+                "shape": (1_000_000,),
+            },
+        )
+        stream.write(b"\0" * 8)
+
+    def allocation_would_be_a_bug(*args, **kwargs):
+        raise AssertionError("payload allocation happened before shape validation")
+
+    monkeypatch.setattr(np, "fromfile", allocation_would_be_a_bug)
+    with pytest.raises(ValueError, match="elements"):
+        load_bounded_npy(artifact, max_elements=100)
+
+
+def test_bounded_npy_rejects_large_header_before_loading_payload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifact = tmp_path / "large-header.npy"
+    header = (
+        b"{'descr': '<f4', 'fortran_order': False, 'shape': (1,), }"
+        + b" " * 450
+        + b"\n"
+    )
+    artifact.write_bytes(
+        b"\x93NUMPY"
+        + b"\x01\x00"
+        + struct.pack("<H", len(header))
+        + header
+        + b"\0" * 4
+    )
+
+    def allocation_would_be_a_bug(*args, **kwargs):
+        raise AssertionError("payload allocation happened before header validation")
+
+    monkeypatch.setattr(np, "fromfile", allocation_would_be_a_bug)
+    with pytest.raises(ValueError, match="header"):
+        load_bounded_npy(artifact, max_header_bytes=128)
+
+
+@pytest.mark.parametrize(
+    "array",
+    [
+        np.ones((1,) * 9, dtype=np.float32),
+        np.array([{"unsafe": True}], dtype=object),
+        np.ones((4,), dtype="S8"),
+    ],
+)
+def test_bounded_npy_rejects_unsupported_structure(
+    tmp_path: Path, array: np.ndarray
+) -> None:
+    artifact = tmp_path / "unsupported.npy"
+    np.save(artifact, array)
+
+    with pytest.raises(ValueError, match="dimensions|dtype"):
+        load_bounded_npy(artifact)
+
+
+def test_bounded_npy_rejects_file_size_and_trailing_payload(tmp_path: Path) -> None:
+    artifact = tmp_path / "array.npy"
+    np.save(artifact, np.ones((4,), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="file size"):
+        load_bounded_npy(artifact, max_file_bytes=8)
+
+    with artifact.open("ab") as stream:
+        stream.write(b"trailing")
+    with pytest.raises(ValueError, match="payload size"):
+        load_bounded_npy(artifact)
+
+
 class _PlanLLM(LLMClient):
     name = "plan-test"
 
@@ -182,20 +295,36 @@ class _PlanLLM(LLMClient):
 
 
 def _dynamic_experiment_plan(
-    params: dict, verifiers: list[str]
+    params: dict,
+    verifiers: list[str],
+    *,
+    include_context: bool = True,
+    context_verifiers: list[str] | None = None,
 ) -> dict:
+    steps = []
+    if include_context:
+        steps.append(
+            {
+                "step_id": "candidate-context",
+                "kind": "experiment",
+                "action": "gather_context",
+                "goal": "read the experiment sources",
+                "verifiers": context_verifiers or ["freshness", "citation"],
+            }
+        )
+    steps.append(
+        {
+            "step_id": "candidate-run",
+            "kind": "experiment",
+            "action": "run_experiment",
+            "goal": "run",
+            "verifiers": verifiers,
+            "params": params,
+        }
+    )
     return {
         "summary": "candidate",
-        "steps": [
-            {
-                "step_id": "candidate-run",
-                "kind": "experiment",
-                "action": "run_experiment",
-                "goal": "run",
-                "verifiers": verifiers,
-                "params": params,
-            }
-        ],
+        "steps": steps,
     }
 
 
@@ -226,6 +355,42 @@ def test_dynamic_experiment_plan_must_retain_runnable_template_params() -> None:
     assert [step.step_id for step in plan.steps] == ["s1-context", "s2-run"]
 
 
+def test_dynamic_experiment_plan_cannot_omit_context_gate() -> None:
+    task = TaskSpec.from_file(_EXPERIMENT_TASK)
+    template = Supervisor(Config()).plan(task)
+    params = next(
+        step.params for step in template.steps if step.action == "run_experiment"
+    )
+    payload = _dynamic_experiment_plan(
+        params,
+        ["psnr", "ssim", "reproducibility"],
+        include_context=False,
+    )
+
+    plan = Supervisor(Config(dynamic_planning=True), _PlanLLM(payload)).plan(task)
+
+    assert [step.step_id for step in plan.steps] == ["s1-context", "s2-run"]
+    assert plan.steps[0].verifiers == ["freshness", "citation"]
+
+
+def test_dynamic_experiment_plan_cannot_weaken_context_gate() -> None:
+    task = TaskSpec.from_file(_EXPERIMENT_TASK)
+    template = Supervisor(Config()).plan(task)
+    params = next(
+        step.params for step in template.steps if step.action == "run_experiment"
+    )
+    payload = _dynamic_experiment_plan(
+        params,
+        ["psnr", "ssim", "reproducibility"],
+        context_verifiers=["freshness"],
+    )
+
+    plan = Supervisor(Config(dynamic_planning=True), _PlanLLM(payload)).plan(task)
+
+    assert [step.step_id for step in plan.steps] == ["s1-context", "s2-run"]
+    assert plan.steps[0].verifiers == ["freshness", "citation"]
+
+
 def test_dynamic_experiment_plan_with_fixed_protocol_is_accepted() -> None:
     task = TaskSpec.from_file(_EXPERIMENT_TASK)
     template = Supervisor(Config()).plan(task)
@@ -238,4 +403,7 @@ def test_dynamic_experiment_plan_with_fixed_protocol_is_accepted() -> None:
 
     plan = Supervisor(Config(dynamic_planning=True), _PlanLLM(payload)).plan(task)
 
-    assert [step.step_id for step in plan.steps] == ["candidate-run"]
+    assert [step.step_id for step in plan.steps] == [
+        "candidate-context",
+        "candidate-run",
+    ]

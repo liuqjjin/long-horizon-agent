@@ -15,7 +15,7 @@ from ...repo_adapter import (
     inspect_repo_integrity,
 )
 from ..base import Verifier, VerifyContext
-from ..verdict import Check
+from ..verdict import Check, process_cleanup_failure_detail
 
 
 class RepoIntegrityVerifier(Verifier):
@@ -167,11 +167,30 @@ def _stage_check(
     passed: bool,
     summary: str | None = None,
 ) -> Check:
+    cleanup_failures = [
+        command for command in result.commands if command.cleanup_unconfirmed
+    ]
+    if cleanup_failures:
+        passed = False
     if summary is None:
         summary = (
             f"{result.stage}: {len(result.commands)} command(s) passed"
             if passed
             else _stage_failure_summary(result)
+        )
+    detail: dict[str, Any] = {
+        "summary": summary,
+        "stage": result.stage,
+        "result": result.model_dump(mode="json"),
+    }
+    if cleanup_failures:
+        command = cleanup_failures[0]
+        detail.update(
+            process_cleanup_failure_detail(
+                returncode=command.returncode,
+                cleanup_unconfirmed=command.cleanup_unconfirmed,
+                detail=command.cleanup_detail or command.stderr[-500:],
+            )
         )
     return Check(
         name=name,
@@ -179,11 +198,7 @@ def _stage_check(
         passed=passed,
         score=float(sum(command.passed for command in result.commands)),
         threshold=float(len(result.commands)),
-        detail={
-            "summary": summary,
-            "stage": result.stage,
-            "result": result.model_dump(mode="json"),
-        },
+        detail=detail,
         duration_s=sum(command.duration_s for command in result.commands),
     )
 

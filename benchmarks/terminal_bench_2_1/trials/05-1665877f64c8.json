@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "kind": "terminal-bench-error-redaction",
+  "source_sha256": "eb9a00836a283fa813141bcbfe36f90b26901a1b10e0342af2c3dfc45d248970",
+  "task_name": "terminal-bench/caffe-cifar-10",
+  "task_checksum": "38da84d32a37ce45b201f202f0deb320dd80b5482afbcf66ba8456c8ea814c69",
+  "raw_status": "ERROR",
+  "raw_correct": null,
+  "raw_protocol_error": "Harbor trial exception: ValueError",
+  "exception_type": "ValueError",
+  "duration_s": 291.228106,
+  "infrastructure_retries": null
+}

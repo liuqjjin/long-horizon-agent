@@ -4,12 +4,13 @@ lha run <task.yaml>      run a task and its configured checks
 lha resume <run_id>      resume a paused/awaiting run
 lha eval [--quick]       run the six repository regression workflows
 lha ablate [tasks...]    compare direct acceptance, checks, and repair
+lha ablation-attempt ... register or close a one-shot formal ablation
 lha horizon              compose measured task outcomes across task counts
 lha batch <task>...      run multiple tasks in parallel (process-isolated)
 lha trace <run_id>       render a run's ledger timeline
 lha index <path>         (re)build the code index for a repo
 lha index-docs           (re)build paper/experiment/skill indexes via CocoIndex
-lha ask <query...>       answer a query with fresh, cited context
+lha ask <query...>       retrieve fresh context with source locations
 lha runs list|show|prune inspect and safely retain persisted runs
 lha approve|reject <run_id>   resolve a pending human-approval gate
 
@@ -36,7 +37,7 @@ examples:
   lha run data/tasks/fix_average.yaml            fix a bug, verified by real pytest
   lha eval                                       run the six repository workflows
   lha run --runtime langgraph <task>             durable run with an approval gate
-  lha ask "how is average computed" --kinds code answer with fresh, cited context
+  lha ask "how is average computed" --kinds code retrieve context with source locations
   lha trace <run_id> --html                      write a self-contained run report
   lha runs prune --older-than-days 30            dry-run terminal-run retention
 """
@@ -116,7 +117,7 @@ def _cmd_ablate(args) -> int:
     if not tasks:
         print("no tasks (pass paths or add data/tasks/bench_*.yaml)")
         return 1
-    llm = getattr(args, "llm", None) or "claude_cli"
+    llm = getattr(args, "llm", None) or "codex_cli"
     out = Path(args.out) if args.out else Path(cfg.runs_dir) / "ablation"
     model = args.model or None
     print(
@@ -136,6 +137,61 @@ def _cmd_ablate(args) -> int:
     print(report.to_markdown())
     print(f"report: {out / 'ablation_report.md'}")
     return 1 if any(record.status == "ERROR" for record in report.records) else 0
+
+
+def _emit_attempt_result(result: dict, *, as_json: bool) -> int:
+    import json
+
+    if as_json:
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+        return 0
+    for key, value in result.items():
+        if value is not None:
+            print(f"{key}: {value}")
+    return 0
+
+
+def _cmd_ablation_attempt_register(args) -> int:
+    from .formal_attempt_cli import register_formal_attempt
+
+    result = register_formal_attempt(
+        repo_root=Path.cwd(),
+        config=_config(args),
+        model=args.model,
+        reasoning_effort=args.reasoning_effort,
+        docker_image_id=args.docker_image_id,
+        witness_remote_name=args.witness_remote,
+    )
+    return _emit_attempt_result(result, as_json=args.json)
+
+
+def _cmd_ablation_attempt_status(args) -> int:
+    from .formal_attempt_cli import formal_attempt_status
+
+    return _emit_attempt_result(
+        formal_attempt_status(repo_root=Path.cwd()),
+        as_json=args.json,
+    )
+
+
+def _cmd_ablation_attempt_complete(args) -> int:
+    from .formal_attempt_cli import complete_formal_attempt
+
+    return _emit_attempt_result(
+        complete_formal_attempt(repo_root=Path.cwd()),
+        as_json=args.json,
+    )
+
+
+def _cmd_ablation_attempt_abandon(args) -> int:
+    from .formal_attempt_cli import abandon_formal_attempt
+
+    result = abandon_formal_attempt(
+        repo_root=Path.cwd(),
+        reason_code=args.reason_code,
+        reason=args.reason,
+    )
+    return _emit_attempt_result(result, as_json=args.json)
 
 
 def _cmd_horizon(args) -> int:
@@ -441,19 +497,71 @@ def _cmd_approve(args, approved: bool) -> int:
     return 0
 
 
+def _delivery_verdict(result):
+    """Return the ledger-bound final verdict only for a deliverable run.
+
+    ``verify.json`` is a mutable last-writer display alias. During a multi-step
+    run it can still describe the preceding completed step while the current
+    patch is awaiting approval. Reuse reporting's terminal replay before
+    exposing a run-level verification claim.
+    """
+    from .reporting import ReportingError, collect_run
+
+    state = result.state
+    if result.status != state.status:
+        raise ReportingError(
+            "result status does not match the persisted run state: "
+            f"{result.status} != {state.status}"
+        )
+    if state.status != "DONE":
+        return None
+
+    run_dir = Path(state.run_dir)
+    report = collect_run(run_dir.parent, state.run_id)
+    if report.run_dir.resolve() != run_dir.resolve():
+        raise ReportingError("result run directory does not match validated evidence")
+    if report.state != state:
+        raise ReportingError("result state does not match the validated checkpoint")
+
+    plan = report.state.plan
+    if plan is None or not plan.steps:
+        raise ReportingError("DONE run has no final plan step")
+    final_step = plan.steps[-1]
+    attempt_id = report.state.attempt_ids.get(final_step.step_id)
+    if attempt_id is None:
+        raise ReportingError("DONE run has no final attempt identity")
+    expected_path = (
+        Path("steps")
+        / final_step.step_id
+        / "attempts"
+        / attempt_id
+        / "verify.json"
+    ).as_posix()
+    matches = [
+        artifact.value
+        for artifact in report.verdicts
+        if artifact.path == expected_path
+    ]
+    if len(matches) != 1:
+        raise ReportingError("DONE run has no unique final attempt verdict")
+    verdict = matches[0]
+    if (
+        not verdict.passed
+        or verdict.step_id != final_step.step_id
+        or verdict.attempt_id != attempt_id
+    ):
+        raise ReportingError("DONE run final verdict is not deliverable")
+    return verdict
+
+
 def _result_dict(result) -> dict:
     run_dir = Path(result.state.run_dir)
-    verified = None
-    vj = run_dir / "verify.json"
-    if vj.exists():
-        from .verifiers.verdict import Verdict
-
-        verified = Verdict.model_validate_json(vj.read_text()).passed
+    verdict = _delivery_verdict(result)
     return {
         "run_id": result.state.run_id,
         "status": result.status,
         "run_dir": str(run_dir),
-        "verified": verified,
+        "verified": verdict.passed if verdict is not None else None,
         "summary": result.state.pr_summary_path,
         "message": result.message,
         "llm_usage": result.state.llm_usage.model_dump(mode="json"),
@@ -496,11 +604,8 @@ def _print_result(result) -> None:
     print(f"run_id : {s.run_id}")
     print(f"status : {result.status}" + (f"  ({result.message})" if result.message else ""))
     print(f"run_dir: {s.run_dir}")
-    verify = Path(s.run_dir) / "verify.json"
-    if verify.exists():
-        from .verifiers.verdict import Verdict
-
-        v = Verdict.model_validate_json(verify.read_text())
+    v = _delivery_verdict(result)
+    if v is not None:
         print(f"verify : passed={v.passed}")
         for c in v.checks:
             print(f"   - {c.name}: passed={c.passed} ({c.detail.get('summary', '')})")
@@ -511,7 +616,7 @@ def _print_result(result) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="lha",
-        description="run model-generated task steps with executable checks and resumable state",
+        description="run task steps with executable checks and resumable state",
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -544,7 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
     pres.add_argument("--json", action="store_true")
     pres.set_defaults(func=_cmd_resume)
 
-    pb = sub.add_parser("batch", help="run multiple tasks in parallel (orchestrator-worker)")
+    pb = sub.add_parser("batch", help="run multiple tasks concurrently")
     pb.add_argument("tasks", nargs="+")
     pb.add_argument("--workers", type=int, default=4)
     pb.set_defaults(func=_cmd_batch)
@@ -557,7 +662,9 @@ def build_parser() -> argparse.ArgumentParser:
     pab.add_argument("tasks", nargs="*", help="task yamls (default: data/tasks/bench_*.yaml)")
     pab.add_argument("--reps", type=int, default=1, help="repetitions per condition")
     pab.add_argument(
-        "--model", default="", help="implementer model (e.g. haiku) to calibrate difficulty"
+        "--model",
+        default="",
+        help="implementer model (for example gpt-5.4-mini)",
     )
     pab.add_argument("--out", default="", help="output dir (default: <runs>/ablation)")
     pab.add_argument(
@@ -567,6 +674,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="where the independent final scorer runs (docker for untrusted repos)",
     )
     pab.set_defaults(func=_cmd_ablate)
+
+    pat = sub.add_parser(
+        "ablation-attempt",
+        help="register, inspect, complete, or abandon a one-shot formal ablation",
+    )
+    attempt_sub = pat.add_subparsers(dest="attempt_cmd", required=True)
+    patr = attempt_sub.add_parser(
+        "register",
+        help="write a REGISTERED event after resolving every formal input",
+    )
+    patr.add_argument("--model", required=True, help="exact Codex model")
+    patr.add_argument(
+        "--reasoning-effort",
+        required=True,
+        help="exact Codex reasoning effort",
+    )
+    patr.add_argument(
+        "--docker-image-id",
+        required=True,
+        help="immutable Docker image ID (sha256:..., tags are rejected)",
+    )
+    patr.add_argument(
+        "--witness-remote",
+        default="formal-witness",
+        help="repository-local public HTTPS witness remote",
+    )
+    patr.add_argument("--json", action="store_true")
+    patr.set_defaults(func=_cmd_ablation_attempt_register)
+
+    pats = attempt_sub.add_parser("status", help="read the current attempt state")
+    pats.add_argument("--json", action="store_true")
+    pats.set_defaults(func=_cmd_ablation_attempt_status)
+
+    patc = attempt_sub.add_parser(
+        "complete",
+        help="validate all formal evidence and write a COMPLETED event",
+    )
+    patc.add_argument("--json", action="store_true")
+    patc.set_defaults(func=_cmd_ablation_attempt_complete)
+
+    pata = attempt_sub.add_parser(
+        "abandon",
+        help="write an explicit ABANDONED event for the open attempt",
+    )
+    pata.add_argument("--reason-code", required=True)
+    pata.add_argument("--reason", required=True)
+    pata.add_argument("--json", action="store_true")
+    pata.set_defaults(func=_cmd_ablation_attempt_abandon)
 
     ph = sub.add_parser("horizon", help="compose measured outcomes across task counts")
     ph.add_argument(
@@ -587,7 +742,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pid.set_defaults(func=_cmd_index_docs)
 
-    pa = sub.add_parser("ask", help="answer a query with fresh, cited context")
+    pa = sub.add_parser(
+        "ask",
+        help="retrieve indexed context and print source locations",
+    )
     pa.add_argument("query", nargs="+")
     pa.add_argument("--root", default=".", help="code root to search")
     pa.add_argument("--kinds", default="", help="comma list: code,paper,experiment,skill")

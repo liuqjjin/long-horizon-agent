@@ -1,4 +1,4 @@
-"""Tiny math utilities used by the walking-skeleton issue->PR task."""
+"""Math utilities used by the bundled issue-to-patch regression."""
 
 
 def average(values):

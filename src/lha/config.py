@@ -1,8 +1,8 @@
 """Runtime configuration, populated from environment variables (``LHA_*``).
 
 A ``.env`` file in the project root is loaded automatically if python-dotenv is
-available. Everything here has a sensible default so the walking skeleton runs
-with zero configuration.
+available. Defaults allow the deterministic self-evaluation to run without
+external credentials.
 """
 
 from __future__ import annotations
@@ -60,6 +60,16 @@ def _env_int_opt(key: str) -> int | None:
     if value < 0:
         raise ValueError(f"{key} must be >= 0 (0 or unset = unlimited), got {raw!r}")
     return value or None
+
+
+def _env_bool(key: str, default: str) -> bool:
+    """Parse an explicit boolean without turning typos into enabled features."""
+    raw = _env(key, default).strip().lower()
+    if raw in {"1", "true"}:
+        return True
+    if raw in {"0", "false"}:
+        return False
+    raise ValueError(f"{key} must be one of 0, 1, false, or true, got {raw!r}")
 
 
 def _env_codex_sandbox() -> Literal["read-only", "workspace-write", "danger-full-access"]:
@@ -135,9 +145,9 @@ class Config(BaseModel):
             max_repairs=int(_env("LHA_MAX_REPAIRS", "3")),
             deadline_s=_env_float_opt("LHA_DEADLINE_S"),
             max_llm_calls=_env_int_opt("LHA_MAX_LLM_CALLS"),
-            parallel_verify=_env("LHA_PARALLEL_VERIFY", "1") not in ("0", "false", "False"),
-            use_skill_memory=_env("LHA_SKILL_MEMORY", "1") not in ("0", "false", "False"),
-            dynamic_planning=_env("LHA_DYNAMIC_PLANNING", "0") not in ("0", "false", "False"),
+            parallel_verify=_env_bool("LHA_PARALLEL_VERIFY", "1"),
+            use_skill_memory=_env_bool("LHA_SKILL_MEMORY", "1"),
+            dynamic_planning=_env_bool("LHA_DYNAMIC_PLANNING", "0"),
             freshness_max_age_s=float(_env("LHA_FRESHNESS_MAX_AGE_S", "3600")),
             llm_backend=_env("LHA_LLM_BACKEND", "stub"),
             claude_cli_path=_env("LHA_CLAUDE_CLI", "claude"),
@@ -146,8 +156,10 @@ class Config(BaseModel):
             codex_model=_env("LHA_CODEX_MODEL", ""),
             codex_reasoning_effort=_env("LHA_CODEX_EFFORT", "medium"),
             codex_sandbox=_env_codex_sandbox(),
-            codex_external_sandbox=_env("LHA_CODEX_EXTERNAL_SANDBOX", "0")
-            not in ("0", "false", "False"),
+            codex_external_sandbox=_env_bool(
+                "LHA_CODEX_EXTERNAL_SANDBOX",
+                "0",
+            ),
             codex_max_retries=int(_env("LHA_CODEX_MAX_RETRIES", "2")),
             codex_retry_backoff_s=float(_env("LHA_CODEX_RETRY_BACKOFF_S", "1")),
             anthropic_model_impl=_env("LHA_ANTHROPIC_MODEL_IMPL", "claude-opus-4-8"),

@@ -1,195 +1,204 @@
-# Verification ablation
+# 校验消融实验
 
-`lha ablate` measures whether executable checks prevent incorrect code changes
-from being delivered, and whether bounded repair recovers work the gate rejects.
-It is a mechanism experiment, not a public-model leaderboard.
+`lha ablate` 用固定的内部缺陷集回答两个问题：
 
-## Paired design
+1. 可执行检查能否阻止错误补丁被交付；
+2. 补丁未通过检查后，有限次数的修复能否得到正确结果。
 
-The fixed corpus contains 17 small Python repositories under `data/bench/`.
-Each has a planted defect, a symptom-level task, and a canonical pytest oracle.
-The corpus and its oracles must not be modified after observing model output.
+它不用于比较公开模型排名。
 
-For each `(task, repetition)`, the harness draws one first attempt and evaluates
-that same attempt under:
+## 配对设计
 
-| condition | gate | repair | delivered when |
+语料位于 `data/bench/`，包含 17 个小型 Python 仓库。每个仓库都有固定缺陷、
+只描述故障现象的任务，以及预先确定的 Pytest 判定程序。运行开始前，任务和仓库会
+复制到按内容寻址的输入快照；后续单元不再读取可变的原始目录。
+
+每个 `(任务, 重复序号)` 共用同一次初始模型输出，再进入三种条件：
+
+| 条件 | 内部门禁 | 修复 | 交付规则 |
 |---|---|---|---|
-| `trust` | off | none | the model returns a patch |
-| `gate` | on | none | the original patch passes the checks |
-| `verify` | on | bounded | the original or a repaired patch passes |
+| `trust` | 关闭 | 不修复 | 直接交付初始补丁 |
+| `gate` | 开启 | 不修复 | 初始补丁通过检查才交付 |
+| `verify` | 开启 | 有次数上限 | 初始补丁或修复补丁通过检查后交付 |
 
-`trust` and `gate` therefore differ in verification, not in the sampled first
-attempt. `verify` may make additional model calls after receiving concrete
-failure evidence.
+这样比较的是同一初始补丁经过不同处理后的结果，而不是三次互不相关的模型采样。
+只有 `verify` 可以在收到检查失败信息后继续调用模型。
 
-## Prediction and truth
+## 独立评分
 
-The internal gate only predicts whether a patch should be accepted. It does not
-grade itself.
+内部门禁只决定流程能否继续，不能同时充当实验真值。独立评分器会：
 
-For every evaluated output, the independent scorer:
+1. 固化最终源码改动并记录 SHA-256；
+2. 从固定语料重新复制一份干净仓库；
+3. 恢复原始测试和受保护配置；
+4. 只应用固化后的源码改动；
+5. 通过独立执行后端运行固定测试。
 
-1. freezes the effective source change and records its SHA-256;
-2. creates a fresh copy of the canonical repository;
-3. restores the original tests and protected configuration;
-4. applies only the frozen source change;
-5. runs pytest through a separate `ExecutionBackend` instance.
+报告区分两个字段：
 
-The scorer's result is `true_success`. A patch that is claimed as successful but
-fails this scorer is `false_success`. Gate predictions are compared with truth
-as TP, FP, TN, and FN.
+- `artifact_correct`：独立评分器是否判定补丁正确；
+- `true_success`：该条件既交付了补丁，且补丁被独立评分器判定正确。
 
-For external or untrusted repositories, use
-`--scorer-backend docker`. A `trusted-local` scorer is state-independent but not
-host-isolated.
+因此，正确补丁若被门禁拒绝，仍是 `artifact_correct=true`，但
+`true_success=false`。门禁的混淆矩阵使用前者，交付成功率和长链分析使用后者。
 
-## Oracle protection
+评分前会记录完整 Pytest 节点集合。正常结果还必须具有匹配的阶段记录、随机 nonce、
+会话结束回执和按内容寻址的评分证据。仅打印伪造的成功文本或提前退出，不能生成这些
+证据，会被记为 `ERROR`。
 
-The first-attempt worktree excludes test files. Model output is reduced to its
-effective source write set; changes to tests, `conftest.py`, package/build
-configuration, or CI files are rejected by policy unless a task explicitly
-allowlists an exact protected path.
+当前评分器面向固定、非对抗的语料程序。同一 UID 的恶意 Python 代码仍可能检查评分
+进程和可写挂载；Docker 减少主机暴露，但不能让容器内判定程序天然不可篡改。若要评分
+不可信代码，还需要独立控制进程和只读判定挂载。`trusted-local` 只适用于用户信任的
+仓库。
 
-The scorer starts from the canonical corpus rather than the gate's worktree. A
-dirty or stale gate directory therefore cannot silently become ground truth.
+## 补丁和模型调用约束
 
-Repair prompts may include compact pytest failure excerpts. That feedback is the
-repair mechanism being measured; repaired output still has to pass the complete
-canonical oracle.
+初始工作区不向模型提供测试文件。测试、`conftest.py`、构建配置、包配置和 CI 文件
+默认禁止修改，只有任务明确列出的精确路径可以例外。
 
-## Codex no-tools protocol
+正式消融通过 Codex CLI 请求一次无工具调用的补丁。完整 JSONL 事件流必须可解析；
+以下情况都会失败：
 
-The Codex CLI does not expose the same file-tool deny-list as the Claude CLI.
-For an ablation attempt, LHA therefore audits the complete `codex exec --json`
-stream and rejects the result if any tool item appears.
+- 非法 JSON、未知事件或显式错误事件；
+- turn 或 item 没有正常结束；
+- 缺少完成的 agent message；
+- 出现任何工具调用；
+- 非零退出、超时、认证失败或中断。
 
-The parser also fails closed on:
+每次调用使用独立的 `HOME`、`CODEX_HOME`、工作区和临时目录。父进程只传递允许的
+环境变量，并在正常返回、失败、超时或已处理的中断后确认原进程组停止，再删除临时
+凭据。主动创建其他进程组或会话的工具进程不在宿主后端的保证内，不可信工具需要
+Docker 或其他外层隔离。`SIGKILL`、内核崩溃或断电仍可能留下权限受限的临时目录，
+需要人工检查。
 
-- malformed JSONL or an unknown event type;
-- an error or failed-turn event;
-- a turn that starts but does not complete;
-- a started item that never reaches a valid completion;
-- a missing completed agent message;
-- non-zero exit, timeout, authentication failure, or interrupted process.
+正式报告只接受经过上述协议检查的 `codex_cli` 证据。预测侧门禁和独立评分都使用
+Docker，并记录不可变镜像 ID、CLI 版本、模型参数、事件摘要、用量和运行环境；凭据
+内容不会进入报告。
 
-Each call uses a temporary `HOME`, `CODEX_HOME`, workspace, and temp directory.
-The parent environment is reduced to an explicit allowlist, the CLI process and
-descendants are stopped before cleanup, and temporary authentication is removed
-on every exit path.
+## 正式尝试
 
-The report records secret-free provenance: selected model, reasoning effort,
-Codex CLI version, event summary, usage, outcome, Python and pytest versions,
-Git state, source-tree digest, task digests, corpus digests, scorer backend, and
-Docker image identity when applicable.
+正式的 17 个任务 × 12 次重复必须先在
+`benchmarks/formal_ablation_attempts.json` 登记。`REGISTERED` 事件固定：
 
-## Cache and transient failures
+- 源码提交、源码树摘要和语料清单；
+- 模型、推理强度、Codex CLI 版本和可执行文件摘要；
+- 无工具、沙箱、权限、重试、超时和退避参数；
+- Docker 镜像 ID，以及由 `pyproject.toml`、`uv.lock`、`.python-version`、
+  `Dockerfile`、`.dockerignore` 计算的评分运行时摘要；
+- 单次使用的输出目录，以及用于留下开始记录的一次性远端 Git 引用地址。
 
-Completed non-error cells can be reused only when the provenance fingerprint
-matches. The fingerprint binds the task bytes, corpus bytes, complete installed
-`lha` source tree, model/backend settings, scorer settings, repair/retry
-configuration, versions, and runtime details.
+登记提交必须直接跟在源码提交之后，而且只能修改登记文件。正式运行开始时，系统先
+持久化运行头，再以“远端引用必须不存在”为条件创建本次尝试专用的一次性 Git 引用。
+该提交绑定登记摘要、协议摘要、一次性随机值（字段名 `outcome_key`）和运行头摘要。
+只有匿名 `ls-remote` 返回精确提交后，才允许开始第一个实验单元。
 
-Protocol violations are deterministic failures and are not retried as transport
-errors. Only failures explicitly classified as transient service or connection
-problems use the configured bounded retry path.
+登记文件是追加式状态机：
 
-If a transient problem persists, the cell is written as `ERROR`, shown in the
-report, excluded from rate denominators, and never cached. It is not counted as
-a model failure or quietly dropped from the record.
+- `REGISTERED`：参数已经固定，但不代表实验已经产生结果；
+- `COMPLETED`：完整报告和全部证据通过校验后，绑定正式结果；
+- `ABANDONED`：预检失败、中断、额度耗尽或日程未完成，本次尝试终止。
 
-## Statistics
+`ABANDONED` 不是实验结果，不能用于计算比例、显著性或简历数字。正式运行不读缓存、
+不恢复，也不能删除残留目录后继续使用同一次尝试。只有带完整 `COMPLETED` 证据的
+尝试才能作为当前 schema v4 结果发布。
 
-The report gives exact counts and rates per condition. For uncertainty:
+这个一次性 Git 引用只能证明登记尝试确实开始过，不会让远端服务、Docker daemon 或
+主机本身变成可信环境。
 
-- interior rates use a seeded task-cluster bootstrap because repetitions from
-  one task are correlated;
-- all-zero or all-one boundary rates use a Wilson score interval, because a
-  percentile bootstrap would produce a false zero-width interval;
-- paired contrasts use the exact two-sided McNemar test on matched
-  `(task, repetition)` cells.
+## 错误、缓存和统计
 
-The gate confusion matrix and error count should be read alongside headline
-rates. A zero observed false-success rate is not proof that the underlying rate
-is exactly zero.
+探索性运行可以复用通过完整指纹校验的缓存；正式运行禁止读取缓存。正式输出目录必须
+全新，初始化前只能包含运行锁。每个单元先写开始标记，再写终态文件。
 
-## Committed schema-v2 result
+schema v4 中，只有“所有有界的首次调用都未产生补丁”可以形成单元级 `ERROR`。每次
+失败调用仍要保存内容寻址回执，三种条件共享同一个 `ERROR`。它留在计划总数中，但
+不进入比例估计和配对检验。
 
-The committed report uses 17 fixed tasks and 12 repetitions, giving 204 paired
-`(task, repetition)` cells. Its protocol is Codex CLI 0.141.0,
-`gpt-5.4-mini`, low reasoning effort, read-only mode, and an independent Docker
-scorer. All 204 cells were scored; the report contains 0 `ERROR` cells.
+一旦已经产生补丁，后续修复、评分、文件系统或容器操作失败，就会终止整个正式尝试，
+而不是把不完整单元转换成 `ERROR`。
 
-| condition | delivered | independently correct | incorrect delivery | result |
-|---|---:|---:|---:|---|
-| `trust` | 204 | 194 | 10 | every first attempt was delivered |
-| `gate` | 194 | 194 | 0 | accepted 194 correct attempts and rejected all 10 incorrect attempts |
-| `verify` | 204 | 204 | 0 | repaired the 10 rejected attempts before delivery |
+报告分别给出计划单元、可用配对单元和错误单元。比例的分母使用可用单元；某次完整
+重复只要缺少一个任务，就不进入完整任务级分析。组合曲线只使用各任务已有样本数，
+不会增加观测。
 
-For `trust` versus `verify`, the discordant counts are 10 in favor of
-`verify` and 0 in favor of `trust`. The exact two-sided McNemar result is
-`p = 0.001953125`, reported in prose as `p = 0.00195`.
+统计方法包括：
 
-These are mechanism results on the repository's fixed corpus. They are not a
-Terminal-Bench, SWE-bench, or general model-quality score. Raw records,
-provenance, configuration, and the generated table are in
-`benchmarks/ablation_report.{json,md}`.
+- 内部比例使用按任务聚类的有种子 bootstrap；
+- 全零或全一边界使用 Wilson 区间；
+- schema v4 的配对比较先在任务内汇总重复结果，再以任务为单位做双侧精确符号翻转
+  检验；单元 discordance 只作描述；
+- schema v1–v3 历史报告保留原来的单元级 McNemar 字段，仅用于复现旧证据。
 
-## Run the experiment
+观测到零次错误交付，并不等于真实错误率为零。
 
-The committed protocol can be rerun after building the scorer image:
+## 当前证据状态
+
+当前正式 schema-v4 尝试已经完成。模型为 `gpt-5.3-codex-spark`，推理强度为
+`high`；17 个固定任务各重复 12 次，计划 204 个配对单元，204 个可用，0 个
+`ERROR`。
+
+同一首轮补丁在三种条件下得到：
+
+- `trust`：201 个正确交付，3 个错误交付；
+- `gate`：201 个正确交付，3 个错误补丁全部拦截，误放和误拒均为 0；
+- `verify`：3 个失败单元各修复 1 次，最终 204/204 正确交付。
+
+`trust` 与 `gate` 的错误交付、`gate` 与 `verify` 的正确交付差异，按任务聚类的精确
+配对符号翻转检验均为 p = 0.2500。该 p 值反映只有 3/17 个任务出现非零配对差异，
+不能只根据 204 个重复单元解释显著性。
+
+正式结果一次性提交：
+
+- JSON 报告及其 Markdown 渲染；
+- 输入快照、补丁、评分证据和模型调用回执；
+- 运行头以及全部单元开始、终态文件；
+- 与报告完全匹配的 `COMPLETED` 事件。
+
+`python -m lha.release_claims` 会重新检查源码和语料摘要、无缓存约束、证据引用、登记
+历史以及一次性远端 Git 引用；任一环节无法验证都不能发布。
+
+## 运行方式
+
+普通探索性运行：
 
 ```bash
-docker build -t lha:release .
-LHA_CODEX_MODEL=gpt-5.4-mini \
-LHA_CODEX_EFFORT=low \
+uv run lha --llm codex_cli ablate \
+  data/tasks/bench_*.yaml \
+  --reps 1 \
+  --model YOUR_MODEL_ID
+```
+
+正式运行只能在已有开放登记、干净工作区和精确远端分支的前提下执行：
+
+```bash
+ATTEMPT_ID=replace-with-registered-attempt-id
+MODEL=replace-with-registered-model
+EFFORT=replace-with-registered-effort
+IMAGE_ID=sha256:replace-with-registered-image-id
+
+LHA_CODEX_MODEL="$MODEL" \
+LHA_CODEX_EFFORT="$EFFORT" \
 LHA_CODEX_SANDBOX=read-only \
-LHA_EXEC_IMAGE=lha:release \
+LHA_EXEC_IMAGE="$IMAGE_ID" \
 uv run lha --llm codex_cli ablate \
   --reps 12 \
-  --model gpt-5.4-mini \
+  --model "$MODEL" \
   --scorer-backend docker \
-  --out runs/ablation
+  --out "runs/formal_ablation/$ATTEMPT_ID"
 ```
 
-The scorer image selected by `LHA_EXEC_IMAGE` must contain pytest and
-`pytest-json-report`. The default slim Python image does not.
+输出目录包含运行头、输入快照、补丁、评分证据、模型回执和逐单元终态文件。日程完整
+结束后运行：
 
-Output layout:
-
-```text
-runs/ablation/
-  ablation_report.json
-  ablation_report.md
-  results/<task>__r<rep>.json
+```bash
+uv run lha ablation-attempt complete
 ```
 
-The per-cell files allow an interrupted run to continue only when their
-fingerprint still matches. `ERROR` files are recomputed.
+该命令会校验全部证据并生成 `COMPLETED` 事件；不能手工拼接报告或直接修改登记文件。
 
-## Result policy
+当前正式文件：
 
-The summary above mirrors the current generated artifacts. The authoritative
-values and full precision remain:
+- [`benchmarks/ablation_report.json`](../benchmarks/ablation_report.json)
+- [`benchmarks/ablation_report.md`](../benchmarks/ablation_report.md)
 
-- `benchmarks/ablation_report.json` for raw records and provenance;
-- `benchmarks/ablation_report.md` for the generated table;
-- `benchmarks/horizon_report.*` for the separate horizon analysis.
-
-Before publishing a result:
-
-1. freeze the code and corpus;
-2. use a new output directory or a matching fingerprint;
-3. complete the registered repetition count;
-4. review every `ERROR` and keep it visible;
-5. confirm the report's Git state and source digest;
-6. copy the generated reports without editing their numbers;
-7. update every public statement that cites the old report.
-
-Do not write a planned sample count as a completed result, substitute a
-different model or scorer into this result, or report a Terminal-Bench or
-SWE-bench score from this internal corpus.
-
-Hermetic tests for pairing, scoring independence, cache invalidation, Wilson
-boundaries, error handling, and report provenance are in
-`tests/test_ablation.py` and `tests/test_codex_backend.py`.
+长链统计见 [HORIZON.md](HORIZON.md)，外部评测见 [BENCHMARKS.md](BENCHMARKS.md)。

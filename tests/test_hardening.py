@@ -1,4 +1,4 @@
-"""Pinning tests for the verification-first hardening pass.
+"""Regression tests for fail-closed checks and durable recovery.
 
 Each test pins a fix whose absence would let an unverified result pass, a budget
 escape across resume, a silent LLM truncation, or a facade-isolation leak. Without
@@ -102,6 +102,26 @@ def test_ruff_fails_on_inconsistent_exit_codes(tmp_path):
     )
     assert not c2.passed
 
+    # JSON syntax is insufficient: Ruff's output contract is a list of
+    # violations. Empty objects and malformed violation records fail closed.
+    for returncode, stdout in (
+        (0, "{}"),
+        (0, ""),
+        (1, '[{"code": "F401"}]'),
+        (0, '[{"code": "F401", "message": "unused", "filename": "x.py",'
+             ' "location": {"row": 1, "column": 1}}]'),
+    ):
+        malformed = RuffVerifier().verify(
+            Patch(step_id="s"),
+            VerifyContext(
+                workdir=tmp_path,
+                step=_step("ruff"),
+                exec=_CannedExec(ProcResult(returncode, stdout, "", 0.0)),
+            ),
+        )
+        assert not malformed.passed
+        assert malformed.detail.get("parse_error")
+
 
 def test_pytest_fails_when_every_collected_test_is_skipped(tmp_path):
     (tmp_path / "test_only.py").write_text(
@@ -155,6 +175,60 @@ def test_budget_is_per_run_across_resume(tmp_path):
         Harness(_cfg(tmp_path, max_steps=20)).resume(paused.state.run_id)
 
 
+def test_deadline_is_checked_after_the_last_step(tmp_path, monkeypatch):
+    from lha.harness.budget import StepBudget
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(StepBudget, "elapsed", lambda self: clock["now"])
+    original = VerifierAgent.verify
+
+    def consume_remaining_time(self, step, artifact, ctx):
+        verdict = original(self, step, artifact, ctx)
+        if step.action == "edit_code":
+            clock["now"] = 2.0
+        return verdict
+
+    monkeypatch.setattr(VerifierAgent, "verify", consume_remaining_time)
+    result = Harness(_cfg(tmp_path, deadline_s=1.0)).run(
+        hermetic_task("data/tasks/fix_average.yaml")
+    )
+
+    assert result.status == "PAUSED"
+    assert result.state.cursor == len(result.state.plan.steps)
+    resumed = Harness(_cfg(tmp_path, deadline_s=1.0)).resume(
+        result.state.run_id
+    )
+    assert resumed.status == "PAUSED"
+
+
+def test_langgraph_deadline_is_checked_after_the_last_step(tmp_path, monkeypatch):
+    pytest.importorskip("langgraph")
+    from lha.runtime import langgraph_runner
+    from lha.runtime.langgraph_runner import LangGraphHarness
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(langgraph_runner.time, "monotonic", lambda: clock["now"])
+    original = VerifierAgent.verify
+
+    def consume_remaining_time(self, step, artifact, ctx):
+        verdict = original(self, step, artifact, ctx)
+        if step.action == "edit_code":
+            clock["now"] = 2.0
+        return verdict
+
+    monkeypatch.setattr(VerifierAgent, "verify", consume_remaining_time)
+    result = LangGraphHarness(_cfg(tmp_path, deadline_s=1.0)).run(
+        hermetic_task("data/tasks/fix_average.yaml")
+    )
+
+    assert result.status == "PAUSED"
+    assert result.state.cursor == len(result.state.plan.steps)
+    resumed = LangGraphHarness(_cfg(tmp_path, deadline_s=1.0)).resume(
+        result.state.run_id
+    )
+    assert resumed.status == "PAUSED"
+
+
 # --- deadline_s reaches the loop through the documented env path ------------
 def test_deadline_s_is_read_from_env(monkeypatch):
     monkeypatch.setenv("LHA_DEADLINE_S", "1.5")
@@ -171,6 +245,29 @@ def test_deadline_s_rejects_non_finite_or_negative(monkeypatch):
         with pytest.raises(ValueError):
             Config.from_env()
     monkeypatch.delenv("LHA_DEADLINE_S", raising=False)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("0", False),
+        ("false", False),
+        ("FALSE", False),
+        ("1", True),
+        ("true", True),
+        (" TRUE ", True),
+    ],
+)
+def test_security_sensitive_boolean_env_is_explicit(monkeypatch, raw, expected):
+    monkeypatch.setenv("LHA_CODEX_EXTERNAL_SANDBOX", raw)
+    assert Config.from_env().codex_external_sandbox is expected
+
+
+@pytest.mark.parametrize("raw", ["fasle", "yes", "2", "", "enabled"])
+def test_security_sensitive_boolean_env_rejects_typos(monkeypatch, raw):
+    monkeypatch.setenv("LHA_CODEX_EXTERNAL_SANDBOX", raw)
+    with pytest.raises(ValueError, match="LHA_CODEX_EXTERNAL_SANDBOX"):
+        Config.from_env()
 
 
 # --- Anthropic backend never returns a truncated / refused completion -------

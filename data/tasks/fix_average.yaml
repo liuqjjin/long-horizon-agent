@@ -4,6 +4,7 @@ description: >
   average() in mathutils.py returns the wrong value because of a stray "- 1".
   tests/test_mathutils.py::test_average fails. Fix the function so the tests pass.
 target_repo: data/sample_repo
+context_requirement: optional
 inputs:
   context_query: "average function arithmetic mean"
 success:

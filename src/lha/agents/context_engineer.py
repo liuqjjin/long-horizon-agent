@@ -31,7 +31,7 @@ class ContextEngineer:
 
     def gather(self, step: Step, workdir: str | Path | None = None) -> ContextBundle:
         kinds = list(_KINDS_BY_STEP.get(step.kind, ("code", "paper", "experiment")))
-        # Episodic memory: retrieve relevant past skills (cheap no-op until indexed).
+        # Include records distilled from earlier successful runs when that index exists.
         if self.config.use_skill_memory and "skill" not in kinds:
             kinds.append("skill")
         kinds = tuple(kinds)
@@ -47,9 +47,10 @@ class ContextEngineer:
                 # freshness verifier fails it closed with a diagnosable reason.
                 bundle.status = "index_failed"
                 bundle.status_notes.append(str(e))
-        if workdir is not None and step.repair_of:
-            # A repair must reason over the CURRENT sandbox, not the pristine
-            # repo the index was built from — the failing state is the point.
+        if workdir is not None:
+            # Indexed locators are only candidates. Re-read every code item
+            # from the run snapshot so stale backend bytes or later source-repo
+            # edits can never become model context.
             self._overlay_workdir(bundle, Path(workdir))
         if step.action == "answer_query":
             bundle.answer = self._synthesize(bundle)
@@ -103,10 +104,10 @@ class ContextEngineer:
 
     @staticmethod
     def _synthesize(bundle: ContextBundle) -> str:
-        """A simple, deterministic, citation-anchored answer for v1."""
+        """Render retrieved snippets with their source locations."""
         if not bundle.items:
             return f"No indexed context found for: {bundle.query}"
-        lines = [f"Answer for: {bundle.query}", ""]
+        lines = [f"Matches for: {bundle.query}", ""]
         for item in bundle.items[:5]:
             snippet = " ".join(item.text.split())[:200]
             lines.append(f"- {snippet} [{item.provenance.locator}]")

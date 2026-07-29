@@ -11,34 +11,129 @@ This module is the ONLY place that knows about ``ccc``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import os
-import shutil
-import subprocess
+from bisect import bisect_right
+from collections.abc import Awaitable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from ...clock import now
+from ...sandbox.base import (
+    PROCESS_CLEANUP_RETURN_CODE,
+    process_group_cleanup_supported,
+    run_bounded_process,
+    terminate_process_group,
+)
+from ...tools.shell import (
+    ProcResult,
+    sanitized_absolute_path,
+    trusted_executable,
+)
 from ..freshness import content_hash, strict_file_sha256
 from ..models import CodeHit, Hit, Provenance, ReindexResult
 from .base import BackendUnavailable, SearchBackend
 
+_MCP_INITIALIZE_TIMEOUT_S = 30.0
+_MCP_SEARCH_TIMEOUT_S = 180.0
+_CCC_CONTROL_OUTPUT_BYTES = 1024 * 1024
+_T = TypeVar("_T")
+
 
 def find_ccc() -> str | None:
     """Locate the ``ccc`` executable, including the pipx default bin dir."""
-    found = shutil.which("ccc")
-    if found:
-        return found
-    candidate = Path.home() / ".local" / "bin" / "ccc"
-    return str(candidate) if candidate.exists() else None
+    return trusted_executable(
+        "ccc",
+        extra_dirs=(
+            Path.home() / ".local" / "bin",
+            Path("/opt/homebrew/bin"),
+        ),
+        require_unwritable=False,
+    )
 
 
 def _env_with_local_bin() -> dict[str, str]:
-    env = dict(os.environ)
-    extra = f"{Path.home()}/.local/bin:/opt/homebrew/bin"
-    env["PATH"] = extra + ":" + env.get("PATH", "")
+    """Build the narrow environment shared with the trusted CCC subprocess.
+
+    Passing ``os.environ`` would also pass model, cloud, GitHub, and SSH
+    credentials to a process started inside a target repository. CCC needs an
+    executable path and locale settings here; everything else is deliberately
+    absent.
+    """
+    env = {
+        "PATH": sanitized_absolute_path(
+            extra_dirs=(
+                Path.home() / ".local" / "bin",
+                Path("/opt/homebrew/bin"),
+            ),
+        ),
+    }
+    for key in ("LANG", "LC_ALL", "LC_CTYPE"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
     return env
+
+
+def _checked_timeout(value: float, *, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite positive number")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return timeout
+
+
+def _run_ccc_control(
+    argv: list[str],
+    *,
+    root: Path,
+    env: dict[str, str],
+    timeout_s: float,
+) -> ProcResult:
+    """Run a fixed CCC control command with bounded output and tree cleanup."""
+    if not process_group_cleanup_supported():
+        return ProcResult(
+            PROCESS_CLEANUP_RETURN_CODE,
+            "",
+            (
+                "ccc control command requires POSIX process-group cleanup; "
+                "use Linux, macOS, or WSL2"
+                ),
+                0.0,
+                cleanup_confirmed=False,
+                cleanup_detail=(
+                    "POSIX process-group cleanup is unavailable"
+                ),
+            )
+    return run_bounded_process(
+        argv,
+        cwd=root,
+        env=env,
+        timeout=timeout_s,
+        output_bytes=_CCC_CONTROL_OUTPUT_BYTES,
+        start_new_session=True,
+        on_exit=terminate_process_group,
+    )
+
+
+async def _await_mcp(
+    awaitable: Awaitable[_T],
+    *,
+    timeout_s: float,
+    operation: str,
+) -> _T:
+    """Await one MCP operation with a fail-closed wall-clock deadline."""
+    try:
+        async with asyncio.timeout(timeout_s):
+            return await awaitable
+    except TimeoutError as error:
+        raise BackendUnavailable(
+            f"ccc MCP {operation} timed out after {timeout_s:g}s"
+        ) from error
 
 
 # Flexible field extraction — we do not hard-code ccc's exact JSON keys.
@@ -101,7 +196,7 @@ def _result_to_codehit(d: dict[str, Any], root: Path, indexed_at: datetime) -> C
 
 
 def _bind_source_evidence(row: dict[str, Any], root: Path) -> dict[str, Any]:
-    """Bind a CCC row to one exact, regular source file inside ``root``."""
+    """Bind a CCC row to exact bytes and an exact line span inside ``root``."""
     raw = str(_first(row, "path", "file", "filename", "file_path", default=""))
     if not raw:
         raise OSError("ccc result has no source path")
@@ -124,7 +219,65 @@ def _bind_source_evidence(row: dict[str, Any], root: Path) -> dict[str, Any]:
         canonical_relative = resolved.relative_to(canonical_root)
     except ValueError as error:
         raise OSError(f"ccc returned path outside indexed root: {raw_path}") from error
+
+    line_start = _first(row, "line_start", "start_line", "start", "lineStart")
+    line_end = _first(row, "line_end", "end_line", "end", "lineEnd")
+    if (
+        isinstance(line_start, bool)
+        or not isinstance(line_start, int)
+        or isinstance(line_end, bool)
+        or not isinstance(line_end, int)
+    ):
+        raise OSError("ccc result has missing or non-integer source line numbers")
+    if line_start < 1 or line_end < line_start:
+        raise OSError(f"ccc returned an invalid source line range: {line_start}-{line_end}")
+
+    snippet = str(_first(row, "code", "content", "text", "snippet", default="") or "")
+    if not snippet:
+        raise OSError("ccc result has no source snippet")
+    try:
+        source_bytes = source.read_bytes()
+        source_text = source_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise OSError(f"ccc source cannot be read as UTF-8: {canonical_relative}") from error
+    if hashlib.sha256(source_bytes).hexdigest() != digest:
+        raise OSError(f"ccc source changed while validating: {canonical_relative}")
+
+    lines = source_text.splitlines(keepends=True)
+    if line_end > len(lines):
+        raise OSError(
+            f"ccc source line range {line_start}-{line_end} exceeds "
+            f"{canonical_relative} ({len(lines)} lines)"
+        )
+    line_offsets: list[int] = []
+    offset = 0
+    for line in lines:
+        line_offsets.append(offset)
+        offset += len(line)
+    span_start = line_offsets[line_start - 1]
+    span_end = span_start + sum(len(line) for line in lines[line_start - 1 : line_end])
+
+    occurrence = source_text.find(snippet, span_start, span_end)
+    matched_range = False
+    while occurrence != -1 and occurrence + len(snippet) <= span_end:
+        actual_start = bisect_right(line_offsets, occurrence)
+        actual_end = bisect_right(line_offsets, occurrence + len(snippet) - 1)
+        if actual_start == line_start and actual_end == line_end:
+            matched_range = True
+            break
+        occurrence = source_text.find(snippet, occurrence + 1, span_end)
+    if not matched_range:
+        raise OSError(
+            f"ccc snippet does not match {canonical_relative}:{line_start}-{line_end}"
+        )
+
     bound = dict(row)
+    # Canonical keys prevent conflicting aliases in an untrusted response from
+    # changing what the converter persists after the checks above.
+    bound["path"] = canonical_relative.as_posix()
+    bound["line_start"] = line_start
+    bound["line_end"] = line_end
+    bound["code"] = snippet
     bound["_lha_source_rel"] = canonical_relative.as_posix()
     bound["_lha_source_root"] = str(canonical_root)
     bound["_lha_source_sha256"] = digest
@@ -193,10 +346,29 @@ def _explicit_empty_result(call_result: Any) -> bool:
     return False
 
 
+def _reported_unsuccessful(call_result: Any) -> bool:
+    structured = getattr(call_result, "structuredContent", None)
+    if isinstance(structured, dict) and structured.get("success") is False:
+        return True
+    for block in getattr(call_result, "content", []) or []:
+        text = getattr(block, "text", None)
+        if not text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("success") is False:
+            return True
+    return False
+
+
 def _checked_results(call_result: Any) -> list[dict]:
     """A tool failure or malformed response is not an empty code search."""
     if bool(getattr(call_result, "isError", False)):
         raise BackendUnavailable("ccc MCP search tool returned an error")
+    if _reported_unsuccessful(call_result):
+        raise BackendUnavailable("ccc MCP search reported an unsuccessful result")
     rows = _extract_results(call_result)
     if not rows:
         if _explicit_empty_result(call_result):
@@ -205,8 +377,12 @@ def _checked_results(call_result: Any) -> list[dict]:
     for row in rows:
         path = _first(row, "path", "file", "filename", "file_path")
         text = _first(row, "code", "content", "text", "snippet")
-        if not path or not text:
-            raise BackendUnavailable("ccc MCP search returned a malformed result without path/text")
+        line_start = _first(row, "line_start", "start_line", "start", "lineStart")
+        line_end = _first(row, "line_end", "end_line", "end", "lineEnd")
+        if not path or not text or line_start is None or line_end is None:
+            raise BackendUnavailable(
+                "ccc MCP search returned a malformed result without path/text/line range"
+            )
     return rows
 
 
@@ -214,9 +390,23 @@ class CccBackend(SearchBackend):
     name = "ccc"
     kind = "code"
 
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        mcp_initialize_timeout_s: float = _MCP_INITIALIZE_TIMEOUT_S,
+        mcp_search_timeout_s: float = _MCP_SEARCH_TIMEOUT_S,
+    ):
         self.root = Path(root)
         self._ccc = find_ccc()
+        self._mcp_initialize_timeout_s = _checked_timeout(
+            mcp_initialize_timeout_s,
+            name="mcp_initialize_timeout_s",
+        )
+        self._mcp_search_timeout_s = _checked_timeout(
+            mcp_search_timeout_s,
+            name="mcp_search_timeout_s",
+        )
 
     def available(self) -> bool:
         return self._ccc is not None and self.root.exists()
@@ -247,8 +437,16 @@ class CccBackend(SearchBackend):
 
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool("search", args)
+                await _await_mcp(
+                    session.initialize(),
+                    timeout_s=self._mcp_initialize_timeout_s,
+                    operation="initialization",
+                )
+                result = await _await_mcp(
+                    session.call_tool("search", args),
+                    timeout_s=self._mcp_search_timeout_s,
+                    operation="search",
+                )
         return _checked_results(result)
 
     def search(self, query: str, *, k: int = 8, **filters) -> list[Hit]:
@@ -302,28 +500,24 @@ class CccBackend(SearchBackend):
         try:
             # Auto-init a fresh project (e.g. a run sandbox) before indexing.
             if not (self.root / ".cocoindex_code" / "settings.yml").exists():
-                init = subprocess.run(
+                init = _run_ccc_control(
                     [self._ccc, "init", "-f"],
-                    cwd=str(self.root),
+                    root=self.root,
                     env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
+                    timeout_s=120,
                 )
                 if init.returncode != 0:
                     return ReindexResult(
                         kind=self.kind, ok=False, version_before=version_before,
                         detail=f"ccc init failed (exit {init.returncode}): {init.stderr[-300:]}",
                     )
-            proc = subprocess.run(
+            proc = _run_ccc_control(
                 [self._ccc, "index"],
-                cwd=str(self.root),
+                root=self.root,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=600,
+                timeout_s=600,
             )
-        except (OSError, subprocess.TimeoutExpired) as e:
+        except OSError as e:
             return ReindexResult(
                 kind=self.kind, ok=False, version_before=version_before,
                 detail=f"ccc index did not run: {type(e).__name__}: {e}",

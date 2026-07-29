@@ -1,4 +1,4 @@
-"""LHA runs model-generated task steps behind executable checks.
+"""LHA runs task steps with executable checks and resumable state.
 
 The main loop reads context, executes a step, runs its checks, then either
 repairs the result or saves a checkpoint and advances. Code and document search

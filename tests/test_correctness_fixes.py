@@ -154,11 +154,12 @@ def test_claude_cli_clears_stale_usage_on_failure(monkeypatch):
     client = mod.ClaudeCLIClient()
     client.last_usage = {"input_tokens": 5, "output_tokens": 2, "cost_usd": 0.1}
 
-    def failing_run(cmd, timeout=None, input=None):
-        return SimpleNamespace(ok=False, returncode=1, stderr="boom", stdout="")
+    def failing_run(*_args, **_kwargs):
+        return SimpleNamespace(returncode=1, stderr="boom", stdout="")
 
-    monkeypatch.setattr(mod, "run", failing_run)
-    with pytest.raises(RuntimeError, match="claude CLI failed"):
+    monkeypatch.setattr(client, "_cli_version", lambda **_kwargs: "test-version")
+    monkeypatch.setattr(mod, "_run_isolated_process", failing_run)
+    with pytest.raises(RuntimeError, match="return code 1"):
         client.complete("system", "prompt")
     assert client.last_usage is None  # the tracer must not re-count old tokens
 

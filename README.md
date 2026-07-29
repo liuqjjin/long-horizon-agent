@@ -1,154 +1,154 @@
-# LHA：可恢复的代码任务执行与校验框架
+# LHA：代码任务的执行、恢复与校验
 
-LHA 用来执行代码修改、实验和资料检索任务。模型产生结果后，框架运行独立检查；
-检查通过才推进，失败信息会进入下一次修复。运行中断后可以从检查点继续。
+LHA 在独立工作目录中执行代码修改和实验任务。每一步都保存状态和证据；
+检查通过后继续，失败时在预算内修复或回滚，进程中断后可以从已保存状态恢复。
 
 [![持续集成](https://github.com/liuqjjin/long-horizon-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/liuqjjin/long-horizon-agent/actions/workflows/ci.yml)
-![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
-![许可](https://img.shields.io/badge/许可-MIT-green)
+[英文说明](https://github.com/liuqjjin/long-horizon-agent/blob/main/docs/README.en.md)
 
-[英文简版](https://github.com/liuqjjin/long-horizon-agent/blob/main/docs/README.en.md)
+## 解决的问题
 
-## 解决什么问题
+代码任务经常需要多轮读取、修改和验证。只保存模型最后一段回答，无法判断补丁是否
+真正应用、检查是否完整执行，也无法在审批或进程中断后安全继续。
 
-多步骤代码任务最危险的情况不是命令报错，而是错误结果被当作成功继续使用。LHA 把
-测试、静态检查、实验指标重算、索引新鲜度和人工审批放进同一个状态机：
+LHA 把这些工作交给运行器：
 
-```text
-读取上下文 → 执行 → 审批（可选）→ 校验 → 修复或推进 → 保存检查点
-```
+- 计划、步数、修复次数、时间和模型调用量随运行保存；
+- 补丁写入前检查真实修改路径，写入后运行预先登记的检查；
+- 需要人工确认时保存待审补丁，批准后核对同一份内容再继续；
+- 检查失败时在预算内修复，证据损坏或检查无法运行时按失败处理；
+- 消融实验使用独立评分器判定补丁，不把内部放行结果当作正确答案。
 
-内部校验只负责决定是否继续。消融实验的最终结果由另一套评分流程给出：它把补丁应用到
-新的仓库副本，恢复原始测试，再独立执行评分，避免同一个检查既做决策又给自己打分。
+## 快速运行
 
-## 如何运行
-
-需要 Python 3.11+ 和 [uv](https://docs.astral.sh/uv/)。
+需要 Python 3.11 或更高版本、`uv`，以及 Linux、macOS 或 WSL2。
+原生 Windows 可通过 WSL2 或 Docker 运行。
 
 ```bash
 git clone https://github.com/liuqjjin/long-horizon-agent.git
 cd long-horizon-agent
 uv sync
 
-# 修复预先植入的错误，并运行真实 pytest
+# 确定性示例，不需要模型凭据或 ccc
 uv run lha run data/tasks/fix_average.yaml
 
-# 执行六条端到端自测
-uv run lha eval
+# 运行仓库自测
+LHA_RUNS_DIR=runs/_quickstart uv run lha eval
 ```
 
-默认使用确定性桩实现，不需要 API 密钥。也可以使用已经登录的命令行模型：
+示例任务将代码索引设为可选，因此没有安装 `ccc` 也会执行 Pytest 和 Ruff。
+其他任务可以把上下文声明为必需；索引不可用时，这类任务不会继续执行。
+
+本机已经登录 Codex CLI 时，可以使用真实模型：
 
 ```bash
 uv run lha --llm codex_cli run data/tasks/fix_average.yaml
-uv run lha --llm claude_cli run data/tasks/fix_average.yaml
 ```
 
-## 核心实现
+命令默认使用当前 Codex CLI 配置。需要固定实验条件时，再把账户实际可用的模型和
+推理强度写入 `LHA_CODEX_MODEL`、`LHA_CODEX_EFFORT`。
+
+查看保存的状态、补丁和检查结果：
+
+```bash
+RUN_ID=替换为实际运行编号
+uv run lha runs show "$RUN_ID"
+uv run lha trace "$RUN_ID"
+uv run lha trace "$RUN_ID" --html
+```
+
+## 执行流程
 
 ```mermaid
 flowchart LR
-    A["任务"] --> B["生成计划"]
-    B --> C["读取代码与资料"]
+    A["读取任务"] --> B["生成计划"]
+    B --> C["读取代码和资料"]
     C --> D["修改代码或运行实验"]
-    D --> E{"需要审批"}
-    E -- "是" --> F["保存补丁并暂停"]
-    F --> G["核对补丁摘要"]
-    E -- "否" --> H["运行校验"]
+    D --> E{"需要人工审批"}
+    E -- "是" --> F["保存产物并暂停"]
+    F --> G["核对审批记录"]
+    E -- "否" --> H["运行检查"]
     G --> H
-    H -- "通过" --> I["提交事务并进入下一步"]
-    H -- "失败且有预算" --> J["携带失败信息修复"]
+    H -- "通过" --> I["提交事务并继续"]
+    H -- "失败且还有预算" --> J["根据失败信息修复"]
     J --> C
     H -- "失败且预算耗尽" --> K["回滚并结束"]
 ```
 
-### 补丁和审批
+## 核心实现
 
-- 从实际 diff 或完整文件内容计算唯一写入路径，不信任模型声明的文件列表。
-- 默认禁止修改测试、构建配置和 CI 文件；任务必须显式授权例外路径。
-- 补丁采用 `PREPARED / APPLIED / VERIFIED / REVERTED` 事务状态。
-- 每次尝试保存校验和、原文件备份和应用后摘要；恢复时发现不一致立即失败。
-- 审批同时绑定步骤编号和补丁字节的 SHA-256，恢复时不能替换成人未看过的补丁。
+### 状态与恢复
 
-### 状态和恢复
+- `state.json` 带 SHA-256 校验，写入时先同步文件，再原子替换并同步目录。
+- `ledger.jsonl` 保存事件链；每次更新先校验已有记录，再原子替换完整内容。
+- 每个运行目录都有文件锁，用于拒绝并发恢复；稳定的尝试编号和幂等键用于避免重复写入
+  审批、失败和完成事件。
+- 恢复沿用创建运行时确定的步数、修复、时间和模型调用预算，不允许临时放宽。
+- 可选的 LangGraph 运行时使用 SQLite 保存图状态，并复用同一套执行和校验代码。
 
-- `state.json` 使用 SHA-256 信封、`fsync` 和原子替换。
-- `ledger.jsonl` 只追加写入；幂等键避免崩溃恢复产生重复完成事件。
-- 步数、修复次数、运行时间和模型调用用量跨进程累计。
-- 同一运行使用文件锁，两个进程不能同时恢复同一个沙箱。
-- 可选 LangGraph 运行时使用 SQLite 保存图状态，并把执行、审批、校验拆成独立节点。
+### 补丁事务与审批
 
-### 代码和实验校验
+- `ResolvedPatch` 从实际差异或文件内容计算写入路径，不相信模型声明的文件列表。
+- 测试、构建配置和持续集成文件默认受保护，例外路径必须由任务明确允许。
+- `PatchTransaction` 记录 `PREPARED`、`APPLIED`、`VERIFIED` 和 `REVERTED`。
+- 原文件、文件模式、摘要和冗余备份在补丁应用前保存；证据矛盾时停止恢复。
+- 审批记录绑定步骤编号和补丁 SHA-256，恢复时不能用另一份补丁替换已审内容。
 
-- 代码任务运行真实的 Pytest 和 Ruff；没有收集到测试、全部跳过或检查无法启动都算失败。
-- 实验任务从保存的数组重新计算 PSNR、SSIM，不采信脚本自报指标。
-- 复现实验使用新的临时目录，并核对输入、输出和数组摘要。
-- 本地执行用于可信仓库；外部仓库应使用关闭网络并限制资源的 Docker 后端。
+### 校验与执行
 
-### 上下文
+- 代码任务运行 Pytest、Ruff 或仓库适配器声明的命令。
+- 实验任务从保存的数组重新计算指标，并在新目录中复跑。
+- 未知检查、无法启动、没有收集到测试或全部跳过，都不计为通过。
+- 目标代码通过统一的 `ExecutionBackend` 执行；外部仓库可使用禁网、限资源的 Docker 后端。
+- Codex CLI 的 JSONL 输出按协议解析；格式错误、未知事件和未结束的工具调用都会失败。
+- 代码与文档索引只通过 `lha.live_context` 访问，并保存来源摘要、新鲜度和不可用原因。
 
-- 代码、论文、实验记录和已验证经验通过 `lha.live_context` 统一访问。
-- 结果记录来源、内容摘要、索引版本和请求的数据类型。
-- “没有命中”“后端不可用”“索引失败”和“内容过期”是不同状态。
-- 修复阶段读取当前运行沙箱中的代码，不回读修改前的原仓库。
+`data/long_tasks/` 还包含五个固定多文件用例，覆盖配置解析、SQLite 迁移、
+并发异常、命令行约定和实验复现。它们用于测试状态转换和恢复，不作为外部榜单成绩。
 
-### 发布检查
+## 已验证结果
 
-```bash
-uv run ruff check .
-uv run pyright src/lha
-uv run pytest -q
-LHA_RUNS_DIR=runs/_release uv run lha eval
-```
+### 内部校验消融
 
-当前发布候选实测为 `523 passed, 3 skipped`，语句覆盖率 83%，端到端自测 6/6。
-Docker 集成测试需要本机 Docker：
+仓库中的消融报告是正式报告，实测模型为 `gpt-5.3-codex-spark`。
+实验使用 17 个预设 Python 缺陷，每个任务重复 12 次，共 204 组。
+计划执行 204 组，其中 204 组结果可用，ERROR 为 0 组；下表比例以
+204 组可用结果为分母。
 
-```bash
-docker build -t lha:release .
-LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
-  uv run pytest tests/test_sandbox.py -q
-docker run --rm lha:release lha --version
-```
-
-项目主要使用 Python 3.11、Pydantic、LangGraph、SQLite、Docker、Pytest 和 Ruff。
-检索库与数值计算库属于局部实现，不作为系统架构的核心依赖来宣传。
-
-## 已提交的实测结果
-
-当前提交的是 schema v2 正式报告（formal）：Codex CLI 0.141.0 使用
-`gpt-5.4-mini`、`low` 推理强度和只读沙箱生成补丁；最终评分在 Docker 中对新的
-仓库副本运行原始测试，与内部检查相互独立。17 个预设 Python 缺陷，每个任务重复
-12 次，共 204 组配对记录，`ERROR` 为 0。
-
-| 条件 | 处理方式 | 独立评分 |
+| 条件 | 处理方式 | 独立评分结果 |
 |---|---|---|
-| `trust` | 直接接受首轮补丁 | 194 个正确，10 个错误仍被接受 |
-| `gate` | 首轮补丁必须通过内部检查 | 接受 194 个正确补丁，拦截 10 个错误补丁 |
-| `verify` | 检查失败后进入修复循环 | 204/204 通过独立评分 |
+| `trust` | 直接交付首轮补丁 | 201 个正确，3 个错误仍被接受 |
+| `gate` | 检查后决定是否交付 | 接受 201 个正确补丁，拦截 3 个错误补丁；误放 0 个，误拒 0 个 |
+| `verify` | 检查失败后允许有限修复 | 204/204 通过独立评分；错误交付 0 个，未交付 0 个 |
 
-`trust` 与 `verify` 的 204 个配对单元有 10/0 个方向不一致，双侧精确 McNemar
-检验为 `p = 0.001953125`，页面按五位小数显示为 `p = 0.00195`。
+`trust` 与 `gate` 的错误交付差异采用按任务聚类的精确配对符号翻转检验，
+p = 0.2500；`trust` 与 `verify` 的正确交付差异使用相同口径，p = 0.2500。
+17 个任务中只有 3 个出现非零配对差异；本次结果不足以说明总体差异显著。
+`verify` 对这 3 组各修复一次，随后全部通过独立评分。
+组合曲线只把实测任务成功率代入独立步骤模型，不增加样本，也不代表实际执行了
+共享状态的长任务。原始证据见[评测证据目录](benchmarks/README.md)，
+实验设计见[消融说明](docs/ABLATION.md)。
 
-把同一次重复中的 17 个任务视为一个完整任务后，`trust` 完整成功 2/12，
-`verify` 完整成功 12/12。组合曲线只是把每个任务的实测速率代入独立步骤模型的
-描述性推演，不增加任何独立样本或观测，也不能当作新增长任务实验。
+### Terminal-Bench 2.1 固定 20 题子集
 
-- [消融报告](https://github.com/liuqjjin/long-horizon-agent/blob/main/benchmarks/ablation_report.md)
-- [原始记录与来源信息](https://github.com/liuqjjin/long-horizon-agent/blob/main/benchmarks/ablation_report.json)
-- [完整任务与组合曲线](https://github.com/liuqjjin/long-horizon-agent/blob/main/benchmarks/horizon_report.md)
-- [评测方法](https://github.com/liuqjjin/long-horizon-agent/blob/main/docs/ABLATION.md)
+已提交结果为 **7/20**：7 个 `PASS`、9 个 `FAIL`、4 个 `ERROR`，
+四个 `ERROR` 保留在分母中。这是固定 20 题子集，不是完整数据集或排行榜成绩。
 
-## 适用边界
+该评测在 Harbor 任务容器中直接运行 Codex，没有经过 LHA 的内部放行和修复流程；
+它不能说明 LHA 拦截错误补丁或修复失败补丁的能力。协议和原始证据见
+[评测说明](docs/BENCHMARKS.md)。
 
-- 这是研究和作品集项目，不是生产服务。
-- `trusted-local` 不是针对恶意代码的安全沙箱。
-- 上下文检查能验证来源和新鲜度，不能证明文本语义一定正确。
-- 当前公开数字来自自建短任务；公开基准尚未发布成绩。
-- 组合曲线不能替代真实执行的十步以上任务。
+## 使用边界
 
-更多说明：[系统结构](https://github.com/liuqjjin/long-horizon-agent/blob/main/docs/ARCHITECTURE.md) · [快速开始](https://github.com/liuqjjin/long-horizon-agent/blob/main/docs/QUICKSTART.md) ·
-[部署](https://github.com/liuqjjin/long-horizon-agent/blob/main/docs/DEPLOY.md) · [安全](https://github.com/liuqjjin/long-horizon-agent/blob/main/SECURITY.md) ·
-[参与开发](https://github.com/liuqjjin/long-horizon-agent/blob/main/CONTRIBUTING.md)
+- 项目用于研究和工程验证，不是多租户线上服务。
+- `trusted-local` 适用于可信仓库，不能阻止目标代码访问当前用户有权访问的主机资源。
+- Docker 隔离仍取决于镜像、挂载、网络、权限和资源限制。
+- 总时限在持久化边界检查；每个阻塞操作仍需要独立超时。
+- 已处理的退出路径会终止并确认原进程组后再清理临时凭据；主动脱离进程组的工具
+  子进程不在宿主后端的强保证内，不可信工具必须使用 Docker 或其他外层隔离。
+- `SIGKILL`、内核崩溃或断电可能绕过清理并留下权限受限的临时目录。
+- 来源摘要和新鲜度检查不能替代可执行测试，测试通过也不代表覆盖所有输入。
+- 无法校验的状态不会被当作成功；证据冲突时保留现场并停止恢复。
 
-MIT 许可证。
+系统结构见[架构说明](docs/ARCHITECTURE.md)，完整发布检查见[部署说明](docs/DEPLOY.md)。
+项目采用 MIT 许可证。

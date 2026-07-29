@@ -21,7 +21,7 @@ from ...array_evidence import (
     safe_artifact_path,
 )
 from ..base import Verifier, VerifyContext
-from ..verdict import Check
+from ..verdict import Check, process_cleanup_failure_detail
 from .common import (
     is_finite,
     load_arrays,
@@ -49,6 +49,26 @@ class ReproVerifier(Verifier):
         has_commit = bool(repro.get("git_commit"))
 
         rc = getattr(artifact, "returncode", 0)
+        cleanup_unconfirmed = bool(
+            getattr(artifact, "cleanup_unconfirmed", False)
+        )
+        if cleanup_unconfirmed:
+            detail = {
+                "summary": "experiment process cleanup could not be confirmed",
+            }
+            detail.update(
+                process_cleanup_failure_detail(
+                    returncode=rc,
+                    cleanup_unconfirmed=cleanup_unconfirmed,
+                    detail=str(getattr(artifact, "stdout_tail", ""))[-500:],
+                )
+            )
+            return Check(
+                name=self.name,
+                family=self.family,
+                passed=False,
+                detail=detail,
+            )
         if rc == 0:
             deterministic, rerun_detail, evidence = self._determinism(artifact, ctx)
         else:
@@ -152,10 +172,18 @@ class ReproVerifier(Verifier):
         rerun_rel = Path(rerun["rerun_dir"])
         res = rerun["process"]
         if res.returncode != 0:
-            return False, f"re-run exit {res.returncode}: {res.stderr[-200:]}", {
+            evidence = {
                 "rerun_dir": rerun_rel.as_posix(),
                 "rerun_isolation": "ephemeral-worktree-copy",
             }
+            evidence.update(
+                process_cleanup_failure_detail(
+                    returncode=res.returncode,
+                    cleanup_unconfirmed=res.cleanup_unconfirmed,
+                    detail=res.cleanup_detail or res.stderr[-500:],
+                )
+            )
+            return False, f"re-run exit {res.returncode}: {res.stderr[-200:]}", evidence
         rerun_repro = rerun["repro"]
 
         rerun_input = rerun_repro.get("input_sha256")

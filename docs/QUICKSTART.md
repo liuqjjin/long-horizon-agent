@@ -1,7 +1,8 @@
 # Quickstart
 
-Run commands from the repository root. The core requires Python 3.11 or newer
-and [`uv`](https://docs.astral.sh/uv/).
+Run commands from the repository root. LHA requires Python 3.11 or newer and
+[`uv`](https://docs.astral.sh/uv/). The current process-cleanup boundary supports
+Linux, macOS, and WSL2. Native Windows is not supported yet; use WSL2 or Docker.
 
 ## Install
 
@@ -10,79 +11,70 @@ uv sync
 uv run lha --version
 ```
 
-`uv sync` installs the development group and document-index dependencies. A
-package-only installation can use `pip install lha`. For paper, experiment, and
-skill indexing, use this source checkout or the project image: the checked-in
-uv configuration selects the official CPU-only PyTorch index on Linux and
-Windows. Wheel metadata cannot carry that index selection, so a bare
-`pip install "lha[context]"` on Linux may resolve much larger GPU packages.
-Consumers that need the context extra from a wheel should bind `torch` to the
-CPU index in their own uv project. When an optional backend is unavailable,
-required-context steps fail with a typed status rather than silently returning
-no matches.
+The source checkout installs development and document-index dependencies. The
+core package can also be installed from this checkout with `python -m pip install .`,
+or from a wheel produced by `uv build`.
+
+When dependencies are resolved on Linux or Windows, this repository points
+PyTorch at the official CPU index.
+That source setting is not stored in wheel metadata. If another project installs
+the `context` extra, it should configure the same index or use the application
+image.
 
 ## Run an offline code task
 
-The default `stub` backend is deterministic, does not need credentials, and fixes
-the planted bug in `data/sample_repo`:
+The default model backend is deterministic and requires no credentials or
+`ccc`:
 
 ```bash
 uv run lha run data/tasks/fix_average.yaml
 ```
 
-The command should finish with `status : DONE` only after the actual pytest and
-Ruff checks pass. Keep the printed `run_id`, then inspect its evidence:
+The run reaches `DONE` only after its Pytest and Ruff checks pass. Keep the
+printed `run_id`, then inspect the saved evidence:
 
 ```bash
-uv run lha runs show <run_id>
-uv run lha trace <run_id>
-uv run lha trace <run_id> --html
+RUN_ID=replace-with-the-printed-run-id
+uv run lha runs show "$RUN_ID"
+uv run lha trace "$RUN_ID"
+uv run lha trace "$RUN_ID" --html
 ```
 
-The HTML command writes a self-contained `trace.html` under the run directory.
-It shows the state timeline, patch, approval records, verifier results, repairs,
-and persisted model-usage totals.
+This bundled task explicitly makes indexed code context optional. It still runs
+the real checks when `ccc` is not installed. `ccc` is an optional code-indexing
+feature, not a quickstart prerequisite; tasks that require indexed context still
+fail closed when the backend is unavailable.
 
-## Exercise approval and resume
+The HTML report contains the timeline, patch, approvals, check results, repair
+events, and recorded model usage.
+
+## Pause for approval and resume
 
 ```bash
-uv run lha run --runtime langgraph data/tasks/fix_average_approval.yaml
-# copy the run_id from the AWAITING_APPROVAL result
-uv run lha approve <run_id> --note "reviewed patch"
-uv run lha resume --runtime langgraph <run_id>
+uv run lha run \
+  --runtime langgraph \
+  data/tasks/fix_average_approval.yaml
+
+APPROVAL_RUN_ID=replace-with-this-run-id
+uv run lha approve "$APPROVAL_RUN_ID" --note "reviewed patch"
+uv run lha resume --runtime langgraph "$APPROVAL_RUN_ID"
 ```
 
-The approval names the step and SHA-256 of the reviewed `patch.json`. The
-LangGraph runner checkpoints the prepared artifact before it interrupts, so a
-new process resumes the reviewed bytes rather than generating a replacement.
-The default loop supports the same approval contract without `--runtime
-langgraph`.
+Approval records the step and SHA-256 of the persisted patch. Resume checks the
+same bytes before continuing.
 
-## Run the repository self-evaluation
+## Run the repository self-eval
 
 ```bash
 LHA_RUNS_DIR=runs/_quickstart uv run lha eval
 ```
 
-The command covers six fixed repository workflows and returns non-zero unless
-all six meet their expected status and checks. The first run may download the
-configured sentence-transformer model. See [BENCHMARKS.md](BENCHMARKS.md) for
-the case definitions.
-
-## Inspect and retain runs
-
-```bash
-uv run lha runs list
-uv run lha runs show <run_id>
-uv run lha runs prune --older-than-days 30
-```
-
-`prune` is a dry run unless `--apply` is supplied. Application is limited to
-validated `DONE` or `FAILED` runs; locked, active, or corrupt state is refused.
+The command runs six fixed workflows and returns non-zero if any expected status
+or check is missing. See [BENCHMARKS.md](BENCHMARKS.md) for the cases.
 
 ## Use indexed context
 
-Code search uses the optional `ccc` executable:
+Code indexing uses the optional `ccc` executable:
 
 ```bash
 uv run lha index data/sample_repo
@@ -91,7 +83,7 @@ uv run lha ask "how is average computed" \
   --kinds code
 ```
 
-Paper, experiment, and skill indexes use the packaged flows:
+Document indexing uses the packaged flows:
 
 ```bash
 uv run lha index-docs
@@ -99,60 +91,55 @@ uv run lha ask "what evidence supports the experiment" \
   --kinds paper,experiment,skill
 ```
 
-Each hit carries a locator and source evidence. A stale index must refresh
-successfully before `reject_stale` clears the stale flag.
+Results include locators and source evidence. Required context fails with a
+typed status when its backend is unavailable or its index cannot be refreshed.
 
-## Use an authenticated Codex CLI
+## Use a local Codex login
 
-First authenticate the locally installed `codex` CLI. Then pin the model and
-reasoning effort appropriate to the run:
+Authenticate the installed `codex` CLI, then run:
 
 ```bash
-LHA_CODEX_MODEL=<model-id> \
-LHA_CODEX_EFFORT=medium \
 uv run lha --llm codex_cli run data/tasks/fix_average.yaml
 ```
 
-LHA copies the required authentication into a temporary `CODEX_HOME`, passes a
-minimal environment, validates the JSONL event stream, records CLI/model/event
-provenance, and deletes the temporary home and workspace on success, failure,
-timeout, or interruption. Authentication bytes are not written to run
-artifacts.
+This uses the current CLI model settings. For a measured run, set
+`LHA_CODEX_MODEL` and `LHA_CODEX_EFFORT` to values supported by the account and
+record them with the result.
 
-For ablation, the Codex path additionally rejects every tool-use event: the
-first attempt must be derived from the source included in the prompt.
+LHA gives the CLI a temporary home and workspace, validates its JSONL events,
+and records secret-free provenance. Handled exit paths confirm that the original
+process group stopped before removing temporary credentials. A tool process
+that deliberately leaves that group is outside the host backend's guarantee;
+run untrusted tools inside Docker or another outer containment boundary.
 
-## Run the five long-task fixtures
-
-The five cases under `data/long_tasks/` use a fixed 10-step repository protocol.
-Their reference-patch and interruption/recovery contracts are exercised
-hermetically:
+## Inspect and prune runs
 
 ```bash
-uv run pytest tests/test_long_tasks.py tests/test_long_task_harness.py -q
+uv run lha runs list
+uv run lha runs show "$RUN_ID"
+uv run lha runs prune --older-than-days 30
 ```
 
-The tests cover configuration parsing, SQLite migration, concurrent failures,
-CLI contracts, and experiment reproducibility. They include a rejected first
-patch, a repair, approval resumes, a simulated process exit at a safe boundary,
-and comparison with an uninterrupted result.
+Pruning is a dry run unless `--apply` is present. Active, locked, corrupt, or
+unfinished runs are not deleted.
 
-## Build and test the distributions
+## Run the long-task checks
+
+Five fixed multi-file fixtures exercise ten repository stages, approval,
+repair, interruption, and resume:
+
+```bash
+uv run pytest \
+  tests/test_long_tasks.py \
+  tests/test_long_task_harness.py -q
+```
+
+## Build distributions
 
 ```bash
 uv build
 ```
 
-Install the wheel and source distribution from an empty scratch directory, not
-from this checkout:
-
-```bash
-REPO_ROOT="$PWD"
-PACKAGE_TMP="$(mktemp -d)"
-cd "$PACKAGE_TMP"
-uv run --no-project --with "$REPO_ROOT"/dist/*.whl lha --version
-uv run --no-project --with "$REPO_ROOT"/dist/*.tar.gz lha --version
-```
-
-See [DEPLOY.md](DEPLOY.md) for container validation and
-[ARCHITECTURE.md](ARCHITECTURE.md) for the recovery model.
+Install the wheel and source archive from an empty directory before release.
+Exact package and container commands are in [DEPLOY.md](DEPLOY.md). The recovery
+model is described in [ARCHITECTURE.md](ARCHITECTURE.md).

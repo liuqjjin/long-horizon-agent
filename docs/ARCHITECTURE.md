@@ -1,67 +1,101 @@
-# Architecture
+# 系统架构
 
-LHA is a state-machine runner with executable checks. The model proposes work;
-the harness owns state transitions, persistence, policy, approval, verification,
-and rollback.
-
-## One run
+LHA 是面向代码修改、实验和检索任务的状态机执行器。模型负责提出方案和产物；运行器
+负责状态迁移、预算、审批、检查、恢复和回滚。
 
 ```text
 plan → context → execute → [approval] → verify → repair or advance → checkpoint
 ```
 
-`src/lha/harness/loop.py` implements the default runtime:
+## 模块边界
 
-1. The Supervisor selects a typed `Plan`.
-2. The Context Engineer returns a `ContextBundle` with source locators, digests,
-   freshness, status, and unavailable reasons.
-3. The Implementer returns a `Patch`, the Experimenter returns an
-   `ExperimentResult`, or a `RepoAdapter` runs a declared repository stage.
-4. A protected-path policy checks the write set computed from the actual patch.
-5. An optional approval pauses the run and binds the decision to the reviewed
-   `patch.json` bytes.
-6. Registered verifiers return one `Verdict`.
-7. Passing work advances; failing work enters a bounded repair attempt or is
-   rolled back.
-8. State and ledger evidence are written before the next step begins.
+| 模块 | 职责 |
+|---|---|
+| `harness/` | 主循环、状态、检查点、审批、补丁事务 |
+| `agents/` | 规划、上下文、实现、实验和校验代理 |
+| `verifiers/` | 代码、实验和上下文检查 |
+| `sandbox/` | 本地与 Docker 执行后端 |
+| `live_context/` | 索引入口、状态和新鲜度判断 |
+| `llm/` | 模型后端、Codex 协议解析和调用追踪 |
+| `runtime/` | 可选 LangGraph 运行时 |
+| `bench/` | 消融、外部基准和统计 |
+| `reporting.py` | 运行记录校验、展示和清理 |
+
+`lha.live_context` 是代码和文档索引的唯一入口。目标仓库或模型影响的命令统一通过
+`ExecutionBackend`；内部门禁不能充当消融或外部基准的真值。
+
+## 一次运行如何推进
+
+`src/lha/harness/loop.py` 实现默认运行时：
+
+1. 生成带类型的计划；
+2. 读取上下文位置、摘要、新鲜度和不可用原因；
+3. 由实现器、实验器或仓库适配器生成产物；
+4. 从真实产物解析写入路径并执行策略检查；
+5. 需要人工审批时，先保存产物再暂停；
+6. 注册的检查器返回结构化 verdict；
+7. 通过后进入下一步，失败后在预算内修复，耗尽预算则回滚；
+8. 每次迁移前保存状态和事件记录。
 
 ```mermaid
 flowchart TD
-    PLAN["Supervisor: Plan"] --> CTX["ContextBundle"]
-    CTX --> EXEC{"step action"}
-    EXEC --> PATCH["Patch"]
-    EXEC --> EXP["ExperimentResult"]
-    EXEC --> STAGE["RepoStageResult"]
-    PATCH --> POLICY{"path policy"}
-    POLICY --> TX["PatchTransaction"]
-    TX --> APPROVE{"approval required?"}
-    EXP --> APPROVE
-    STAGE --> APPROVE
-    APPROVE -- "yes" --> PAUSE["AWAITING_APPROVAL"]
-    PAUSE --> VERIFY
-    APPROVE -- "no" --> VERIFY["VerifierAgent: Verdict"]
-    VERIFY -- "pass" --> ADVANCE["advance and checkpoint"]
-    VERIFY -- "fail, budget left" --> REPAIR["repair"]
-    VERIFY -- "fail, exhausted" --> REVERT["rollback and FAILED"]
-    REPAIR --> CTX
+    PLAN["计划"] --> CONTEXT["读取上下文"]
+    CONTEXT --> EXECUTE{"执行步骤"}
+    EXECUTE --> PATCH["代码补丁"]
+    EXECUTE --> EXPERIMENT["实验产物"]
+    EXECUTE --> STAGE["仓库阶段结果"]
+    PATCH --> POLICY{"路径策略"}
+    POLICY --> TX["补丁事务"]
+    TX --> REVIEW{"需要审批？"}
+    EXPERIMENT --> REVIEW
+    STAGE --> REVIEW
+    REVIEW -- "是" --> PAUSE["保存并暂停"]
+    PAUSE --> DECISION{"批准？"}
+    DECISION -- "是" --> VERIFY["执行检查"]
+    DECISION -- "否" --> ROLLBACK["回滚"]
+    REVIEW -- "否" --> VERIFY
+    VERIFY -- "通过" --> NEXT["推进并保存检查点"]
+    VERIFY -- "失败且有预算" --> REPAIR["修复"]
+    VERIFY -- "失败且预算耗尽" --> ROLLBACK
+    REPAIR --> CONTEXT
 ```
 
-## State, ledger, and locks
+## 状态与恢复
 
-`RunState` schema v2 persists the cursor, completed and failed steps, repair
-counters, stable attempt IDs, elapsed time, consumed steps, and model usage.
-`state.json` is a checksummed envelope written with `fsync` and atomic
-replacement. `ledger.jsonl` is append-only; a torn non-newline-terminated tail is
-treated as an interrupted write, while corruption in durable records fails.
+`RunState` schema v2 保存游标、已完成和失败步骤、稳定 attempt ID、修复次数、原始预算、
+累计耗时和模型用量。恢复时若步骤上限、修复上限、deadline 或模型调用上限发生变化，
+系统会拒绝继续。schema v1 记录可以查看，但不能按 schema v2 直接恢复。
 
-Every run has a file lock. A second process cannot resume the same `run_id`
-concurrently. Ledger records carry attempt IDs and idempotency keys so recovery
-does not duplicate approval or completion events. Schema-v1 runs can be inspected
-but are not resumed as schema v2.
+这里的 **RunState schema v2 是运行检查点格式**，校验消融的
+**report schema v4 是评测证据格式**。两者版本号属于不同数据模型，没有“运行状态从
+v2 升级到报告 v4”的关系；Terminal-Bench 还有自己独立的证据版本。
 
-## Patch transaction
+`state.json` 放在带校验和的 envelope 中，写入过程为：
 
-Patch handling is a transaction rather than a sequence of unrelated file writes.
+1. 写临时文件；
+2. `fsync` 文件；
+3. 原子替换正式文件；
+4. `fsync` 目录。
+
+`ledger.jsonl` 在逻辑上只追加事件。每次更新先验证现有事件链，再原子替换完整字节，
+不依赖操作系统 `O_APPEND`。完整事件损坏会停止恢复；仅旧格式最后一条出现明确撕裂时，
+才按中断写入处理。
+
+每个运行目录都有文件锁，阻止两个进程并发恢复。attempt ID 和幂等键用于避免重复记录
+审批、失败和完成事件。不能确认是否已经发生的外部副作用由预写 intent 和恢复检查处理，
+不会仅凭幂等键推断为安全。
+
+强制停止可能留下权限受限的临时文件，首次写入 write-once 证据时也可能留下不完整的
+正式文件。恢复只处理与已验证事务状态精确匹配的残留；无法证明内容时停止并保留现场，
+不会猜测缺失字节。
+
+可选 LangGraph 运行时复用相同的执行和校验函数。准备、审批中断和验证是不同节点，
+SQLite 只保存图检查点，不能在恢复时替换已经审批的补丁。
+
+## 补丁事务
+
+`ResolvedPatch` 从 diff 或文件内容计算唯一写入集合，不信任模型声明的
+`touched_files`。路径策略、备份、应用、审批、产物清单、检查和回滚使用同一集合。
 
 ```mermaid
 stateDiagram-v2
@@ -73,198 +107,102 @@ stateDiagram-v2
     VERIFIED --> REVERTED
 ```
 
-`ResolvedPatch` computes one canonical write set from the unified diff or direct
-file contents. Policy checks, backups, the artifact manifest, application,
-approval, verification, and rollback all consume that same set. The patch,
-manifest, primary backup, redundant backup, and transaction journal are durable
-before `PREPARED` is recorded.
+进入 `PREPARED` 前，补丁、清单、原文件数据、冗余备份和事务日志都必须已经持久化。
+恢复按已记录状态处理：
 
-Recovery behavior depends on evidence:
+- `PREPARED`：先确认或恢复原状态，再应用同一补丁；
+- `APPLIED` / `VERIFIED`：校验当前文件摘要，不重复应用；
+- `REVERTED`：不再次执行该 attempt；
+- 证据缺失、矛盾或备份损坏：停止恢复。
 
-- `PREPARED`: restore the known pre-apply state, then apply the same patch bytes;
-- `APPLIED` or `VERIFIED`: validate the recorded worktree hashes instead of
-  applying again;
-- `REVERTED`: never apply the attempt again;
-- missing, contradictory, or damaged evidence: fail closed and preserve or
-  restore the last trustworthy state.
+备份保存文件字节、权限和补丁创建的目录。路径穿越、符号链接写入和受保护文件修改会
+被拒绝。审批记录绑定 step ID 和 `patch.json` 的 SHA-256；拒绝、摘要不匹配或审批
+证据损坏都会触发回滚。
 
-Backups retain original bytes, file modes, and directories created by a patch.
-Rollback rejects path traversal and writes through symbolic links.
+## 仓库阶段
 
-## Human approval
+`src/lha/repo_adapter.py` 用带类型的参数向量描述仓库命令，不接受任意 shell 字符串。
+`data/long_tasks/` 中五个固定多文件任务分别覆盖配置优先级、SQLite 迁移、并发更新、
+CLI 契约和实验复现。
 
-An approval names the step and SHA-256 of the exact persisted `patch.json`.
-Resume checks that hash before using the artifact. Rejection, hash mismatch, or
-artifact corruption rolls the change back.
-
-`src/lha/runtime/langgraph_runner.py` drives the same helpers through a LangGraph
-`StateGraph` and `SqliteSaver`. Prepare, interrupt, and verify are separate nodes:
-the patch is checkpointed before `interrupt()`, so resume cannot regenerate work
-after a person reviewed it.
-
-## Long repository tasks
-
-`src/lha/repo_adapter.py` provides typed repository stages. Commands are declared
-as argument vectors and executed through an `ExecutionBackend`; arbitrary shell
-strings are not accepted.
-
-Five fixed cases live under `data/long_tasks/`: configuration parsing, SQLite
-migration, concurrency failure, CLI contracts, and experiment reproducibility.
-Each has immutable repository/reference digests and a 10-step plan:
+每个任务按十个阶段执行：
 
 ```text
 integrity → setup → baseline → reproduce → context → approved edit
           → targeted tests → full tests → lint → build
 ```
 
-The test protocol includes a failing first patch, repair, approval resume,
-process interruption at a safe boundary, and comparison with an uninterrupted
-run. Repository stages write intent before execution and completion evidence
-afterward. If a stage may have run but completion is missing, recovery refuses to
-repeat a possibly non-idempotent side effect.
+阶段执行前先保存 intent，完成后再保存结果。如果进程可能已经产生副作用、但完成证据
+尚未写入，恢复会停止，而不是重复执行可能不幂等的命令。
 
-## Structured artifacts
+仓库适配器只定义准备和检查方式。没有固定协议、原始结果、来源信息和提交后的汇总，
+它本身不构成基准成绩。
 
-Boundary data uses Pydantic models. Major persisted artifacts include:
+## 持久化产物
 
-| producer | artifact | typical path |
+边界数据使用 Pydantic，内部辅助值使用 dataclass。常见文件包括：
+
+| 产物 | 路径示例 |
+|---|---|
+| 计划 | `plan.json` |
+| 上下文 | `steps/<step>/context_bundle.json` |
+| 补丁 | `steps/<step>/attempts/<attempt>/patch.json` |
+| 事务证据 | `steps/`、`backups/`、`transactions/` |
+| 实验结果 | `steps/<step>/experiment.json` |
+| 仓库阶段 | `steps/<step>/repo_stage.json` |
+| 检查结果 | `steps/<step>/verify.json` |
+| 模型调用 | `llm_trace.jsonl` |
+
+运行根目录保留指向最新产物的兼容文件；按步骤和 attempt 保存的文件构成完整历史。
+
+## 校验
+
+未知检查器、空检查集合、检查进程崩溃或命令无法启动都返回失败。
+
+| 类型 | 主要检查 | 证据 |
 |---|---|---|
-| Supervisor | `Plan` | `plan.json` |
-| Context Engineer | `ContextBundle` | `steps/<step>/context_bundle.json` |
-| Implementer | `Patch` | `steps/<step>/attempts/<attempt>/patch.json` |
-| patch layer | manifest, backups, transaction journal | `steps/`, `backups/`, `transactions/` |
-| Experimenter | `ExperimentResult` | `steps/<step>/experiment.json` |
-| RepoAdapter | `RepoStageResult` | `steps/<step>/repo_stage.json` |
-| VerifierAgent | `Verdict` | `steps/<step>/verify.json` |
-| LLM tracing | usage and call records | `state.json`, `llm_trace.jsonl` |
+| 代码 | Pytest、Ruff、仓库阶段 | 子进程结果 |
+| 实验 | PSNR、SSIM、复现 | 数组、摘要、全新目录复跑 |
+| 上下文 | 新鲜度、引用 | 来源摘要、状态、定位信息 |
 
-Flat compatibility files at the run root point readers to the latest applicable
-artifact; per-step and per-attempt paths preserve the full history.
+实验结果绑定路径、形状、数据类型、数组摘要和输入摘要。复跑使用新目录，并拒绝缺失、
+过期、非有限或不匹配的数组。
 
-## Verification families
+上下文状态区分 `ok`、`empty`、`backend_unavailable` 和 `index_failed`，同时保存部分
+可用情况和失败原因。任务声明上下文必需时，没有可用证据就不能继续。
 
-`select_verifiers(step)` resolves names through the registry. An unknown
-verifier, empty verifier set, crashing verifier, or unusable subprocess produces
-a failing check.
+## 模型和执行后端
 
-| family | checks | evidence |
-|---|---|---|
-| code | pytest, Ruff, repository stages | actual command result |
-| experiment | PSNR, SSIM, reproducibility | recomputed arrays and fresh rerun |
-| context | freshness, citation | source digests, index status, locators |
+Codex CLI 后端为每次调用创建独立 home、`CODEX_HOME`、工作区和临时目录，只传递允许
+的环境变量，并在子进程停止后清理临时认证。非法 JSONL、未知或错误事件、未结束 turn、
+缺少完成消息以及不允许的工具调用都会失败。成功记录包含 CLI、模型、推理强度、事件
+计数、用量和结果，不包含凭据。
 
-Experiment artifacts bind array path, shape, dtype, SHA-256, input digest, and
-metrics. Reproducibility runs in a fresh directory and rejects old files,
-missing arrays, non-finite values, and digest mismatches.
+| 执行后端 | 用途 |
+|---|---|
+| `trusted-local` | 用户信任的开发仓库 |
+| `docker` | 外部仓库和独立消融评分 |
 
-Context status distinguishes `ok`, `empty`, `backend_unavailable`, and
-`index_failed`; unavailable kinds and reasons survive partial success. Required
-context fails closed.
+本地后端会收敛环境变量、设置资源限制并管理进程组，但不是安全沙箱。Docker 后端断网、
+使用只读根文件系统、非 root UID、资源上限、capability 清理和
+`no-new-privileges`；目标工作区仍按任务需要挂载为可写。
 
-## Indexed-context facade
+## 评测与报告
 
-All indexed context passes through `src/lha/live_context/`:
+正式消融会在提交中固定源码、语料、模型、CLI/client 参数、Docker 镜像 ID、输出目录
+和用于留下开始记录的一次性远端 Git 引用。`scorer_runtime_sha256` 另外绑定
+`pyproject.toml`、`uv.lock`、
+`.python-version`、`Dockerfile` 与 `.dockerignore`；重建相同输入不能重新开放已经
+消耗的实验选择。正式单元不读缓存，运行中断后写 `ABANDONED`，不能恢复。只有完整
+报告及 `COMPLETED` 事件可以成为当前证据。
 
-```text
-search_code · search_papers · search_experiments · search_skills
-get_fresh_context · reject_stale
-```
+`lha horizon` 把配对单元、按重复序号从已测单元构造的完整语料聚合和组合推演分开。
+schema v4 的单元推断按任务聚类，重复单元不会被当作独立样本；聚合级比较使用完整重复
+作为配对单位。这里的聚合不是实际执行的共享状态长任务，组合推演也不增加样本。外部
+Terminal-Bench 适配器直接调用模型，不经过 LHA 门禁，因此其成绩不能证明门禁或修复能力。
 
-```mermaid
-flowchart LR
-    CALLER["harness / agents / verifiers"] --> FACADE["lha.live_context"]
-    FACADE --> CCC["CccBackend: code"]
-    FACADE --> COCO["CocoFlowBackend: papers / experiments / skills"]
-    FACADE --> NULL["NullBackend"]
-    CCC --> MCP["ccc MCP process"]
-    COCO --> FLOW["lha.live_context.flows"]
-    FLOW --> INDEX["data/.lha_index"]
-```
+`src/lha/reporting.py` 在展示或删除前验证运行证据。`lha runs prune` 默认只预览，
+并拒绝清理活动中、加锁、未完成或损坏的运行。
 
-Nothing outside this package may import `cocoindex` or `cocoindex_code`, or
-invoke `ccc`. CI enforces the boundary with both tests and a source scan.
-
-## LLM backends and Codex isolation
-
-LLM calls go through one interface and `TracedLLM`. The deterministic stub is
-used for hermetic tests and self-eval; Claude CLI, Codex CLI, and the Anthropic
-SDK are optional execution paths.
-
-The Codex CLI backend creates an attempt-local `HOME`, `CODEX_HOME`, temporary
-directory, and empty workspace. It copies only the authentication material the
-CLI requires and passes a small environment allowlist, not the caller's secrets.
-The CLI runs in a new process group; timeout, failure, or interruption terminates
-descendants before temporary credentials are removed.
-
-Its JSONL protocol is strict. Invalid JSON, unknown event types, error events,
-an incomplete turn, or unfinished/disallowed tool use fails the call. Successful
-metadata includes CLI version, configured model and reasoning effort, event
-summary, usage, and outcome.
-
-## Execution boundary
-
-Target or model-influenced commands use `lha.sandbox.ExecutionBackend`.
-
-| backend | controls | intended use |
-|---|---|---|
-| `trusted-local` | small environment, process-group cleanup, optional limits | trusted repository development and self-eval |
-| `docker` | no network, empty environment, resource limits, read-only source mounts | external repositories and independent scoring |
-
-`trusted-local` is not a hostile-code sandbox. The Docker backend image must
-contain every command the task declares; the default slim Python image does not
-include pytest or Ruff.
-
-## Ablation and horizon analysis
-
-`lha ablate` draws one first attempt per `(task, repetition)` and evaluates that
-attempt under `trust`, `gate`, and `verify`. The gate's acceptance is a
-prediction. Truth is obtained by freezing the effective source change, applying
-it to a fresh canonical copy with original tests, and running a separate scorer
-backend. Error cells remain visible, are not cached, and are excluded from rate
-estimation.
-
-`lha horizon` reports three estimands:
-
-1. paired task/repetition cells;
-2. paired complete-corpus repetitions;
-3. a descriptive composition over empirical per-task rates.
-
-The cell and episode McNemar tests use different units and may have different
-p-values. Composition adds zero observations and has no McNemar p-value. Wilson
-intervals are used for boundary proportions.
-
-## Reports and retention
-
-`src/lha/reporting.py` validates a run before displaying or deleting it.
-
-```bash
-uv run lha trace <run_id>
-uv run lha trace <run_id> --html
-uv run lha runs list
-uv run lha runs show <run_id>
-uv run lha runs prune --older-than-days 30
-```
-
-The static HTML report includes the step timeline, patches, approval history,
-verdicts, repair events, and model usage. Persisted checksummed totals are
-authoritative when the optional trace is incomplete. Pruning is a dry run by
-default and can delete only unlocked, validated, terminal runs.
-
-## Module map
-
-```text
-src/lha/
-  harness/        loop · state · checkpoint · approval · manifest · transaction
-  live_context/   facade · models · freshness · backends · packaged flows
-  agents/         supervisor · context_engineer · implementer · experimenter · verifier_agent
-  verifiers/      base · registry · verdict · code/ · experiment/ · context/
-  llm/            base · stub · claude_cli · codex_cli · anthropic_client · trace
-  sandbox/        ExecutionBackend · trusted_local · docker
-  runtime/        langgraph_runner
-  bench/          swebench · terminal_bench · stats
-  tasks/ tools/   task specs · patch resolution · policy · shell
-  reporting.py    run inspection, HTML, retention
-  repo_adapter.py typed long-task stages and evidence
-data/long_tasks/  five fixed multi-file cases
-runs/<id>/        state · ledger · transactions · artifacts · worktree · reports
-```
+实验协议见 [校验消融](ABLATION.md) 和 [评测说明](BENCHMARKS.md)，发布门禁见
+[构建与发布检查](DEPLOY.md)。

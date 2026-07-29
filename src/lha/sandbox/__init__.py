@@ -10,7 +10,12 @@ scripts, test suites. ``ExecutionBackend`` is the seam that decides where:
   for external or untrusted target repos.
 """
 
-from .base import ExecutionBackend, ResourceLimits, scrub_env
+from .base import (
+    ExecutionBackend,
+    ProcessCleanupUnconfirmed,
+    ResourceLimits,
+    scrub_env,
+)
 from .docker import DockerBackend
 from .local import TrustedLocalBackend
 
@@ -25,6 +30,7 @@ def make_backend(name: str, **kwargs) -> ExecutionBackend:
 
 __all__ = [
     "ExecutionBackend",
+    "ProcessCleanupUnconfirmed",
     "ResourceLimits",
     "TrustedLocalBackend",
     "DockerBackend",

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..artifacts import _reject_non_finite
 
@@ -15,6 +15,8 @@ TaskKind = Literal["issue_to_pr", "paper_to_experiment", "freshness"]
 
 class TaskSpec(BaseModel):
     """A unit of work for the harness."""
+
+    model_config = ConfigDict(extra="forbid")
 
     kind: TaskKind
     title: str

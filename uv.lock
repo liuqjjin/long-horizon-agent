@@ -1577,6 +1577,7 @@ name = "lha"
 version = "0.4.2.dev0"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-sqlite" },
     { name = "mcp" },
@@ -1620,6 +1621,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", marker = "extra == 'llm'", specifier = ">=0.69" },
     { name = "cocoindex", marker = "extra == 'context'", specifier = ">=1.0.11" },
+    { name = "cryptography", specifier = ">=45.0" },
     { name = "harbor", marker = "python_full_version >= '3.12' and extra == 'bench'", specifier = ">=0.20" },
     { name = "langgraph", specifier = ">=1.2.6" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.0" },

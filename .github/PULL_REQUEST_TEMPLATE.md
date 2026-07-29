@@ -1,63 +1,26 @@
-## Problem and scope
+## 问题
 
-<!-- What failed or was missing? Why is this the smallest relevant change? -->
+<!-- 说明实际问题、影响范围，以及为什么需要这次改动。 -->
 
-## Contract affected
+## 改动
 
-<!-- Name the state transition, verifier, CLI contract, security boundary, or public claim. -->
+<!-- 说明行为变化和不在本 PR 范围内的内容。 -->
 
-## Implementation
+## 验证
 
-<!-- Summarize behavior. Call out migration, rollback, compatibility, and failure handling. -->
+<!-- 粘贴本次提交的命令输出或链接到对应 CI，不沿用旧提交的数字。 -->
 
-## Verification evidence
+未运行的检查及原因：
 
-<!-- Paste the real output or link to the exact CI job. Do not copy counts from an older commit. -->
+<!-- 缺少 Docker、凭据、模型或网络时如实记录，不能写成通过。 -->
 
-- [ ] `uv run ruff check .`
-- [ ] `uv run pyright src/lha`
-- [ ] `uv run pytest -q`
-- [ ] `LHA_RUNS_DIR=runs/_pr uv run lha eval`
-- [ ] facade-isolation scan prints nothing
-- [ ] wheel and source distribution build
-- [ ] wheel installs and imports packaged flows from an empty directory
-- [ ] source distribution installs and imports packaged flows from an empty directory
-- [ ] `LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release uv run pytest tests/test_sandbox.py -q`
-- [ ] Docker image builds and `lha --version` runs
-- [ ] Docker image contains no local credential/config paths checked by CI
+## 提交前检查
 
-Commands not run and why:
-
-<!-- A missing daemon, credential, model, or network is a disclosed gap, not a pass. -->
-
-## Adversarial and recovery cases
-
-<!-- What happens on malformed input, timeout, interruption, duplicate resume, and damaged evidence? -->
-
-- [ ] no test was skipped, deleted, weakened, or marked `xfail` to pass
-- [ ] no verifier, threshold, protected-path policy, or denominator was loosened
-- [ ] unexecutable checks still fail closed
-- [ ] unverified changes are rolled back
-- [ ] recovery does not duplicate side effects
-
-## Security and credentials
-
-<!-- Note host/container execution, environment handling, temp credentials, and cleanup. -->
-
-- [ ] no token, authentication file, private path, or secret-bearing log is committed
-- [ ] external target code uses an appropriate Docker execution image
-- [ ] generated HTML/output was reviewed before sharing
-
-## Data, statistics, and documentation
-
-- [ ] corpus repositories, oracles, and reference patches were not changed after observing results
-- [ ] internal gate output is not reused as benchmark truth
-- [ ] cell, episode, and composition units are labelled separately
-- [ ] all-zero/all-one proportions use Wilson intervals
-- [ ] benchmark/report numbers were generated, not hand-edited
-- [ ] README, architecture, security, changelog, and method docs match behavior
-- [ ] unfinished Terminal-Bench or SWE-bench work is not presented as a score
-
-Generated report provenance, if applicable:
-
-<!-- Git commit/dirty state, source digest, model, effort, CLI version, scorer/image, repetitions, errors. -->
+- [ ] 未通过删除、跳过、弱化测试或降低阈值让门禁通过
+- [ ] 无法执行的检查仍按失败处理
+- [ ] 没有提交凭据、本机配置和用户路径
+- [ ] 文档、CLI 和兼容性说明已随行为变化更新
+- [ ] 修改恢复逻辑时，已覆盖中断、重复恢复和幂等
+- [ ] 修改评测时，语料未在观察模型输出后变更，ERROR 仍保留在分母
+- [ ] 修改公开数字时，原始记录、版本和源码提交已一并提交
+- [ ] 发布相关改动已验证 wheel、sdist 和 Docker 镜像

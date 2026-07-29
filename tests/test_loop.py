@@ -1,13 +1,13 @@
-"""The loop fixes the toy bug with a REAL pytest — hermetic (stub LLM, no ccc)."""
+"""The raw quickstart tasks work with a REAL pytest and no code index."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from conftest import hermetic_task
-
 from lha.config import Config
 from lha.harness import Harness
+from lha.harness.approval import HumanApprovalGate
+from lha.tasks.spec import TaskSpec
 from lha.verifiers.verdict import Verdict
 
 
@@ -22,7 +22,7 @@ def _config(tmp_path: Path) -> Config:
 
 
 def test_issue_to_pr_reaches_verified_done(tmp_path):
-    task = hermetic_task("data/tasks/fix_average.yaml")
+    task = TaskSpec.from_file("data/tasks/fix_average.yaml")
     result = Harness(_config(tmp_path)).run(task)
 
     assert result.status == "DONE"
@@ -43,3 +43,23 @@ def test_issue_to_pr_reaches_verified_done(tmp_path):
     pr = Path(result.state.pr_summary_path).read_text()
     assert "Verification" in pr
     assert "pytest" in pr
+
+
+def test_approval_quickstart_pauses_and_resumes_without_code_index(tmp_path):
+    task = TaskSpec.from_file("data/tasks/fix_average_approval.yaml")
+    config = _config(tmp_path)
+
+    paused = Harness(config, interactive_approval=False).run(task)
+    assert paused.status == "AWAITING_APPROVAL"
+
+    HumanApprovalGate(paused.state.run_dir).resolve(
+        approved=True,
+        note="quickstart regression",
+    )
+    resumed = Harness(config, interactive_approval=False).resume(paused.state.run_id)
+
+    assert resumed.status == "DONE"
+    verdict = Verdict.model_validate_json(
+        (Path(resumed.state.run_dir) / "verify.json").read_text()
+    )
+    assert verdict.passed

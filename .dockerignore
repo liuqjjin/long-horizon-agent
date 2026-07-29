@@ -5,6 +5,7 @@
 !.env.example
 .codex/
 .claude/
+.agents/
 .mcp.json
 auth.json
 .ssh/

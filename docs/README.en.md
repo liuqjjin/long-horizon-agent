@@ -1,97 +1,17 @@
-# LHA: resumable execution and verification for coding tasks
+# LHA
 
-LHA runs code changes, experiments, and retrieval-backed tasks as a state
-machine. A step advances only after its executable checks pass. Failed checks
-feed a bounded repair attempt; interrupted runs resume from durable evidence.
-
-The Chinese [README](../README.md) is the primary project page. This file is a
-compact English reference.
-
-## Problem
-
-A model can return a plausible patch that is still wrong. In a multi-step task,
-that error becomes input to every later step. LHA separates:
-
-- generation: a model proposes work;
-- acceptance: the internal gate decides whether the run may advance;
-- measurement: an independent scorer decides whether a benchmark delivery is
-  actually correct.
-
-The scorer does not reuse the gate's verdict. It applies the frozen source
-change to a fresh canonical repository and runs the original tests through a
-separate execution backend.
-
-## Runtime
+LHA is a Python runner for recoverable coding tasks, experiments, and indexed
+context:
 
 ```text
 plan → context → execute → [approval] → verify → repair or advance → checkpoint
 ```
 
-The main recovery properties are:
+The [Chinese README](../README.md) is the main project page.
 
-- `RunState` schema v2 persists cursor, attempts, repair counters, time/step/call
-  budgets, and model usage.
-- `state.json` is checksummed and written with `fsync` plus atomic replacement;
-  `ledger.jsonl` is append-only.
-- A run lock rejects concurrent resume of the same `run_id`.
-- Stable attempt IDs and ledger idempotency keys prevent duplicate transitions.
-- `ResolvedPatch` derives the write set from the real patch, not model metadata.
-- `PatchTransaction` records `PREPARED`, `APPLIED`, `VERIFIED`, and `REVERTED`
-  with durable patch, manifest, journal, and redundant backup evidence.
-- Approval binds the step and SHA-256 of the exact reviewed `patch.json`.
-- Unverified, rejected, corrupt, or exhausted changes are rolled back.
+## Quick start
 
-The default runtime is implemented directly by `Harness`. The optional
-LangGraph runtime uses the same execution and verification helpers with SQLite
-checkpointing and a separate approval interrupt node.
-
-## Checks
-
-| task family | checks |
-|---|---|
-| code | real pytest and Ruff commands, plus typed repository stages |
-| experiment | PSNR/SSIM recomputed from saved arrays and a fresh rerun |
-| context | source freshness, backend status, and resolvable citations |
-
-A check that cannot run fails. Experiment evidence rejects stale, missing,
-non-finite, or digest-mismatched arrays. Context distinguishes empty results from
-an unavailable backend, failed index, stale source, and partial kind
-availability.
-
-Target or model-influenced commands use one `ExecutionBackend` interface.
-`trusted-local` is for trusted development code; Docker is the isolation boundary
-for external repositories and independent scoring.
-
-## Long repository tasks
-
-Five fixed multi-file cases live under `data/long_tasks/`:
-
-- configuration precedence and environment parsing;
-- transactional SQLite migration;
-- concurrent updates and worker exception propagation;
-- CLI stdout, stderr, JSON, and exit-code contracts;
-- seeded experiment reproduction and artifact digests.
-
-Each case has a fixed repository digest, oracle digest, reference patch, and a
-10-step plan covering integrity, setup, baseline, reproduction, context,
-approved editing, targeted tests, full tests, lint, and build. Integration tests
-exercise a rejected first patch, repair, two approval resumes, process
-interruption, and equality with an uninterrupted terminal state.
-
-## Codex CLI backend
-
-The Codex backend runs `codex exec --json` with an attempt-local home, workspace,
-and temporary directory. It copies only required authentication, passes a
-minimal environment, terminates the process group on timeout or interruption,
-and removes temporary credentials on every exit path.
-
-Its event parser rejects malformed JSONL, unknown events, error events,
-incomplete turns, and unfinished tool calls. The no-tools ablation path rejects
-any tool item. Successful provenance records the configured model, reasoning
-effort, CLI version, event summary, usage, and outcome without recording
-credential bytes.
-
-## Run it
+Python 3.11+ and [uv](https://docs.astral.sh/uv/) are required.
 
 ```bash
 uv sync
@@ -99,97 +19,81 @@ uv run lha run data/tasks/fix_average.yaml
 LHA_RUNS_DIR=runs/_quickstart uv run lha eval
 ```
 
-Inspect a completed or paused run:
+The bundled example uses a deterministic backend and needs no model credentials
+or code index. With an authenticated Codex CLI:
 
 ```bash
-uv run lha runs show <run_id>
-uv run lha trace <run_id>
-uv run lha trace <run_id> --html
+LHA_CODEX_MODEL=YOUR_MODEL_ID \
+LHA_CODEX_EFFORT=medium \
+uv run lha --llm codex_cli run data/tasks/fix_average.yaml
 ```
 
-The HTML file is self-contained and includes the timeline, patches, approvals,
-verdicts, repairs, and model-usage totals. Safe retention is dry-run by default:
+Inspect a run with `lha runs show <run-id>` or `lha trace <run-id> --html`.
 
-```bash
-uv run lha runs prune --older-than-days 30
-```
+## What is implemented
 
-## Ablation and horizon reports
+- Schema-v2 run state stores the cursor, attempts, fixed budgets, elapsed time,
+  repair counts, and model usage.
+- Checksummed state, an event-chain ledger, atomic replacement, and a run lock
+  support fail-closed recovery.
+- `ResolvedPatch` computes the real write set. `PatchTransaction` records
+  `PREPARED`, `APPLIED`, `VERIFIED`, or `REVERTED` with redundant backups.
+- Approval binds the exact patch digest; resume cannot replace reviewed work.
+- Pytest, Ruff, experiment reruns, and repository-defined stages return typed
+  evidence. A check that cannot run fails.
+- Local and Docker backends share timeout, cleanup, and resource-limit handling.
+- The optional LangGraph runtime reuses the same execution and verification
+  code and stores graph checkpoints in SQLite.
+- Indexed context is accessed only through `lha.live_context`, with source
+  digests, freshness, partial availability, and explicit failure states.
 
-`lha ablate` pairs one first attempt under `trust`, `gate`, and `verify`, then
-grades deliveries with the independent scorer. The report preserves error cells,
-gate confusion matrices, source and runtime provenance, and a fingerprint used
-for safe cache reuse.
+## Evaluation
 
-Rate intervals use a task-cluster bootstrap in the interior and Wilson score
-intervals at all-zero or all-one boundaries. Paired contrasts use the exact
-McNemar test.
+### Formal schema-v4 verification ablation
 
-`lha horizon` keeps three quantities separate:
+The formal report evaluated `gpt-5.3-codex-spark` on 17 preregistered defects
+with 12 repetitions each: 204 scheduled paired cells, 204 usable cells, and
+0 ERROR cells. Rates use the 204 usable cells.
 
-1. paired `(task, repetition)` cells;
-2. observed complete-corpus repetitions;
-3. a descriptive independent-step composition.
+| condition | behavior | independently scored outcome |
+|---|---|---|
+| `trust` | deliver the first patch | 201 delivered-correct; 3 delivered-wrong |
+| `gate` | deliver only after the checks | 201 delivered-correct; 3 wrong patches intercepted; 0 delivered-wrong; 0 correct patches rejected |
+| `verify` | allow bounded repair after a failed check | 204/204 delivered-correct; 0 delivered-wrong; 0 not delivered |
 
-Cell and episode tests use different units and may have different p-values. The
-composition adds no independent samples and reports no McNemar p-value.
+The task-cluster exact paired sign-flip p-values are 0.2500 for `trust`
+versus `gate` on delivered-wrong outcomes and 0.2500 for `trust` versus
+`verify` on delivered-correct outcomes. The horizon composition is a
+descriptive projection over measured task rates. It adds no observations and
+is not an executed shared-state long task.
 
-### Committed schema-v2 result
+The report, frozen patches, scorer evidence, model-call receipts, and all cell
+results are under [`benchmarks/`](../benchmarks/).
 
-The committed run used Codex CLI 0.141.0 with `gpt-5.4-mini`, `low` reasoning,
-and the read-only sandbox. It evaluated 17 fixed Python defects over 12
-repetitions: 204 paired `(task, repetition)` cells. The final scorer ran the
-canonical tests in Docker on fresh repository copies, independently of the
-internal gate. The report contains zero `ERROR` cells.
+### Terminal-Bench 2.1
 
-| condition | independently scored result |
-|---|---|
-| `trust` | 194 correct deliveries; 10 incorrect deliveries accepted |
-| `gate` | 194 correct attempts accepted; all 10 incorrect attempts blocked |
-| `verify` | 204/204 correct after the bounded repair loop |
+The preregistered Terminal-Bench 2.1 fixed 20-task subset produced **7 PASS,
+9 FAIL, and 4 ERROR**, reported as **7/20**. Every task ran once and all errors
+remain in the denominator. This is not a full-dataset or leaderboard score.
 
-For the 204 paired cells, the exact two-sided McNemar value is
-`p = 0.001953125` (displayed as `0.00195`). Grouping all 17 tasks in a
-repetition into one observed episode gives 2/12 complete successes for `trust`
-and 12/12 for `verify`.
+That adapter calls Codex directly inside Harbor. It does not use LHA's gate or
+repair loop, so the result does not measure interception or repair behavior.
 
-The separate composition curve is a descriptive projection from measured
-per-task rates. It adds zero independent samples and is not evidence from an
-additional long-task run. See the generated
-[ablation report](../benchmarks/ablation_report.md), its
-[schema-v2 JSON](../benchmarks/ablation_report.json), and the
-[horizon report](../benchmarks/horizon_report.md).
+See [BENCHMARKS.md](BENCHMARKS.md), [ABLATION.md](ABLATION.md), and
+[HORIZON.md](HORIZON.md) for protocols and evidence boundaries.
 
-## Build checks
+## Scope and limits
 
-```bash
-uv run ruff check .
-uv run pyright src/lha
-uv run pytest -q
-LHA_RUNS_DIR=runs/_release uv run lha eval
-uv build
-docker build -t lha:release .
-LHA_DOCKER_TESTS=1 LHA_DOCKER_TEST_IMAGE=lha:release \
-  uv run pytest tests/test_sandbox.py -q
-docker run --rm lha:release lha --version
-```
+- This is a research and portfolio project, not an online service.
+- `trusted-local` is only for trusted repositories; it keeps the user's host
+  permissions.
+- Docker reduces host exposure but still depends on the image, mounts, daemon,
+  kernel, and configured permissions.
+- Temporary credentials are cleaned after handled exits, not guaranteed after
+  `SIGKILL`, a kernel crash, or power loss.
+- A durable deadline is checked at state boundaries; each blocking operation
+  still needs its own timeout.
+- Source freshness and citations are weaker evidence than executable tests.
+- Passing fixed tests does not prove correctness for every input.
 
-The current release candidate produced `523 passed, 3 skipped`, 83% statement
-coverage, and 6/6 self-evaluation cases.
-
-The wheel and source distribution must also install from empty directories. See
-[DEPLOY.md](DEPLOY.md) for the exact package and container smoke checks.
-
-## Limits
-
-- This is a research and portfolio project, not a production service.
-- `trusted-local` is not a hostile-code sandbox.
-- Prompt injection from indexed content is mitigated by checks, not eliminated.
-- Context freshness and citation checks are weaker than an executable oracle.
-- The internal corpus is not a public leaderboard.
-- Public benchmark adapters are not benchmark results; no Terminal-Bench or
-  SWE-bench score is claimed until an official run is completed and committed.
-- A composed horizon curve is not a new long-task experiment.
-
-See [ARCHITECTURE.md](ARCHITECTURE.md),
-[ABLATION.md](ABLATION.md), and [HORIZON.md](HORIZON.md) for details.
+Implementation details are in [ARCHITECTURE.md](ARCHITECTURE.md); build, package, and container checks are in [DEPLOY.md](DEPLOY.md).

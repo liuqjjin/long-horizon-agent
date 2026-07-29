@@ -1,8 +1,7 @@
-"""Deterministic, network-free LLM stub for the walking skeleton.
+"""Deterministic, network-free backend used by tests and self-evaluation.
 
-It produces a scripted Patch for the toy issue->PR task (the average() off-by-one
-bug), so the loop fixes a REAL bug that a REAL pytest then verifies — with no LLM,
-no API key, and fully reproducible CI.
+It returns the fixed patch for the bundled ``average()`` regression, allowing
+the execution and verification path to run without an API key.
 """
 
 from __future__ import annotations

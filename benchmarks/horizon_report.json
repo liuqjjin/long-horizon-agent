@@ -20,30 +20,40 @@
   ],
   "n_steps": 17,
   "independent_episode_count": 12,
-  "model": "gpt-5.4-mini",
+  "model": "gpt-5.3-codex-spark",
   "source": "benchmarks/ablation_report.json",
+  "coverage": {
+    "scheduled_paired_cells": 204,
+    "usable_paired_cells": 204,
+    "unavailable_or_error_cells": 0,
+    "scheduled_repetitions": 12,
+    "complete_paired_repetitions": 12
+  },
   "estimands": {
     "cell": {
-      "unit": "task \u00d7 repetition cell",
+      "unit": "task \u00d7 repetition cell (inference clustered by task)",
       "pairs": 204,
-      "trust_successes": 194,
+      "trust_successes": 201,
       "verify_successes": 204,
       "discordant": [
-        10,
+        3,
         0
       ],
-      "mcnemar_p": 0.001953125
+      "task_clusters": 17,
+      "nonzero_task_clusters": 3,
+      "task_cluster_mean_difference": 0.014705882352941176,
+      "task_cluster_sign_flip_p": 0.25
     },
     "episode": {
       "unit": "complete corpus repetition",
       "pairs": 12,
-      "trust_successes": 2,
+      "trust_successes": 10,
       "verify_successes": 12,
       "discordant": [
-        10,
+        2,
         0
       ],
-      "mcnemar_p": 0.001953125
+      "mcnemar_p": 0.5
     },
     "composition": {
       "unit": "independent-step projection over empirical per-task rates",
@@ -51,12 +61,12 @@
       "per_task_p": {
         "trust-chain": {
           "bench_basen": 1.0,
-          "bench_brackets": 1.0,
+          "bench_brackets": 0.9166666666666666,
           "bench_bsearch": 1.0,
-          "bench_caesar": 0.75,
+          "bench_caesar": 0.9166666666666666,
           "bench_csvlite": 1.0,
           "bench_flatten": 1.0,
-          "bench_lru": 1.0,
+          "bench_lru": 0.9166666666666666,
           "bench_median": 1.0,
           "bench_merge_intervals": 1.0,
           "bench_paginate": 1.0,
@@ -65,7 +75,7 @@
           "bench_runstats": 1.0,
           "bench_slugify": 1.0,
           "bench_spans": 1.0,
-          "bench_urljoin": 0.4166666666666667,
+          "bench_urljoin": 1.0,
           "bench_window": 1.0
         },
         "verify-chain": {
@@ -88,46 +98,86 @@
           "bench_window": 1.0
         }
       },
+      "per_task_n": {
+        "trust-chain": {
+          "bench_basen": 12,
+          "bench_brackets": 12,
+          "bench_bsearch": 12,
+          "bench_caesar": 12,
+          "bench_csvlite": 12,
+          "bench_flatten": 12,
+          "bench_lru": 12,
+          "bench_median": 12,
+          "bench_merge_intervals": 12,
+          "bench_paginate": 12,
+          "bench_roman": 12,
+          "bench_rpn": 12,
+          "bench_runstats": 12,
+          "bench_slugify": 12,
+          "bench_spans": 12,
+          "bench_urljoin": 12,
+          "bench_window": 12
+        },
+        "verify-chain": {
+          "bench_basen": 12,
+          "bench_brackets": 12,
+          "bench_bsearch": 12,
+          "bench_caesar": 12,
+          "bench_csvlite": 12,
+          "bench_flatten": 12,
+          "bench_lru": 12,
+          "bench_median": 12,
+          "bench_merge_intervals": 12,
+          "bench_paginate": 12,
+          "bench_roman": 12,
+          "bench_rpn": 12,
+          "bench_runstats": 12,
+          "bench_slugify": 12,
+          "bench_spans": 12,
+          "bench_urljoin": 12,
+          "bench_window": 12
+        }
+      },
       "curves": [
         {
           "condition": "trust-chain",
           "rate": [
-            0.9509803921568626,
-            0.9030330882352942,
-            0.8561580882352942,
-            0.8103553921568628,
-            0.765625,
-            0.7219669117647058,
-            0.6793811274509804,
-            0.6378676470588235,
-            0.5974264705882353,
-            0.5580575980392157,
-            0.5197610294117647,
-            0.48253676470588236,
-            0.4463848039215687,
-            0.41130514705882354,
-            0.3772977941176471,
-            0.3443627450980392,
-            0.3125
+            0.9852941176470589,
+            0.9707414215686273,
+            0.9563410607298475,
+            0.9420921840958604,
+            0.9279939406318083,
+            0.9140454793028321,
+            0.9002459490740738,
+            0.8865944989106752,
+            0.8730902777777776,
+            0.8597324346405227,
+            0.8465201184640522,
+            0.8334524782135077,
+            0.8205286628540305,
+            0.8077478213507625,
+            0.7951091026688452,
+            0.7826116557734205,
+            0.7702546296296295
           ],
           "task_bootstrap_lo": [
-            0.8725490196078431,
-            0.7589358660130718,
-            0.6579248366013072,
-            0.568366122490663,
-            0.489191635187729,
-            0.4194109406457896,
-            0.35810730072527813,
-            0.30443382205646685,
-            0.25760971230439295,
-            0.21691664383602,
-            0.1816952247896354,
-            0.15134157754648334,
-            0.12530402460463352,
-            0.10307988185508579,
-            0.0842123592601103,
-            0.06828756893382353,
-            0.05425347222222223
+            0.9705882352941174,
+            0.941942401960784,
+            0.9140454793028319,
+            0.8868807505641142,
+            0.8604317990328252,
+            0.8346825041718804,
+            0.8096170377763581,
+            0.7852198601580003,
+            0.7614757163567732,
+            0.7383696323794903,
+            0.7158869114654927,
+            0.694013130379392,
+            0.6727341357308738,
+            0.6520360403215585,
+            0.6319052195189254,
+            0.6123283076572961,
+            0.5932921944658778
           ],
           "task_bootstrap_hi": [
             1.0,
@@ -217,11 +267,9 @@
       "condition": "trust-chain",
       "rep": 0,
       "n_steps": 17,
-      "steps_correct": 16,
-      "end_to_end": false,
-      "failing_tasks": [
-        "bench_caesar"
-      ]
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     },
     {
       "condition": "trust-chain",
@@ -235,61 +283,52 @@
       "condition": "trust-chain",
       "rep": 2,
       "n_steps": 17,
-      "steps_correct": 16,
-      "end_to_end": false,
-      "failing_tasks": [
-        "bench_urljoin"
-      ]
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     },
     {
       "condition": "trust-chain",
       "rep": 3,
       "n_steps": 17,
-      "steps_correct": 16,
-      "end_to_end": false,
-      "failing_tasks": [
-        "bench_urljoin"
-      ]
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     },
     {
       "condition": "trust-chain",
       "rep": 4,
       "n_steps": 17,
-      "steps_correct": 16,
-      "end_to_end": false,
-      "failing_tasks": [
-        "bench_urljoin"
-      ]
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     },
     {
       "condition": "trust-chain",
       "rep": 5,
       "n_steps": 17,
-      "steps_correct": 16,
-      "end_to_end": false,
-      "failing_tasks": [
-        "bench_caesar"
-      ]
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     },
     {
       "condition": "trust-chain",
       "rep": 6,
       "n_steps": 17,
-      "steps_correct": 16,
+      "steps_correct": 15,
       "end_to_end": false,
       "failing_tasks": [
-        "bench_caesar"
+        "bench_caesar",
+        "bench_lru"
       ]
     },
     {
       "condition": "trust-chain",
       "rep": 7,
       "n_steps": 17,
-      "steps_correct": 16,
-      "end_to_end": false,
-      "failing_tasks": [
-        "bench_urljoin"
-      ]
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     },
     {
       "condition": "trust-chain",
@@ -303,21 +342,17 @@
       "condition": "trust-chain",
       "rep": 9,
       "n_steps": 17,
-      "steps_correct": 16,
-      "end_to_end": false,
-      "failing_tasks": [
-        "bench_urljoin"
-      ]
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     },
     {
       "condition": "trust-chain",
       "rep": 10,
       "n_steps": 17,
-      "steps_correct": 16,
-      "end_to_end": false,
-      "failing_tasks": [
-        "bench_urljoin"
-      ]
+      "steps_correct": 17,
+      "end_to_end": true,
+      "failing_tasks": []
     },
     {
       "condition": "trust-chain",
@@ -326,7 +361,7 @@
       "steps_correct": 16,
       "end_to_end": false,
       "failing_tasks": [
-        "bench_urljoin"
+        "bench_brackets"
       ]
     },
     {

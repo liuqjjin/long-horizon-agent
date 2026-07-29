@@ -1,4 +1,4 @@
-"""Loop budget: bound steps, repairs, and wall-clock so runs always terminate."""
+"""Persisted step, repair, model-call, and elapsed-time limits."""
 
 from __future__ import annotations
 

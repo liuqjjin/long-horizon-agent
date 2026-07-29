@@ -1,0 +1,172 @@
+{
+    "id": "8b0b3549-5961-4d84-ada5-3776d9fb6a40",
+    "task_name": "terminal-bench/cancel-async-tasks",
+    "trial_name": "cancel-async-tasks__wcicLhE",
+    "trial_uri": "file:///private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-16-27ac46b249/cancel-async-tasks__wcicLhE",
+    "task_id": {
+        "org": "terminal-bench",
+        "name": "cancel-async-tasks",
+        "ref": "sha256:a3d048d351136e48070696cda8bb79660dfd74db1fea3b6da88559f0332699c1"
+    },
+    "source": "terminal-bench/terminal-bench-2-1",
+    "task_checksum": "44b08781bbffcbff0555fafbad034389009edeb85c2f83cd10620f91aa24974f",
+    "config": {
+        "task": {
+            "path": null,
+            "git_url": null,
+            "git_commit_id": null,
+            "name": "terminal-bench/cancel-async-tasks",
+            "ref": "sha256:a3d048d351136e48070696cda8bb79660dfd74db1fea3b6da88559f0332699c1",
+            "overwrite": false,
+            "download_dir": null,
+            "source": "terminal-bench/terminal-bench-2-1"
+        },
+        "trial_name": "cancel-async-tasks__wcicLhE",
+        "trials_dir": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/jobs/lha-tbench-2-1-d88c314c61ad-scored-16-27ac46b249",
+        "install_only": false,
+        "timeout_multiplier": 1.0,
+        "agent_timeout_multiplier": 4.0,
+        "verifier_timeout_multiplier": null,
+        "agent_setup_timeout_multiplier": null,
+        "environment_build_timeout_multiplier": null,
+        "agent": {
+            "name": "lha.bench.terminal_bench:LhaAgent",
+            "import_path": null,
+            "model_name": "gpt-5.5",
+            "n_concurrent": null,
+            "concurrency_group": null,
+            "skills": [],
+            "override_timeout_sec": null,
+            "override_setup_timeout_sec": null,
+            "max_timeout_sec": null,
+            "resume_trajectory": false,
+            "load_trajectory": null,
+            "extra_allowed_hosts": [],
+            "kwargs": {
+                "wheel_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/lha-0.4.2.dev0-py3-none-any.whl",
+                "codex_binary_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/codex-x86_64-unknown-linux-musl",
+                "protocol_path": "/private/tmp/lha-terminal-bench-2-1-public/d88c314c61adf99a4315983a55287924/inputs/protocol.json",
+                "reasoning_effort": "xhigh",
+                "instance_id": "terminal-bench/cancel-async-tasks",
+                "run_kind": "scored",
+                "attempt_id": "91b10ff23c9f6a32ad152e47abf8f195eb00fa815f72d12f04c2b9c56decdf69"
+            },
+            "mcp_servers": []
+        },
+        "environment": {
+            "type": "docker",
+            "import_path": null,
+            "force_build": false,
+            "delete": true,
+            "cpu_enforcement_policy": "auto",
+            "memory_enforcement_policy": "auto",
+            "override_cpus": null,
+            "override_memory_mb": null,
+            "override_storage_mb": null,
+            "override_gpus": null,
+            "override_tpu": null,
+            "mounts": null,
+            "extra_docker_compose": [],
+            "kwargs": {},
+            "extra_allowed_hosts": []
+        },
+        "verifier": {
+            "override_timeout_sec": null,
+            "max_timeout_sec": null,
+            "disable": false
+        },
+        "artifacts": [],
+        "extra_instruction_paths": [],
+        "job_id": "e7a7e79f-05cd-483e-8f9e-1b0e911a69b7"
+    },
+    "agent_info": {
+        "name": "lha",
+        "version": "0.4.2.dev0",
+        "model_info": {
+            "name": "gpt-5.5",
+            "provider": null
+        }
+    },
+    "agent_result": {
+        "n_input_tokens": 60260,
+        "n_cache_tokens": 45952,
+        "n_output_tokens": 3560,
+        "cost_usd": null,
+        "rollout_details": null,
+        "metadata": {
+            "dataset": "terminal-bench/terminal-bench-2-1",
+            "evaluation_id": "d88c314c61adf99a4315983a55287924",
+            "attempt_id": "91b10ff23c9f6a32ad152e47abf8f195eb00fa815f72d12f04c2b9c56decdf69",
+            "dataset_version": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+            "agent_import_path": "lha.bench.terminal_bench:LhaAgent",
+            "instance_id": "terminal-bench/cancel-async-tasks",
+            "run_kind": "scored",
+            "model": "gpt-5.5",
+            "reasoning_effort": "xhigh",
+            "harbor_version": "0.20.0",
+            "codex_cli_version": "codex-cli 0.141.0",
+            "codex_binary_sha256": "1f37cb63f6c8c3e5e9dddb247a822706f153c00e553efe8c0b05f62d0e4f1cab",
+            "wheel_sha256": "d34e0569943102c73b8ac4d6209bf5a3a061fada285f7e00c6f70c107f10fac0",
+            "protocol_sha256": "02e63fe754d3254a761153220325e33a88809ec9e3e8a03459abc6c8926893a2",
+            "task_content_digest": "sha256:a3d048d351136e48070696cda8bb79660dfd74db1fea3b6da88559f0332699c1",
+            "task_image_digest": "sha256:84c7fae6b256dcc56a350790e2a9715eefc7dad662a9d8e8a472363aa71ef18d",
+            "container_id": "00e20f5519f5626b068720ec8045fc88e174077361708da8b3e47b6eb818f430",
+            "container_image_id": "sha256:84c7fae6b256dcc56a350790e2a9715eefc7dad662a9d8e8a472363aa71ef18d",
+            "container_configured_image": "alexgshaw/cancel-async-tasks:20251031",
+            "container_repo_digests": [
+                "alexgshaw/cancel-async-tasks@sha256:84c7fae6b256dcc56a350790e2a9715eefc7dad662a9d8e8a472363aa71ef18d"
+            ],
+            "container_compose_project": "cancel-async-tasks__wciclhe__env",
+            "container_network_name": "cancel-async-tasks__wciclhe__env_default",
+            "post_quiescence_container_id": "00e20f5519f5626b068720ec8045fc88e174077361708da8b3e47b6eb818f430",
+            "broker_image_id": "sha256:82dbd69b53aec0323878ff4eaf4d0dff59b044aa0a8c77a53e94b9cdd113c603",
+            "broker_receipt_sha256": "a4b38ceacc5c0571cbe4afee6b07a87d4f2f1f48d68cc8da93355fe950c0f5ad",
+            "broker_accepted_requests": 5,
+            "broker_revoked": true,
+            "terminal_record_sha256": "5e67ac857ae6601070d2837de53fb5352c798dbc8c0287ff840790d5053a8371",
+            "codex_events_sha256": "d5237d8fd2836434bc1bab083a754e88e6a2d4f966e3d0447fe0f2382b633a60",
+            "codex_event_counts": {
+                "item.completed": 11,
+                "item.started": 6,
+                "thread.started": 1,
+                "turn.completed": 1,
+                "turn.started": 1
+            },
+            "codex_item_counts": {
+                "agent_message": 5,
+                "command_execution": 10,
+                "file_change": 2
+            },
+            "codex_tool_calls": 6,
+            "codex_reconnect_notices": 0,
+            "codex_reasoning_output_tokens": 2397,
+            "infrastructure_retries_used": 0,
+            "smoke_seal_sha256": "9640b0c413c65c6267407d46c0c1790f2d3aad8d68a138f445d10d21198d2bab"
+        }
+    },
+    "verifier_result": {
+        "rewards": {
+            "reward": 1.0
+        }
+    },
+    "exception_info": null,
+    "started_at": "2026-07-27T22:32:10.258837Z",
+    "finished_at": "2026-07-27T22:35:15.864212Z",
+    "environment_setup": {
+        "started_at": "2026-07-27T22:32:10.279536Z",
+        "finished_at": "2026-07-27T22:32:11.176596Z"
+    },
+    "agent_setup": {
+        "started_at": "2026-07-27T22:32:11.176674Z",
+        "finished_at": "2026-07-27T22:32:15.259163Z"
+    },
+    "agent_execution": {
+        "started_at": "2026-07-27T22:32:15.259386Z",
+        "finished_at": "2026-07-27T22:33:45.318587Z"
+    },
+    "verifier": {
+        "started_at": "2026-07-27T22:33:45.663697Z",
+        "finished_at": "2026-07-27T22:35:05.207443Z"
+    },
+    "step_results": null
+}

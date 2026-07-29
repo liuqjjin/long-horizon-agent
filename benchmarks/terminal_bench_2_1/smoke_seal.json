@@ -1,0 +1,17 @@
+{
+  "evaluation_id": "d88c314c61adf99a4315983a55287924",
+  "manifest_sha256": "10a32966568e26df5aa6f8903ec8067e402d6109d1ff3905a0aceabedaa1611e",
+  "protocol_sha256": "02e63fe754d3254a761153220325e33a88809ec9e3e8a03459abc6c8926893a2",
+  "schema_version": 2,
+  "sealed_at": "2026-07-27T19:42:11.645861+00:00",
+  "smoke_instance_ids": [
+    "terminal-bench/sam-cell-seg",
+    "terminal-bench/sqlite-with-gcov",
+    "terminal-bench/password-recovery"
+  ],
+  "terminal_record_sha256": {
+    "terminal-bench/password-recovery": "e03212930057273dd79acd6d98ead3d28df6ce9418989ba184962aaf39a1cfd6",
+    "terminal-bench/sam-cell-seg": "96bb93e33da498862aa3f0eaedc31ba2915b966b6304777ff0a93daf604efae7",
+    "terminal-bench/sqlite-with-gcov": "61e38e2ded85c87555b252f5cf0efbaca4c98e881401a51e424586cfbd293512"
+  }
+}

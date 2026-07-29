@@ -265,6 +265,18 @@ def test_psnr_fails_when_experiment_failed(tmp_path):
     assert not check.passed
 
 
+def test_psnr_fails_when_experiment_output_was_truncated(tmp_path):
+    rng = np.random.default_rng(4)
+    ref = rng.random((16, 16, 3)).astype(np.float32)
+    art = _write_pair(tmp_path, ref, ref.copy())
+    art.output_truncated = True
+    check = PSNRVerifier().verify(
+        art, VerifyContext(workdir=tmp_path, step=_step("psnr", {"psnr_min": 1.0}))
+    )
+    assert not check.passed
+    assert "incomplete" in check.detail["summary"]
+
+
 def test_psnr_fails_on_nonfinite_recomputed(tmp_path):
     ref = np.full((16, 16, 3), np.nan, dtype=np.float32)
     pred = np.zeros((16, 16, 3), dtype=np.float32)

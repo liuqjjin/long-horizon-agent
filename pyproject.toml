@@ -8,20 +8,19 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "liuqjjin", email = "156533013+liuqjjin@users.noreply.github.com" }]
 keywords = [
-    "llm-agents",
-    "agent-harness",
-    "verification",
-    "llm-evals",
-    "research-agent",
+    "task-runner",
+    "checkpoint-recovery",
+    "code-verification",
+    "docker",
+    "reproducible-evaluation",
     "langgraph",
-    "reproducibility",
-    "ablation",
-    "swe-bench",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -29,6 +28,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "cryptography>=45.0",
     "langgraph>=1.2.6",
     "langgraph-checkpoint-sqlite>=3.1.0",
     "mcp>=1.28.0",
@@ -52,7 +52,7 @@ context = [
 ]
 # Public-benchmark harnesses. harbor needs Python >= 3.12 (lha itself runs on 3.11).
 bench = ["swebench>=4.1.0", "harbor>=0.20; python_version >= '3.12'"]
-llm = ["anthropic>=0.69"]  # needs the Opus-4.8 surface (adaptive thinking, output_config.effort)
+llm = ["anthropic>=0.69"]
 typecheck = ["pyright>=1.1"]
 
 [project.urls]
