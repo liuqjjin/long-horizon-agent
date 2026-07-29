@@ -33,17 +33,17 @@ uv run lha run data/tasks/fix_average.yaml
 The run reaches `DONE` only after its Pytest and Ruff checks pass. Keep the
 printed `run_id`, then inspect the saved evidence:
 
-This bundled task explicitly makes indexed code context optional. It still runs
-the real checks when `ccc` is not installed. `ccc` is an optional code-indexing
-feature, not a quickstart prerequisite; tasks that require indexed context still
-fail closed when the backend is unavailable.
-
 ```bash
 RUN_ID=replace-with-the-printed-run-id
 uv run lha runs show "$RUN_ID"
 uv run lha trace "$RUN_ID"
 uv run lha trace "$RUN_ID" --html
 ```
+
+This bundled task explicitly makes indexed code context optional. It still runs
+the real checks when `ccc` is not installed. `ccc` is an optional code-indexing
+feature, not a quickstart prerequisite; tasks that require indexed context still
+fail closed when the backend is unavailable.
 
 The HTML report contains the timeline, patch, approvals, check results, repair
 events, and recorded model usage.
@@ -55,8 +55,9 @@ uv run lha run \
   --runtime langgraph \
   data/tasks/fix_average_approval.yaml
 
-uv run lha approve "$RUN_ID" --note "reviewed patch"
-uv run lha resume --runtime langgraph "$RUN_ID"
+APPROVAL_RUN_ID=replace-with-this-run-id
+uv run lha approve "$APPROVAL_RUN_ID" --note "reviewed patch"
+uv run lha resume --runtime langgraph "$APPROVAL_RUN_ID"
 ```
 
 Approval records the step and SHA-256 of the persisted patch. Resume checks the
@@ -95,17 +96,21 @@ typed status when its backend is unavailable or its index cannot be refreshed.
 
 ## Use a local Codex login
 
-Authenticate the installed `codex` CLI, then set the model explicitly:
+Authenticate the installed `codex` CLI, then run:
 
 ```bash
-LHA_CODEX_MODEL=gpt-5.4-mini \
-LHA_CODEX_EFFORT=medium \
 uv run lha --llm codex_cli run data/tasks/fix_average.yaml
 ```
 
+This uses the current CLI model settings. For a measured run, set
+`LHA_CODEX_MODEL` and `LHA_CODEX_EFFORT` to values supported by the account and
+record them with the result.
+
 LHA gives the CLI a temporary home and workspace, validates its JSONL events,
-records secret-free provenance, and removes temporary credentials after success,
-failure, timeout, or interruption.
+and records secret-free provenance. Handled exit paths confirm that the original
+process group stopped before removing temporary credentials. A tool process
+that deliberately leaves that group is outside the host backend's guarantee;
+run untrusted tools inside Docker or another outer containment boundary.
 
 ## Inspect and prune runs
 

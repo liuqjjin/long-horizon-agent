@@ -149,10 +149,12 @@ observed.
 
 `src/lha/llm/codex_cli.py` runs `codex exec --json` in an attempt-local home and
 workspace. It copies only required authentication, starts a separate process
-group, stops descendants on normal failure, timeout, or handled interruption,
-and then removes temporary credentials. `SIGKILL`, a kernel crash, or power
-loss can prevent that cleanup; any surviving directory remains protected by
-its file mode and must be inspected manually.
+group, and confirms that the original group stopped on normal failure, timeout,
+or handled interruption before removing temporary credentials. A tool process
+that deliberately creates another process group or session is outside this host
+cleanup guarantee and requires Docker or another outer containment boundary.
+`SIGKILL`, a kernel crash, or power loss can prevent cleanup; any surviving
+directory remains protected by its file mode and must be inspected manually.
 
 The parser rejects malformed JSONL, unknown events, incomplete turns, error
 events, and unfinished or disallowed tool use. The no-tools ablation path

@@ -1,102 +1,91 @@
-# Benchmark reports
+# 评测证据目录
 
-This directory contains committed, machine-checkable reports. Generated runs
-under `runs/` are ignored by Git; files are copied here only after the report,
-source revision, and execution provenance have been validated.
+本目录只保存已经提交、可以由程序校验的评测证据。运行过程中生成的文件位于
+`runs/`，不会因为存在于本机就成为公开结果。
 
-## Internal ablation: historical schema-v2 record
+## 当前状态
 
-The committed ablation and horizon files were produced with the schema-v2
-protocol. They are retained so the earlier run and its raw cells can be
-inspected.
+| 评测 | 状态 | 可公开结论 |
+|---|---|---|
+| 早期内部消融 | 历史记录 | 仅用于核对旧协议，不代表当前实现 |
+| 两次未登记的 schema-v4 运行 | 已披露 | 缺少事前登记和一次性远端 Git 开始记录，不是正式结果 |
+| 两次正式 schema-v4 尝试 | `ABANDONED` | 均无可发布的消融结果 |
+| Terminal-Bench 2.1 固定子集 | 已完成 | 7/20：7 `PASS`、9 `FAIL`、4 `ERROR` |
 
-The scoring boundary, error classification, and evidence format have since
-changed. The schema-v2 files are therefore not the current project result and
-their numbers should not be copied into the README or a resume. New claims
-require a complete schema-v4 rerun with its raw records, configuration, and
-rendered reports committed together.
+正式内部消融只有在登记状态为 `COMPLETED`、完整报告和原始证据同时提交后，
+才会成为当前项目结果。现在尚无满足这些条件的内部消融报告。
 
-The formal schema-v4 protocol requires a committed attempt registration, a
-create-only remote start witness, a new output directory, no cache reads, and
-no resume. An interrupted attempt is recorded as abandoned. The final
-schema-v4 result has not been committed, so this directory does not publish its
-counts.
+## 内部消融证据
 
-## Terminal-Bench 2.1 fixed subset
+### 历史 schema-v2 报告
 
-[`terminal_bench_2_1/`](terminal_bench_2_1/) is the committed schema-v4 evidence
-for one fixed 20-task subset run: 7 `PASS`, 9 `FAIL`, and 4 `ERROR`. All four
-errors remain in the denominator, so the result is 7/20. This is not a
-full-dataset or leaderboard score.
+- [`ablation_report.json`](ablation_report.json)：早期消融的机器可读记录。
+- [`ablation_report.md`](ablation_report.md)：由该 JSON 生成的文本报告。
+- [`horizon_report.json`](horizon_report.json)：早期任务单元、完整重复和组合推演记录。
+- [`horizon_report.md`](horizon_report.md) 与
+  [`horizon_curve.svg`](horizon_curve.svg)：对应的文本和图形。
 
-The package binds the protocol, selected task IDs, source commit and wheel,
-model settings, Harbor and Codex versions, task outcomes, and summary. Official
-result JSON is public for the 16 `PASS` or `FAIL` tasks. The four error records
-are redacted projections bound to private originals by SHA-256, so their
-private exception text cannot be reconstructed from this repository.
+这些文件使用旧评分边界保留历史运行，不能作为当前 README 或简历中的实验数字。
 
-## Files
+### 未登记的 schema-v4 运行
 
-- [`ablation_report.json`](ablation_report.json) is the machine-readable source
-  for the historical run. It
-  contains schema version, every cell, condition summaries, model-call audits,
-  source hashes, clean-worktree status, runtime versions, scorer image, and a
-  report fingerprint.
-- [`ablation_report.md`](ablation_report.md) is generated from that JSON.
-- [`horizon_report.json`](horizon_report.json) keeps cell, episode, and
-  composition estimands in separate objects.
-- [`horizon_report.md`](horizon_report.md) and
-  [`horizon_curve.svg`](horizon_curve.svg) are generated renderings.
-- [`terminal_bench_2_1/evidence.json`](terminal_bench_2_1/evidence.json) indexes
-  the fixed-subset protocol, manifests, source attestation, records, trials,
-  and summary.
+[`formal_ablation_history/`](formal_ablation_history/) 保存两份 schema-v4 格式报告。
+它们产生在正式尝试登记和一次性远端 Git 开始记录建立之前，登记簿将其记为
+`UNREGISTERED_RUN_RECORDED`。保留这些文件是为了披露历史，不把它们转成正式结果。
 
-`trust` and `gate` score the same first attempt. The internal gate predicts
-whether work may advance; it is not reused as the benchmark result. The
-schema-v2 scoring path applies the frozen change to a fresh repository and runs
-the original tests through a separate execution backend.
+### 正式尝试登记
 
-## Exploratory ablation
+[`formal_ablation_attempts.json`](formal_ablation_attempts.json) 是正式尝试登记簿，
+[`formal_ablation_manifest.json`](formal_ablation_manifest.json) 固定 17 个任务及其语料摘要。
 
-Build the scorer image first. It must contain the task's scoring dependencies;
-the default slim Python image is insufficient.
+登记簿目前包含两次 `REGISTERED → ABANDONED`：
 
-```bash
-docker build -t lha:release .
+1. 第一次尝试在创建一次性远端 Git 引用时被 GitHub 规则阻止，未进入模型评测。
+2. 第二次尝试在 Codex 用量耗尽后中止；按协议保留已有文件，不恢复也不把部分输出发布为结果。
 
-LHA_EXEC_IMAGE=lha:release \
-LHA_CODEX_MODEL=gpt-5.4-mini \
-LHA_CODEX_EFFORT=low \
-uv run lha --llm codex_cli ablate \
-  --model gpt-5.4-mini \
-  --reps 1 \
-  --scorer-backend docker \
-  --out runs/ablation-exploratory
+两次尝试都没有 `COMPLETED` 事件。后续正式运行必须使用新的登记和输出目录，
+并继续保留这两条失败记录。
 
-uv run lha horizon \
-  --from-report runs/ablation-exploratory/ablation_report.json \
-  --out runs/horizon-exploratory
-```
+内部消融中，`trust` 与 `gate` 对同一份首轮补丁评分；内部检查只负责决定是否放行，
+独立评分器在新的仓库副本中运行固定测试。方法和错误处理见
+[消融说明](../docs/ABLATION.md)，任务长度推演口径见
+[Horizon 说明](../docs/HORIZON.md)。
 
-This command is exploratory evidence and may differ from the historical
-record. The formal 17 × 12 command is accepted only from a clean checkout whose
-registration fixes the exact source, corpus, model, CLI/client settings, Docker
-image, output path, and witness remote. See
-[`docs/ABLATION.md`](../docs/ABLATION.md); do not turn an exploratory output
-into a formal claim.
+## Terminal-Bench 2.1 固定 20 题子集
 
-Before publishing or changing any number, run:
+[`terminal_bench_2_1/`](terminal_bench_2_1/) 是已经完成的公开证据包。
+结果为 7 个 `PASS`、9 个 `FAIL`、4 个 `ERROR`，四个 `ERROR` 保留在分母中，
+因此结果为 7/20。这不是完整数据集或排行榜成绩。
+
+主要文件：
+
+- [`evidence.json`](terminal_bench_2_1/evidence.json)：证据索引和摘要绑定。
+- [`protocol.json`](terminal_bench_2_1/protocol.json)：固定任务、预算和运行协议。
+- [`scored_manifest.json`](terminal_bench_2_1/scored_manifest.json)：20 个正式任务。
+- [`records.json`](terminal_bench_2_1/records.json)：任务结果记录。
+- [`summary.json`](terminal_bench_2_1/summary.json) 与
+  [`summary.md`](terminal_bench_2_1/summary.md)：机器和文本汇总。
+- [`trials/`](terminal_bench_2_1/trials/)：每个任务的公开结果。
+
+16 个 `PASS` 或 `FAIL` 任务保留官方结果 JSON。四个 `ERROR` 使用脱敏记录，
+并通过 SHA-256 绑定私有原文；公开仓库不能还原未公开的异常内容。
+
+Harbor 适配器直接运行 Codex，不经过 LHA 的内部放行或修复流程。因此 7/20
+只说明这次固定子集运行，不是 LHA 校验机制的成绩。完整解释见
+[评测说明](../docs/BENCHMARKS.md)。
+
+## 校验证据
+
+修改公开数字或报告前运行：
 
 ```bash
 uv run python -m lha.release_claims
+uv run python tools/run_terminal_bench_2_1.py \
+  validate benchmarks/terminal_bench_2_1
 ```
 
-This check derives counts and exact paired tests from the raw records,
-reproduces the horizon artifacts, and compares public claims with the committed
-JSON. Method details are in [`docs/ABLATION.md`](../docs/ABLATION.md) and
-[`docs/HORIZON.md`](../docs/HORIZON.md).
+第一条命令从已提交记录重新计算统计量，并检查文档与证据是否一致。
+第二条命令只校验已提交的 Terminal-Bench 包，不会重新运行评测任务。
 
-The deterministic `lha eval` and public-benchmark adapters are documented in
-[`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md). Adapter support alone is not a
-Terminal-Bench or SWE-bench result. The only public external result currently
-claimed is the committed Terminal-Bench fixed 20-task subset above.
+探索性运行可以用于调试，但不写入本目录的当前结果。适配器存在也不等于已经获得
+Terminal-Bench 或 SWE-bench 成绩。

@@ -37,9 +37,10 @@ Notable changes are listed here. The format follows
   stale, non-finite, or mismatched data.
 - Context records now distinguish no result, unavailable backend, failed index,
   stale source, and partial availability.
-- Horizon reports now separate paired cells, complete-corpus repetitions, and
-  descriptive composition. Cell and episode tests may differ; composition adds
-  no samples.
+- Horizon reports now separate paired cells, complete-corpus repetition
+  aggregates, and descriptive composition. Schema-v4 paired inference uses the
+  task-cluster sign-flip test; cell discordance is descriptive, and composition
+  adds no samples.
 - Boundary proportions use Wilson score intervals. Interior rates continue to
   use a task-cluster bootstrap.
 - Packaged context flows moved under `src/lha/live_context/flows/`. Release
@@ -49,8 +50,8 @@ Notable changes are listed here. The format follows
 - The application image now bundles a pinned `all-MiniLM-L6-v2` snapshot and
   loads it offline, so container self-eval does not download model files.
 - Host, Codex, and Claude subprocesses now bound output, reject invalid timeout
-  values, remove process groups on every exit path, and fail when cleanup cannot
-  be confirmed.
+  values, terminate their original process groups on handled exit paths, and
+  fail when that group cleanup cannot be confirmed.
 
 ### Evaluation record
 

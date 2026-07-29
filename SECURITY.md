@@ -95,9 +95,18 @@ required by the CLI and passes an explicit environment allowlist. API keys,
 cloud credentials, SSH agent sockets, and arbitrary caller variables are not
 forwarded.
 
-The CLI runs in a new process group. Normal return, exception, timeout, or a
-handled keyboard interruption stops the leader and descendants before the
-temporary credential directory is removed.
+The CLI runs in a new process group. On normal return, exception, timeout, or a
+handled keyboard interruption, LHA terminates the original process group and
+confirms that group is absent before removing the temporary credential
+directory.
+
+This is not a guarantee that every descendant process has exited. A tool can
+deliberately create another process group or session; after reparenting, the
+host backend cannot identify it without a race on both macOS and Linux. The
+generated Codex permission profile is checked before credentials are copied and
+denies tool processes access to the temporary Codex home, but untrusted tool
+execution still requires Docker, a Linux cgroup, or another outer containment
+boundary.
 
 That cleanup is cooperative process-exit behavior, not a crash-proof erasure
 guarantee. `SIGKILL`, a kernel crash, or power loss can stop the cleanup handler
@@ -141,6 +150,8 @@ not be present.
 ## Known limitations
 
 - `trusted-local` is not a hostile-code sandbox.
+- Host process-group cleanup cannot prove that a deliberately detached
+  descendant has exited.
 - Docker reduces exposure but does not prove that a task image or Docker daemon
   is trustworthy.
 - `LHA_DEADLINE_S` is checked when control returns to persisted boundaries. It
